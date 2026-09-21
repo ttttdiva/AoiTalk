@@ -66,6 +66,8 @@ export const DOCS_CLIP_INGEST_POLL_INTERVAL_MS = 1_000;
 export const DOCS_CLIP_INGEST_RECONCILIATION_INTERVAL_MS = 1_000;
 export const DOCS_CLIP_INGEST_RECONCILIATION_MAX_ATTEMPTS = 10;
 export const DOCS_CLIP_INGEST_JOBS_PATH = "/api/docs/ingest/jobs";
+export const DOCS_CLIP_INGEST_DISMISS_PATH = (jobId: string) =>
+  DOCS_CLIP_INGEST_JOBS_PATH + "/" + encodeURIComponent(jobId) + "/dismiss";
 export const DOCS_CLIP_INGEST_CONNECTION_ERROR =
   "接続できません。状態を再取得します。";
 const DOCS_CLIP_INGEST_HTTP_ERROR_PREFIX = "取り込み要求が拒否されました";
@@ -430,6 +432,8 @@ export function useDocsClipIngestJobs() {
   const mountedRef = useRef(true);
   const scopeRef = useRef<string | null>(null);
   const epochRef = useRef(1);
+  const dismissedServerJobIdsRef = useRef<Set<string>>(new Set());
+  const dismissInFlightRef = useRef<Set<string>>(new Set());
   const persistenceQueueRef = useRef<Promise<void>>(Promise.resolve());
   const pollInFlightRef = useRef(false);
   const reconciliationInFlightRef = useRef(false);
@@ -501,9 +505,10 @@ export function useDocsClipIngestJobs() {
         const idempotencyKey = job.idempotency_key;
         if (idempotencyKey) unresolvedSubmissionsRef.current.delete(idempotencyKey);
       }
+      const serverJobs = normalized.jobs.filter((job) => !dismissedServerJobIdsRef.current.has(job.id));
       const currentServer = jobsRef.current.filter((job) => job.origin === "server");
       const currentById = new Map(currentServer.map((job) => [job.id, job]));
-      const mergedJobs = normalized.jobs.map((job) => {
+      const mergedJobs = serverJobs.map((job) => {
         const current = currentById.get(job.id);
         const currentTerminal = current?.status === "success"
           || current?.status === "failure"
@@ -513,7 +518,7 @@ export function useDocsClipIngestJobs() {
       });
       const byId = new Map(mergedJobs.map((job) => [job.id, job]));
       const stillLocal = currentServer.filter(
-        (job) => !byId.has(job.id),
+        (job) => !dismissedServerJobIdsRef.current.has(job.id) && !byId.has(job.id),
       );
       setSnapshot(
         (previous) => [
@@ -600,6 +605,8 @@ export function useDocsClipIngestJobs() {
       : ++epochRef.current;
     pollInFlightRef.current = false;
     unresolvedSubmissionsRef.current.clear();
+    dismissedServerJobIdsRef.current.clear();
+    dismissInFlightRef.current.clear();
     setConnectionError(false);
     setRequestError(null);
     jobsRef.current = jobsRef.current.filter((job) => job.origin !== "server");
@@ -719,8 +726,24 @@ export function useDocsClipIngestJobs() {
       });
   }, [markConnectionError, markHttpError, rememberUnresolvedSubmission, setSnapshot]);
 
-  const dismiss = useCallback((id: string) => {
-    setSnapshot((previous) => previous.filter((job) => job.id !== id), true);
+  const dismiss = useCallback(async (id: string) => {
+    const job = jobsRef.current.find((item) => item.id === id);
+    if (!job) return;
+    if (job.origin !== "server") {
+      setSnapshot((previous) => previous.filter((item) => item.id !== id), true);
+      return;
+    }
+    if (dismissInFlightRef.current.has(id)) return;
+    dismissInFlightRef.current.add(id);
+    try {
+      await apiFetch<unknown>(DOCS_CLIP_INGEST_DISMISS_PATH(id), { method: "POST" });
+      dismissedServerJobIdsRef.current.add(id);
+      setSnapshot((previous) => previous.filter((item) => item.id !== id), false);
+    } catch {
+      // Keep the card visible until a dismiss POST succeeds.
+    } finally {
+      dismissInFlightRef.current.delete(id);
+    }
   }, [setSnapshot]);
 
   const retry = useCallback((id: string) => {

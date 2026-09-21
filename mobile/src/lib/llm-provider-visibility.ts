@@ -1,5 +1,11 @@
 import type { LlmDeploymentMetadata, UserSettings } from "../types/api";
 
+type ProviderVisibilitySource =
+  | UserSettings
+  | { hidden_provider_ids?: unknown }
+  | null
+  | undefined;
+
 export function normalizeProviderId(value: unknown): string | null {
   if (typeof value !== "string") return null;
   const normalized = value.trim().toLowerCase();
@@ -19,9 +25,13 @@ function normalizeProviderIdList(value: unknown): string[] | null {
 
 /** ユーザー設定から非表示プロバイダーIDを安全に正規化する。 */
 export function normalizeHiddenProviderIds(
-  settings: UserSettings | null | undefined,
+  settings: ProviderVisibilitySource,
 ): string[] {
-  const rawIds = settings?.llm_provider_visibility?.hidden_provider_ids;
+  const rawIds =
+    (settings as { hidden_provider_ids?: unknown } | null | undefined)
+      ?.hidden_provider_ids ??
+    (settings as UserSettings | null | undefined)?.llm_provider_visibility
+      ?.hidden_provider_ids;
   if (!Array.isArray(rawIds)) return [];
 
   const seen = new Set<string>();
@@ -134,7 +144,7 @@ export function filterProvidersByDeployment<T>(
 /** 非表示設定を適用しつつ、現在使用中のプロバイダーは候補に残す。 */
 export function filterVisibleProviders<T>(
   providers: readonly T[] | null | undefined,
-  settings: UserSettings | null | undefined,
+  settings: ProviderVisibilitySource,
   preserveProviderIds: Iterable<unknown> = [],
   getProviderId: (provider: T) => unknown = (provider) =>
     (provider as { id?: unknown }).id,
@@ -142,14 +152,12 @@ export function filterVisibleProviders<T>(
   const hiddenIds = new Set(normalizeHiddenProviderIds(settings));
   if (!hiddenIds.size) return Array.from(providers ?? []);
 
-  const preservedIds = new Set<string>();
-  for (const rawId of preserveProviderIds) {
-    const providerId = normalizeProviderId(rawId);
-    if (providerId) preservedIds.add(providerId);
-  }
+  // Retain the argument for compatibility with older callers, but a globally
+  // hidden provider must not be reintroduced because it is currently selected.
+  void preserveProviderIds;
 
   return (providers ?? []).filter((provider) => {
     const providerId = normalizeProviderId(getProviderId(provider));
-    return !providerId || !hiddenIds.has(providerId) || preservedIds.has(providerId);
+    return !providerId || !hiddenIds.has(providerId);
   });
 }

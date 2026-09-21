@@ -3,6 +3,8 @@ Main conversation memory manager
 """
 
 import asyncio
+import inspect
+import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from .config import MemoryConfig
@@ -11,6 +13,15 @@ from .repository import ConversationRepository
 from .services import SummarizationService, MemorySearchService, ConversationHistoryService
 from .models import ConversationSession, ConversationMessage
 from .cross_session_memory import get_cross_session_memory
+from ..services.privacy_masking_projection import (
+    is_privacy_masking_source,
+    public_model_message_metadata,
+)
+from ..runtime import AsyncResourceScope
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
 
 
 class ConversationMemoryManager:
@@ -35,16 +46,6 @@ class ConversationMemoryManager:
             if 'enable_search' in memory_config:
                 self.config.enable_search = memory_config['enable_search']
             
-            # Apply other memory settings
-            if 'embedding_model' in memory_config:
-                self.config.embedding_model = memory_config['embedding_model']
-            if 'preload_embedding_model' in memory_config:
-                self.config.preload_embedding_model = memory_config['preload_embedding_model']
-                
-            # If search is disabled, also disable embedding model preloading
-            if not self.config.enable_search:
-                self.config.preload_embedding_model = False
-            
             logging_config = app_config.get_conversation_logging_config()
             self.config.conversation_logging_enabled = logging_config.get('enabled', True)
             self.config.save_user_messages = logging_config.get('save_user_messages', True)
@@ -56,17 +57,104 @@ class ConversationMemoryManager:
             self.config.auto_cleanup_enabled = logging_config.get('auto_cleanup_enabled', True)
             self.config.exclude_patterns = logging_config.get('exclude_patterns', [])
         
-        # Pass enable_search to repository to avoid loading embedding model when search is disabled
+        # Keep the repository aware of whether semantic search is enabled.
         self.repository = ConversationRepository(enable_search=self.config.enable_search)
         self.summarization_service = SummarizationService(self.config)
-        # Lazy initialization of search service to avoid loading embedding model when search is disabled
+        # Keep cross-session search dependencies lazy until a search is requested.
         self._search_service = None
         self.history_service = ConversationHistoryService(self.config)
         
         self._initialized = False
         self._current_sessions: Dict[str, ConversationSession] = {}
         self._summarization_tasks: Dict[str, asyncio.Task] = {}
+        self._indexing_tasks: set[asyncio.Task] = set()
+        self._background_tasks: set[asyncio.Task] = set()
+        self._resource_scope = AsyncResourceScope("conversation-memory")
         self._cleanup_done = False
+        self._cleanup_task: Optional[asyncio.Task] = None
+
+    @staticmethod
+    def _close_unawaited(coro: Any) -> None:
+        """Close a coroutine that could not be scheduled.
+
+        ``_spawn_background`` accepts a coroutine object so callers can build
+        the operation inline.  If cleanup has already started (or task
+        creation fails), simply dropping that object would emit Python's
+        ``coroutine was never awaited`` warning.  Futures/tasks are not closed
+        here because they may be owned by another component.
+        """
+
+        if inspect.iscoroutine(coro):
+            coro.close()
+
+    def _background_task_done(self, task: asyncio.Task) -> None:
+        """Forget a completed task and retrieve any unhandled exception."""
+
+        self._background_tasks.discard(task)
+        self._indexing_tasks.discard(task)
+
+        if task.cancelled():
+            return
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            return
+        except BaseException as exc:
+            # Calling ``exception()`` above still retrieves the task result;
+            # do not allow unusual BaseException subclasses to become an
+            # unobserved task failure during interpreter shutdown.
+            print(
+                "[ConversationMemoryManager] Background task result retrieval "
+                f"failed: {exc}"
+            )
+            return
+        if exception is not None:
+            print(
+                "[ConversationMemoryManager] Background task failed: "
+                f"{exception}"
+            )
+
+    def _summarization_task_done(
+        self,
+        session_key: str,
+        task: asyncio.Task,
+    ) -> None:
+        """Remove a summary task only if it is still the current task."""
+
+        if self._summarization_tasks.get(session_key) is task:
+            self._summarization_tasks.pop(session_key, None)
+
+    def _spawn_background(
+        self,
+        coro,
+        *,
+        name: str,
+    ) -> Optional[asyncio.Task]:
+        """Spawn and own a manager background operation.
+
+        Every manager-owned background task goes through the resource scope so
+        ``cleanup`` can cancel and await it before closing the database.  The
+        coroutine is explicitly closed when creation is refused, preventing a
+        dropped coroutine warning during shutdown races.
+        """
+
+        if self._cleanup_done:
+            self._close_unawaited(coro)
+            return None
+
+        try:
+            task = self._resource_scope.spawn(coro, name=name)
+        except Exception as exc:
+            self._close_unawaited(coro)
+            print(
+                f"[ConversationMemoryManager] Failed to start background task "
+                f"{name}: {exc}"
+            )
+            return None
+
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_task_done)
+        return task
     
     @property
     def search_service(self):
@@ -85,30 +173,24 @@ class ConversationMemoryManager:
             success = await init_database(self.config.database_path)
             if success:
                 self._initialized = True
-                print("[ConversationMemoryManager] Memory system initialized")
-                
-                # Search is enabled by default, but model preload must stay opt-in
-                # so startup and first response are not slowed down.
-                if (
-                    hasattr(self.config, 'enable_search')
-                    and self.config.enable_search
-                    and getattr(self.config, 'preload_embedding_model', False)
-                ):
-                    try:
-                        from .embedding import get_embedding_manager
-                        embedding_manager = get_embedding_manager(self.config.embedding_model)
-                        await embedding_manager.preload_model()
-                        print("[ConversationMemoryManager] Embedding model preloaded")
-                    except Exception as e:
-                        print(f"[ConversationMemoryManager] Failed to preload embedding model: {e}")
-                else:
-                    print("[ConversationMemoryManager] Memory search preload skipped")
+                logger.info(
+                    "Conversation memory system initialized",
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
+
             else:
-                print("[ConversationMemoryManager] Database initialization failed, continuing without memory")
+                logger.warning(
+                    "Conversation memory database initialization failed; continuing without memory",
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
                 self._initialized = False
             return success
         except Exception as e:
-            print(f"[ConversationMemoryManager] Initialization failed: {e}, continuing without memory")
+            logger.warning(
+                "Conversation memory initialization failed; continuing without memory: %s",
+                e,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             self._initialized = False
             return False
     
@@ -340,8 +422,15 @@ class ConversationMemoryManager:
         except Exception as e:
             print(f"[ConversationMemoryManager] Warning: Could not log to history: {e}")
 
-        # Index message in cross-session memory for future retrieval (fire-and-forget)
-        if message and self.config.enable_search and session_info:
+        # Index message in cross-session memory for future retrieval.  This is
+        # intentionally background work: a Qdrant/indexing failure must never
+        # fail the durable message write.
+        # ``/masking`` source rows remain in the canonical transcript for
+        # audit/UI purposes, but must never become reusable cross-session
+        # retrieval/indexing material.  The marker is server-issued metadata;
+        # do not infer it from slash text or prompt content.
+        is_masking_source = bool(message and is_privacy_masking_source(message))
+        if message and self.config.enable_search and session_info and not is_masking_source:
             message_id = str(message.id)
             message_created_at = message.created_at
             index_user_id = session_info.user_id
@@ -368,9 +457,12 @@ class ConversationMemoryManager:
                     # Indexing failure should not affect main flow
                     print(f"[ConversationMemoryManager] Warning: Cross-session indexing failed: {e}")
             
-            # Fire-and-forget: don't await, let it run in background
-            import asyncio
-            asyncio.create_task(_index_in_background())
+            task = self._spawn_background(
+                _index_in_background(),
+                name=f"cross-session-index-{message_id}",
+            )
+            if task is not None:
+                self._indexing_tasks.add(task)
 
         if session_info and (session_info.message_count or 0) >= self.config.max_active_messages:
             await self._trigger_summarization(session_info, llm_client)
@@ -434,29 +526,34 @@ class ConversationMemoryManager:
             session: Conversation session
             llm_client: LLM client for summarization
         """
-        # Skip if cleanup is in progress
+        # Avoid even constructing a summary coroutine once shutdown has
+        # started.  The helper below remains defensive for direct callers that
+        # hand it an already-created coroutine.
         if self._cleanup_done:
             return
 
         session_key = str(session.id)
 
         # Do not block the response path waiting for an existing summary task.
-        if session_key in self._summarization_tasks:
-            existing_task = self._summarization_tasks[session_key]
+        existing_task = self._summarization_tasks.get(session_key)
+        if existing_task is not None:
             if not existing_task.done():
                 return
         
         # Start new summarization task with proper error handling
-        try:
-            task = asyncio.create_task(
-                self._summarize_session_with_cleanup(session, llm_client)
+        task = self._spawn_background(
+            self._summarize_session_with_cleanup(session, llm_client),
+            name=f"summarization-{session_key}",
+        )
+        if task is None:
+            return
+        self._summarization_tasks[session_key] = task
+        task.add_done_callback(
+            lambda completed, key=session_key: self._summarization_task_done(
+                key, completed
             )
-            self._summarization_tasks[session_key] = task
-            # Set task name for better debugging
-            task.set_name(f"summarization-{session_key}")
-            print(f"[ConversationMemoryManager] Started summarization for session: {session.id}")
-        except Exception as e:
-            print(f"[ConversationMemoryManager] Failed to start summarization: {e}")
+        )
+        print(f"[ConversationMemoryManager] Started summarization for session: {session.id}")
     
     async def _summarize_session_with_cleanup(self, session: ConversationSession, llm_client = None):
         """Wrapper for summarization with proper cleanup and error handling
@@ -481,11 +578,11 @@ class ConversationMemoryManager:
                 print(f"[ConversationMemoryManager] Summarization error for session {session.id}: {e}")
         finally:
             # Remove task from tracking
-            if session_key in self._summarization_tasks:
-                try:
-                    del self._summarization_tasks[session_key]
-                except KeyError:
-                    pass
+            current_task = self._summarization_tasks.get(session_key)
+            # A previous task may finish after a replacement task was
+            # installed.  Never remove the replacement from the tracking map.
+            if current_task is asyncio.current_task():
+                self._summarization_tasks.pop(session_key, None)
     
     async def _summarize_session(self, session: ConversationSession, llm_client = None):
         """Summarize conversation session and archive
@@ -501,6 +598,15 @@ class ConversationMemoryManager:
             if callable(get_active)
             else self.repository.get_session_messages(session.id)
         )
+
+        # A masking source is intentionally retained in the user-visible
+        # transcript, but summarising it would copy raw confidential text into
+        # ``current_summary``/archives and make it provider-visible later.
+        all_messages = [
+            message
+            for message in all_messages
+            if not is_privacy_masking_source(message)
+        ]
         
         if len(all_messages) < self.config.max_active_messages:
             print(f"[ConversationMemoryManager] Not enough messages to summarize: {len(all_messages)}")
@@ -606,9 +712,23 @@ class ConversationMemoryManager:
         session = await self.repository.get_active_session(user_id, character_name)
         if not session:
             return []
-        
+
         messages = await self.repository.get_recent_messages(session.id, count)
-        return [msg.to_dict() for msg in messages]
+        # This method feeds legacy memory-prefill consumers (for example the
+        # Discord adapter), not the user-facing conversation-history API.  A
+        # masking source remains durable in the latter but must never become
+        # future provider context through this compatibility projection.
+        projected: list[dict[str, Any]] = []
+        for msg in messages:
+            if is_privacy_masking_source(msg):
+                continue
+            payload = msg.to_dict()
+            if isinstance(payload, dict):
+                payload["metadata"] = public_model_message_metadata(
+                    payload.get("metadata") or {}
+                )
+            projected.append(payload)
+        return projected
     
     async def add_function_call(self, user_id: str, character_name: str, function_name: str, 
                                function_args: Dict[str, Any], function_result: Any, 
@@ -652,36 +772,62 @@ class ConversationMemoryManager:
                 metadata={'function_call_data': function_call_data}
             )
     
-    async def cleanup(self):
-        """Cleanup resources and pending tasks"""
-        if self._cleanup_done:
-            return
-        
-        self._cleanup_done = True
+    async def _cleanup_impl(self) -> None:
+        """Run the one-and-only cleanup sequence for this manager."""
+
         print("[ConversationMemoryManager] Starting cleanup...")
-        
-        # Cancel all summarization tasks gracefully
-        if self._summarization_tasks:
-            print(f"[ConversationMemoryManager] Cancelling {len(self._summarization_tasks)} summarization tasks")
-            
-            # Cancel all tasks immediately without waiting
-            for session_key, task in self._summarization_tasks.items():
-                if not task.done():
-                    task.cancel()
-            
-            # Clear the task dictionary immediately
+
+        # The resource scope owns both summarization and indexing tasks.  It
+        # cancels unfinished tasks and awaits every one before we release the
+        # database they may still be using.
+        try:
+            await self._resource_scope.aclose()
+        except Exception as exc:
+            # One background cleanup failure must not prevent the database
+            # manager from being closed.  AsyncResourceScope itself continues
+            # through all registered cleanups before reporting failures.
+            print(f"[ConversationMemoryManager] Background cleanup error: {exc}")
+        finally:
             self._summarization_tasks.clear()
-        
-        # Close database connections with error suppression
+            self._indexing_tasks.clear()
+            self._background_tasks.clear()
+
+        # Close database connections only after all owned tasks have stopped.
         try:
             from .database import get_database_manager
+
             db_manager = get_database_manager()
             await db_manager.close()
-        except Exception:
-            # Silently ignore database cleanup errors during shutdown
-            pass
-        
+        except Exception as exc:
+            # Preserve the existing shutdown behavior: database cleanup errors
+            # are logged/suppressed rather than escaping process teardown.
+            print(f"[ConversationMemoryManager] Database cleanup error: {exc}")
+
         print("[ConversationMemoryManager] Cleanup complete")
+
+    async def cleanup(self):
+        """Cleanup resources and pending tasks exactly once.
+
+        Concurrent callers share a single cleanup task.  ``_cleanup_done`` is
+        set before that task is scheduled so no new background operation can
+        race with shutdown.
+        """
+
+        cleanup_task = self._cleanup_task
+        if cleanup_task is None:
+            self._cleanup_done = True
+            cleanup_task = asyncio.create_task(
+                self._cleanup_impl(),
+                name="conversation-memory-cleanup",
+            )
+            self._cleanup_task = cleanup_task
+
+        # ``cleanup`` itself is never run as the implementation task, but keep
+        # this guard defensive for tests/custom callers that invoke the helper
+        # directly.
+        if cleanup_task is asyncio.current_task():
+            return
+        await asyncio.shield(cleanup_task)
     
     def is_initialized(self) -> bool:
         """Check if memory manager is initialized

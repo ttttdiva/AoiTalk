@@ -4,7 +4,6 @@ import { AppSelect } from "@/components/ui/app-select";
 import {
   ReadOnlyBadge,
   StatusBadge,
-  StatusNote,
 } from "@/components/ui/semantic-status";
 
 import {
@@ -16,6 +15,7 @@ import {
   useSyncExternalStore,
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type DragEvent as ReactDragEvent,
 } from "react";
 import { usePathname } from "next/navigation";
 import {
@@ -27,6 +27,7 @@ import {
   CalendarDays,
   Columns2,
   FileDown,
+  FileText,
   History,
   ListTree,
   ListFilter,
@@ -119,10 +120,18 @@ import type {
   DocsSupertag,
   DocsSavedView,
   DocsAiSuggestion,
+  DocsNodeLifecycle,
+  DocsProject,
 } from "./types";
 import {
   EMPTY_REFERENCES,
   EMPTY_STATE,
+  canMutateDocsNode,
+  docsCanonicalNodeTitle,
+  docsProjectIdFromSystemKey,
+  docsNodeProtectionMessage,
+  isDocsProjectCanonicalNode,
+  isDocsStaleProjectNode,
 } from "./types";
 import {
   DOCS_BOOTSTRAP_CACHE_PREFIX,
@@ -136,6 +145,11 @@ import {
   fieldValueToDraft,
   projectsFromContext,
 } from "./docs-utils";
+import {
+  filterMeetingImportFiles,
+  type MeetingImportResponse,
+} from "./docs-meeting-import";
+import { DocsMeetingImportDialog } from "./docs-meeting-import-dialog";
 import { getImageFiles } from "@/lib/editor-image-files";
 import {
   EXPANDED_KEY,
@@ -260,6 +274,9 @@ type DocsNeighborhoodResponse = Partial<DocsState> & {
   children_next_cursor_by_parent?: Record<string, string | null>;
   child_count_by_parent?: Record<string, number>;
   next_cursor?: string | null;
+  archived_node_ids?: string[];
+  restored_node_ids?: string[];
+  node_lifecycle?: Record<string, DocsNodeLifecycle>;
 };
 
 // Optimistic rollback and an in-flight lazy response can briefly overlap. Be
@@ -407,6 +424,10 @@ export function rebaseDocsStateToLibrary(
     child_count_by_parent: Object.fromEntries(
       Object.entries(state.child_count_by_parent ?? {}).filter(([parentId]) => nodeIds.has(parentId)),
     ),
+    archived_node_ids: retainedNodeIds(state.archived_node_ids),
+    node_lifecycle: Object.fromEntries(
+      Object.entries(state.node_lifecycle ?? {}).filter(([nodeId]) => nodeIds.has(nodeId)),
+    ),
   };
 }
 
@@ -461,14 +482,18 @@ export function mergeLoadedDocsState(current: DocsState, incoming: DocsNeighborh
   const incomingDetails = new Set(incomingState.details_loaded_ids ?? []);
   const nodes = (incomingState.nodes ?? []).reduce((items, next) => {
     const existing = items.find((item) => item.id === next.id);
+    const projectedLifecycle = incomingState.node_lifecycle?.[next.id];
+    const nextWithLifecycle = projectedLifecycle && !next.lifecycle
+      ? { ...next, lifecycle: projectedLifecycle }
+      : next;
     const mergedNode = existing && currentDetails.has(next.id) && !incomingDetails.has(next.id)
       ? {
           ...existing,
-          ...next,
-          body_json: { ...existing.body_json, ...next.body_json },
+          ...nextWithLifecycle,
+          body_json: { ...existing.body_json, ...nextWithLifecycle.body_json },
           body_text: existing.body_text,
         }
-      : next;
+      : nextWithLifecycle;
     return mergeById(items, mergedNode);
   }, scopedCurrent.nodes);
   return {
@@ -529,6 +554,14 @@ export function mergeLoadedDocsState(current: DocsState, incoming: DocsNeighborh
     child_count_by_parent: {
       ...(scopedCurrent.child_count_by_parent ?? {}),
       ...(incomingState.child_count_by_parent ?? {}),
+    },
+    archived_node_ids: Array.from(new Set([
+      ...(scopedCurrent.archived_node_ids ?? []),
+      ...(incomingState.archived_node_ids ?? []),
+    ])),
+    node_lifecycle: {
+      ...(scopedCurrent.node_lifecycle ?? {}),
+      ...(incomingState.node_lifecycle ?? {}),
     },
   };
 }
@@ -595,6 +628,10 @@ function evictDocsSubtrees(state: DocsState, parentIds: string[]) {
     ),
     child_count_by_parent: Object.fromEntries(
       Object.entries(state.child_count_by_parent ?? {}).filter(([parentId]) => !removeIds.has(parentId) && !evictRoots.has(parentId)),
+    ),
+    archived_node_ids: (state.archived_node_ids ?? []).filter((id) => !removeIds.has(id) && !evictRoots.has(id)),
+    node_lifecycle: Object.fromEntries(
+      Object.entries(state.node_lifecycle ?? {}).filter(([nodeId]) => !removeIds.has(nodeId) && !evictRoots.has(nodeId)),
     ),
   };
 }
@@ -698,6 +735,26 @@ export function DocsWorkspace({
   const [propertiesTagId, setPropertiesTagId] = useState<string | null>(null);
   // ゴミ箱 / Search nodes はメイン領域にフルビューとして開く。tagPageId と排他。
   const [mainView, setMainView] = useState<"trash" | "search" | null>(null);
+  useEffect(() => {
+    if (mainView !== "trash" || docsReadOnly) return;
+    let cancelled = false;
+    // The normal bootstrap is intentionally active-only.  Trash is an
+    // explicit lifecycle view, so hydrate the archived projection on demand
+    // rather than keeping archived bodies in every normal Docs snapshot.
+    void apiFetch<DocsState>("/api/docs?include_archived=1")
+      .then((incoming) => {
+        if (cancelled) return;
+        setState((current) => mergeLoadedDocsState(current, incoming as DocsNeighborhoodResponse));
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          toast.error(error instanceof Error ? error.message : "ゴミ箱の読み込みに失敗しました");
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [apiFetch, docsReadOnly, mainView]);
   const [splitNodeId, setSplitNodeId] = useState<string | null>(null);
   const [newTagName, setNewTagName] = useState("");
   const [tagPageId, setTagPageId] = useState<string | null>(null);
@@ -743,6 +800,8 @@ export function DocsWorkspace({
     setOpenNodeHandler,
     setIngestEnabled,
   } = useDocsClipIngest();
+  const [meetingImportOpen, setMeetingImportOpen] = useState(false);
+  const [meetingImportFile, setMeetingImportFile] = useState<File | null>(null);
 
   useEffect(() => {
     setIngestEnabled(!docsReadOnly);
@@ -773,7 +832,11 @@ export function DocsWorkspace({
     // per-page last meaningful title so an empty blur or a failed PATCH can
     // restore the canonical value instead of leaving a blank row behind.
     const pageTitleCanonicalRef = useRef(new Map<string, string>());
-    const pendingCreateHistoryIdsRef = useRef(new Set<string>());
+  const pendingCreateHistoryIdsRef = useRef(new Set<string>());
+  // DELETE returns the complete closure even when descendants were not
+  // hydrated in this client snapshot. Keep it by mutation root so history and
+  // selection reconciliation can remove every known ghost row deterministically.
+  const archivedDescendantIdsRef = useRef(new Map<string, string[]>());
   const taskBindingInFlightRef = useRef<Set<string>>(new Set());
   const sidebarScrollNodeRef = useRef<string | null>(null);
   const previousInitialNodeIdRef = useRef(initialNodeId);
@@ -952,7 +1015,7 @@ export function DocsWorkspace({
   // hoisting), but apply one visible/nonblank predicate to every UI list.
   const isNodeProjectionVisible = useCallback((node: DocsNode) => (
     !node.archived_at
-    && isDocsNodeTitleVisible(node)
+    && (isDocsNodeTitleVisible(node) || isDocsProjectCanonicalNode(node))
     && !isLegacyEmailEmptyLineNode(node, nodesById)
   ), [nodesById]);
   const isSidebarProjectionVisible = useCallback((node: DocsNode) => (
@@ -1047,11 +1110,93 @@ export function DocsWorkspace({
   const focusNode = focusNodeId ? nodesById.get(focusNodeId) ?? null : null;
   const focusNodeReferenceId = !tagPageId ? focusNode?.id ?? null : null;
   const selectedNode = selectedNodeId ? nodesById.get(selectedNodeId) ?? null : focusNode;
+  // The normal Project context intentionally excludes deleted Projects.  Docs
+  // lifecycle state, however, may still contain an owner/admin-visible retained
+  // Project row so its stale canonical node can be cleaned up explicitly.
+  const projectLifecycleRows = useMemo(() => {
+    const byId = new Map<string, DocsProject>();
+    for (const project of allProjects) byId.set(project.id, project as DocsProject);
+    for (const project of state.projects) {
+      if (!byId.has(project.id)) byId.set(project.id, project);
+    }
+    return Array.from(byId.values());
+  }, [allProjects, state.projects]);
   // Personal subtree shares carry an effective ACL on every hydrated node.
   // Keep UI mutations disabled locally for read recipients instead of
   // surfacing avoidable 403 toasts from the API.
   const canWriteNode = (node: DocsNode | null | undefined) =>
     !docsReadOnly && node?.permission !== "read";
+  const hasPersistedProjectPointer = (node: DocsNode) =>
+    projectLifecycleRows.some((project) =>
+      project.knowledge_node_id === node.id
+      || project.knowledge_node_id_raw === node.id,
+    );
+  const isProjectIdentityNode = (node: DocsNode) =>
+    isDocsProjectCanonicalNode(node) || hasPersistedProjectPointer(node);
+  /**
+   * Resolve a canonical Project title from the authoritative Project context
+   * before falling back to a server-projected title/last-known draft.  The
+   * system key is deliberately not used to invent a Project identity; it is
+   * only a fail-closed signal in the shared lifecycle helpers.
+   */
+  const canonicalTitleForNode = (node: DocsNode): string | null => {
+    const project = projectLifecycleRows.find((item) =>
+      item.knowledge_node_id === node.id || item.knowledge_node_id_raw === node.id,
+    )
+      ?? (isDocsProjectCanonicalNode(node)
+        ? projectLifecycleRows.find((item) => item.id === node.project_id)
+        : undefined);
+    if (project?.name && project.name.trim()) return project.name.trim();
+    return docsCanonicalNodeTitle(node)
+      ?? pageTitleCanonicalRef.current.get(node.id)
+      ?? (hasMeaningfulBlockTitle(node.title) ? node.title : null);
+  };
+  const canCleanupProjectInfoNode = (node: DocsNode): boolean => {
+    if (!isProjectIdentityNode(node)) return false;
+    const pointedProject = projectLifecycleRows.find((project) =>
+      project.knowledge_node_id === node.id || project.knowledge_node_id_raw === node.id,
+    );
+    const projectId = node.project_id
+      ?? docsProjectIdFromSystemKey(node.system_key)
+      ?? pointedProject?.id;
+    if (!projectId) return false;
+    const project = projectLifecycleRows.find((item) => item.id === projectId);
+    // Absence from the project context is not proof of staleness (the list
+    // may still be loading or be ACL-filtered).  Expose destructive cleanup
+    // only when an authoritative project row explicitly points elsewhere.
+    if (!project) return false;
+    // The cleanup API is owner/admin-only.  The Docs client has the current
+    // user id but intentionally does not carry a second auth model; requiring
+    // ownership here prevents ordinary Project members from seeing an action
+    // that would deterministically return 403.  Global admins can still use
+    // the dedicated endpoint from the Project/operations surface.
+    const projectOwnerId = project.owner_user_id ?? project.owner_id;
+    if (projectOwnerId && currentUserId && projectOwnerId !== currentUserId) {
+      return false;
+    }
+    const duplicateKey = typeof node.system_key === "string"
+      && node.system_key.trim().startsWith("project_information:duplicate:");
+    const inactive = project.is_completed === true || Boolean(project.deleted_at);
+    if (!inactive && !duplicateKey) return false;
+    return project.knowledge_node_id !== node.id || inactive || duplicateKey;
+  };
+  const canMutateNode = useCallback((node: DocsNode, action: "archive" | "move" | "taskify" | "tag" | "title" | "content") => {
+    if (!canWriteNode(node)) return false;
+    if (
+      hasPersistedProjectPointer(node)
+      && ["archive", "move", "taskify", "tag", "title", "content"].includes(action)
+    ) {
+      return false;
+    }
+    return canMutateDocsNode(node, action);
+  }, [canWriteNode, docsReadOnly, hasPersistedProjectPointer, projectLifecycleRows]);
+  const protectedNodeMessage = (node: DocsNode) => {
+    const blocked = isProjectIdentityNode(node)
+      || !canMutateDocsNode(node, "archive")
+      || !canMutateDocsNode(node, "move")
+      || !canMutateDocsNode(node, "title");
+    return blocked ? docsNodeProtectionMessage(node) : null;
+  };
   const selectedNodeCanWrite = canWriteNode(selectedNode);
   const canEditDefinitions = canEditDocsDefinitions(
     selectedNode,
@@ -1091,7 +1236,20 @@ export function DocsWorkspace({
   const archivedNodes = useMemo(() => {
     const archivedIds = new Set(state.nodes.filter((node) => !!node.archived_at).map((node) => node.id));
     return state.nodes
-      .filter((node) => !!node.archived_at && isDocsNodeTitleVisible(node) && !isLegacyEmailEmptyLineNode(node, nodesById) && !(node.parent_id && archivedIds.has(node.parent_id)))
+      .filter((node) => {
+        // Keep historical markerless empty paragraphs addressable in Trash so
+        // they can be permanently cleaned up or restored after the
+        // discriminator migration.  System-keyed rows remain excluded here;
+        // their dedicated Project lifecycle is handled separately.
+        const legacyBlankCandidate =
+          node.title.trim() === ""
+          && !node.system_key
+          && node.node_type === "node";
+        return !!node.archived_at
+          && (isDocsNodeTitleVisible(node) || legacyBlankCandidate)
+          && !isLegacyEmailEmptyLineNode(node, nodesById)
+          && !(node.parent_id && archivedIds.has(node.parent_id));
+      })
       .sort((a, b) => (b.archived_at ?? "").localeCompare(a.archived_at ?? ""));
   }, [nodesById, state.nodes]);
   const currentRows = useMemo(
@@ -2056,6 +2214,40 @@ export function DocsWorkspace({
     loadNodeNeighborhood,
   ]);
 
+  const handleMeetingImportImported = useCallback(async (result: MeetingImportResponse) => {
+    const nodeId = result.node_id || result.node?.id;
+    if (!nodeId) throw new Error("取り込んだDocs nodeを開けませんでした");
+    const status = await openDocsNode(nodeId);
+    if (status !== "success") throw new Error("取り込んだDocs nodeを開けませんでした");
+    toast.success(
+      result.action === "duplicate_skip"
+        ? "同じ議事録は既にDocsへ保存されています"
+        : "議事録をDocsへ取り込みました",
+    );
+  }, [openDocsNode]);
+
+  const handleMeetingImportDragOver = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (docsReadOnly) return;
+    const files = filterMeetingImportFiles(Array.from(event.dataTransfer.files ?? []));
+    if (files.length === 0) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "copy";
+  }, [docsReadOnly]);
+
+  const handleMeetingImportDrop = useCallback((event: ReactDragEvent<HTMLDivElement>) => {
+    if (docsReadOnly) return;
+    const files = filterMeetingImportFiles(Array.from(event.dataTransfer.files ?? []));
+    if (files.length === 0) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (files.length !== 1) {
+      toast.error("議事録の取り込みは .md / .txt の1ファイルずつです");
+      return;
+    }
+    setMeetingImportFile(files[0]);
+    setMeetingImportOpen(true);
+  }, [docsReadOnly]);
+
   const openDocsNodeRef = useRef(openDocsNode);
   openDocsNodeRef.current = openDocsNode;
 
@@ -2234,7 +2426,6 @@ export function DocsWorkspace({
         event.preventDefault();
         event.stopImmediatePropagation();
         void archiveSelectedNodesRef.current();
-        return;
       }
       const key = event.key.toLowerCase();
       const editableTarget = target?.closest(".cm-editor, input, textarea, select, [contenteditable='true']");
@@ -2277,7 +2468,6 @@ export function DocsWorkspace({
           event.stopImmediatePropagation();
           extendNodeSelection(active.node, active.rows, event.key === "ArrowUp" ? -1 : 1);
         }
-        return;
       }
       if (event.ctrlKey && event.shiftKey && key === "d") {
         event.preventDefault();
@@ -2404,7 +2594,11 @@ export function DocsWorkspace({
       return await docsSaveQueue.enqueue(nodeId, {
         execute: async () => {
           await nodeCreateInFlightRef.current.get(nodeId);
-          const data = await apiFetch<{ node: DocsNode }>(`/api/docs/nodes/${nodeId}`, {
+          const data = await apiFetch<{
+            node: DocsNode;
+            committed?: boolean;
+            task_binding_error?: string | null;
+          }>(`/api/docs/nodes/${nodeId}`, {
             method: "PATCH",
             // Send the library/project identity alongside content edits. The
             // server still treats the node's persisted library as canonical,
@@ -2417,11 +2611,20 @@ export function DocsWorkspace({
             }),
             keepalive: true,
           });
+          if (data.task_binding_error) {
+            toast.error("Docs nodeは保存されましたが、タスク連携の同期に失敗しました");
+          }
           return data.node;
         },
         apply: (node) => {
           if (!node || typeof node.id !== "string") return;
-          setState((current) => ({ ...current, nodes: validDocsNodes(current.nodes).map((item) => (item.id === node.id ? node : item)) }));
+          setState((current) => ({
+            ...current,
+            nodes: validDocsNodes(current.nodes).map((item) => (item.id === node.id ? node : item)),
+            node_lifecycle: node.lifecycle
+              ? { ...(current.node_lifecycle ?? {}), [node.id]: node.lifecycle }
+              : current.node_lifecycle,
+          }));
         },
       });
     } catch (error) {
@@ -2433,6 +2636,10 @@ export function DocsWorkspace({
   const archiveNode = useCallback((nodeId: string) => {
     const target = nodesByIdRef.current.get(nodeId);
     if (docsReadOnly || target?.permission === "read") return Promise.resolve(target);
+    if (target && !canMutateDocsNode(target, "archive")) {
+      toast.error(docsNodeProtectionMessage(target));
+      return Promise.reject(new Error(docsNodeProtectionMessage(target)));
+    }
     return (
     docsSaveQueue.enqueue(nodeId, {
       execute: async () => {
@@ -2441,7 +2648,13 @@ export function DocsWorkspace({
           node: DocsNode;
           committed?: boolean;
           task_binding_error?: string | null;
+          archived_node_ids?: string[];
         }>(`/api/docs/nodes/${nodeId}`, { method: "DELETE", keepalive: true });
+        const descendantIds = Array.from(new Set([
+          nodeId,
+          ...(Array.isArray(data.archived_node_ids) ? data.archived_node_ids : []),
+        ]));
+        archivedDescendantIdsRef.current.set(nodeId, descendantIds);
         if (data.task_binding_error) {
           toast.error("ノードは削除されましたが、タスク連携解除に失敗しました");
         }
@@ -2449,7 +2662,16 @@ export function DocsWorkspace({
       },
       apply: (node) => {
         if (!node || typeof node.id !== "string") return;
-        setState((current) => ({ ...current, nodes: validDocsNodes(current.nodes).map((item) => (item.id === node.id ? node : item)) }));
+        const archivedIds = new Set([
+          node.id,
+          ...(archivedDescendantIdsRef.current.get(nodeId) ?? []),
+        ]);
+        const archivedAt = node.archived_at ?? new Date().toISOString();
+        setState((current) => ({
+          ...current,
+          nodes: validDocsNodes(current.nodes).map((item) => archivedIds.has(item.id) ? { ...item, archived_at: item.id === node.id ? node.archived_at : item.archived_at ?? archivedAt } : (item.id === node.id ? node : item)),
+          archived_node_ids: Array.from(new Set([...(current.archived_node_ids ?? []), ...archivedIds])),
+        }));
       },
     })
     );
@@ -2462,16 +2684,24 @@ export function DocsWorkspace({
     docsSaveQueue.enqueue(nodeId, {
       execute: async () => {
         await nodeCreateInFlightRef.current.get(nodeId);
-        const data = await apiFetch<{ node: DocsNode }>(`/api/docs/nodes/${nodeId}`, {
+        const data = await apiFetch<{ node: DocsNode; restored_node_ids?: string[] }>(`/api/docs/nodes/${nodeId}`, {
           method: "PATCH",
           body: JSON.stringify({ archived: false }),
           keepalive: true,
         });
+        if (Array.isArray(data.restored_node_ids)) {
+          archivedDescendantIdsRef.current.set(nodeId, data.restored_node_ids);
+        }
         return data.node;
       },
       apply: (node) => {
         if (!node || typeof node.id !== "string") return;
-        setState((current) => ({ ...current, nodes: validDocsNodes(current.nodes).map((item) => (item.id === node.id ? node : item)) }));
+        const restoredIds = new Set([node.id, ...(archivedDescendantIdsRef.current.get(node.id) ?? [])]);
+        setState((current) => ({
+          ...current,
+          nodes: validDocsNodes(current.nodes).map((item) => restoredIds.has(item.id) ? { ...item, archived_at: item.id === node.id ? node.archived_at : null } : (item.id === node.id ? node : item)),
+          archived_node_ids: (current.archived_node_ids ?? []).filter((id) => !restoredIds.has(id)),
+        }));
       },
     })
     );
@@ -2480,8 +2710,23 @@ export function DocsWorkspace({
   const permanentlyDeleteNode = useCallback(async (nodeId: string) => {
     const target = nodesByIdRef.current.get(nodeId);
     if (docsReadOnly || target?.permission === "read") return;
-    await apiFetch<{ ok: boolean }>(`/api/docs/nodes/${nodeId}?permanent=1`, { method: "DELETE" });
-    setState((current) => ({ ...current, nodes: current.nodes.filter((node) => node.id !== nodeId) }));
+    const data = await apiFetch<{ ok: boolean; deleted_node_ids?: string[] }>(`/api/docs/nodes/${nodeId}?permanent=1`, { method: "DELETE" });
+    const deletedIds = new Set([nodeId, ...(Array.isArray(data.deleted_node_ids) ? data.deleted_node_ids : [])]);
+    setState((current) => ({
+      ...current,
+      nodes: current.nodes.filter((node) => !deletedIds.has(node.id)),
+      archived_node_ids: (current.archived_node_ids ?? []).filter((id) => !deletedIds.has(id)),
+      node_supertags: current.node_supertags.filter((item) => !deletedIds.has(item.node_id)),
+      field_values: current.field_values.filter((item) => !deletedIds.has(item.node_id)),
+      attachments: current.attachments.filter((item) => !deletedIds.has(item.node_id)),
+      placements: current.placements.filter((item) => !deletedIds.has(item.node_id) && !deletedIds.has(item.parent_node_id)),
+      ai_suggestions: current.ai_suggestions.filter((item) => !item.node_id || !deletedIds.has(item.node_id)),
+      has_children_ids: (current.has_children_ids ?? []).filter((id) => !deletedIds.has(id)),
+      loaded_children_parent_ids: (current.loaded_children_parent_ids ?? []).filter((id) => !deletedIds.has(id)),
+      children_next_cursor_by_parent: Object.fromEntries(
+        Object.entries(current.children_next_cursor_by_parent ?? {}).filter(([parentId]) => !deletedIds.has(parentId)),
+      ),
+    }));
   }, [apiFetch, docsReadOnly]);
 
   const createNode = useCallback((
@@ -2556,6 +2801,11 @@ export function DocsWorkspace({
     });
     const persistNode = apiFetch<{ node: DocsNode }>("/api/docs", {
       method: "POST",
+      // Optimistic outline rows may be created from the last non-empty
+      // editor-only draft during pagehide.  Keep that create alive across a
+      // reload; otherwise the root page can survive while its first body row
+      // is cancelled with the old document.
+      keepalive: true,
       body: JSON.stringify({
         id,
         parent_id: parentId,
@@ -2791,8 +3041,9 @@ export function DocsWorkspace({
       .map((nodeId) => nodesByIdRef.current.get(nodeId))
       .filter((node): node is DocsNode => node != null && !node.archived_at);
     if (normalizedNodes.length === 0) return false;
-    if (normalizedNodes.some((node) => !canWriteNode(node))) {
-      toast.error("このDocsは閲覧専用です");
+    const blockedNode = normalizedNodes.find((node) => !canMutateNode(node, "archive"));
+    if (blockedNode) {
+      toast.error(canWriteNode(blockedNode) ? docsNodeProtectionMessage(blockedNode) : "このDocsは閲覧専用です");
       return false;
     }
 
@@ -2800,19 +3051,34 @@ export function DocsWorkspace({
       normalizedNodes.map(async (node) => {
         try {
           await archiveNode(node.id);
-          return { ok: true as const, node };
-        } catch {
-          return { ok: false as const, node };
+          return {
+            ok: true as const,
+            node,
+            archivedIds: archivedDescendantIdsRef.current.get(node.id) ?? [node.id],
+          };
+        } catch (error) {
+          return {
+            ok: false as const,
+            node,
+            archivedIds: [] as string[],
+            error: error instanceof Error ? error.message : "ノードのアーカイブに失敗しました",
+          };
         }
       }),
     );
     const successNodes = archiveResults.filter((result) => result.ok).map((result) => result.node);
     if (successNodes.length === 0) {
-      toast.error("ノードのアーカイブに失敗しました");
+      const failure = archiveResults.find((result) => !result.ok);
+      toast.error(failure && "error" in failure ? failure.error : "ノードのアーカイブに失敗しました");
       return false;
     }
 
     const successIds = successNodes.map((node) => node.id);
+    const serverArchivedIds = new Set(
+      archiveResults
+        .filter((result): result is Extract<(typeof archiveResults)[number], { ok: true }> => result.ok)
+        .flatMap((result) => result.archivedIds),
+    );
     pushHistory({
       label: successNodes.length > 1 ? "ノード一括削除" : "ノード削除",
       patches: successNodes.map((node) => ({
@@ -2821,7 +3087,7 @@ export function DocsWorkspace({
       })),
     });
 
-    const removedIds = expandArchivedNodeIds(successIds, parentIdByNodeId);
+    const removedIds = expandArchivedNodeIds([...successIds, ...serverArchivedIds], parentIdByNodeId);
     if (splitNodeId && removedIds.has(splitNodeId)) {
       setSplitNodeId(null);
     }
@@ -2838,8 +3104,9 @@ export function DocsWorkspace({
         : roots.find((root) => !removedIds.has(root.id))?.id ?? null;
       if (fallbackPageId) openDocsNode(fallbackPageId);
       else selectSingleNode(null);
-      if (successNodes.length < normalizedNodes.length) {
-        toast.error("ノードのアーカイブに失敗しました");
+    if (successNodes.length < normalizedNodes.length) {
+        const failure = archiveResults.find((result) => !result.ok);
+        toast.error(failure && "error" in failure ? failure.error : "ノードのアーカイブに失敗しました");
         return false;
       }
       return true;
@@ -2882,12 +3149,14 @@ export function DocsWorkspace({
     }
 
     if (successNodes.length < normalizedNodes.length) {
-      toast.error("ノードのアーカイブに失敗しました");
+      const failure = archiveResults.find((result) => !result.ok);
+      toast.error(failure && "error" in failure ? failure.error : "ノードのアーカイブに失敗しました");
       return false;
     }
     return true;
   }, [
     archiveNode,
+    canMutateNode,
     currentRows,
     openDocsNode,
     parentIdByNodeId,
@@ -3003,6 +3272,11 @@ export function DocsWorkspace({
     const draggedNode = nodesById.get(dragSidebarNodeId);
     if (!draggedNode) return;
     if (!canWriteNode(targetNode) || !canWriteNode(draggedNode)) return;
+    if (!canMutateNode(draggedNode, "move")) {
+      toast.error(docsNodeProtectionMessage(draggedNode));
+      setDragSidebarNodeId(null);
+      return;
+    }
     setDragSidebarNodeId(null);
     const targets = selectedNodeIdsRef.current.includes(draggedNode.id)
       ? selectedNodeIdsRef.current.map((nodeId) => nodesById.get(nodeId)).filter((node): node is DocsNode => Boolean(node))
@@ -3015,7 +3289,7 @@ export function DocsWorkspace({
       });
     }
     await load();
-  }, [dragSidebarNodeId, flushPendingDocsEditorWritesBeforeNavigation, load, nodesById]);
+  }, [canMutateNode, dragSidebarNodeId, flushPendingDocsEditorWritesBeforeNavigation, load, nodesById]);
 
   const archiveSidebarNode = useCallback(async (node: DocsNode) => {
     setSidebarContextMenu(null);
@@ -3033,15 +3307,26 @@ export function DocsWorkspace({
 
   async function renameSidebarNode(node: DocsNode) {
     setSidebarContextMenu(null);
-    if (!canWriteNode(node)) return;
+    if (!canMutateNode(node, "title")) {
+      toast.error(docsNodeProtectionMessage(node));
+      return;
+    }
     const nextTitle = window.prompt("ノード名を変更", nodeText(node));
     if (!nextTitle || nextTitle.trim() === node.title) return;
-    await patchNode(node.id, { title: nextTitle.trim() });
+    try {
+      await patchNode(node.id, { title: nextTitle.trim() });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "ノード名を変更できませんでした");
+    }
   }
 
   async function duplicateSidebarNode(node: DocsNode) {
     setSidebarContextMenu(null);
     if (!canWriteNode(node)) return;
+    if (isProjectIdentityNode(node)) {
+      toast.error(docsNodeProtectionMessage(node));
+      return;
+    }
     const duplicated = await createNode(node.parent_id, node, `${nodeText(node)} copy`);
     await patchNode(duplicated.id, {
       description: node.description,
@@ -3055,6 +3340,50 @@ export function DocsWorkspace({
       await applyTag(duplicated, relation.supertag_id);
     }
     toast.success("ノードを複製しました");
+  }
+
+  async function cleanupProjectInformationNode(node: DocsNode) {
+    setSidebarContextMenu(null);
+    if (!canCleanupProjectInfoNode(node)) {
+      toast.error(docsNodeProtectionMessage(node));
+      return;
+    }
+    const pointedProject = projectLifecycleRows.find((project) =>
+      project.knowledge_node_id === node.id || project.knowledge_node_id_raw === node.id,
+    );
+    const nodeProjectId = node.project_id && projectLifecycleRows.some((project) => project.id === node.project_id)
+      ? node.project_id
+      : null;
+    const projectId = nodeProjectId
+      ?? docsProjectIdFromSystemKey(node.system_key)
+      ?? pointedProject?.id;
+    if (!projectId) {
+      toast.error("Project identityがないstale nodeはクリーンアップできません");
+      return;
+    }
+    if (typeof window !== "undefined" && !window.confirm("staleな案件情報Docsと子ノードをクリーンアップしますか？")) {
+      return;
+    }
+    try {
+      const result = await apiFetch<{
+        cleaned?: boolean;
+        archived_node_ids?: string[];
+        task_binding_error?: string | null;
+      }>(
+        `/api/projects/${projectId}/information/cleanup`,
+        {
+          method: "POST",
+          body: JSON.stringify({ node_id: node.id, cascade: true }),
+        },
+      );
+      toast.success(`stale案件情報をクリーンアップしました（${result.archived_node_ids?.length ?? 0}件）`);
+      if (result.task_binding_error) {
+        toast.error("Docsはクリーンアップされましたが、タスク連携解除に失敗しました");
+      }
+      await load({ nodeId: focusNodeIdRef.current ?? undefined });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "stale案件情報のクリーンアップに失敗しました");
+    }
   }
 
   async function exportSidebarNode(node: DocsNode) {
@@ -3081,19 +3410,30 @@ export function DocsWorkspace({
 
   async function pinSidebarNode(node: DocsNode) {
     setSidebarContextMenu(null);
-    if (!canWriteNode(node)) return;
+    if (!canWriteNode(node) || isProjectIdentityNode(node)) {
+      if (isProjectIdentityNode(node)) toast.error(docsNodeProtectionMessage(node));
+      return;
+    }
     await updateDisplayProps(node, { pinned_sidebar: node.display_props?.pinned_sidebar !== true });
   }
 
   function moveSidebarNodeWithReference(node: DocsNode) {
     setSidebarContextMenu(null);
-    if (!canWriteNode(node)) return;
+    if (!canMutateNode(node, "move")) {
+      toast.error(docsNodeProtectionMessage(node));
+      return;
+    }
     selectSingleNode(node.id);
     window.setTimeout(() => requestDocsCommand({ kind: "move", leaveReference: true }), 0);
   }
 
   const mutateTag = async (node: DocsNode, tagId: string, mode: "add" | "remove") => {
     if (!canWriteNode(node)) return;
+    if (!canMutateNode(node, "tag")) {
+      const message = docsNodeProtectionMessage(node);
+      toast.error(message);
+      throw new Error(message);
+    }
     const currentIds = nodeTagIdsRef.current.get(node.id) ?? (nodeTags.get(node.id) ?? []).map((tag) => tag.id);
     if ((mode === "add" && currentIds.includes(tagId)) || (mode === "remove" && !currentIds.includes(tagId))) return;
     const desiredIds = mode === "add"
@@ -3328,7 +3668,30 @@ export function DocsWorkspace({
     }
   };
 
-  const commitTitle = async (node: DocsNode, title: string) => {
+  const commitTitle = async (node: DocsNode, title: string): Promise<DocsNode> => {
+    const canonicalIdentity = isProjectIdentityNode(node) && !isDocsStaleProjectNode(node);
+    if (canonicalIdentity) {
+      const canonicalTitle = canonicalTitleForNode(node);
+      // Project-information roots are identity-owned.  A generic Docs title
+      // edit (including a clear-to-blank blur) is normalized locally and never
+      // sent as a destructive PATCH.  Child rows remain ordinary nodes.
+      if (canonicalTitle && (title.trim() !== canonicalTitle.trim() || !hasMeaningfulBlockTitle(title))) {
+        setState((current) => ({
+          ...current,
+          nodes: current.nodes.map((item) => item.id === node.id
+            ? { ...item, title: canonicalTitle, body_text: canonicalTitle }
+            : item),
+        }));
+      }
+      if (canonicalTitle) pageTitleCanonicalRef.current.set(node.id, canonicalTitle);
+      if (canonicalTitle && node.title.trim() !== canonicalTitle.trim()) {
+        // Repair an already-corrupted canonical label through the generic API;
+        // the server normalizes it again under the Project authority.  Never
+        // send the outline's blank paragraph envelope for this identity node.
+        return await patchNode(node.id, { title: canonicalTitle });
+      }
+      return nodesByIdRef.current.get(node.id) ?? { ...node, title: canonicalTitle ?? node.title, body_text: canonicalTitle ?? node.body_text };
+    }
     const matchedTags = titleTagNames(title)
       .map((name) => state.supertags.find((tag) => tag.name.toLowerCase() === name.toLowerCase()))
       .filter((tag): tag is DocsSupertag => Boolean(tag));
@@ -3343,15 +3706,15 @@ export function DocsWorkspace({
             : item),
         }));
       }
-      return;
+      return nodesByIdRef.current.get(node.id) ?? node;
     }
     // 入力中は同じ node.title を楽観更新しているため、確定時の比較では
     // 永続化済みかを判定できない。blur / Enter では必ず保存キューへ送る。
     const bodyPatch = node.body_json?.blank === true
       ? { body_json: clearBlankParagraphMarker(node.body_json), body_text: nextTitle }
       : {};
-    await patchNode(node.id, { title: nextTitle, ...bodyPatch });
-    pageTitleCanonicalRef.current.set(node.id, nextTitle);
+    const normalized = await patchNode(node.id, { title: nextTitle, ...bodyPatch });
+    pageTitleCanonicalRef.current.set(node.id, normalized.title);
     if (/\[\[user:[0-9a-f-]{36}\|[^\]\n]+\]\]/i.test(nextTitle)) {
       void apiFetch(`/api/docs/nodes/${node.id}/mentions`, {
         method: "POST",
@@ -3361,6 +3724,7 @@ export function DocsWorkspace({
     for (const tag of matchedTags) {
       await applyTag(node, tag.id);
     }
+    return normalized;
   };
 
   const replaceNodeTitles = async (updates: Array<{ node: DocsNode; title: string }>) => {
@@ -3654,6 +4018,11 @@ export function DocsWorkspace({
   const moveBlockNode = async (input: BlockMoveInput) => {
     const target = nodesById.get(input.nodeId);
     if (!target) return;
+    if (!canMutateNode(target, "move")) {
+      const message = docsNodeProtectionMessage(target);
+      toast.error(message);
+      throw new Error(message);
+    }
     const parentId = input.parentId;
     const siblings = parentId ? childrenByParent.get(parentId) ?? [] : roots;
     const previous = input.afterNodeId ? nodesById.get(input.afterNodeId) ?? null : null;
@@ -3980,6 +4349,11 @@ export function DocsWorkspace({
     onCommitPending: (operation) => {
       editorCommitInFlightRef.current = operation;
     },
+    canMutateNode,
+    canCleanupNode: canCleanupProjectInfoNode,
+    onNodeProtection: (target, action) => {
+      toast.error(`${docsNodeProtectionMessage(target)}（${action}）`);
+    },
     onCommitTitle: async (target, title, patch) => {
       // Empty titles are editor-only transient state.  Do not optimistically
       // replace the existing row or call the API; this also keeps table/blur
@@ -3987,6 +4361,21 @@ export function DocsWorkspace({
       // sole exception is the explicit persisted blank paragraph contract
       // emitted by the outline editor.
       const explicitBlank = isExplicitBlankParagraphPatch(target, title, patch);
+      const canonicalIdentity = isProjectIdentityNode(target) && !isDocsStaleProjectNode(target);
+      if (canonicalIdentity) {
+        const canonicalTitle = canonicalTitleForNode(target);
+        // A blank/renamed canonical identity is normalized by commitTitle. A
+        // typed body patch is still allowed when the identity title remains
+        // unchanged (the server treats content and identity separately).
+        if (
+          !canonicalTitle
+          || !hasMeaningfulBlockTitle(title)
+          || title.trim() !== canonicalTitle.trim()
+          || explicitBlank
+        ) {
+          return commitTitle(target, canonicalTitle ?? target.title);
+        }
+      }
       if (!hasMeaningfulBlockTitle(title) && !explicitBlank) return;
       const nextTitle = explicitBlank ? "" : title;
       const effectivePatch = explicitBlank
@@ -4015,8 +4404,9 @@ export function DocsWorkspace({
           )),
         }));
         try {
-          await patchNode(target.id, { ...effectivePatch, title: nextTitle });
-          pageTitleCanonicalRef.current.set(target.id, nextTitle);
+          const normalized = await patchNode(target.id, { ...effectivePatch, title: nextTitle });
+          pageTitleCanonicalRef.current.set(target.id, normalized.title);
+          return normalized;
         } catch (error) {
           // Keep the optimistic draft/state visible after a failed PATCH. The
           // save queue and editor retain the draft so the user can retry;
@@ -4055,8 +4445,9 @@ export function DocsWorkspace({
         }));
       }
       try {
-        await commitTitle(target, nextTitle);
-        pageTitleCanonicalRef.current.set(target.id, nextTitle);
+        const normalized = await commitTitle(target, nextTitle);
+        if (normalized) pageTitleCanonicalRef.current.set(target.id, normalized.title);
+        return normalized;
       } catch (error) {
         // As above, do not roll back the in-memory title: the active editor
         // draft must remain recoverable after a navigation-blocking failure.
@@ -4087,6 +4478,12 @@ export function DocsWorkspace({
       const nodes = actionIds
         .map((id) => nodesByIdRef.current.get(id))
         .filter((node): node is DocsNode => Boolean(node));
+      const blocked = nodes.find((node) => !canMutateNode(node, "archive"));
+      if (blocked) {
+        const message = docsNodeProtectionMessage(blocked);
+        toast.error(message);
+        throw new Error(message);
+      }
       const archived = await archiveNodesWithHistory(nodes);
       if (!archived) {
         // Outline structural edits must not continue as if the sibling was
@@ -4099,6 +4496,7 @@ export function DocsWorkspace({
     onToggleCheckbox: (target) => void toggleNodeCheckbox(target),
     onToggleCollapsed: toggleCollapsed,
     onDuplicateNode: (target) => void duplicateSidebarNode(target),
+    onCleanupNode: (target) => void cleanupProjectInformationNode(target),
     onApplyTag: (target, tag) => void applyTagToActionNodes(target, tag.id),
     onRemoveTag: (target, tag) => void removeTag(target, tag.id),
     onOpenTag: (tag) => {
@@ -4130,10 +4528,14 @@ export function DocsWorkspace({
     applyFieldShorthand,
     applyTagToActionNodes,
     archiveNodesWithHistory,
+    canMutateNode,
+    canonicalTitleForNode,
+    canCleanupProjectInfoNode,
     commitTitle,
     createBlockNode,
     createFieldCandidateForRow,
     createSearchNodeForRow,
+    cleanupProjectInformationNode,
     docsReadOnly,
     deleteAttachment,
     duplicateSidebarNode,
@@ -4141,6 +4543,7 @@ export function DocsWorkspace({
     flushPendingDocsEditorWritesBeforeNavigation,
     historySync,
     insertDocsImages,
+    isProjectIdentityNode,
     load,
     moveBlockNode,
     openDocsNode,
@@ -4202,6 +4605,7 @@ export function DocsWorkspace({
       ? hoistedVisibleChildren(childrenByParent, node.id, isNodeProjectionVisible)
       : [];
     const childrenLayout = node?.display_props?.children_layout === "table" ? "table" : "outline";
+    const projectIdentityProtected = Boolean(node && isProjectIdentityNode(node));
     const documentFields = node ? fieldsForNode(node, nodeTags, fieldsByTag) : [];
     const documentFieldValues = node ? fieldValuesByNodeId.get(node.id) ?? [] : [];
     const visibleRows = node
@@ -4270,7 +4674,8 @@ export function DocsWorkspace({
             <div className="min-w-0 flex-1">
               <PageTitleEditor
                 node={node}
-                readOnly={!canWriteNode(node)}
+                readOnly={!canWriteNode(node) || !canMutateNode(node, "title")}
+                canonicalTitle={canonicalTitleForNode(node)}
                 tags={nodeTags.get(node.id) ?? []}
                 requestFocus={focusRequestNodeId === node.id}
                 onFocused={() => setFocusRequestNodeId(null)}
@@ -4329,21 +4734,41 @@ export function DocsWorkspace({
                       onClose={() => setDocumentContextMenu(null)}
                       onCopyNodeId={(target) => copySidebarNodeId(target)}
                       onDuplicateNode={(target) => duplicateSidebarNode(target)}
+                      onCleanupNode={(target) => cleanupProjectInformationNode(target)}
                       onArchiveNode={(target) => docsEditorContextValue.onArchiveNode(target)}
                       onMoveNode={(target) => {
-                        if (!canWriteNode(target)) return;
+                        if (!canMutateNode(target, "move")) {
+                          toast.error(docsNodeProtectionMessage(target));
+                          return;
+                        }
                         selectSingleNode(target.id);
                         requestDocsCommand({ kind: "move", leaveReference: false });
                       }}
                       onTaskifyNode={(target) => {
-                        if (!canWriteNode(target)) return;
+                        if (!canMutateNode(target, "taskify")) {
+                          toast.error(docsNodeProtectionMessage(target));
+                          return;
+                        }
                         return docsEditorContextValue.onCommitTitle(target, target.title, {
                           body_json: { ...target.body_json, ...blockJsonForKind("checkbox") },
                           display_props: { ...target.display_props, show_checkbox: true },
                         });
                       }}
-                      onApplyTag={(target, tag) => applyTag(target, tag.id)}
+                      onApplyTag={(target, tag) => {
+                        if (!canMutateNode(target, "tag")) {
+                          toast.error(docsNodeProtectionMessage(target));
+                          return;
+                        }
+                        return applyTag(target, tag.id);
+                      }}
                       onOpenNode={(target) => openDocsNode(target.id)}
+                      canArchive={canMutateNode(documentEditorRow.node, "archive")}
+                      canDuplicate={canMutateNode(documentEditorRow.node, "content") && !isProjectIdentityNode(documentEditorRow.node)}
+                      canCleanup={canCleanupProjectInfoNode(documentEditorRow.node)}
+                      canMove={canMutateNode(documentEditorRow.node, "move")}
+                      canTaskify={canMutateNode(documentEditorRow.node, "taskify")}
+                      canTag={canMutateNode(documentEditorRow.node, "tag")}
+                      protectedMessage={protectedNodeMessage(documentEditorRow.node)}
                     />,
                     document.body,
                   )
@@ -4351,7 +4776,7 @@ export function DocsWorkspace({
               <div className="mt-2 flex flex-wrap items-center gap-1.5">
                 {node.node_type === "day" && <StatusBadge tone="info" className="text-xs font-normal">Daily</StatusBadge>}
                 <TaskBindingButton task={taskBindingsByNodeId.get(node.id) ?? null} onOpenTask={setTaskModalId} />
-                <div className="flex items-center rounded border bg-muted/20 p-0.5" aria-label="子ノードの表示形式">
+                {!projectIdentityProtected ? <div className="flex items-center rounded border bg-muted/20 p-0.5" aria-label="子ノードの表示形式">
                   <button
                     type="button"
                     aria-label="子ノードをアウトライン表示"
@@ -4379,8 +4804,8 @@ export function DocsWorkspace({
                   >
                     <Table2 className="size-3.5" />
                   </button>
-                </div>
-                <Button
+                </div> : null}
+                {!projectIdentityProtected ? <Button
                   type="button"
                   variant="ghost"
                   size="sm"
@@ -4389,8 +4814,8 @@ export function DocsWorkspace({
                 >
                   エイリアス
                   {(node.aliases?.length ?? 0) > 0 ? ` ${node.aliases.length}` : ""}
-                </Button>
-                {node.permission === "owner" ? (
+                </Button> : null}
+                {node.permission === "owner" && !projectIdentityProtected ? (
                   <Button
                     type="button"
                     variant="ghost"
@@ -4440,17 +4865,6 @@ export function DocsWorkspace({
                  compact && "max-w-none px-1",
                )}
             >
-              {node.system_key?.startsWith("agent_memory") ||
-              node.display_props?.managed_domain === "legacy_agent_memory" ? (
-                <StatusNote tone="warning" className="mb-3">
-                  <p className="font-medium">この旧エージェントメモリは移行済みの読み取り専用データです。</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    新しいメモリの確認・編集・候補承認は
-                    <a className="mx-1 underline underline-offset-2" href="/settings#conversation">設定の「メモリ」</a>
-                    から行ってください。
-                  </p>
-                </StatusNote>
-              ) : null}
               {childrenLayout === "table" ? (
                 <DocsChildrenTable
                   rows={directChildren}
@@ -4642,6 +5056,15 @@ export function DocsWorkspace({
               }}
             />
             <SidebarButton
+              icon={FileText}
+              label="議事録を取り込む"
+              active={meetingImportOpen}
+              onClick={() => {
+                setMeetingImportFile(null);
+                setMeetingImportOpen(true);
+              }}
+            />
+            <SidebarButton
               icon={History}
               label="取り込み履歴"
               active={clipIngestPanelOpen}
@@ -4697,6 +5120,8 @@ export function DocsWorkspace({
               childrenByParent={childrenByParent}
               nodeHasChildren={sidebarNodeHasChildren}
               isNodeVisible={isSidebarProjectionVisible}
+              isNodeDraggable={(candidate) => canMutateNode(candidate, "move")}
+              canDropOnNode={() => true}
               collapsed={sidebarCollapsed}
               onToggle={toggleSidebarCollapsed}
               onOpen={openSidebarNode}
@@ -4801,6 +5226,8 @@ export function DocsWorkspace({
       data-shell-workspace="docs"
       onKeyDownCapture={handleWorkspaceKeyDownCapture}
       onKeyUpCapture={handleWorkspaceKeyUpCapture}
+      onDragOver={handleMeetingImportDragOver}
+      onDrop={handleMeetingImportDrop}
     >
       {docsSidebarSlot ? createPortal(docsSidebar, docsSidebarSlot) : docsSidebar}
       <div className="flex h-full min-h-0 min-w-0 flex-1 overflow-hidden bg-background" data-shell-region="docs-canvas">
@@ -4834,8 +5261,17 @@ export function DocsWorkspace({
         ) : mainView === "trash" ? (
           <TrashMainView
             archivedNodes={archivedNodes}
-            onRestoreNode={(nodeId) => void restoreNode(nodeId)}
-            onPermanentDeleteNode={(nodeId) => void permanentlyDeleteNode(nodeId)}
+            onCleanupNode={(node) => void cleanupProjectInformationNode(node)}
+            onRestoreNode={(nodeId) => {
+              void restoreNode(nodeId).catch((error) => {
+                toast.error(error instanceof Error ? error.message : "ノードの復元に失敗しました");
+              });
+            }}
+            onPermanentDeleteNode={(nodeId) => {
+              void permanentlyDeleteNode(nodeId).catch((error) => {
+                toast.error(error instanceof Error ? error.message : "ノードの完全削除に失敗しました");
+              });
+            }}
           />
         ) : mainView === "search" ? (
           <SearchNodesMainView
@@ -4874,12 +5310,20 @@ export function DocsWorkspace({
         }}
         onRename={(node) => void renameSidebarNode(node)}
         onDuplicate={(node) => void duplicateSidebarNode(node)}
+        onCleanup={(node) => void cleanupProjectInformationNode(node)}
         onMoveWithReference={moveSidebarNodeWithReference}
         onExport={(node) => void exportSidebarNode(node)}
         onCopyReference={(node) => void copySidebarNodeReference(node)}
         onCopyId={(node) => void copySidebarNodeId(node)}
         onPin={(node) => void pinSidebarNode(node)}
         onArchive={(node) => void archiveSidebarNode(node)}
+        canRename={sidebarContextNode ? canMutateNode(sidebarContextNode, "title") : false}
+        canDuplicate={sidebarContextNode ? canMutateNode(sidebarContextNode, "content") && !isProjectIdentityNode(sidebarContextNode) : false}
+        canCleanup={sidebarContextNode ? canCleanupProjectInfoNode(sidebarContextNode) : false}
+        canPin={sidebarContextNode ? canMutateNode(sidebarContextNode, "content") && !isProjectIdentityNode(sidebarContextNode) : false}
+        canArchive={sidebarContextNode ? canMutateNode(sidebarContextNode, "archive") : false}
+        canMove={sidebarContextNode ? canMutateNode(sidebarContextNode, "move") : false}
+        protectedMessage={sidebarContextNode ? protectedNodeMessage(sidebarContextNode) : null}
       />
       <DocsAiPreviewDialog
         preview={aiPreview}
@@ -4900,6 +5344,7 @@ export function DocsWorkspace({
         }}
       />
       <DocsShareDialog
+        key={shareNode?.id ?? "closed"}
         open={Boolean(shareNode)}
         nodeId={shareNode?.id ?? null}
         nodeTitle={shareNode ? nodeText(shareNode) : undefined}
@@ -4918,6 +5363,16 @@ export function DocsWorkspace({
           setTaskBindingsByNodeId(new Map());
           void load({ focusToday: false });
         }}
+      />
+      <DocsMeetingImportDialog
+        open={meetingImportOpen}
+        initialFile={meetingImportFile}
+        fetcher={apiFetch}
+        onOpenChange={(open) => {
+          setMeetingImportOpen(open);
+          if (!open) setMeetingImportFile(null);
+        }}
+        onImported={handleMeetingImportImported}
       />
     </div>
   );

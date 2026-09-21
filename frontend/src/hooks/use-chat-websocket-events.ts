@@ -7,6 +7,7 @@ import {
   type SetStateAction,
 } from "react";
 import { toast } from "sonner";
+import { usePetChatActivity } from "@/components/pets/use-pet-chat-activity";
 import type {
   ChatToolResultMetadata,
   ConversationMessage,
@@ -35,12 +36,15 @@ import type {
 } from "@/lib/chat-generation-state";
 import { selectGenerationAgentRunId } from "@/lib/chat-generation-state";
 import { explorerBookmarks, explorerSearch } from "@/lib/explorer-api";
-import type {
-  AskUserQuestionRequest,
-  ExternalModelPromptRequest,
-  PlanApprovalRequest,
-  ToolPermissionRequest,
-  ToolPermissionScope,
+import {
+  parsePlanApprovalRequestData,
+  parseExternalModelPromptRequestData,
+  type AskUserQuestionRequest,
+  type ExternalModelPromptRequest,
+  type ExternalModelPromptResponseInput,
+  type PlanApprovalRequest,
+  type ToolPermissionRequest,
+  type ToolPermissionScope,
 } from "@/components/chat/chat-permission-dialogs";
 
 type WSMessage = NonNullable<ReturnType<typeof useWebSocket>["lastMessage"]>;
@@ -79,11 +83,14 @@ type UseChatWebSocketEventsArgs = {
     request: ExternalModelPromptRequest | null,
   ) => void;
   setExternalModelPromptDraft: (draft: string) => void;
+  /** Optional so legacy hook test harnesses can omit the transport. */
+  sendExternalModelPromptResponse?: (
+    input: ExternalModelPromptResponseInput,
+  ) => boolean | void;
   setAskUserQuestionRequest?: (request: AskUserQuestionRequest | null) => void;
   setAskUserQuestionDraft?: (draft: string) => void;
   setAskUserQuestionChoices?: (choices: string[]) => void;
   setPlanApprovalRequest?: (request: PlanApprovalRequest | null) => void;
-  setPlanApprovalDraft?: (draft: string) => void;
   setPlanApprovalFeedbackDraft?: (draft: string) => void;
   setSteeringInstructions: Dispatch<
     SetStateAction<SubmittedSteeringInstruction[]>
@@ -125,11 +132,11 @@ export function useChatWebSocketEvents({
   setToolPermissionRequest,
   setExternalModelPromptRequest,
   setExternalModelPromptDraft,
+  sendExternalModelPromptResponse,
   setAskUserQuestionRequest,
   setAskUserQuestionDraft,
   setAskUserQuestionChoices,
   setPlanApprovalRequest,
-  setPlanApprovalDraft,
   setPlanApprovalFeedbackDraft,
   setSteeringInstructions,
   setStreamingContent,
@@ -140,6 +147,7 @@ export function useChatWebSocketEvents({
   stopAudio,
   setVolume,
 }: UseChatWebSocketEventsArgs) {
+  usePetChatActivity(generationState.lifecycle.phase, generationState.lifecycle.sessionId, activeSessionId);
   useEffect(() => {
     if (!lastMessage) return;
 
@@ -323,48 +331,48 @@ export function useChatWebSocketEvents({
 
     if (lastMessage.type === "external_model_prompt_request") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
-      if (data && eventSessionId === activeSessionId && eventSessionId) {
-        const prompt = String(data.original_prompt || data.prompt || "");
-        const redactedPrompt = String(data.redacted_prompt || prompt);
-        const redactionFindings = Array.isArray(data.redaction_findings)
-          ? data.redaction_findings
-              .map((item) =>
-                item && typeof item === "object"
-                  ? {
-                      category: String(
-                        (item as Record<string, unknown>).category || "",
-                      ),
-                      placeholder: String(
-                        (item as Record<string, unknown>).placeholder || "",
-                      ),
-                    }
-                  : null,
-              )
-              .filter(
-                (item): item is { category: string; placeholder: string } =>
-                  Boolean(item?.category && item.placeholder),
-              )
-          : [];
-        const request = {
+      if (eventSessionId === activeSessionId && eventSessionId) {
+        const parsed = parseExternalModelPromptRequestData(data);
+        if (!parsed) {
+          // Never open an approval UI for an unsupported or malformed review
+          // contract.  If all binding fields are present, send an explicit
+          // v2 deny; otherwise the transport helper fails closed.
+          const requestId =
+            typeof data?.request_id === "string" ? data.request_id : "";
+          const reviewNonce =
+            typeof data?.review_nonce === "string" ? data.review_nonce : "";
+          const bindingDigest =
+            typeof data?.binding_digest === "string" ? data.binding_digest : "";
+          setExternalModelPromptRequest(null);
+          setExternalModelPromptDraft("");
+          if (
+            requestId.trim() &&
+            reviewNonce.trim() &&
+            bindingDigest.trim()
+          ) {
+            sendExternalModelPromptResponse?.({
+              requestId,
+              approved: false,
+              finalPayload: "",
+              reviewNonce,
+              bindingDigest,
+              targetSessionId: eventSessionId,
+            });
+          }
+          toast.error("外部モデル送信の確認データが不正なため、送信を拒否しました");
+          return;
+        }
+
+        const request: ExternalModelPromptRequest = {
           sessionId: eventSessionId,
-          requestId: String(data.request_id || ""),
-          provider: String(data.provider || ""),
-          model: String(data.model || ""),
-          description: String(
-            data.description ||
-              "分担先モデルへ送るプロンプトを確認してください",
-          ),
-          prompt,
-          redactedPrompt,
-          redactionFindings,
-          notify: data.notify !== false,
-          sourceKind: String(data.source_kind || ""),
-          riskLevel: String(data.risk_level || ""),
-          semanticStatus: String(data.semantic_status || ""),
-          warning: String(data.warning || ""),
+          requestId:
+            typeof data?.request_id === "string" ? data.request_id : "",
+          ...parsed,
         };
         setExternalModelPromptRequest(request);
-        setExternalModelPromptDraft(redactedPrompt);
+        // Preserve the server candidate byte-for-byte.  The original payload
+        // is never used as a compatibility fallback.
+        setExternalModelPromptDraft(request.candidatePayload);
         if (request.notify) {
           toast.info("外部モデル送信の確認が必要です");
         }
@@ -396,15 +404,12 @@ export function useChatWebSocketEvents({
     if (lastMessage.type === "plan_approval_request") {
       const data = lastMessage.data as Record<string, unknown> | undefined;
       if (data && eventSessionId === activeSessionId && eventSessionId) {
-        const planText = String(data.plan_text || "");
+        const parsed = parsePlanApprovalRequestData(data);
         setPlanApprovalRequest?.({
           sessionId: eventSessionId,
           requestId: String(data.request_id || ""),
-          planText,
-          summary: String(data.summary || "実行前に計画を確認してください。"),
-          revision: Number(data.revision || 0),
+          ...parsed,
         });
-        setPlanApprovalDraft?.(planText);
         setPlanApprovalFeedbackDraft?.("");
       }
       return;

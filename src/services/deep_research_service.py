@@ -11,14 +11,18 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import contextvars
 import html
 import json
 import logging
+import math
 import os
 import re
+import tempfile
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Iterable, Mapping, Optional
@@ -35,18 +39,242 @@ from ..llm.agent_runtime import (
 from ..llm.conversation_context import normalize_usage, persist_usage_sync
 from ..llm.sglang_url import resolve_sglang_base_url, resolve_sglang_model
 from .outbound_privacy_service import (
+    EgressDescriptor,
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
     PrivacyError,
+    effective_privacy_mode,
+    reset_privacy_policy_context,
+    set_privacy_policy_context,
 )
-from .turn_context import get_turn_context
+from .search_egress_policy import (
+    SearchEgressPreconditionError,
+    approved_public_egress,
+    assert_public_search_egress_approved,
+    is_enterprise_profile,
+)
+from .turn_context import get_turn_context, reset_turn_context, set_turn_context
+
+from ..tools.external_llm_permission import (
+    reset_permission_session_key,
+    set_permission_session_key,
+)
 
 logger = logging.getLogger(__name__)
 
 
 DEFAULT_ENGINES = ["searxng", "wikipedia", "arxiv", "openalex", "pubmed"]
+SUPPORTED_ENGINES = frozenset(
+    {
+        "searxng",
+        "duckduckgo",
+        "yahoo_realtime",
+        "wikipedia",
+        "arxiv",
+        "openalex",
+        "pubmed",
+        "local_knowledge",
+    }
+)
 DEFAULT_YAHOO_REALTIME_URL = "https://search.yahoo.co.jp/realtime/search"
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "interrupted"}
+MAX_RESEARCH_ENGINES = 16
+_ENGINE_ALIASES = {
+    "ddg": "duckduckgo",
+    "duck_duck_go": "duckduckgo",
+    "yahoo": "yahoo_realtime",
+    "yahoo_realtime_search": "yahoo_realtime",
+}
+
+_PRIVACY_POLICY_KEYS = frozenset(
+    {
+        "privacy_mode",
+        "review_policy",
+        "semantic_redaction_enabled",
+        "raw_media_policy",
+        "trusted_local_hosts",
+        "local_provider",
+        "local_model",
+    }
+)
+_PRIVACY_MODES = frozenset({"direct", "protected", "local_only"})
+
+
+def _normalize_privacy_policy(value: Any, *, project_id: Optional[str] = None) -> dict[str, Any]:
+    """Copy only the policy subset safe to persist into a research job."""
+
+    if not isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+    else:
+        result = {}
+        for key in _PRIVACY_POLICY_KEYS:
+            if key not in value:
+                continue
+            candidate = value.get(key)
+            if key == "privacy_mode":
+                normalized = str(candidate or "").strip().lower()
+                if normalized in _PRIVACY_MODES:
+                    result[key] = normalized
+            elif key == "semantic_redaction_enabled":
+                if isinstance(candidate, bool):
+                    result[key] = candidate
+            elif key == "trusted_local_hosts":
+                hosts = [candidate] if isinstance(candidate, str) else candidate
+                if isinstance(hosts, (list, tuple, set, frozenset)):
+                    result[key] = list(
+                        dict.fromkeys(
+                            str(item).strip().lower()
+                            for item in hosts
+                            if str(item).strip()
+                        )
+                    )[:32]
+            elif isinstance(candidate, str):
+                normalized = candidate.strip()
+                if normalized and len(normalized) <= 128:
+                    result[key] = normalized
+    if project_id:
+        result["project_id"] = str(project_id).strip()
+    return result
+
+
+def _privacy_snapshot(
+    session_context: Any,
+    project_metadata: Any,
+    *,
+    project_id: Optional[str] = None,
+    global_policy: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Canonical immutable shape used for enqueue and worker drift checks."""
+
+    global_snapshot: dict[str, Any] = {}
+    if isinstance(global_policy, Mapping):
+        global_snapshot = dict(global_policy)
+        if "privacy_mode" not in global_snapshot and "mode" in global_snapshot:
+            global_snapshot["privacy_mode"] = global_snapshot.get("mode")
+    return {
+        "session": _normalize_privacy_policy(session_context),
+        "project": _normalize_privacy_policy(project_metadata, project_id=project_id),
+        "global": _normalize_privacy_policy(global_snapshot),
+    }
+
+# Bounded worker/lifetime defaults.  Deployments can override these under the
+# ``deep_research`` config namespace, but every stage remains finite even when
+# no config object is available (for example in a direct CLI invocation).
+DEFAULT_QUEUE_CAPACITY = 8
+DEFAULT_WORKER_COUNT = 1
+DEFAULT_PLANNING_TIMEOUT_SECONDS = 30.0
+DEFAULT_ENGINE_TIMEOUT_SECONDS = 45.0
+DEFAULT_SYNTHESIS_TIMEOUT_SECONDS = 90.0
+DEFAULT_OVERALL_TIMEOUT_SECONDS = 180.0
+DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
+
+DEEP_RESEARCH_ERROR_MESSAGES = {
+    "scope_missing": "調査を開始できませんでした（会話セッションの指定が必要です）。",
+    "scope_revoked": "調査を開始できませんでした（会話セッションへのアクセスが失効しました）。",
+    "privacy_protection_failed": "調査を開始できませんでした（プライバシー保護に失敗しました）。",
+    "queue_full": "調査を開始できませんでした（調査キューが混雑しています）。",
+    "manager_shutdown": "調査サービスは現在停止中です。しばらくしてから再試行してください。",
+    "planning_timeout": "調査計画が制限時間を超えました。",
+    "engine_timeout": "検索エンジンが制限時間を超えました。",
+    "synthesis_timeout": "レポート生成が制限時間を超えました。",
+    "deadline": "調査が全体制限時間を超えました。",
+    "process_restarted": "調査はサーバー再起動により中断されました。",
+    "cancelled": "調査はキャンセルされました。",
+    "internal_error": "調査に失敗しました。",
+    "provider_failed": "調査プロバイダーが利用できませんでした。設定とサービス状態を確認してください。",
+    "provider_invalid": "調査エンジンの設定が不正です。利用可能なエンジンを選択してください。",
+    "egress_unreachable": "検索サービスに到達できませんでした。承認済みネットワーク経路を確認してください。",
+    "credential_missing": "調査に必要な認証情報が設定されていません。",
+}
+
+
+def _consume_async_task(task: asyncio.Task[Any]) -> None:
+    """Consume a detached coroutine result so late failures stay observed."""
+
+    if task.cancelled():
+        return
+    try:
+        task.exception()
+    except BaseException:
+        return
+
+
+async def _await_bounded(awaitable: Awaitable[Any], timeout: float) -> Any:
+    """Await an untrusted provider coroutine without cancellation hangs.
+
+    ``asyncio.wait_for`` waits for cancellation propagation when the callee
+    suppresses ``CancelledError``.  Provider/sidecar calls are instead run as
+    a child task and detached after the finite deadline; their durable caller
+    must terminalize the associated job before returning.
+    """
+
+    task = asyncio.ensure_future(awaitable)
+    try:
+        _done, pending = await asyncio.wait({task}, timeout=timeout)
+        if pending:
+            task.cancel()
+            task.add_done_callback(_consume_async_task)
+            raise asyncio.TimeoutError
+        return task.result()
+    except asyncio.CancelledError:
+        if not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_async_task)
+        raise
+
+
+class DeepResearchScopeError(RuntimeError):
+    """A server-owned conversation scope is missing or no longer valid."""
+
+    def __init__(self, code: str = "scope_missing") -> None:
+        self.code = code if code in {"scope_missing", "scope_revoked"} else "scope_missing"
+        super().__init__(self.code)
+
+
+class DeepResearchStageTimeout(TimeoutError):
+    """A planning/search/synthesis stage exceeded its finite deadline."""
+
+    def __init__(self, stage: str) -> None:
+        self.stage = stage
+        super().__init__(stage)
+
+
+class DeepResearchQueueFullError(RuntimeError):
+    """Raised when the bounded research queue cannot accept another job."""
+
+    code = "queue_full"
+
+
+class DeepResearchTransportError(RuntimeError):
+    """A search provider failed before yielding any usable transport result."""
+
+    def __init__(self, code: str = "egress_unreachable") -> None:
+        self.code = code if code in {"egress_unreachable", "engine_timeout"} else "egress_unreachable"
+        super().__init__(self.code)
+
+
+class DeepResearchCredentialError(RuntimeError):
+    """Raised when an explicitly selected hosted model lacks credentials."""
+
+    code = "credential_missing"
+
+
+class DeepResearchProviderError(RuntimeError):
+    """A model/provider returned no usable result or failed unexpectedly."""
+
+    def __init__(self, code: str = "provider_failed") -> None:
+        self.code = (
+            code
+            if code in {"provider_failed", "provider_invalid", "internal_error"}
+            else "provider_failed"
+        )
+        super().__init__(self.code)
+
+
+class DeepResearchManagerClosedError(RuntimeError):
+    """Raised when a process-owned research manager is already shut down."""
+
+    code = "manager_shutdown"
 
 
 def _utc_now() -> str:
@@ -56,6 +284,18 @@ def _utc_now() -> str:
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
     if config is None:
         return default
+    # Mapping-backed Config objects commonly store nested dictionaries while
+    # the runtime Config helper exposes dotted keys.  Prefer the nested form
+    # before calling ``dict.get`` so ``{"deep_research": {"workers": 2}}``
+    # is not mistaken for an absent value.
+    if isinstance(config, Mapping):
+        value: Any = config
+        for part in key.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                break
+            value = value[part]
+        else:
+            return value
     if hasattr(config, "get"):
         try:
             value = config.get(key, default)
@@ -63,13 +303,6 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
                 return value
         except Exception:
             pass
-    if isinstance(config, dict):
-        value: Any = config
-        for part in key.split("."):
-            if not isinstance(value, dict) or part not in value:
-                return default
-            value = value[part]
-        return value
     return default
 
 
@@ -109,6 +342,86 @@ def _normalize_duckduckgo_url(url: str) -> str:
 
 def _safe_filename(job_id: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", job_id)
+
+
+@contextmanager
+def _exclusive_job_file_lock(path: Path):
+    """Serialize status read/replace transitions across local processes."""
+
+    lock_path = path.with_name(f".{path.name}.lock")
+    handle = lock_path.open("a+b")
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
+
+
+def _normalize_engine_id(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    return _ENGINE_ALIASES.get(normalized, normalized)
+
+
+def _is_transport_failure(error: BaseException) -> bool:
+    """Return whether an exception represents a failed provider transport.
+
+    Parser/validation errors are deliberately excluded: an HTTP 200 response
+    with no matching records is a valid empty result, whereas a connect,
+    timeout, or HTTP status failure means the engine was not reachable.
+    """
+
+    return isinstance(error, DeepResearchTransportError) or isinstance(
+        error,
+        (
+            asyncio.TimeoutError,
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.NetworkError,
+            httpx.HTTPStatusError,
+            OSError,
+        ),
+    )
+
+
+def _provider_failure_code(error: BaseException, config: Any) -> str:
+    """Map provider failures to stable, non-sensitive terminal codes."""
+
+    if isinstance(error, DeepResearchTransportError):
+        return error.code
+    if _is_transport_failure(error):
+        if isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException)):
+            return "engine_timeout"
+        return "egress_unreachable"
+    provider = str(_config_get(config, "llm_provider", "") or "").strip().lower()
+    if provider in {"openai", "gemini"}:
+        message = str(error).lower()
+        if "api_key" in message or "credential" in message or "not configured" in message:
+            return "credential_missing"
+    return "provider_failed"
 
 
 @dataclass
@@ -151,31 +464,59 @@ class DeepResearchRequest:
     session_context: Optional[Mapping[str, Any]] = None
     project_metadata: Optional[Mapping[str, Any]] = None
 
-    def normalized(self) -> "DeepResearchRequest":
+    def normalized(
+        self,
+        *,
+        enterprise_public_egress_approved: Optional[bool] = None,
+    ) -> "DeepResearchRequest":
         mode = self.mode if self.mode in {"quick", "detailed", "report"} else "detailed"
         default_iterations = {"quick": 1, "detailed": 3, "report": 4}[mode]
         max_iterations = self.max_iterations or default_iterations
+        normalized_engines: list[str] = []
+        for engine in self.engines or DEFAULT_ENGINES:
+            normalized = _normalize_engine_id(engine)
+            if not normalized or normalized in normalized_engines:
+                continue
+            normalized_engines.append(normalized)
+        # Keep direct/non-HTTP callers bounded just like the API model.  A
+        # sentinel preserves fail-closed validation instead of silently
+        # dropping an attacker-supplied engine after the cap.
+        if len(normalized_engines) > MAX_RESEARCH_ENGINES:
+            normalized_engines = normalized_engines[:MAX_RESEARCH_ENGINES]
+            normalized_engines.append("__too_many_engines__")
+        # The historical default list contains public engines.  A fresh
+        # Enterprise/local deployment must not silently turn that default into
+        # public HTTP egress; SearXNG is the local authority and its own
+        # configured endpoint/egress gate decides whether it can run.  An
+        # explicitly approved public route can still be selected by enabling
+        # public egress in the operator configuration.
+        if (
+            is_enterprise_profile()
+            and enterprise_public_egress_approved is not True
+            and normalized_engines == [
+                _normalize_engine_id(e) for e in DEFAULT_ENGINES
+            ]
+        ):
+            normalized_engines = ["searxng"]
         return DeepResearchRequest(
             query=self.query.strip(),
             mode=mode,
             max_iterations=max(1, min(int(max_iterations), 8)),
             questions_per_iteration=max(1, min(int(self.questions_per_iteration), 6)),
             max_results_per_query=max(1, min(int(self.max_results_per_query), 10)),
-            engines=[e for e in (self.engines or DEFAULT_ENGINES) if e],
+            engines=normalized_engines,
             include_local_knowledge=bool(self.include_local_knowledge),
             project_id=self.project_id,
             actor_user_id=self.actor_user_id,
             is_admin=bool(self.is_admin),
             session_id=str(self.session_id).strip() if self.session_id else None,
-            session_context=(
-                dict(self.session_context)
-                if isinstance(self.session_context, Mapping)
-                else None
-            ),
+            session_context=_normalize_privacy_policy(self.session_context) or None,
             project_metadata=(
-                dict(self.project_metadata)
-                if isinstance(self.project_metadata, Mapping)
-                else None
+                _normalize_privacy_policy(
+                    self.project_metadata,
+                    project_id=self.project_id,
+                )
+                or None
             ),
         )
 
@@ -193,6 +534,14 @@ class DeepResearchJob:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     error: Optional[str] = None
+    error_code: Optional[str] = None
+    # Durable actor/conversation scope.  ``metadata`` retains the historical
+    # extensible projection, while these first-class fields make authorization
+    # and client rendering independent of untrusted request payloads.
+    actor_user_id: Optional[str] = None
+    session_id: Optional[str] = None
+    project_id: Optional[str] = None
+    privacy_snapshot: dict[str, Any] = field(default_factory=dict)
     events: list[DeepResearchEvent] = field(default_factory=list)
     questions_by_iteration: dict[str, list[str]] = field(default_factory=dict)
     sources: list[DeepResearchSource] = field(default_factory=list)
@@ -226,6 +575,7 @@ class DeepResearchJob:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DeepResearchJob":
+        metadata = data.get("metadata") if isinstance(data.get("metadata"), dict) else {}
         events = [
             DeepResearchEvent(**event)
             for event in data.get("events", [])
@@ -248,11 +598,27 @@ class DeepResearchJob:
             started_at=data.get("started_at"),
             completed_at=data.get("completed_at"),
             error=data.get("error"),
+            error_code=data.get("error_code"),
+            actor_user_id=data.get("actor_user_id")
+            or metadata.get("actor_user_id"),
+            session_id=data.get("session_id")
+            or metadata.get("session_id"),
+            project_id=data.get("project_id")
+            or metadata.get("project_id"),
+            privacy_snapshot=(
+                dict(data.get("privacy_snapshot"))
+                if isinstance(data.get("privacy_snapshot"), Mapping)
+                else (
+                    dict(metadata.get("privacy_snapshot"))
+                    if isinstance(metadata.get("privacy_snapshot"), Mapping)
+                    else {}
+                )
+            ),
             events=events,
             questions_by_iteration=data.get("questions_by_iteration", {}),
             sources=sources,
             report_markdown=data.get("report_markdown", ""),
-            metadata=data.get("metadata", {}),
+            metadata=metadata,
         )
 
 
@@ -262,13 +628,66 @@ class DeepResearchJobStore:
     def __init__(self, base_dir: Path | str = "cache/deep_research") -> None:
         self.base_dir = Path(base_dir)
         self.base_dir.mkdir(parents=True, exist_ok=True)
+        # Jobs include private conversation queries, snippets and generated
+        # reports.  Keep the cache process-private where the host filesystem
+        # supports POSIX-style modes; Windows and restricted filesystems simply
+        # retain their platform ACLs.
+        try:
+            self.base_dir.chmod(0o700)
+        except OSError:
+            pass
 
     def save(self, job: DeepResearchJob) -> None:
         path = self.base_dir / f"{_safe_filename(job.id)}.json"
-        path.write_text(
-            json.dumps(job.to_dict(), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        with _exclusive_job_file_lock(path):
+            # A cancellation/restart tombstone is authoritative for this
+            # local durable store. A provider coroutine detached during
+            # shutdown may still hold an old in-memory job and attempt to
+            # persist a late ``completed`` result; never let that stale writer
+            # resurrect work. Same-status writes remain valid so a terminal
+            # report can still be enriched with metadata by its owner.
+            if path.exists():
+                try:
+                    existing = DeepResearchJob.from_dict(
+                        json.loads(path.read_text(encoding="utf-8"))
+                    )
+                except Exception:
+                    existing = None
+                if (
+                    existing is not None
+                    and existing.status in TERMINAL_STATUSES
+                    and job.status != existing.status
+                ):
+                    return
+            payload = json.dumps(job.to_dict(), ensure_ascii=False, indent=2)
+            # Write/replace atomically so a process crash cannot leave a
+            # truncated JSON document that hides a terminal state or scope
+            # metadata.
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{_safe_filename(job.id)}.",
+                suffix=".tmp",
+                dir=str(self.base_dir),
+                text=True,
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                os.replace(temp_name, path)
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
+            finally:
+                try:
+                    if os.path.exists(temp_name):
+                        os.unlink(temp_name)
+                except OSError:
+                    pass
 
     def load(self, job_id: str) -> Optional[DeepResearchJob]:
         path = self.base_dir / f"{_safe_filename(job_id)}.json"
@@ -292,6 +711,38 @@ class DeepResearchJobStore:
             jobs.append(job)
         jobs.sort(key=lambda item: item.created_at, reverse=True)
         return jobs[:limit]
+
+    def reconcile_stale_jobs(self) -> int:
+        """Terminalize jobs left queued/running by a previous process.
+
+        The JSON store has no distributed lease, so a restarted process cannot
+        safely resume a job that may still be running elsewhere.  Reconcile
+        those records once at manager startup; never auto-retry an external
+        search or model call from an untrusted checkpoint.
+        """
+
+        reconciled = 0
+        for path in self.base_dir.glob("*.json"):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                job = DeepResearchJob.from_dict(data)
+            except Exception:
+                continue
+            if job.status not in {"queued", "running"}:
+                continue
+            job.status = "failed"
+            job.error_code = "process_restarted"
+            job.error = DEEP_RESEARCH_ERROR_MESSAGES["process_restarted"]
+            job.completed_at = _utc_now()
+            job.emit(
+                "調査はサーバー再起動により中断されました",
+                job.progress,
+                "failed",
+                {"error_code": "process_restarted"},
+            )
+            self.save(job)
+            reconciled += 1
+        return reconciled
 
 
 class DeepResearchLLMAdapter:
@@ -333,6 +784,70 @@ class DeepResearchLLMAdapter:
             session_id=str(session_id or ""),
             session_context=self.session_context,
             project_metadata=self.project_metadata,
+        )
+
+    @staticmethod
+    def _is_enterprise() -> bool:
+        try:
+            from ..features import Features
+
+            return bool(Features.is_enterprise())
+        except Exception:
+            return any(
+                str(os.getenv(name) or "").strip().lower() == "enterprise"
+                for name in ("AOITALK_PROFILE", "AIVTUBER_ENV")
+            )
+
+    @staticmethod
+    def _model_descriptor(
+        *,
+        action: str,
+        transport: str,
+        destination: str,
+        provider: str,
+        model: str = "",
+    ) -> EgressDescriptor:
+        """Describe one direct research-model transaction."""
+
+        return EgressDescriptor(
+            action=str(action or "deep_research_model_request"),
+            transport=str(transport or "provider"),
+            destination=str(destination or provider),
+            provider=str(provider or ""),
+            tool="deep_research",
+            model=str(model or ""),
+        )
+
+    async def _execute_model_request(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        provider: str,
+        base_url: str,
+        source_kind: str,
+        descriptor: EgressDescriptor,
+        sender: Callable[[Any], Any],
+        model: str = "",
+    ) -> Any:
+        """Route one direct model call through the transaction gateway.
+
+        Keeping the sender nested makes the gateway's review result the sole
+        authority for the wire payload.  There is deliberately no
+        ``protect``-then-send fallback when an injected legacy gateway lacks
+        ``execute``.
+        """
+
+        execute = getattr(self._privacy_gateway, "execute", None)
+        if not callable(execute):
+            raise PrivacyError("outbound privacy gateway does not support execution")
+        return await execute(
+            dict(payload),
+            provider=provider,
+            descriptor=descriptor,
+            sender=sender,
+            base_url=base_url,
+            source_kind=source_kind,
+            model=model,
         )
 
     def _apply_deployment_contract(self) -> None:
@@ -685,6 +1200,11 @@ class DeepResearchLLMAdapter:
             raise
         except Exception as exc:
             logger.warning("Direct deep research LLM call failed: %s", exc)
+            # Enterprise deployments have one operator-selected provider.  A
+            # failed call must not silently fall through to a different,
+            # potentially unapproved client/configuration.
+            if self._is_enterprise():
+                raise
 
         return await self._generate_with_existing_client(prompt)
 
@@ -702,16 +1222,33 @@ class DeepResearchLLMAdapter:
         model_name = _config_get(self.config, "llm_model", "gemini-3-flash-preview")
         model = genai.GenerativeModel(model_name=model_name)
         started = time.perf_counter()
-        protected = await self._privacy_gateway.protect(
+        descriptor = self._model_descriptor(
+            action="deep_research_model_request",
+            transport="google.generativeai.GenerativeModel.generate_content",
+            destination="gemini",
+            provider="gemini",
+            model=str(model_name),
+        )
+
+        async def send(final_payload: Any) -> Any:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("deep research Gemini payload is malformed")
+            outbound_prompt = final_payload.get("prompt")
+            if not isinstance(outbound_prompt, str) or not outbound_prompt:
+                raise PrivacyError("deep research Gemini payload has no prompt")
+            if hasattr(model, "generate_content_async"):
+                return await model.generate_content_async(outbound_prompt)
+            return await asyncio.to_thread(model.generate_content, outbound_prompt)
+
+        response = await self._execute_model_request(
             {"prompt": prompt},
             provider="gemini",
+            base_url="",
             source_kind="deep_research_model_request",
+            descriptor=descriptor,
+            sender=send,
+            model=str(model_name),
         )
-        outbound_prompt = str((protected.payload or {}).get("prompt") or "")
-        if hasattr(model, "generate_content_async"):
-            response = await model.generate_content_async(outbound_prompt)
-        else:
-            response = await asyncio.to_thread(model.generate_content, outbound_prompt)
         self._record_direct_usage(
             response,
             provider="gemini",
@@ -736,22 +1273,43 @@ class DeepResearchLLMAdapter:
             "temperature": 0.2,
             "max_output_tokens": max_tokens,
         }
-        protected = await self._privacy_gateway.protect(
-            request_kwargs,
-            provider="openai",
-            base_url=str(getattr(client, "base_url", "") or ""),
-            source_kind="deep_research_model_request",
-        )
-        response = await client.responses.create(
-            **protected.payload
-        )
-        self._record_direct_usage(
-            response,
+        base_url = str(getattr(client, "base_url", "") or "")
+        descriptor = self._model_descriptor(
+            action="deep_research_model_request",
+            transport="openai.AsyncOpenAI.responses.create",
+            destination=base_url or "https://api.openai.com/v1",
             provider="openai",
             model=model_name,
-            started=started,
         )
-        return self._privacy_gateway.restore(getattr(response, "output_text", "") or "")
+        try:
+            async def send(final_payload: Any) -> Any:
+                if not isinstance(final_payload, Mapping):
+                    raise PrivacyError("deep research OpenAI payload is malformed")
+                return await client.responses.create(**dict(final_payload))
+
+            response = await self._execute_model_request(
+                request_kwargs,
+                provider="openai",
+                base_url=base_url,
+                source_kind="deep_research_model_request",
+                descriptor=descriptor,
+                sender=send,
+                model=model_name,
+            )
+            self._record_direct_usage(
+                response,
+                provider="openai",
+                model=model_name,
+                started=started,
+            )
+            return self._privacy_gateway.restore(getattr(response, "output_text", "") or "")
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    logger.debug("Deep research OpenAI client cleanup failed", exc_info=True)
 
     async def _generate_openai_compatible(
         self,
@@ -775,22 +1333,45 @@ class DeepResearchLLMAdapter:
             "temperature": 0.2,
             "max_tokens": max_tokens,
         }
-        protected = await self._privacy_gateway.protect(
-            request_kwargs,
-            provider=str(_config_get(self.config, "llm_provider", "openai_compatible_local")),
-            base_url=base_url,
-            source_kind="deep_research_model_request",
+        provider = str(
+            _config_get(self.config, "llm_provider", "openai_compatible_local")
         )
-        response = await client.chat.completions.create(
-            **protected.payload
-        )
-        self._record_direct_usage(
-            response,
-            provider=str(_config_get(self.config, "llm_provider", "openai_compatible_local")),
+        descriptor = self._model_descriptor(
+            action="deep_research_model_request",
+            transport="openai.AsyncOpenAI.chat.completions.create",
+            destination=base_url,
+            provider=provider,
             model=str(model),
-            started=started,
         )
-        return self._privacy_gateway.restore(response.choices[0].message.content or "")
+        try:
+            async def send(final_payload: Any) -> Any:
+                if not isinstance(final_payload, Mapping):
+                    raise PrivacyError("deep research compatible-model payload is malformed")
+                return await client.chat.completions.create(**dict(final_payload))
+
+            response = await self._execute_model_request(
+                request_kwargs,
+                provider=provider,
+                base_url=base_url,
+                source_kind="deep_research_model_request",
+                descriptor=descriptor,
+                sender=send,
+                model=str(model),
+            )
+            self._record_direct_usage(
+                response,
+                provider=provider,
+                model=str(model),
+                started=started,
+            )
+            return self._privacy_gateway.restore(response.choices[0].message.content or "")
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:
+                    logger.debug("Deep research local client cleanup failed", exc_info=True)
 
     async def _generate_with_existing_client(self, prompt: str) -> str:
         provider = str(_config_get(self.config, "llm_provider", "gemini")).strip().lower()
@@ -813,17 +1394,33 @@ class DeepResearchLLMAdapter:
         self._apply_client_usage_context(client)
         if hasattr(client, "clear_history"):
             client.clear_history()
-        protected = await self._privacy_gateway.protect(
+        descriptor = self._model_descriptor(
+            action="deep_research_model_request_fallback",
+            transport="llm.client.generate_response",
+            destination=base_url or provider,
+            provider=provider,
+            model=str(_config_get(self.config, "llm_model", "") or ""),
+        )
+
+        async def send(final_payload: Any) -> Any:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("deep research fallback payload is malformed")
+            outbound_prompt = final_payload.get("prompt")
+            if not isinstance(outbound_prompt, str) or not outbound_prompt:
+                raise PrivacyError("deep research fallback payload has no prompt")
+            if hasattr(client, "generate_response_async"):
+                return await client.generate_response_async(outbound_prompt)
+            return await asyncio.to_thread(client.generate_response, outbound_prompt)
+
+        result = await self._execute_model_request(
             {"prompt": prompt},
             provider=provider,
             base_url=base_url,
             source_kind="deep_research_model_request_fallback",
+            descriptor=descriptor,
+            sender=send,
+            model=str(_config_get(self.config, "llm_model", "") or ""),
         )
-        outbound_prompt = str((protected.payload or {}).get("prompt") or "")
-        if hasattr(client, "generate_response_async"):
-            result = await client.generate_response_async(outbound_prompt)
-        else:
-            result = await asyncio.to_thread(client.generate_response, outbound_prompt)
         return self._privacy_gateway.restore(result or "")
 
 
@@ -852,6 +1449,10 @@ class DeepResearchSearchClient:
         self.project_metadata = (
             dict(project_metadata) if isinstance(project_metadata, Mapping) else None
         )
+        # Reachability is an observation, not configuration.  Listing engines
+        # never performs a network probe; entries stay ``unknown`` until an
+        # actual search transport succeeds or fails.
+        self._engine_observations: dict[str, dict[str, Any]] = {}
         self._privacy_gateway = OutboundPrivacyGateway(
             config,
             user_id=self.user_id,
@@ -919,41 +1520,129 @@ class DeepResearchSearchClient:
             "pubmed": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/",
         }.get(provider, "https://example.invalid/")
 
-    async def _protect_payload(
-        self,
-        payload: Mapping[str, Any],
+    @staticmethod
+    def _search_descriptor(
         *,
+        action: str,
+        transport: str,
+        destination: str,
         provider: str,
-        base_url: str,
-        source_kind: str,
-    ) -> dict[str, Any]:
-        """Protect one request immediately before its network transport."""
+        tool: str = "deep_research",
+        model: str = "",
+    ) -> EgressDescriptor:
+        """Describe one concrete deep-research provider transaction.
 
-        protected = await self._privacy_gateway.protect(
+        The descriptor is intentionally created at the call site for every
+        request (including language fan-out and PubMed summary calls).  This
+        keeps review/audit binding scoped to the exact route and means a
+        retry cannot accidentally reuse an approval for another payload.
+        """
+
+        return EgressDescriptor(
+            action=str(action or "deep_research_search"),
+            transport=str(transport or "httpx.AsyncClient.get"),
+            destination=str(destination or ""),
+            provider=str(provider or ""),
+            tool=str(tool or "deep_research"),
+            model=str(model or ""),
+        )
+
+    @staticmethod
+    async def _http_get(
+        client: Any,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> Any:
+        """Call an injected/real HTTP client with redirects disabled.
+
+        A small compatibility fallback is retained for test doubles that do
+        not accept ``follow_redirects``; real ``httpx`` clients always receive
+        the explicit false value and never follow provider redirects.
+        """
+
+        getter = getattr(client, "get", None)
+        if not callable(getter):
+            raise PrivacyError("search client does not expose get()")
+        kwargs: dict[str, Any] = {
+            "params": dict(params or {}),
+            "follow_redirects": False,
+        }
+        if headers:
+            kwargs["headers"] = dict(headers)
+        try:
+            response = getter(url, **kwargs)
+        except TypeError:
+            # Tiny fixture clients often implement only ``get(url, params=)``.
+            # This path is never used by httpx and therefore cannot weaken
+            # redirect policy for a production transport.
+            kwargs.pop("follow_redirects", None)
+            response = getter(url, **kwargs)
+        if hasattr(response, "__await__"):
+            return await response
+        return response
+
+    async def _execute_http_get(
+        self,
+        client: Any,
+        *,
+        url: str,
+        payload: Mapping[str, Any],
+        provider: str,
+        source_kind: str,
+        params_builder: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+        headers: Mapping[str, str] | None = None,
+        action: str | None = None,
+        model: str = "",
+    ) -> Any:
+        """Review/mask one request, then invoke its GET sender exactly once."""
+
+        execute = getattr(self._privacy_gateway, "execute", None)
+        if not callable(execute):
+            # Never fall back to ``protect`` + raw transport.  An injected
+            # legacy gateway lacking the transaction API must fail closed.
+            raise PrivacyError("outbound privacy gateway does not support execution")
+
+        descriptor = self._search_descriptor(
+            action=action or source_kind,
+            transport="httpx.AsyncClient.get",
+            destination=url,
+            provider=provider,
+            model=model,
+        )
+
+        async def send(final_payload: Any) -> Any:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("search privacy boundary returned no mapping payload")
+            params = params_builder(final_payload)
+            if not isinstance(params, Mapping):
+                raise PrivacyError("search request parameter builder returned no mapping")
+            return await self._http_get(
+                client,
+                url,
+                params=params,
+                headers=headers,
+            )
+
+        return await execute(
             dict(payload),
             provider=provider,
-            base_url=base_url,
+            descriptor=descriptor,
+            sender=send,
+            base_url=url,
             source_kind=source_kind,
+            model=model,
         )
-        if isinstance(protected.payload, Mapping):
-            return dict(protected.payload)
-        return dict(payload)
 
-    async def _protected_query(
-        self,
-        query: str,
-        *,
-        provider: str,
-        base_url: str,
-        source_kind: str = "deep_research_search",
-    ) -> str:
-        payload = await self._protect_payload(
-            {"query": str(query or "")},
-            provider=provider,
-            base_url=base_url,
-            source_kind=source_kind,
-        )
-        return str(payload.get("query") or query or "")
+    @staticmethod
+    def _protected_query_value(payload: Mapping[str, Any]) -> str:
+        """Extract the gateway-approved query without raw fallback."""
+
+        value = payload.get("query")
+        if not isinstance(value, str) or not value.strip():
+            raise PrivacyError("privacy boundary returned no protected query")
+        return value
 
     def _request_scope(
         self,
@@ -996,6 +1685,35 @@ class DeepResearchSearchClient:
             project_metadata=scoped.project_metadata,
         )
         return scoped
+
+    def _observe_engine(
+        self,
+        engine: str,
+        *,
+        success: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        normalized = str(engine or "").strip().lower()
+        if not normalized:
+            return
+        if success:
+            safe_reason = "transport_succeeded"
+        else:
+            # Provider exception text can contain credentials, proxy URLs or
+            # internal hostnames.  Keep only a stable machine-readable reason.
+            if isinstance(reason, str) and "privacy" in reason.lower():
+                safe_reason = "privacy_blocked"
+            elif isinstance(reason, str) and "timeout" in reason.lower():
+                safe_reason = "timeout"
+            elif isinstance(reason, str) and "connect" in reason.lower():
+                safe_reason = "unreachable"
+            else:
+                safe_reason = "transport_failed"
+        self._engine_observations[normalized] = {
+            "reachability": "ready" if success else "unreachable",
+            "reason": safe_reason,
+            "checked_at": _utc_now(),
+        }
 
     async def search(
         self,
@@ -1080,13 +1798,33 @@ class DeepResearchSearchClient:
             session_context=self.session_context,
             project_metadata=self.project_metadata,
         )
-        tasks: list[Awaitable[list[DeepResearchSource]]] = []
-        selected = [engine.lower() for engine in engines]
+        tasks: list[tuple[str, Awaitable[list[DeepResearchSource]]]] = []
+        selected = [_normalize_engine_id(engine) for engine in engines]
+        unknown_engines = sorted(set(selected) - SUPPORTED_ENGINES)
+        if unknown_engines:
+            # Do not let an unrecognized identifier fall through to an empty
+            # task list and get reported as an egress outage.  The exact
+            # values are provider-controlled request data; expose only the
+            # stable provider_invalid code to the job/route.
+            raise DeepResearchProviderError("provider_invalid")
         # Fail closed before opening an AsyncClient or scheduling any external
         # search transport.  In particular, local_only must not degrade to an
         # empty result set that looks like a successful search.
         searxng_url = self._searxng_url()
         if "searxng" in selected and searxng_url:
+            if is_enterprise_profile():
+                try:
+                    # A configured SearXNG label does not make an arbitrary
+                    # URL local.  Require loopback/explicit trusted-host
+                    # classification (or a deliberate public-egress flag)
+                    # before opening the shared HTTP client.
+                    assert_public_search_egress_approved(
+                        self.config,
+                        engine="searxng",
+                        endpoint=searxng_url,
+                    )
+                except SearchEgressPreconditionError as exc:
+                    raise DeepResearchTransportError("egress_unreachable") from exc
             self._privacy_gateway.ensure_provider_allowed(
                 "openai_compatible_local",
                 base_url=searxng_url,
@@ -1099,7 +1837,9 @@ class DeepResearchSearchClient:
             "openalex",
             "pubmed",
         }
+        enterprise = is_enterprise_profile()
         yahoo_url = self._yahoo_realtime_url()
+        yahoo_intent_completed = False
         # X links/posts have a substantially more reliable source in Yahoo's
         # realtime index than generic web engines.  Always put that request
         # first for an X-intent query, and keep it out of the subsequent
@@ -1112,6 +1852,15 @@ class DeepResearchSearchClient:
         if x_intent and yahoo_url and "yahoo_realtime" not in selected:
             selected.insert(0, "yahoo_realtime")
         if "yahoo_realtime" in selected and yahoo_url:
+            if enterprise:
+                try:
+                    assert_public_search_egress_approved(
+                        self.config,
+                        engine="yahoo_realtime",
+                        endpoint=yahoo_url,
+                    )
+                except SearchEgressPreconditionError as exc:
+                    raise DeepResearchTransportError("egress_unreachable") from exc
             self._privacy_gateway.ensure_provider_allowed(
                 "yahoo_realtime",
                 base_url=yahoo_url,
@@ -1122,11 +1871,26 @@ class DeepResearchSearchClient:
                 # URL.  Keep the provider allowlist explicit even when the
                 # caller supplied an alias in ``engines``.
                 continue
+            if enterprise:
+                try:
+                    assert_public_search_egress_approved(
+                        self.config,
+                        engine=engine,
+                        endpoint=self._external_base_url(engine),
+                    )
+                except SearchEgressPreconditionError as exc:
+                    raise DeepResearchTransportError("egress_unreachable") from exc
             self._privacy_gateway.ensure_provider_allowed(
                 "openai",
                 base_url=self._external_base_url(engine),
             )
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        transport_errors: list[BaseException] = []
+        provider_errors: list[BaseException] = []
+        # A redirect can move a protected query to an arbitrary host after
+        # provider preflight has completed.  Keep the destination bound to the
+        # configured provider and let each adapter surface 3xx as a typed
+        # failure instead of following it automatically.
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             batches: list[Any] = []
             if x_intent and "yahoo_realtime" in selected and yahoo_url:
                 try:
@@ -1138,70 +1902,209 @@ class DeepResearchSearchClient:
                             client, query, max_results_per_engine
                         )
                     )
+                    yahoo_intent_completed = True
+                    self._observe_engine("yahoo_realtime", success=True)
                 except (ExternalProviderBlocked, PrivacyError):
                     raise
                 except Exception as exc:  # provider failure must not hide others
-                    logger.debug("Yahoo realtime search failed: %s", exc)
+                    self._observe_engine("yahoo_realtime", success=False, reason=str(exc))
+                    if _is_transport_failure(exc):
+                        transport_errors.append(exc)
+                    else:
+                        provider_errors.append(exc)
+                    logger.debug(
+                        "Yahoo realtime search failed (%s)",
+                        getattr(exc, "code", type(exc).__name__),
+                    )
             if "searxng" in selected:
                 if self._searxng_url():
-                    tasks.append(self._search_searxng(client, query, max_results_per_engine))
-                elif "duckduckgo" not in selected:
-                    tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
+                    tasks.append(
+                        ("searxng", self._search_searxng(client, query, max_results_per_engine))
+                    )
+                elif not enterprise and "duckduckgo" not in selected:
+                    tasks.append(
+                        ("duckduckgo", self._search_duckduckgo(client, query, max_results_per_engine))
+                    )
             if "duckduckgo" in selected:
-                tasks.append(self._search_duckduckgo(client, query, max_results_per_engine))
+                tasks.append(
+                    ("duckduckgo", self._search_duckduckgo(client, query, max_results_per_engine))
+                )
             if "yahoo_realtime" in selected and not (x_intent and yahoo_url):
                 if yahoo_url:
                     tasks.append(
-                        self._search_yahoo_realtime(
-                            client, query, max_results_per_engine
+                        (
+                            "yahoo_realtime",
+                            self._search_yahoo_realtime(
+                                client, query, max_results_per_engine
+                            ),
                         )
                     )
             if "wikipedia" in selected:
-                tasks.append(self._search_wikipedia(client, query, max_results_per_engine))
+                tasks.append(
+                    ("wikipedia", self._search_wikipedia(client, query, max_results_per_engine))
+                )
             if "arxiv" in selected:
-                tasks.append(self._search_arxiv(client, query, max_results_per_engine))
+                tasks.append(("arxiv", self._search_arxiv(client, query, max_results_per_engine)))
             if "openalex" in selected:
-                tasks.append(self._search_openalex(client, query, max_results_per_engine))
+                tasks.append(
+                    ("openalex", self._search_openalex(client, query, max_results_per_engine))
+                )
             if "pubmed" in selected:
-                tasks.append(self._search_pubmed(client, query, max_results_per_engine))
+                tasks.append(("pubmed", self._search_pubmed(client, query, max_results_per_engine)))
             if include_local_knowledge:
                 tasks.append(
-                    self._search_local_knowledge(
-                        query,
-                        max_results_per_engine,
-                        project_id,
-                        actor_user_id=actor_user_id,
-                        is_admin=is_admin,
+                    (
+                        "local_knowledge",
+                        self._search_local_knowledge(
+                            query,
+                            max_results_per_engine,
+                            project_id,
+                            actor_user_id=actor_user_id,
+                            is_admin=is_admin,
+                        ),
                     )
                 )
 
-            batches.extend(await asyncio.gather(*tasks, return_exceptions=True))
+            # An Enterprise request with no configured internal route must
+            # fail truthfully before the empty result can be mistaken for a
+            # successful search.  Personal callers retain the historical
+            # empty-result compatibility path.
+            if (
+                enterprise
+                and not tasks
+                and not include_local_knowledge
+                and not yahoo_intent_completed
+            ):
+                raise DeepResearchTransportError("egress_unreachable")
+
+            batches.extend(
+                await asyncio.gather(
+                    *[task for _engine, task in tasks],
+                    return_exceptions=True,
+                )
+            )
 
         results: list[DeepResearchSource] = []
-        for batch in batches:
-            if isinstance(batch, Exception):
+        successful_batches = 0
+        successful_external_batches = 1 if yahoo_intent_completed else 0
+        # The first ``batches`` entries may include the serialized X-intent
+        # Yahoo result above.  Mark named tasks by their positional result and
+        # leave preflight/privacy failures as unobserved (no transport ran).
+        named_offset = 1 if yahoo_intent_completed else 0
+        for index, batch in enumerate(batches):
+            if isinstance(batch, BaseException):
+                if isinstance(batch, asyncio.CancelledError):
+                    raise batch
                 if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
                     raise batch
-                logger.debug("Deep research search batch failed: %s", batch)
+                if isinstance(
+                    batch,
+                    (
+                        httpx.TimeoutException,
+                        asyncio.TimeoutError,
+                        httpx.ConnectError,
+                        httpx.NetworkError,
+                        httpx.HTTPStatusError,
+                        OSError,
+                    ),
+                ):
+                    transport_errors.append(batch)
+                elif isinstance(batch, DeepResearchTransportError):
+                    transport_errors.append(batch)
+                else:
+                    provider_errors.append(batch)
+                task_index = index - named_offset
+                if 0 <= task_index < len(tasks):
+                    self._observe_engine(
+                        tasks[task_index][0], success=False, reason=str(batch)
+                    )
+                logger.debug(
+                    "Deep research search batch failed (%s)",
+                    getattr(batch, "code", type(batch).__name__),
+                )
                 continue
+            task_index = index - named_offset
+            if 0 <= task_index < len(tasks):
+                self._observe_engine(tasks[task_index][0], success=True)
+                if tasks[task_index][0] in external_engines or tasks[task_index][0] == "searxng":
+                    # An empty list is still a successful provider transport;
+                    # it must count only for the external engine that actually
+                    # answered, not for a local-knowledge task that could
+                    # otherwise mask a complete public-egress outage.
+                    successful_external_batches += 1
+            successful_batches += 1
             results.extend(batch)
+        external_requested = bool(
+            set(selected).intersection(external_engines | {"searxng"})
+        )
+        if enterprise and external_requested and successful_external_batches == 0 and transport_errors:
+            if any(
+                isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException))
+                or getattr(error, "code", None) == "engine_timeout"
+                for error in transport_errors
+            ):
+                raise DeepResearchTransportError("engine_timeout")
+            raise DeepResearchTransportError("egress_unreachable")
+        if enterprise and external_requested and successful_external_batches == 0 and provider_errors:
+            raise DeepResearchProviderError()
+        if enterprise and external_requested and successful_external_batches == 0:
+            # Local-knowledge results must not mask an unavailable external
+            # route.  A request that explicitly selected SearXNG/Yahoo/etc.
+            # is only successful after at least one external transport has
+            # answered, even when the local knowledge task returned rows.
+            raise DeepResearchTransportError("egress_unreachable")
         return self._dedupe(results)
 
     def available_engines(self) -> list[dict[str, Any]]:
         searxng_url = self._searxng_url()
-        return [
-            {"id": "searxng", "label": "SearXNG", "available": bool(searxng_url)},
-            {
-                "id": "yahoo_realtime",
-                "label": "Yahoo!リアルタイム検索",
-                "available": bool(self._yahoo_realtime_url()),
-            },
-            {"id": "duckduckgo", "label": "DuckDuckGo HTML", "available": True},
-            {"id": "wikipedia", "label": "Wikipedia", "available": True},
-            {"id": "arxiv", "label": "arXiv", "available": True},
-            {"id": "openalex", "label": "OpenAlex", "available": True},
-            {"id": "pubmed", "label": "PubMed", "available": True},
-        ]
+        configured = {
+            "searxng": bool(searxng_url),
+            "yahoo_realtime": bool(self._yahoo_realtime_url()),
+            "duckduckgo": True,
+            "wikipedia": True,
+            "arxiv": True,
+            "openalex": True,
+            "pubmed": True,
+        }
+        labels = {
+            "searxng": "SearXNG",
+            "yahoo_realtime": "Yahoo!リアルタイム検索",
+            "duckduckgo": "DuckDuckGo HTML",
+            "wikipedia": "Wikipedia",
+            "arxiv": "arXiv",
+            "openalex": "OpenAlex",
+            "pubmed": "PubMed",
+        }
+        entries: list[dict[str, Any]] = []
+        for engine, is_configured in configured.items():
+            observation = self._engine_observations.get(engine)
+            reachability = (
+                str(observation.get("reachability"))
+                if observation
+                else "unknown"
+            )
+            reason = (
+                str(observation.get("reason"))
+                if observation
+                else ("not_configured" if not is_configured else "not_checked")
+            )
+            entries.append(
+                {
+                    "id": engine,
+                    "label": labels[engine],
+                    # ``available`` is retained for older clients, but it is
+                    # derived from an observed successful transport rather
+                    # than registration/configuration alone.
+                    "available": bool(
+                        is_configured and observation and reachability == "ready"
+                    ),
+                    "configured": is_configured,
+                    "reachability": reachability,
+                    "reason": reason,
+                    "checked_at": observation.get("checked_at") if observation else None,
+                }
+            )
+        return entries
 
     def _searxng_url(self) -> str:
         configured = (
@@ -1265,15 +2168,17 @@ class DeepResearchSearchClient:
     async def _search_duckduckgo(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
-        outbound_query = await self._protected_query(
-            query,
-            provider="openai",
-            base_url=self._external_base_url("duckduckgo"),
+        endpoint = self._external_base_url("duckduckgo")
+        response = await self._execute_http_get(
+            client,
+            url=endpoint,
+            payload={"query": str(query or "")},
+            provider="duckduckgo",
             source_kind="deep_research_search_duckduckgo",
-        )
-        response = await client.get(
-            "https://html.duckduckgo.com/html/",
-            params={"q": outbound_query, "kl": "jp-jp"},
+            params_builder=lambda protected: {
+                "q": self._protected_query_value(protected),
+                "kl": "jp-jp",
+            },
             headers={
                 "User-Agent": (
                     "Mozilla/5.0 (compatible; AoiTalkLocalSearch/0.1; "
@@ -1340,6 +2245,22 @@ class DeepResearchSearchClient:
         if result_status in {"blocked", "privacy_blocked"}:
             raise ExternalProviderBlocked(
                 "Yahoo realtime search was blocked by the privacy policy"
+            )
+        if result_status in {
+            "timeout",
+            "invalid_endpoint",
+            "network_error",
+            "http_error",
+            "redirect_rejected",
+            "body_too_large",
+            "parse_error",
+        }:
+            # The Yahoo adapter returns typed failure envelopes rather than
+            # raising transport exceptions.  Propagate them here so the
+            # engine observation cannot mark a failed probe as ``ready`` and
+            # the runner can persist a truthful terminal failure.
+            raise DeepResearchTransportError(
+                "engine_timeout" if result_status == "timeout" else "egress_unreachable"
             )
         # The shared service returns a typed result envelope.  Accepting a
         # plain list/mapping as well keeps this boundary compatible with small
@@ -1411,16 +2332,15 @@ class DeepResearchSearchClient:
         base_url = self._searxng_url()
         if not base_url:
             return []
-        outbound_query = await self._protected_query(
-            query,
+        endpoint = f"{base_url}/search"
+        response = await self._execute_http_get(
+            client,
+            url=endpoint,
+            payload={"query": str(query or "")},
             provider="openai_compatible_local",
-            base_url=base_url,
             source_kind="deep_research_search_searxng",
-        )
-        response = await client.get(
-            f"{base_url}/search",
-            params={
-                "q": outbound_query,
+            params_builder=lambda protected: {
+                "q": self._protected_query_value(protected),
                 "format": "json",
                 "language": "ja-JP",
                 "safesearch": 1,
@@ -1451,18 +2371,18 @@ class DeepResearchSearchClient:
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
         async def run_language(lang: str) -> list[DeepResearchSource]:
-            outbound_query = await self._protected_query(
-                query,
-                provider="openai",
-                base_url=f"https://{lang}.wikipedia.org/w/api.php",
+            endpoint = f"https://{lang}.wikipedia.org/w/api.php"
+            response = await self._execute_http_get(
+                client,
+                url=endpoint,
+                payload={"query": str(query or "")},
+                provider="wikipedia",
                 source_kind="deep_research_search_wikipedia",
-            )
-            response = await client.get(
-                f"https://{lang}.wikipedia.org/w/api.php",
-                params={
+                action=f"deep_research_search_wikipedia_{lang}",
+                params_builder=lambda protected: {
                     "action": "query",
                     "list": "search",
-                    "srsearch": outbound_query,
+                    "srsearch": self._protected_query_value(protected),
                     "format": "json",
                     "srlimit": limit,
                     "utf8": 1,
@@ -1494,29 +2414,44 @@ class DeepResearchSearchClient:
                 )
             return sources
 
-        batches = await asyncio.gather(run_language("ja"), run_language("en"), return_exceptions=True)
+        batches = await asyncio.gather(
+            run_language("ja"), run_language("en"), return_exceptions=True
+        )
         sources: list[DeepResearchSource] = []
+        failures: list[BaseException] = []
         for batch in batches:
-            if isinstance(batch, Exception):
+            if isinstance(batch, BaseException):
+                if isinstance(batch, asyncio.CancelledError):
+                    raise batch
                 if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
                     raise batch
+                failures.append(batch)
                 continue
             sources.extend(batch)
+        # A valid response with zero hits is a successful empty search.  If
+        # both language probes failed before producing a response, propagate a
+        # representative failure so readiness/lifecycle cannot report
+        # ``ready`` or complete a job with a fabricated empty result.
+        if not sources and failures:
+            raise failures[0]
         return sources[:limit]
 
     async def _search_arxiv(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
-        outbound_query = await self._protected_query(
-            query,
-            provider="openai",
-            base_url=self._external_base_url("arxiv"),
+        endpoint = self._external_base_url("arxiv")
+        response = await self._execute_http_get(
+            client,
+            url=endpoint,
+            payload={"query": str(query or "")},
+            provider="arxiv",
             source_kind="deep_research_search_arxiv",
+            params_builder=lambda protected: {
+                "search_query": f"all:{self._protected_query_value(protected)}",
+                "start": 0,
+                "max_results": limit,
+            },
         )
-        params = urlencode(
-            {"search_query": f"all:{outbound_query}", "start": 0, "max_results": limit}
-        )
-        response = await client.get(f"https://export.arxiv.org/api/query?{params}")
         response.raise_for_status()
         root = ET.fromstring(response.text)
         ns = {"atom": "http://www.w3.org/2005/Atom"}
@@ -1543,16 +2478,15 @@ class DeepResearchSearchClient:
     async def _search_openalex(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
-        outbound_query = await self._protected_query(
-            query,
-            provider="openai",
-            base_url=self._external_base_url("openalex"),
+        endpoint = self._external_base_url("openalex")
+        response = await self._execute_http_get(
+            client,
+            url=endpoint,
+            payload={"query": str(query or "")},
+            provider="openalex",
             source_kind="deep_research_search_openalex",
-        )
-        response = await client.get(
-            "https://api.openalex.org/works",
-            params={
-                "search": outbound_query,
+            params_builder=lambda protected: {
+                "search": self._protected_query_value(protected),
                 "per-page": limit,
                 "sort": "relevance_score:desc",
             },
@@ -1584,44 +2518,44 @@ class DeepResearchSearchClient:
     async def _search_pubmed(
         self, client: httpx.AsyncClient, query: str, limit: int
     ) -> list[DeepResearchSource]:
-        outbound_query = await self._protected_query(
-            query,
-            provider="openai",
-            base_url=self._external_base_url("pubmed"),
+        search_endpoint = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+        response_headers = {"User-Agent": "AoiTalkDeepResearch/0.1"}
+        search = await self._execute_http_get(
+            client,
+            url=search_endpoint,
+            payload={"query": str(query or "")},
+            provider="pubmed",
             source_kind="deep_research_search_pubmed",
-        )
-        search = await client.get(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            params={
+            params_builder=lambda protected: {
                 "db": "pubmed",
-                "term": outbound_query,
+                "term": self._protected_query_value(protected),
                 "retmode": "json",
                 "retmax": limit,
             },
-            headers={"User-Agent": "AoiTalkDeepResearch/0.1"},
+            headers=response_headers,
         )
         search.raise_for_status()
         ids = search.json().get("esearchresult", {}).get("idlist", [])
         if not ids:
             return []
-        summary_payload = await self._protect_payload(
-            {
+        summary_endpoint = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+        summary = await self._execute_http_get(
+            client,
+            url=summary_endpoint,
+            payload={
                 "db": "pubmed",
                 "id": ",".join(str(item) for item in ids),
                 "retmode": "json",
             },
-            provider="openai",
-            base_url=self._external_base_url("pubmed"),
+            provider="pubmed",
             source_kind="deep_research_search_pubmed_summary",
-        )
-        summary = await client.get(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-            params={
-                "db": str(summary_payload.get("db") or "pubmed"),
-                "id": str(summary_payload.get("id") or ",".join(ids)),
-                "retmode": str(summary_payload.get("retmode") or "json"),
+            action="deep_research_search_pubmed_summary",
+            params_builder=lambda protected: {
+                "db": str(protected.get("db") or "pubmed"),
+                "id": str(protected.get("id") or ",".join(str(item) for item in ids)),
+                "retmode": str(protected.get("retmode") or "json"),
             },
-            headers={"User-Agent": "AoiTalkDeepResearch/0.1"},
+            headers=response_headers,
         )
         summary.raise_for_status()
         data = summary.json().get("result", {})
@@ -1747,23 +2681,388 @@ class DeepResearchRunner:
         self.search_client = search_client or DeepResearchSearchClient(config)
         self.llm_factory = llm_factory or (lambda user_id: DeepResearchLLMAdapter(config, user_id))
 
+    @staticmethod
+    def _is_enterprise() -> bool:
+        try:
+            from ..features import Features
+
+            return bool(Features.is_enterprise())
+        except Exception:
+            return str(os.getenv("AOITALK_PROFILE") or "").strip().lower() == "enterprise" or str(
+                os.getenv("AIVTUBER_ENV") or ""
+            ).strip().lower() == "enterprise"
+
+    def _timeout(self, stage: str) -> float:
+        key = {
+            "planning": "planning_timeout_seconds",
+            "engine": "engine_timeout_seconds",
+            "synthesis": "synthesis_timeout_seconds",
+            "overall": "overall_timeout_seconds",
+        }[stage]
+        default = {
+            "planning": DEFAULT_PLANNING_TIMEOUT_SECONDS,
+            "engine": DEFAULT_ENGINE_TIMEOUT_SECONDS,
+            "synthesis": DEFAULT_SYNTHESIS_TIMEOUT_SECONDS,
+            "overall": DEFAULT_OVERALL_TIMEOUT_SECONDS,
+        }[stage]
+        try:
+            value = float(_config_get(self.config, f"deep_research.{key}", default))
+        except (TypeError, ValueError):
+            value = default
+        return max(0.1, min(value, 3600.0))
+
+    async def _current_project_privacy_policy(
+        self,
+        project_id: Optional[str],
+        *,
+        conversation: Any = None,
+    ) -> dict[str, Any]:
+        """Read current project policy from the ACL authority, not the job."""
+
+        if not project_id:
+            return {}
+        relationship = (
+            conversation.get("project")
+            if isinstance(conversation, Mapping)
+            else None
+        )
+        raw_metadata = (
+            relationship.get("project_metadata")
+            if isinstance(relationship, Mapping)
+            else getattr(relationship, "project_metadata", None)
+        )
+        if isinstance(raw_metadata, Mapping):
+            return _normalize_privacy_policy(raw_metadata, project_id=project_id)
+
+        # ConversationRepository normally does not eager-load ``project``;
+        # query the project ACL/session explicitly and fail closed if the
+        # authoritative row cannot be read.
+        try:
+            from ..memory.database import get_database_manager
+            from ..memory.project_repository import ProjectRepository
+
+            database = get_database_manager()
+            if database is None:
+                raise RuntimeError("database unavailable")
+            db_session = await database.get_session()
+            try:
+                project_uuid = uuid.UUID(str(project_id))
+                getter = getattr(ProjectRepository, "get_by_id", None)
+                if callable(getter):
+                    project = await getter(db_session, project_uuid)
+                else:
+                    from sqlalchemy import select
+                    from ..memory.models import Project
+
+                    result = await db_session.execute(
+                        select(Project).where(Project.id == project_uuid)
+                    )
+                    project = result.scalar_one_or_none()
+            finally:
+                await db_session.close()
+        except Exception as exc:
+            raise DeepResearchScopeError("scope_revoked") from exc
+        if project is None:
+            raise DeepResearchScopeError("scope_revoked")
+        raw_metadata = getattr(project, "project_metadata", None)
+        return _normalize_privacy_policy(raw_metadata, project_id=project_id)
+
+    async def _validate_scope(
+        self,
+        request: DeepResearchRequest,
+        *,
+        effective_user_id: str,
+        effective_session_id: Optional[str],
+    ) -> None:
+        privacy_mode = effective_privacy_mode(
+            self.config,
+            session_context=request.session_context,
+            project_metadata=request.project_metadata,
+        )
+        if not effective_session_id:
+            # Enterprise and protected transports cannot safely scope a
+            # permission cache or reversible privacy aliases to a synthetic
+            # job id.  Personal/direct legacy callers remain compatible.
+            if self._is_enterprise() or privacy_mode == "protected":
+                raise DeepResearchScopeError("scope_missing")
+            return
+        if not effective_user_id:
+            raise DeepResearchScopeError("scope_missing")
+        # Enterprise workers and any protected/local-only job re-check the
+        # durable conversation ACL after the HTTP request has returned.  A
+        # revoked session or changed privacy policy therefore cannot race a
+        # queued job into external search/model execution.  Personal/direct
+        # callers retain the historical compatibility path.
+        # Enterprise always carries a durable session scope.  Personal direct
+        # callers may use a synthetic/legacy session id in unit integrations;
+        # only revalidate those protected calls when an authoritative policy
+        # snapshot is present, while Enterprise remains fail-closed regardless.
+        requires_revalidation = self._is_enterprise() or (
+            privacy_mode in {"protected", "local_only"}
+            and bool(request.session_context or request.project_metadata)
+        )
+        if not requires_revalidation:
+            return
+        try:
+            from ..memory.conversation_repository import ConversationRepository
+
+            repository = ConversationRepository()
+            allowed = await repository.user_has_session_write_access(
+                str(effective_session_id), str(effective_user_id)
+            )
+            if not allowed:
+                raise DeepResearchScopeError("scope_revoked")
+            # Re-read the session itself on every validation.  ACL membership
+            # can remain valid while an administrator moves the conversation
+            # to another Project; that drift must revoke this job's durable
+            # scope rather than silently widening its data access.
+            get_session = getattr(repository, "get_session_by_id", None)
+            if not callable(get_session):
+                raise DeepResearchScopeError("scope_revoked")
+            conversation = await get_session(str(effective_session_id), with_messages=False)
+            if conversation is None:
+                raise DeepResearchScopeError("scope_revoked")
+
+            if isinstance(conversation, Mapping):
+                current_project = conversation.get("project_id")
+                current_session_context = conversation.get("context")
+            else:
+                current_project = getattr(conversation, "project_id", None)
+                current_session_context = getattr(conversation, "context", None)
+            expected_project = str(request.project_id or "").strip().casefold() or None
+            current_project_text = (
+                str(current_project).strip().casefold() if current_project else None
+            )
+            if current_project_text != expected_project:
+                raise DeepResearchScopeError("scope_revoked")
+            # Compare the allowlisted policy subset captured after the initial
+            # ACL check with the current durable rows.  A privacy-mode change
+            # while a job is queued/running is a scope revocation; continuing
+            # would let the job send data under a policy the user did not
+            # authorize at launch time.
+            expected_session_policy = _normalize_privacy_policy(
+                request.session_context
+            )
+            current_session_policy = _normalize_privacy_policy(current_session_context)
+            if current_session_policy != expected_session_policy:
+                raise DeepResearchScopeError("scope_revoked")
+            expected_project_policy = _normalize_privacy_policy(
+                request.project_metadata,
+                project_id=request.project_id,
+            )
+            current_project_policy = await self._current_project_privacy_policy(
+                current_project_text,
+                conversation=conversation,
+            )
+            # Project IDs are stable scope metadata; compare only policy keys
+            # so equivalent IDs with different casing do not cause false drift.
+            expected_project_policy.pop("project_id", None)
+            current_project_policy.pop("project_id", None)
+            if current_project_policy != expected_project_policy:
+                raise DeepResearchScopeError("scope_revoked")
+        except Exception:
+            # Never expose repository/provider details to the job or route.
+            # Preserve an explicit scope error while normalizing database and
+            # malformed-session failures to the same fail-closed result.
+            raise DeepResearchScopeError("scope_revoked")
+
+    async def _await_stage(self, awaitable: Awaitable[Any], stage: str) -> Any:
+        try:
+            return await _await_bounded(awaitable, self._timeout(stage))
+        except asyncio.TimeoutError as exc:
+            raise DeepResearchStageTimeout(stage) from exc
+
+    def _terminalize(
+        self,
+        job: DeepResearchJob,
+        code: str,
+        *,
+        phase: str = "failed",
+        status: str = "failed",
+    ) -> DeepResearchJob:
+        normalized = code if code in DEEP_RESEARCH_ERROR_MESSAGES else "internal_error"
+        if job.status in TERMINAL_STATUSES:
+            return job
+        job.status = status
+        job.error_code = normalized
+        job.error = DEEP_RESEARCH_ERROR_MESSAGES[normalized]
+        job.completed_at = _utc_now()
+        job.emit(
+            DEEP_RESEARCH_ERROR_MESSAGES[normalized],
+            job.progress,
+            phase,
+            {"error_code": normalized},
+        )
+        self.store.save(job)
+        return job
+
     async def run(self, job: DeepResearchJob, request: DeepResearchRequest) -> DeepResearchJob:
-        request = request.normalized()
+        """Run one job with an overall deadline and cancellation settlement."""
+
+        inner_task: asyncio.Task[DeepResearchJob] | None = None
+        try:
+            inner_task = asyncio.create_task(self._run_inner(job, request))
+            _done, pending = await asyncio.wait(
+                {inner_task}, timeout=self._timeout("overall")
+            )
+            if pending:
+                inner_task.cancel()
+                inner_task.add_done_callback(_consume_async_task)
+                raise asyncio.TimeoutError
+            return inner_task.result()
+        except asyncio.TimeoutError:
+            return self._terminalize(job, "deadline")
+        except asyncio.CancelledError:
+            if inner_task is not None and not inner_task.done():
+                inner_task.cancel()
+                inner_task.add_done_callback(_consume_async_task)
+            # Cancellation is a terminal business state.  Persist it before
+            # allowing the worker task to settle so callers never observe a
+            # permanently running job.
+            self._terminalize(job, "cancelled", status="cancelled")
+            return job
+
+    async def _run_inner(self, job: DeepResearchJob, request: DeepResearchRequest) -> DeepResearchJob:
+        request = request.normalized(
+            enterprise_public_egress_approved=approved_public_egress(self.config)
+        )
+        # A queued cancellation may race the worker between ``queue.get`` and
+        # task registration.  Re-read the durable record before changing it to
+        # ``running`` so a canceled job cannot resurrect and perform provider
+        # work after the caller has already observed a terminal state.
+        persisted = self.store.load(job.id)
+        if persisted is not None:
+            job = persisted
+        if job.status in TERMINAL_STATUSES:
+            return job
         job.status = "running"
         job.started_at = _utc_now()
         job.updated_at = job.started_at
         job.emit("調査を開始しました", 2, "setup", {"mode": request.mode})
         self.store.save(job)
 
+        permission_scope_token = None
+        turn_scope_token = None
+        privacy_policy_token = None
         try:
-            llm = self.llm_factory(job.user_id)
             turn = get_turn_context()
-            effective_session_id = (
-                request.session_id
-                or turn.session_id
-                or f"deep-research:{job.id}"
+            expected_privacy_snapshot = _privacy_snapshot(
+                request.session_context,
+                request.project_metadata,
+                # The job's persisted project binding is authoritative when a
+                # caller supplies a mutable request object after enqueue.
+                project_id=job.project_id or request.project_id,
+                global_policy=_config_get(self.config, "external_model_privacy", {}),
             )
-            effective_user_id = request.actor_user_id or job.user_id
+            stored_snapshot = job.privacy_snapshot if isinstance(job.privacy_snapshot, Mapping) else {}
+            stored_privacy_snapshot = {
+                "session": _normalize_privacy_policy(stored_snapshot.get("session")),
+                "project": _normalize_privacy_policy(
+                    stored_snapshot.get("project"),
+                    project_id=job.project_id or request.project_id,
+                ),
+                "global": _normalize_privacy_policy(stored_snapshot.get("global")),
+            }
+            # A persisted job snapshot is server-owned.  If a custom caller
+            # mutates the request policy between enqueue and execution, reject
+            # it instead of allowing the worker to run under a weaker policy.
+            if job.privacy_snapshot and stored_privacy_snapshot != expected_privacy_snapshot:
+                raise DeepResearchScopeError("scope_revoked")
+            effective_mode = effective_privacy_mode(
+                self.config,
+                session_context=request.session_context,
+                project_metadata=request.project_metadata,
+            )
+            # Workers are created from a neutral ContextVar context.  Bind the
+            # job's server-resolved policy explicitly so custom LLM/search
+            # adapters that consult ``get_privacy_policy_context`` cannot
+            # inherit a previous request's metadata (or accidentally fall
+            # back to an unscoped direct policy).
+            privacy_policy_token = set_privacy_policy_context(
+                session_context=request.session_context,
+                project_metadata=request.project_metadata,
+            )
+            protected_scope = self._is_enterprise() or effective_mode in {
+                "protected",
+                "local_only",
+            }
+            # For protected/Enterprise jobs the request's server-validated
+            # scope is authoritative.  Do not inherit a caller ContextVar or
+            # fabricate a job-id scope inside a background worker.
+            effective_session_id = (
+                job.session_id or request.session_id
+                if protected_scope
+                else request.session_id or job.session_id or turn.session_id
+            )
+            effective_user_id = (
+                job.actor_user_id or request.actor_user_id
+                if protected_scope
+                else request.actor_user_id or job.actor_user_id or job.user_id
+            )
+            effective_project_id = job.project_id or request.project_id
+            # Reuse the durable scope for every downstream adapter call.  This
+            # also covers direct/persisted callers whose request object omits
+            # actor/session/project fields; Enterprise never falls back to a
+            # worker's inherited TurnContext for those identities.
+            request = replace(
+                request,
+                actor_user_id=(
+                    str(effective_user_id).strip() if effective_user_id else None
+                ),
+                session_id=(
+                    str(effective_session_id).strip() if effective_session_id else None
+                ),
+                project_id=(
+                    str(effective_project_id).strip() if effective_project_id else None
+                ),
+            )
+            await self._validate_scope(
+                request,
+                effective_user_id=str(effective_user_id or ""),
+                effective_session_id=(
+                    str(effective_session_id).strip()
+                    if effective_session_id
+                    else None
+                ),
+            )
+            # Persist only server-resolved identity/scope.  In protected mode
+            # an invented ``deep-research:<job>`` key is forbidden: aliases and
+            # permission approvals must not outlive the authenticated session.
+            job.actor_user_id = str(effective_user_id or "") or None
+            job.session_id = (
+                str(effective_session_id).strip() if effective_session_id else None
+            )
+            job.project_id = (
+                str(effective_project_id).strip() if effective_project_id else None
+            )
+            job.metadata.update(
+                {
+                    "actor_user_id": job.actor_user_id,
+                    "session_id": job.session_id,
+                    "project_id": job.project_id,
+                }
+            )
+            # Always bind a worker-local permission key so a ContextVar copied
+            # from the request task cannot leak a previous conversation into a
+            # legacy no-session Personal job.  ``default`` is a neutral scope,
+            # not a synthetic job identity; protected/Enterprise jobs have
+            # already been rejected above when no real session exists.
+            permission_scope_token = set_permission_session_key(
+                f"{effective_user_id}|{effective_session_id}"
+                if effective_session_id
+                else None
+            )
+            turn_scope_token = set_turn_context(
+                user_id=str(effective_user_id or "") or None,
+                project_id=request.project_id,
+                session_id=(
+                    str(effective_session_id).strip()
+                    if effective_session_id
+                    else None
+                ),
+            )
+            self.store.save(job)
+            llm = self.llm_factory(job.user_id)
             # The default adapter records direct SDK usage itself.  Preserve
             # the request scope without requiring custom test/caller factories
             # to change their one-argument contract.
@@ -1807,6 +3106,19 @@ class DeepResearchRunner:
             seen: set[str] = set()
 
             for iteration in range(1, request.max_iterations + 1):
+                # Re-check the durable ACL immediately before every
+                # external-capable planning phase.  A queued job must not run
+                # after its conversation membership/project permission was
+                # revoked.
+                await self._validate_scope(
+                    request,
+                    effective_user_id=str(effective_user_id or ""),
+                    effective_session_id=(
+                        str(effective_session_id).strip()
+                        if effective_session_id
+                        else None
+                    ),
+                )
                 progress_base = 8 + int((iteration - 1) * (64 / request.max_iterations))
                 job.emit(
                     f"{iteration}回目の検索クエリを組み立てています",
@@ -1814,13 +3126,16 @@ class DeepResearchRunner:
                     "planning",
                     {"iteration": iteration},
                 )
-                questions = await self._generate_questions(
-                    llm=llm,
-                    query=request.query,
-                    iteration=iteration,
-                    request=request,
-                    sources=all_sources,
-                    previous_questions=job.questions_by_iteration,
+                questions = await self._await_stage(
+                    self._generate_questions(
+                        llm=llm,
+                        query=request.query,
+                        iteration=iteration,
+                        request=request,
+                        sources=all_sources,
+                        previous_questions=job.questions_by_iteration,
+                    ),
+                    "planning",
                 )
                 job.questions_by_iteration[str(iteration)] = questions
                 self.store.save(job)
@@ -1832,15 +3147,25 @@ class DeepResearchRunner:
                     {"iteration": iteration, "questions": questions},
                 )
 
+                await self._validate_scope(
+                    request,
+                    effective_user_id=str(effective_user_id or ""),
+                    effective_session_id=(
+                        str(effective_session_id).strip()
+                        if effective_session_id
+                        else None
+                    ),
+                )
+
                 def _search_question(question: str):
                     """Call custom/legacy search clients without losing scope."""
 
                     common_kwargs = {
                         "engines": request.engines,
                         "max_results_per_engine": request.max_results_per_query,
-                        "project_id": request.project_id,
+                        "project_id": effective_project_id,
                         "include_local_knowledge": request.include_local_knowledge,
-                        "actor_user_id": request.actor_user_id,
+                        "actor_user_id": effective_user_id,
                         "is_admin": request.is_admin,
                     }
                     scoped_kwargs = {
@@ -1869,18 +3194,33 @@ class DeepResearchRunner:
                             raise
                         return self.search_client.search(question, **common_kwargs)
 
-                batches = await asyncio.gather(
-                    *[_search_question(question) for question in questions],
-                    return_exceptions=True,
+                batches = await self._await_stage(
+                    asyncio.gather(
+                        *[_search_question(question) for question in questions],
+                        return_exceptions=True,
+                    ),
+                    "engine",
                 )
 
                 added = 0
+                successful_batches = 0
+                transport_failures: list[BaseException] = []
+                provider_failures: list[BaseException] = []
                 for batch in batches:
-                    if isinstance(batch, Exception):
+                    if isinstance(batch, BaseException):
+                        if isinstance(batch, asyncio.CancelledError):
+                            raise batch
                         if isinstance(batch, (ExternalProviderBlocked, PrivacyError)):
                             raise batch
+                        if isinstance(batch, DeepResearchTransportError):
+                            transport_failures.append(batch)
+                        elif _is_transport_failure(batch):
+                            transport_failures.append(batch)
+                        else:
+                            provider_failures.append(batch)
                         logger.debug("Deep research query failed: %s", batch)
                         continue
+                    successful_batches += 1
                     for source in batch:
                         key = _source_key(source)
                         if not key or key in seen:
@@ -1889,6 +3229,22 @@ class DeepResearchRunner:
                         source.id = len(all_sources) + 1
                         all_sources.append(source)
                         added += 1
+
+                # Distinguish an engine that validly returned no records from
+                # a set of engines that all failed before producing a result.
+                # Enterprise must not turn the latter into a successful empty
+                # report (or silently fall through to another provider).
+                if self._is_enterprise() and successful_batches == 0:
+                    if transport_failures:
+                        if any(
+                            isinstance(error, (asyncio.TimeoutError, httpx.TimeoutException))
+                            or getattr(error, "code", None) == "engine_timeout"
+                            for error in transport_failures
+                        ):
+                            raise DeepResearchTransportError("engine_timeout")
+                        raise DeepResearchTransportError("egress_unreachable")
+                    if provider_failures:
+                        raise DeepResearchProviderError()
 
                 job.sources = all_sources
                 job.emit(
@@ -1899,22 +3255,55 @@ class DeepResearchRunner:
                 )
                 self.store.save(job)
 
+            await self._validate_scope(
+                request,
+                effective_user_id=str(effective_user_id or ""),
+                effective_session_id=(
+                    str(effective_session_id).strip()
+                    if effective_session_id
+                    else None
+                ),
+            )
             job.emit("収集したソースからレポートを生成しています", 88, "synthesis")
-            report = await self._synthesize_report(llm, request, all_sources, job.questions_by_iteration)
+            report = await self._await_stage(
+                self._synthesize_report(
+                    llm, request, all_sources, job.questions_by_iteration
+                ),
+                "synthesis",
+            )
             job.report_markdown = report
             job.status = "completed"
             job.completed_at = _utc_now()
             job.emit("調査が完了しました", 100, "completed", {"sources": len(all_sources)})
             self.store.save(job)
             return job
-        except Exception as exc:
+        except DeepResearchScopeError as exc:
+            return self._terminalize(job, exc.code)
+        except DeepResearchTransportError as exc:
+            return self._terminalize(job, exc.code)
+        except DeepResearchCredentialError:
+            return self._terminalize(job, "credential_missing")
+        except DeepResearchProviderError as exc:
+            return self._terminalize(job, exc.code)
+        except DeepResearchStageTimeout as exc:
+            return self._terminalize(job, f"{exc.stage}_timeout")
+        except (ExternalProviderBlocked, PrivacyError):
+            return self._terminalize(job, "privacy_protection_failed")
+        except asyncio.TimeoutError:
+            return self._terminalize(job, "deadline")
+        except Exception:
+            # Error details may contain provider URLs, credentials or internal
+            # hostnames.  Persist only a stable code/message and keep details in
+            # server logs for operators.
             logger.exception("Deep research job failed")
-            job.status = "failed"
-            job.error = str(exc)
-            job.completed_at = _utc_now()
-            job.emit("調査が失敗しました", job.progress, "failed", {"error": str(exc)})
-            self.store.save(job)
-            return job
+            return self._terminalize(job, "internal_error")
+        finally:
+            if privacy_policy_token is not None:
+                reset_privacy_policy_context(privacy_policy_token)
+            if turn_scope_token is not None:
+                reset_turn_context(turn_scope_token)
+            if permission_scope_token is not None:
+                reset_permission_session_key(permission_scope_token)
 
     async def _generate_questions(
         self,
@@ -1952,7 +3341,24 @@ class DeepResearchRunner:
         try:
             response = await llm.generate(prompt, max_tokens=800)
             generated = self._parse_questions(response)
+            if self._is_enterprise() and not generated:
+                # A successful HTTP response with no usable planning output is
+                # not a safe basis for an implicit fallback query.  Keep the
+                # terminal state truthful instead of manufacturing work.
+                raise DeepResearchProviderError()
+        except (ExternalProviderBlocked, PrivacyError):
+            # A privacy/permission failure is a hard boundary failure.  Do not
+            # turn it into fallback questions that would trigger an external
+            # search with an unverified payload.
+            raise
         except Exception as exc:
+            if self._is_enterprise():
+                code = _provider_failure_code(exc, self.config)
+                if code == "credential_missing":
+                    raise DeepResearchCredentialError() from exc
+                if code in {"engine_timeout", "egress_unreachable"}:
+                    raise DeepResearchTransportError(code) from exc
+                raise DeepResearchProviderError(code) from exc
             logger.warning("Question generation failed: %s", exc)
             generated = []
 
@@ -2051,7 +3457,18 @@ class DeepResearchRunner:
         )
         try:
             report = await llm.generate(prompt, max_tokens=4096)
+            if self._is_enterprise() and not str(report or "").strip():
+                raise DeepResearchProviderError()
+        except (ExternalProviderBlocked, PrivacyError):
+            raise
         except Exception as exc:
+            if self._is_enterprise():
+                code = _provider_failure_code(exc, self.config)
+                if code == "credential_missing":
+                    raise DeepResearchCredentialError() from exc
+                if code in {"engine_timeout", "egress_unreachable"}:
+                    raise DeepResearchTransportError(code) from exc
+                raise DeepResearchProviderError(code) from exc
             logger.warning("Report synthesis failed: %s", exc)
             report = self._fallback_report(request.query, sources)
         finally:
@@ -2125,6 +3542,345 @@ class DeepResearchManager:
         self.store = store or DeepResearchJobStore()
         self.runner = runner or DeepResearchRunner(config=config, store=self.store)
         self._tasks: dict[str, asyncio.Task] = {}
+        self._detached_tasks: dict[str, asyncio.Task] = {}
+        self._active_jobs: dict[str, DeepResearchJob] = {}
+        self._job_workers: dict[str, asyncio.Task] = {}
+        self._worker_cancel_requested: set[asyncio.Task] = set()
+        self._shutdown_requested: set[str] = set()
+        self._workers: list[asyncio.Task] = []
+        self._queue: asyncio.Queue[tuple[DeepResearchJob, DeepResearchRequest]] | None = None
+        self._closed = False
+        self._queue_capacity = self._bounded_int(
+            _config_get(config, "deep_research.queue_capacity", DEFAULT_QUEUE_CAPACITY),
+            minimum=1,
+            maximum=256,
+            default=DEFAULT_QUEUE_CAPACITY,
+        )
+        self._worker_count = self._bounded_int(
+            _config_get(config, "deep_research.worker_count", DEFAULT_WORKER_COUNT),
+            minimum=1,
+            maximum=32,
+            default=DEFAULT_WORKER_COUNT,
+        )
+        self._shutdown_timeout_seconds = self._bounded_float(
+            _config_get(
+                config,
+                "deep_research.shutdown_timeout_seconds",
+                DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+            ),
+            minimum=1.0,
+            maximum=30.0,
+            default=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+        # A new process must not claim work left by a previous process without
+        # an external lease.  Terminalize stale records before exposing list/
+        # get APIs or accepting new jobs.
+        reconcile = getattr(self.store, "reconcile_stale_jobs", None)
+        if callable(reconcile):
+            reconcile()
+
+    def reopen(self) -> None:
+        """Re-arm a manager for a subsequent application lifespan.
+
+        FastAPI/WebChatServer test and development lifespans can be entered
+        more than once in one Python process.  Shutdown intentionally closes
+        the current queue and workers, but that terminal state must not leak
+        into the next startup.  Reopening is only valid after the previous
+        shutdown has drained all owned tasks; a live manager is left intact.
+        """
+
+        if self._tasks or self._workers:
+            return
+        self._closed = False
+        # Detached provider tasks are allowed to finish in the background
+        # after a bounded shutdown.  Keep their cancellation markers until
+        # their callbacks consume them, but do not let them prevent a new
+        # lifespan from accepting fresh work.
+        self._shutdown_requested.intersection_update(self._detached_tasks)
+        self._queue = None
+        reconcile = getattr(self.store, "reconcile_stale_jobs", None)
+        if callable(reconcile):
+            reconcile()
+
+    @staticmethod
+    def _bounded_int(value: Any, *, minimum: int, maximum: int, default: int) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    @staticmethod
+    def _bounded_float(value: Any, *, minimum: float, maximum: float, default: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default
+        if not math.isfinite(parsed):
+            parsed = default
+        return max(minimum, min(parsed, maximum))
+
+    def _ensure_workers(self) -> None:
+        if self._closed:
+            raise DeepResearchManagerClosedError()
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=self._queue_capacity)
+        self._workers = [worker for worker in self._workers if not worker.done()]
+        while len(self._workers) < self._worker_count:
+            # A request handler may carry a TurnContext/permission key.  Do
+            # not inherit it into a process-wide worker; the runner binds the
+            # persisted job scope explicitly for the duration of its task.
+            self._workers.append(self._create_neutral_task(self._worker_loop()))
+
+    @staticmethod
+    def _create_neutral_task(coro: Awaitable[Any]) -> asyncio.Task:
+        """Create a task with a fresh, empty ContextVar context.
+
+        ``context=`` is available on newer Python versions.  The fallback
+        schedules through ``Context.run`` for the Python 3.10 runtime still
+        supported by some AoiTalk deployments.
+        """
+
+        context = contextvars.Context()
+        try:
+            return asyncio.create_task(coro, context=context)
+        except TypeError:  # pragma: no cover - exercised on Python 3.10
+            return context.run(asyncio.create_task, coro)
+
+    async def _worker_loop(self) -> None:
+        if self._queue is None:  # pragma: no cover - ensured by _ensure_workers
+            return
+        queue = self._queue
+        while True:
+            job, request = await queue.get()
+            try:
+                stored = self.store.load(job.id)
+                if stored is not None:
+                    job = stored
+                if job.status in TERMINAL_STATUSES:
+                    continue
+                task = self._create_neutral_task(self.runner.run(job, request))
+                self._tasks[job.id] = task
+                self._active_jobs[job.id] = job
+                worker_task = asyncio.current_task()
+                if worker_task is not None:
+                    self._job_workers[job.id] = worker_task
+                try:
+                    # Do not allow cancellation of the worker itself to make
+                    # us synchronously wait for a provider task that suppresses
+                    # cancellation. The manager owns the child and can detach
+                    # it after the bounded shutdown window.
+                    result = await asyncio.shield(task)
+                    if job.id in self._shutdown_requested:
+                        # A stubborn child may ignore cancellation and return
+                        # a completed object after shutdown has already
+                        # settled the job as cancelled.  Never let that late
+                        # result resurrect a terminal cancellation.
+                        latest = self.store.load(job.id) or job
+                        self._force_cancelled(latest)
+                        continue
+                    # A custom runner is allowed to return a job object, but
+                    # it must never leave a non-terminal persisted record.
+                    settled = result if isinstance(result, DeepResearchJob) else job
+                    if settled.status not in TERMINAL_STATUSES:
+                        settled = self.runner._terminalize(settled, "internal_error")
+                        self.store.save(settled)
+                except asyncio.CancelledError:
+                    current_worker = asyncio.current_task()
+                    worker_cancelled = (
+                        self._closed
+                        or (
+                            current_worker is not None
+                            and current_worker in self._worker_cancel_requested
+                        )
+                        or bool(
+                            current_worker is not None
+                            and getattr(current_worker, "cancelling", lambda: 0)()
+                        )
+                    )
+                    if current_worker is not None:
+                        self._worker_cancel_requested.discard(current_worker)
+                    if not task.done():
+                        task.cancel()
+                    latest = self.store.load(job.id) or job
+                    if job.id in self._shutdown_requested:
+                        self._force_cancelled(latest)
+                    else:
+                        self._cancel_if_nonterminal(latest)
+                    if not task.done():
+                        self._detach_task(job.id, task)
+                    if worker_cancelled:
+                        raise
+                    # Cancellation of the child task itself (for example a
+                    # user-requested cancel) must not kill the shared worker
+                    # lane.  Continue to the next queued job after settling
+                    # this record.
+                    continue
+                except Exception:
+                    logger.exception("Deep research worker task failed")
+                    latest = self.store.load(job.id) or job
+                    if latest.status not in TERMINAL_STATUSES:
+                        latest = self.runner._terminalize(latest, "internal_error")
+                        self.store.save(latest)
+                finally:
+                    self._tasks.pop(job.id, None)
+                    self._active_jobs.pop(job.id, None)
+                    self._job_workers.pop(job.id, None)
+                    if job.id not in self._detached_tasks:
+                        self._shutdown_requested.discard(job.id)
+            finally:
+                queue.task_done()
+
+    async def shutdown(self) -> None:
+        """Cancel and await workers/active jobs during application shutdown."""
+
+        if (
+            self._closed
+            and not self._workers
+            and not self._tasks
+            and not self._detached_tasks
+        ):
+            return
+        self._closed = True
+
+        # Anything still in the queue has not acquired a runner task.  Drain
+        # and terminalize it so shutdown cannot strand records in ``queued``.
+        queue = self._queue
+        if queue is not None:
+            while True:
+                try:
+                    queued_job, _request = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    latest = self.store.load(queued_job.id) or queued_job
+                    if latest.status not in TERMINAL_STATUSES:
+                        latest = self.runner._terminalize(
+                            latest, "cancelled", status="cancelled"
+                        )
+                        self.store.save(latest)
+                finally:
+                    queue.task_done()
+
+        workers = list(self._workers)
+        active_items = list(self._tasks.items())
+        for job_id, task in active_items:
+            if not task.done():
+                # Write the cancellation tombstone before delivering
+                # cancellation to the child. This closes the event-loop
+                # window in which a cancellation-suppressing provider could
+                # save a late result.
+                latest = self.store.load(job_id) or self._active_jobs.get(job_id)
+                if latest is not None:
+                    self._force_cancelled(latest)
+                self._shutdown_requested.add(job_id)
+                task.cancel()
+            else:
+                # A task that already reached a terminal state before shutdown
+                # keeps its result (notably a successful completion).
+                latest = self.store.load(job_id)
+                if latest is not None:
+                    self._cancel_if_nonterminal(latest)
+        for worker in workers:
+            self._worker_cancel_requested.add(worker)
+            worker.cancel()
+        # Do not let a misbehaving provider that suppresses cancellation hold
+        # application shutdown forever.  ``asyncio.wait`` returns after the
+        # bounded drain window even when a child ignores its cancellation;
+        # those jobs are persisted as cancelled and their late exceptions are
+        # consumed by a callback.
+        if active_items:
+            active_tasks = [task for _job_id, task in active_items]
+            _done, pending = await asyncio.wait(
+                active_tasks,
+                timeout=self._shutdown_timeout_seconds,
+            )
+            for job_id, task in active_items:
+                if task not in pending:
+                    try:
+                        task.exception()
+                    except BaseException:
+                        pass
+                    latest = self.store.load(job_id)
+                    if job_id in self._shutdown_requested and latest is not None:
+                        self._force_cancelled(latest)
+                    continue
+                latest = self.store.load(job_id)
+                if latest is not None:
+                    self._force_cancelled(latest)
+                self._detach_task(job_id, task)
+        if workers:
+            _done, pending_workers = await asyncio.wait(
+                workers,
+                timeout=self._shutdown_timeout_seconds,
+            )
+            for worker in pending_workers:
+                worker.add_done_callback(self._consume_task_exception)
+        self._tasks.clear()
+        self._workers.clear()
+        self._active_jobs.clear()
+        self._job_workers.clear()
+        self._worker_cancel_requested.clear()
+
+    @staticmethod
+    def _consume_task_exception(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except BaseException:
+            pass
+
+    def _settle_late_task(self, job_id: str, task: asyncio.Task) -> None:
+        """Consume a detached child and preserve its shutdown terminal state."""
+
+        try:
+            task.exception()
+        except BaseException:
+            pass
+        if self._detached_tasks.get(job_id) is task:
+            self._detached_tasks.pop(job_id, None)
+        if job_id not in self._shutdown_requested:
+            return
+        latest = self.store.load(job_id)
+        if latest is None:
+            self._shutdown_requested.discard(job_id)
+            return
+        self._force_cancelled(latest)
+        self._shutdown_requested.discard(job_id)
+
+    def _detach_task(self, job_id: str, task: asyncio.Task) -> None:
+        """Track a child that outlived its bounded manager drain window."""
+
+        self._shutdown_requested.add(job_id)
+        if self._detached_tasks.get(job_id) is task:
+            return
+        self._detached_tasks[job_id] = task
+        task.add_done_callback(
+            lambda finished, detached_job_id=job_id: self._settle_late_task(
+                detached_job_id, finished
+            )
+        )
+
+    def _cancel_if_nonterminal(self, job: DeepResearchJob) -> None:
+        """Persist cancellation without overwriting an already terminal result."""
+
+        if job.status in TERMINAL_STATUSES:
+            return
+        job = self.runner._terminalize(job, "cancelled", status="cancelled")
+        self.store.save(job)
+
+    def _force_cancelled(self, job: DeepResearchJob) -> None:
+        """Persist cancellation without overwriting a truthful terminal result.
+
+        ``DeepResearchJobStore.save`` rejects stale status transitions from a
+        cancellation tombstone, so a detached provider cannot resurrect a
+        report after shutdown.  If a provider had already reached ``completed``
+        or ``failed`` before shutdown, preserve that terminal result instead of
+        rewriting its error/report as cancellation.
+        """
+
+        self._cancel_if_nonterminal(job)
+
+    close = shutdown
 
     def available_engines(self) -> list[dict[str, Any]]:
         return self.runner.search_client.available_engines()
@@ -2141,7 +3897,18 @@ class DeepResearchManager:
         return job
 
     async def start_job(self, request: DeepResearchRequest, *, user_id: str) -> DeepResearchJob:
-        normalized = request.normalized()
+        if self._closed:
+            raise DeepResearchManagerClosedError()
+        normalized = request.normalized(
+            enterprise_public_egress_approved=approved_public_egress(self.config)
+        )
+        self._ensure_workers()
+        assert self._queue is not None
+        # Check before persisting so a rejected request never leaves a ghost
+        # job record.  ``put_nowait`` cannot be interleaved by another task in
+        # this synchronous section of the event loop.
+        if self._queue.full():
+            raise DeepResearchQueueFullError()
         job = DeepResearchJob(
             id=str(uuid.uuid4()),
             user_id=user_id,
@@ -2156,11 +3923,105 @@ class DeepResearchManager:
                 "actor_user_id": normalized.actor_user_id,
                 "is_admin": normalized.is_admin,
                 "session_id": normalized.session_id,
+                "session_context": dict(normalized.session_context or {}),
+                "project_metadata": dict(normalized.project_metadata or {}),
+                "privacy_snapshot": _privacy_snapshot(
+                    normalized.session_context,
+                    normalized.project_metadata,
+                    project_id=normalized.project_id,
+                    global_policy=_config_get(
+                        self.config, "external_model_privacy", {}
+                    ),
+                ),
             },
+            actor_user_id=normalized.actor_user_id,
+            session_id=normalized.session_id,
+            project_id=normalized.project_id,
+            privacy_snapshot=_privacy_snapshot(
+                normalized.session_context,
+                normalized.project_metadata,
+                project_id=normalized.project_id,
+                global_policy=_config_get(
+                    self.config, "external_model_privacy", {}
+                ),
+            ),
         )
         job.emit("キューに追加しました", 0, "queued")
         self.store.save(job)
-        task = asyncio.create_task(self.runner.run(job, normalized))
-        self._tasks[job.id] = task
-        task.add_done_callback(lambda _: self._tasks.pop(job.id, None))
+        try:
+            self._queue.put_nowait((job, normalized))
+        except asyncio.QueueFull as exc:
+            # Keep persistence and queue admission atomic from the caller's
+            # point of view: remove the queued record's ghost terminally and
+            # surface a retryable queue error instead of leaving ``queued``.
+            job = self.runner._terminalize(job, "queue_full")
+            self.store.save(job)
+            raise DeepResearchQueueFullError() from exc
         return job
+
+    async def cancel_job(
+        self,
+        job_id: str,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Optional[DeepResearchJob]:
+        job = self.get_job(job_id, user_id=user_id)
+        if job is None:
+            return None
+        task = self._tasks.get(job.id)
+        if task is not None and not task.done():
+            task.cancel()
+            _done, pending = await asyncio.wait(
+                {task}, timeout=self._shutdown_timeout_seconds
+            )
+            if pending:
+                self._detach_task(job.id, task)
+                worker = self._job_workers.get(job.id)
+                current = asyncio.current_task()
+                if worker is not None and worker is not current and not worker.done():
+                    # A cancelled stubborn child must not pin the worker lane
+                    # forever.  The worker's cancellation handler detaches the
+                    # child and ``_ensure_workers`` will replace the worker on
+                    # the next admission.
+                    self._worker_cancel_requested.add(worker)
+                    worker.cancel()
+                    # Retire the canceled worker from capacity immediately and
+                    # replace it now.  Waiting for a future ``start_job`` call
+                    # would leave jobs already queued behind a stubborn child
+                    # indefinitely.
+                    self._workers = [
+                        item
+                        for item in self._workers
+                        if item is not worker and not item.done()
+                    ]
+                    worker.add_done_callback(self._consume_task_exception)
+                    if not self._closed:
+                        self._ensure_workers()
+                    await asyncio.wait({worker}, timeout=0.1)
+            # ``runner.run`` normally settles cancellation itself, but custom
+            # runners (and a cancellation racing startup) may propagate the
+            # CancelledError before persisting.  Re-read and settle here so a
+            # caller never observes a permanently queued/running job.
+        # Always re-read after a cancellation/completion race.  The initial
+        # `get_job` snapshot may still say ``running`` while the worker has
+        # already persisted a completed report; never overwrite that terminal
+        # result with a late cancellation.
+        latest = self.store.load(job.id) or job
+        if task is not None and task.done():
+            try:
+                task_result = task.result()
+            except asyncio.CancelledError:
+                task_result = None
+            except Exception:
+                task_result = None
+            if isinstance(task_result, DeepResearchJob) and task_result.status in TERMINAL_STATUSES:
+                latest = self.store.load(job.id) or task_result
+                if latest.status not in TERMINAL_STATUSES:
+                    self.store.save(task_result)
+                    latest = task_result
+        if latest.status not in TERMINAL_STATUSES:
+            latest = self.runner._terminalize(
+                latest, "cancelled", status="cancelled"
+            )
+            self.store.save(latest)
+        return self.store.load(job.id) or latest

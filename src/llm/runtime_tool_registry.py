@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
+import hashlib
 import inspect
+import json
 import os
 import re
+import shlex
+import tempfile
 import threading
 from collections.abc import Mapping
+from contextlib import ExitStack
 from dataclasses import replace
 from typing import Any, Callable, Optional
 from uuid import UUID, uuid4
@@ -107,6 +113,258 @@ _ROOT_TOOL_FAILURE_BREAKERS: contextvars.ContextVar[dict[str, Any]] = contextvar
 )
 
 
+class _BoundedManagedToolExecutionAdapter:
+    """Route managed scripts through the bounded ``execute_command`` tool.
+
+    ``ManagedToolService`` deliberately has no Enterprise host-subprocess
+    fallback.  This adapter keeps execution on the same command/scope
+    boundary used by ordinary tools and passes JSON input only as a base64
+    stdin stream, never by interpolating raw JSON into shell text.
+    """
+
+    _MAX_INPUT_BYTES = 1_048_576
+
+    def __init__(self, *, config: Any | None = None) -> None:
+        # Keep the registry's server-resolved configuration so the Enterprise
+        # scope factory observes the same policy that enabled managed tools.
+        # The value is never accepted from managed-tool/model arguments.
+        self._config = config
+
+    @staticmethod
+    def _interpreter(runtime: str, *, enterprise: bool) -> str:
+        runtime_name = str(runtime or "").strip().casefold()
+        if runtime_name == "python":
+            return "python3" if enterprise else "python"
+        if runtime_name == "shell":
+            return "bash" if enterprise else ("bash" if os.name != "nt" else "sh")
+        if runtime_name == "node":
+            return "node"
+        if runtime_name == "powershell":
+            # Enterprise commands still stay inside WSL+bubblewrap; invoke
+            # the Linux PowerShell binary rather than host powershell.exe.
+            return (
+                "pwsh -NoProfile -NonInteractive -File"
+                if enterprise
+                else "powershell"
+            )
+        raise ValueError(f"unsupported managed runtime: {runtime_name}")
+
+    @classmethod
+    def _encode_input(cls, input_json: Mapping[str, Any] | None) -> str | None:
+        if input_json is None:
+            return None
+        if not isinstance(input_json, Mapping):
+            raise ValueError("input_json must be a JSON object")
+        try:
+            payload = json.dumps(
+                dict(input_json),
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("input_json must contain only JSON-compatible values") from exc
+        if len(payload) > cls._MAX_INPUT_BYTES:
+            raise ValueError("input_json exceeds the maximum size")
+        return base64.b64encode(payload).decode("ascii")
+
+    async def execute(
+        self,
+        *,
+        path: Any,
+        runtime: str,
+        content: bytes | None = None,
+        input_json: Mapping[str, Any] | None = None,
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        snapshot_path: str | None = None
+        try:
+            enterprise = bool(Features.is_enterprise())
+        except Exception:
+            enterprise = True
+        try:
+            encoded = self._encode_input(input_json)
+            interpreter = self._interpreter(runtime, enterprise=enterprise)
+            execution_path = os.fspath(path)
+            if content is not None:
+                parent = os.path.dirname(execution_path)
+                suffix = os.path.splitext(execution_path)[1]
+                fd, snapshot_path = tempfile.mkstemp(
+                    prefix=".managed-exec-",
+                    suffix=suffix,
+                    dir=parent,
+                )
+                with os.fdopen(fd, "wb") as handle:
+                    handle.write(bytes(content))
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                execution_path = snapshot_path
+            script = shlex.quote(os.path.basename(execution_path))
+            command = f"{interpreter} {script}"
+            if encoded:
+                # Base64's alphabet is shell-safe; quoting remains explicit so
+                # this command cannot be altered by arbitrary JSON content.
+                if os.name == "nt" and not enterprise:
+                    command = (
+                        "[Text.Encoding]::UTF8.GetString("
+                        f"[Convert]::FromBase64String('{encoded}')) | & "
+                        f"{command}"
+                    )
+                else:
+                    command = f"printf %s {shlex.quote(encoded)} | base64 -d | {command}"
+            from ..tools.os_operations import execute_command
+
+            timeout = max(0.1, float(timeout_seconds or 30.0))
+            shell = (
+                "bash"
+                if enterprise
+                else ("powershell" if encoded and os.name == "nt" else None)
+            )
+            # Generic Enterprise OS tools no longer manufacture a current-turn
+            # scope. Managed scripts still use that mediated command path, so
+            # bind a trusted upper HarnessExecutionScope and its matching
+            # AgentRunScope explicitly for this call. Existing coding scopes
+            # are reused without replacement; a lower-only or mismatched scope
+            # is rejected rather than widened or silently repaired.
+            with ExitStack() as scope_stack:
+                if enterprise:
+                    from ..security.agent_run_scope import (
+                        AgentRunScope,
+                        get_current_run_scope,
+                        run_scope_context,
+                    )
+                    from ..security.harness_execution_scope import (
+                        HarnessExecutionScope,
+                        get_current_harness_execution_scope,
+                        harness_execution_scope_context,
+                    )
+
+                    upper_scope = get_current_harness_execution_scope()
+                    lower_scope = get_current_run_scope()
+                    if upper_scope is None and lower_scope is not None:
+                        raise RuntimeError(
+                            "Enterprise AgentRunScope requires a matching server-issued "
+                            "HarnessExecutionScope"
+                        )
+                    if upper_scope is not None and not isinstance(
+                        upper_scope, HarnessExecutionScope
+                    ):
+                        raise TypeError("invalid trusted HarnessExecutionScope")
+                    if lower_scope is not None and not isinstance(
+                        lower_scope, AgentRunScope
+                    ):
+                        raise TypeError("invalid trusted AgentRunScope")
+
+                    if upper_scope is None:
+                        from ..services.harness_execution_scope_service import (
+                            build_current_turn_enterprise_scope,
+                        )
+
+                        scope_config = self._config
+                        if scope_config is None:
+                            from ..config import Config
+
+                            scope_config = Config()
+                        upper_scope = build_current_turn_enterprise_scope(
+                            config=scope_config,
+                        )
+                        if not isinstance(upper_scope, HarnessExecutionScope):
+                            raise TypeError("invalid trusted HarnessExecutionScope")
+
+                    expected_lower_scope = upper_scope.to_agent_run_scope()
+                    if lower_scope is None:
+                        lower_scope = expected_lower_scope
+                    else:
+                        # ``AgentRunScope`` also carries coding-run evidence
+                        # (for example ``baseline_revision`` and
+                        # ``baseline_git_state``).  Those fields are not part
+                        # of the execution authority and may legitimately be
+                        # populated on a caller-owned lower scope while the
+                        # upper harness adapter leaves them at their defaults.
+                        # Compare the established immutable capability
+                        # identity instead of the full dataclass value, so
+                        # baseline metadata cannot cause a valid coding scope
+                        # to be rejected or replaced.
+                        try:
+                            from ..tools.os_operations.background_jobs import (
+                                compute_scope_fingerprint,
+                            )
+
+                            matching = (
+                                str(getattr(lower_scope, "run_id", ""))
+                                == str(getattr(expected_lower_scope, "run_id", ""))
+                                and str(
+                                    getattr(lower_scope, "repo_identity", "")
+                                )
+                                == str(
+                                    getattr(expected_lower_scope, "repo_identity", "")
+                                )
+                                and compute_scope_fingerprint(lower_scope)
+                                == compute_scope_fingerprint(expected_lower_scope)
+                            )
+                        except Exception:
+                            matching = False
+                        if not matching:
+                            raise RuntimeError(
+                                "HarnessExecutionScope and AgentRunScope do not match"
+                            )
+
+                    if upper_scope is not get_current_harness_execution_scope():
+                        scope_stack.enter_context(
+                            harness_execution_scope_context(upper_scope)
+                        )
+                    if lower_scope is not get_current_run_scope():
+                        scope_stack.enter_context(run_scope_context(lower_scope))
+
+                executor = getattr(execute_command, "execute_async", None)
+                if callable(executor):
+                    raw = await executor(
+                        command=command,
+                        working_directory=os.path.dirname(execution_path),
+                        timeout=timeout,
+                        shell=shell,
+                    )
+                else:  # pragma: no cover - compatibility for test doubles
+                    raw = execute_command(
+                        command=command,
+                        working_directory=os.path.dirname(execution_path),
+                        timeout=timeout,
+                        shell=shell,
+                    )
+                    if inspect.isawaitable(raw):
+                        raw = await raw
+            if not isinstance(raw, Mapping):
+                raise RuntimeError("bounded command adapter returned an invalid result")
+            success = raw.get("success") is True
+            stdout = str(raw.get("stdout") or "")
+            stderr = str(raw.get("stderr") or "")
+            if not success and not stderr:
+                stderr = str(raw.get("error") or "")
+            return {
+                "success": success,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": raw.get("return_code"),
+                "duration_ms": int(float(raw.get("duration_seconds") or 0.0) * 1000),
+                "timed_out": raw.get("timed_out") is True,
+            }
+        except Exception as exc:
+            return {
+                "success": False,
+                "stdout": "",
+                "stderr": str(exc),
+                "exit_code": None,
+                "duration_ms": 0,
+                "timed_out": False,
+            }
+        finally:
+            if snapshot_path is not None:
+                try:
+                    os.unlink(snapshot_path)
+                except FileNotFoundError:
+                    pass
+
+
 def _session_identity(client: Any = None) -> str:
     candidates = (
         getattr(client, "current_session_id", None),
@@ -157,11 +415,16 @@ def _register_load_agent_team_tool(
 
     async def load_agent_team(team_id: str) -> str:
         """Load one manual Agent Team by name or stable ID for this session."""
+        client_config = getattr(client, "config", None)
+        effective_config = client_config if client_config is not None else config
+        if not agent_team_v3_delegation_enabled(effective_config):
+            return "Agent Team delegation is disabled in the current configuration"
+        current_teams = agent_team_v3_teams(effective_config)
         requested_name = str(team_id or "").strip()
         team = next(
             (
                 item
-                for item in agent_team_v3_teams(config)
+                for item in current_teams
                 if str(item.get("team_id") or "") == requested_name
                 or str(item.get("name") or "").casefold() == requested_name.casefold()
             ),
@@ -423,15 +686,119 @@ def _agent_enabled(config: Any, domain_key: str, default: bool = True) -> bool:
     return bool(config.get("agents", {}).get(domain_key, {}).get("enabled", default))
 
 
+def _strict_config_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    # A malformed persisted policy must never expose process/write tools.
+    return False
+
+
 def _apps_enabled(config: Any, default: bool = True) -> bool:
     if not config:
         return default
     if isinstance(config, dict):
-        return bool((config.get("apps") or {}).get("enabled", default))
+        return _strict_config_bool(
+            (config.get("apps") or {}).get("enabled", default),
+            default=default,
+        )
     getter = getattr(config, "get", None)
     if callable(getter):
-        return bool(getter("apps.enabled", default))
+        return _strict_config_bool(
+            getter("apps.enabled", default),
+            default=default,
+        )
     return default
+
+
+def _managed_tool_promotion_settings(config: Any) -> dict[str, Any] | None:
+    """Return the server config for managed-tool promotion when enabled."""
+
+    if not _apps_enabled(config, False):
+        return None
+    raw = _config_get(config, "apps.managed_tool_promotion", None)
+    # A partially migrated/hand-written config must not expose write/process
+    # tools accidentally.  Fresh installs receive this branch from the seed.
+    if not isinstance(raw, Mapping) or not _strict_config_bool(
+        raw.get("enabled", False),
+        default=False,
+    ):
+        return None
+    return dict(raw)
+
+
+def _register_managed_tool_direct_tools(
+    registry: ToolRegistry,
+    *,
+    config: Any,
+    context: dict[str, Any] | None,
+    workspace_root: str | os.PathLike[str] | None,
+) -> bool:
+    """Register server-controlled managed script lifecycle tools.
+
+    Execution is injected with the bounded command adapter so Enterprise can
+    never reach ``ManagedToolService``'s Personal subprocess fallback.
+    """
+
+    settings = _managed_tool_promotion_settings(config)
+    if settings is None:
+        return False
+    try:
+        from ..services.managed_tool_service import ManagedToolService
+        from ..tools.managed_tools import build_managed_tool_definitions
+
+        service = ManagedToolService(
+            workspace_root=workspace_root,
+            policy=settings,
+            executor=_BoundedManagedToolExecutionAdapter(config=config),
+        )
+        definitions = build_managed_tool_definitions(
+            context,
+            workspace_root=str(workspace_root) if workspace_root is not None else None,
+            policy=settings,
+            config=config,
+            service=service,
+        )
+    except Exception:
+        # Managed tools are optional during migration.  Do not prevent the
+        # rest of the runtime registry from coming up when their persistence
+        # or service dependencies are unavailable.
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Managed-tool runtime definitions could not be loaded", exc_info=True
+        )
+        return False
+
+    registered = False
+    for definition in ensure_tool_definitions(definitions):
+        # Routine managed create/update/execute/promotion calls are handled by
+        # the generation policy (AUTONOMOUS_WORK is AUTO_APPROVE).  Existing
+        # destructive filesystem/command tools retain their own approval gate.
+        risk = "low" if definition.name == "list_managed_tools" else "medium"
+        side_effect = "none" if definition.name == "list_managed_tools" else definition.side_effect
+        registered = (
+            _register_tool_definition(
+                registry,
+                definition,
+                owner="managed_tools",
+                side_effect=side_effect,
+                risk=risk,
+                requires_approval=False,
+                supports_parallel=definition.name == "list_managed_tools",
+            )
+            or registered
+        )
+    return registered
 
 
 def _story_context_active_for_client(client: Any) -> bool:
@@ -611,12 +978,15 @@ def _search_x_enabled(config: Any) -> bool:
     search_config = _config_get(config, "search", {}) or {}
     if not isinstance(search_config, dict):
         return False
-    return bool(
-        search_config.get(
-            "x_enabled",
-            search_config.get("grok_x_enabled", False),
-        )
+    configured = search_config.get(
+        "x_enabled",
+        search_config.get("grok_x_enabled", False),
     )
+    if isinstance(configured, bool):
+        return configured
+    # Persisted YAML/DB values are not allowed to use Python truthiness:
+    # ``"false"`` must keep the optional external Grok route disabled.
+    return str(configured or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _webex_configured() -> bool:
@@ -655,6 +1025,7 @@ def _register_search_direct_tools(
     registry: ToolRegistry,
     *,
     config: Any,
+    client: Any = None,
 ) -> bool:
     """Expose search primitives directly to the root turn runtime."""
 
@@ -669,11 +1040,13 @@ def _register_search_direct_tools(
     ) -> str:
         """Yahooリアルタイム検索を使ってXの投稿を調べます。"""
 
+        client_config = getattr(client, "config", None)
+        active_config = client_config if client_config is not None else config
         return x_search_impl(
             query,
             max_results=max_results,
             timeout_seconds=timeout_seconds,
-            config=config,
+            config=active_config,
         )
 
     registered = _register_tool_definition(
@@ -687,7 +1060,9 @@ def _register_search_direct_tools(
     @tool_decorator
     def web_search(query: str) -> str:
         """Search the public web for fresh or time-sensitive information."""
-        return web_search_with_config(query, config=config)
+        client_config = getattr(client, "config", None)
+        active_config = client_config if client_config is not None else config
+        return web_search_with_config(query, config=active_config)
 
     registered = (
         _register_tool_definition(
@@ -700,7 +1075,9 @@ def _register_search_direct_tools(
         or registered
     )
 
-    if _search_x_enabled(config):
+    current_client_config = getattr(client, "config", None)
+    active_config = current_client_config if current_client_config is not None else config
+    if _search_x_enabled(active_config):
         from ..tools.basic.grok_x_search import grok_x_search
 
         registered = (
@@ -714,11 +1091,24 @@ def _register_search_direct_tools(
             or registered
         )
 
-    if is_knowledge_search_enabled(config):
-        from ..tools.knowledge import knowledge_read, knowledge_search, knowledge_status
+    if is_knowledge_search_enabled(active_config):
+        from ..tools import knowledge as knowledge_tools
+
+        # ``knowledge_query`` is introduced alongside the structured-query
+        # lane.  Keep this lookup optional during rolling upgrades so a
+        # provider can still start while the tool package is being updated.
+        knowledge_definitions = [
+            getattr(knowledge_tools, name, None)
+            for name in (
+                "knowledge_search",
+                "knowledge_query",
+                "knowledge_read",
+                "knowledge_status",
+            )
+        ]
 
         for tool_def in ensure_tool_definitions(
-            [knowledge_search, knowledge_read, knowledge_status]
+            [tool for tool in knowledge_definitions if tool is not None]
         ):
             registered = (
                 _register_tool_definition(
@@ -803,6 +1193,55 @@ def _register_utility_direct_tools(registry: ToolRegistry) -> bool:
     return registered
 
 
+def _register_operations_direct_tools(registry: ToolRegistry) -> bool:
+    """Expose the narrow, ACL-backed Engagement Operations facade.
+
+    The Operations tool definitions resolve their authenticated principal from
+    ``TurnContext`` and delegate every access/mutation to ``OperationsService``.
+    Keep the definitions in the root registry (rather than a nested specialist
+    hop) so providers that retain a fixed registry can invoke them directly.
+    Human approval is still required for mutation-capable definitions through
+    the same generic runtime gate used by project-management tools.
+    """
+
+    try:
+        from ..tools.operations_direct import (
+            MEDIA_OPERATIONS_MUTATION_TOOL_NAMES,
+            MEDIA_OPERATIONS_READ_TOOL_NAMES,
+            OPERATIONS_MUTATION_TOOL_NAMES,
+            OPERATIONS_READ_TOOL_NAMES,
+            ALL_OPERATIONS_TOOL_DEFINITIONS,
+        )
+    except Exception:
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "Operations tools could not be loaded",
+            exc_info=True,
+        )
+        return False
+
+    registered = False
+    mutation_names = OPERATIONS_MUTATION_TOOL_NAMES | MEDIA_OPERATIONS_MUTATION_TOOL_NAMES
+    read_names = OPERATIONS_READ_TOOL_NAMES | MEDIA_OPERATIONS_READ_TOOL_NAMES
+    for tool_def in ALL_OPERATIONS_TOOL_DEFINITIONS:
+        is_mutation = tool_def.name in mutation_names
+        is_read = tool_def.name in read_names
+        registered = (
+            _register_tool_definition(
+                registry,
+                tool_def,
+                owner="operations",
+                side_effect="mutation" if is_mutation else "none",
+                risk="medium" if is_mutation else "low",
+                requires_approval=is_mutation,
+                supports_parallel=bool(is_read),
+            )
+            or registered
+        )
+    return registered
+
+
 def _register_session_tools(
     registry: ToolRegistry,
     *,
@@ -854,10 +1293,6 @@ def _register_session_tools(
 
 
 def _register_scoped_memory_tools(registry: ToolRegistry) -> bool:
-    from ..services.scoped_memory_flags import scoped_memory_v2_enabled
-
-    if not scoped_memory_v2_enabled():
-        return False
     from ..tools.memory.scoped_memory_tools import SCOPED_MEMORY_TOOLS
 
     registered = False
@@ -1463,6 +1898,24 @@ def _register_agent_team_delegate_tool(
                 "Agent Team child workers cannot delegate nested workers; "
                 "return the bounded WorkerReport to the parent coordinator."
             )
+        # A provider registry can outlive the config/Team rows that created
+        # it.  Resolve the latest client config and roster at invocation time;
+        # the closure's initial graph is used only to build a compatibility
+        # schema and is never an authority for delegation.
+        client_config = getattr(client, "config", None)
+        effective_config = client_config if client_config is not None else config
+        current_configured_teams = agent_team_v3_teams(effective_config)
+        current_subagents_by_id = {
+            str(item.get("subagent_id") or ""): item
+            for item in agent_team_v3_subagents(
+                effective_config,
+                include_disabled=False,
+            )
+        }
+        if not agent_team_v3_delegation_enabled(effective_config):
+            return "Agent Team delegation is disabled in the current configuration"
+        if not current_configured_teams:
+            return "Agent Team is not configured in the current runtime"
         requested_team_id = str(team or "").strip()
         requested_subagent_id = str(subagent or "").strip()
         tools_required = True
@@ -1478,7 +1931,7 @@ def _register_agent_team_delegate_tool(
                 "tools_required": tools_required,
                 "scopes": scopes,
             },
-            config=config,
+            config=effective_config,
         )
         if not decision.allowed:
             print(f"[ToolPolicy] blocked agent_team_delegate: {decision.reason}")
@@ -1491,7 +1944,7 @@ def _register_agent_team_delegate_tool(
         if not requested_team_id or not requested_subagent_id:
             return "Agent Team delegation requires both team and subagent"
         configured_team = next(
-            (item for item in configured_teams
+            (item for item in current_configured_teams
              if str(item.get("team_id") or "") == requested_team_id
              or str(item.get("name") or "").casefold() == requested_team_id.casefold()),
             None,
@@ -1501,7 +1954,7 @@ def _register_agent_team_delegate_tool(
         if not configured_team.get("enabled", True):
             return f"Agent Team is disabled: {requested_team_id}"
         scope = _agent_team_scope_for_request(
-            config,
+            effective_config,
             client=client,
             project_context=(
                 get_runtime_project_context()
@@ -1516,11 +1969,11 @@ def _register_agent_team_delegate_tool(
             if activation_mode == "manual":
                 return f"Agent Team {requested_team_id} is not loaded for this conversation; call load_agent_team first"
             return f"Agent Team {requested_team_id} is not active in the current context"
-        subagent = subagents_by_id.get(requested_subagent_id)
+        subagent = current_subagents_by_id.get(requested_subagent_id)
         if subagent is None:
             subagent = next(
                 (
-                    item for item in subagents_by_id.values()
+                    item for item in current_subagents_by_id.values()
                     if str(item.get("name") or "").casefold()
                     == requested_subagent_id.casefold()
                 ),
@@ -1631,7 +2084,7 @@ def _register_agent_team_delegate_tool(
                 if str(capability).strip()
             )
         )
-        route = resolve_agent_team_v3_route(config, subagent_id) or {}
+        route = resolve_agent_team_v3_route(effective_config, subagent_id) or {}
         backend = str(
             route.get("backend")
             or ("cli" if str(route.get("provider") or "").endswith("-cli") else "api")
@@ -1987,7 +2440,7 @@ def _register_agent_team_delegate_tool(
                 runner_params = {}
             if "work_mode" in runner_params:
                 runner_kwargs["work_mode"] = requested_work_mode
-            runner = AgentTeamSubagentDelegationRunner(config, **runner_kwargs)
+            runner = AgentTeamSubagentDelegationRunner(effective_config, **runner_kwargs)
             scope = (
                 normalized_scopes[index - 1]
                 if normalized_scopes
@@ -2420,7 +2873,88 @@ def _register_project_workspace_tools(
     from ..services.project_workspace_cleanup import get_project_workspace_path
     workspace = get_project_workspace_path(UUID(project_id))
     for manifest in load_workspace_tool_manifests(workspace):
-        registry.register(manifest_to_tool(manifest))
+        definition = manifest_to_tool(manifest)
+        # Persist only bounded provenance needed for request-time
+        # revalidation.  The registry may outlive this Project/manifest, so a
+        # ``ws_*`` name alone is never an authority to execute the old script.
+        try:
+            manifest_path = (
+                workspace / "tools" / manifest.name / "manifest.yaml"
+            ).resolve()
+            manifest_hash = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+            entrypoint = manifest.entrypoint.resolve()
+            entrypoint_hash = hashlib.sha256(entrypoint.read_bytes()).hexdigest()
+            availability = {
+                "project_id": project_id,
+                "manifest_name": manifest.name,
+                "manifest_sha256": manifest_hash,
+                "entrypoint": str(entrypoint),
+                "entrypoint_sha256": entrypoint_hash,
+            }
+        except (OSError, ValueError):
+            # A definition without an integrity snapshot is not executable;
+            # it remains absent from the registry rather than widening to an
+            # unproven project script.
+            continue
+        registry.register(replace(definition, availability=availability))
+
+
+def _register_cloud_advisor_tool(
+    registry: ToolRegistry,
+    *,
+    config: Any,
+) -> None:
+    """Register the canonical root-owned Cloud Advisor entrypoint.
+
+    Only the advisory query crosses the model tool schema. Trigger origin and
+    automatic-escalation assessment are trusted runtime ContextVars and cannot
+    be forged through tool arguments.
+    """
+
+    from ..services.cloud_advisor_service import (
+        CloudAdvisorCoordinator,
+        CloudAdvisorRequest,
+        assessment_for_parent_tool_invocation,
+        get_cloud_advisor_invocation_context,
+    )
+
+    coordinator = CloudAdvisorCoordinator(config)
+
+    async def consult_cloud_advisor(query: str) -> str:
+        """Consult the parent-owned read-only Cloud Advisor.
+
+        Args:
+            query: The bounded text question or task for external advisory
+                analysis. The returned advisory has no execution authority.
+        """
+
+        invocation = get_cloud_advisor_invocation_context()
+        # A root Main-Agent tool selection is the automatic parent decision.
+        # Resolve it to a trusted semantic assessment here, outside the model
+        # arguments.  Explicit controller assessments remain authoritative.
+        assessment = assessment_for_parent_tool_invocation(invocation)
+        result = await coordinator.consult(
+            CloudAdvisorRequest(
+                query=str(query or ""),
+                trigger_origin=invocation.origin,
+                assessment=assessment,
+            )
+        )
+        return json.dumps(result.to_dict(), ensure_ascii=False)
+
+    definition = tool_decorator(consult_cloud_advisor)
+    registry.register(
+        replace(
+            definition,
+            owner="cloud_advisor",
+            risk="medium",
+            side_effect="external_egress",
+            # Privacy review is owned by OutboundPrivacyGateway policy, not
+            # generic tool approval (avoiding a duplicate approval dialog).
+            requires_approval=False,
+            supports_parallel=False,
+        )
+    )
 
 
 def build_runtime_tool_registry(
@@ -2478,6 +3012,11 @@ def build_runtime_tool_registry(
     if config and config.get("skills", {}).get("enabled", True) and invoke_skill is not None:
         registry.register(invoke_skill)
 
+    # Engagement Operations is a direct, ACL-backed root capability.  Register
+    # it before the legacy ``not config`` return so providers using the default
+    # config still receive the same safe tool surface.
+    _register_operations_direct_tools(registry)
+
     # Keep deferred App definitions in the provider registry (as Spotify and
     # media packs do), but let the contextual pack gate below decide whether
     # they reach a model payload.  This is required for providers that retain
@@ -2493,6 +3032,27 @@ def build_runtime_tool_registry(
             deployment_config=config if isinstance(config, dict) else getattr(config, "config", None),
         ):
             registry.register(app_tool)
+        _register_managed_tool_direct_tools(
+            registry,
+            config=config,
+            context=server_project_context,
+            workspace_root=app_workspace_root,
+        )
+
+    if Features.is_enterprise():
+        # Project storage remains read-only inside the generic shell.  These
+        # dedicated tools are the only runtime bridge that can publish a
+        # structured diff, and the service rechecks Project ACL/row lock,
+        # quota, managed references and durable idempotency before mutation.
+        from ..services.app_storage import get_workspaces_root
+        from ..tools.project_storage import build_project_storage_tool_definitions
+
+        project_workspace_root = str(get_workspaces_root(workspace_root))
+        for definition in build_project_storage_tool_definitions(
+            server_project_context,
+            workspace_root=project_workspace_root,
+        ):
+            registry.register(definition)
 
     if not config:
         _register_project_workspace_tools(
@@ -2501,6 +3061,13 @@ def build_runtime_tool_registry(
             client=client,
         )
         return registry
+
+    # Independent parent-owned capability. It is not a Team/Subagent and is
+    # deliberately not added to Agent Team capability/profile topology.
+    _register_cloud_advisor_tool(
+        registry,
+        config=config,
+    )
 
     # Agent Team（汎用作業系）の公開スイッチ。OFF時はSubagent委譲と
     # 高度推論を隠す。単独で動く専門エージェントは個別設定に従う。
@@ -2524,13 +3091,18 @@ def build_runtime_tool_registry(
 
     search_enabled = _agent_enabled(config, "search", True)
     if search_enabled:
-        _register_search_direct_tools(registry, config=config)
+        _register_search_direct_tools(registry, config=config, client=client)
     _register_session_tools(
         registry,
         config=config,
         search_enabled=search_enabled,
     )
     _register_scoped_memory_tools(registry)
+
+    from ..tools.browser_agent import build_browser_agent_tool
+    registry.register(build_browser_agent_tool(config, client=client))
+    from ..tools.computer_use import build_computer_use_tool
+    registry.register(build_computer_use_tool(config, client=client))
 
     # Spotify is a disabled-by-default Shared Integration.  When enabled,
     # expose its direct high-level tools lazily through the ``spotify`` pack;

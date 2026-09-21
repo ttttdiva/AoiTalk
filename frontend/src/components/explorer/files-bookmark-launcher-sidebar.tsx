@@ -78,6 +78,14 @@ import {
   getFilesSidebarSnapshot,
   subscribeFilesSidebar,
 } from "./files-sidebar-store";
+import {
+  bookmarkOwnerFromItem as resolveBookmarkOwner,
+  bookmarkOwnerKey,
+  classifyBookmarkTarget,
+  projectExplorerBookmarks,
+  sameBookmarkOwner as ownersMatch,
+  withBookmarkOwner,
+} from "@/lib/explorer-bookmark-ownership";
 
 const DND_MIME = "application/x-explorer-paths";
 const DND_BOOKMARK_MIME = "application/x-files-bookmark-id";
@@ -130,7 +138,10 @@ function parentPath(path: string): string | null {
 }
 
 function isAbsolutePath(path: string): boolean {
-  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("/");
+  // Drive-letter, POSIX-rooted, and UNC paths are all filesystem targets.
+  // Keep this aligned with the ownership classifier so an authorized UNC
+  // directory cannot be mistaken for a virtual relative path.
+  return /^[A-Za-z]:[\\/]/.test(path) || /^[/\\]{1,2}/.test(path);
 }
 
 function normalizeScopePath(path: string): string {
@@ -172,45 +183,6 @@ function pathWithinScope(
   return normalizedPath === normalizedRoot || normalizedPath.startsWith(`${normalizedRoot}/`);
 }
 
-/**
- * Keep bookmark hierarchy intact while restricting Project Files to the
- * selected Space's canonical Project roots.  Structural folders have no
- * target Space of their own, so only ancestors of an allowed target remain.
- */
-function filterBookmarksForWorkspace(
-  bookmarks: ExplorerBookmark[],
-  projectIds: ReadonlySet<string>,
-): ExplorerBookmark[] {
-  const allowedIds = new Set<string>();
-  const byId = new Map<string, ExplorerBookmark>();
-  for (const item of bookmarks) {
-    if (item.id) byId.set(item.id, item);
-    if (
-      !isExplorerBookmarkFolder(item) &&
-      workspaceProjectIdFromPath(item.path) !== null &&
-      projectIds.has(workspaceProjectIdFromPath(item.path)!) &&
-      item.id
-    ) {
-      allowedIds.add(item.id);
-    }
-  }
-  for (const item of bookmarks) {
-    if (!item.id || !allowedIds.has(item.id)) continue;
-    let parentId = item.parent_id ?? null;
-    const visited = new Set<string>();
-    while (parentId && !visited.has(parentId)) {
-      visited.add(parentId);
-      allowedIds.add(parentId);
-      parentId = byId.get(parentId)?.parent_id ?? null;
-    }
-  }
-  return bookmarks.filter((item) => {
-    if (item.id) return allowedIds.has(item.id);
-    const projectId = workspaceProjectIdFromPath(item.path);
-    return !isExplorerBookmarkFolder(item) && projectId !== null && projectIds.has(projectId);
-  });
-}
-
 const OPENABLE_EXTENSIONS = new Set([
   "txt", "md", "json", "yaml", "yml", "csv", "py", "js", "ts", "tsx", "jsx",
   "html", "css", "xml", "log", "ini", "cfg", "sql", "bat", "cmd", "sh", "ps1", "vbs",
@@ -233,6 +205,52 @@ function sortedByOrder<T extends { sort_order?: number; created_at?: string }>(i
 
 function bookmarkScopeIdentity(scope: ExplorerBookmarkScope): string {
   return scope.scope === "shared" ? `shared:${scope.spaceId}` : "personal";
+}
+
+/**
+ * A bookmark row carries ownership through the collection it came from.  The
+ * API also includes `space_id`/`user_id`, but the collection provenance is the
+ * authoritative value for legacy rows and for test doubles that omit those
+ * fields.  Keep the owner on a small wrapper instead of mutating API objects;
+ * the same bookmark path may legitimately exist in both collections.
+ */
+type OwnedBookmark = {
+  item: ExplorerBookmark;
+  owner: ExplorerBookmarkScope;
+};
+
+type BookmarkCollections = {
+  personal: ExplorerBookmark[];
+  shared: { spaceId: string; bookmarks: ExplorerBookmark[] } | null;
+};
+
+function normalizeBookmarkPath(path: string): string {
+  const normalized = path.trim().replace(/\\/g, "/");
+  if (!normalized) return normalized;
+  // Keep a filesystem root (`/` or `C:/`) intact while avoiding duplicate
+  // rows caused by harmless trailing separators on directory targets.
+  if (normalized === "/" || /^[A-Za-z]:\/$/.test(normalized)) return normalized;
+  return normalized.replace(/\/+$/, "");
+}
+
+function sortOwnedBookmarks(rows: OwnedBookmark[]): OwnedBookmark[] {
+  return [...rows].sort((a, b) => {
+    const ownerOrder = (a.owner.scope === "shared" ? 0 : 1) -
+      (b.owner.scope === "shared" ? 0 : 1);
+    if (ownerOrder !== 0) return ownerOrder;
+    if (a.owner.scope === "shared" && b.owner.scope === "shared") {
+      const spaceOrder = a.owner.spaceId.localeCompare(b.owner.spaceId);
+      if (spaceOrder !== 0) return spaceOrder;
+    }
+    const order = (a.item.sort_order ?? Number.MAX_SAFE_INTEGER) -
+      (b.item.sort_order ?? Number.MAX_SAFE_INTEGER);
+    if (order !== 0) return order;
+    const name = a.item.name.localeCompare(b.item.name);
+    if (name !== 0) return name;
+    return normalizeBookmarkPath(a.item.path).localeCompare(
+      normalizeBookmarkPath(b.item.path),
+    );
+  });
 }
 
 function parseDroppedPaths(event: DragEvent): string[] {
@@ -326,6 +344,11 @@ function reportSidebarGuard(message: string) {
  */
 export function FilesBookmarkLauncherSidebar() {
   const pathname = usePathname();
+  const sidebarSnapshot = useSyncExternalStore(
+    subscribeFilesSidebar,
+    getFilesSidebarSnapshot,
+    getFilesSidebarServerSnapshot,
+  );
   const {
     currentPath,
     browseData,
@@ -346,11 +369,15 @@ export function FilesBookmarkLauncherSidebar() {
     selectProjectForPath: bridgedSelectProjectForPath,
     closeEditor,
     refreshBookmarks,
-  } = useSyncExternalStore(
-    subscribeFilesSidebar,
-    getFilesSidebarSnapshot,
-    getFilesSidebarServerSnapshot,
-  );
+  } = sidebarSnapshot;
+  // `bookmarkCollections` was added after the original sidebar bridge. Keep a
+  // defensive fallback so SSR/legacy test snapshots still render while the
+  // canonical provider is mounting.
+  const bridgedBookmarkCollections = (
+    sidebarSnapshot as typeof sidebarSnapshot & {
+      bookmarkCollections?: BookmarkCollections;
+    }
+  ).bookmarkCollections;
   const spaceProjectIds = bridgedSpaceProjectIds;
   const filesTargetProjectId = bridgedFilesTargetProjectId;
   const bookmarkScope = bridgedBookmarkScope;
@@ -359,13 +386,41 @@ export function FilesBookmarkLauncherSidebar() {
   // provider is mounting, and use the real ProjectContext-backed function when
   // it is available.
   const selectProjectForPath = bridgedSelectProjectForPath ?? defaultSelectProjectForPath;
+  const bookmarkCollections = useMemo<BookmarkCollections>(() => {
+    if (
+      bridgedBookmarkCollections &&
+      Array.isArray(bridgedBookmarkCollections.personal) &&
+      (bridgedBookmarkCollections.shared === null ||
+        (typeof bridgedBookmarkCollections.shared === "object" &&
+          Array.isArray(bridgedBookmarkCollections.shared.bookmarks)))
+    ) {
+      return bridgedBookmarkCollections;
+    }
+    return bookmarkScope.scope === "shared"
+      ? {
+          personal: [],
+          shared: { spaceId: bookmarkScope.spaceId, bookmarks },
+        }
+      : { personal: bookmarks, shared: null };
+  }, [bookmarks, bookmarkScope, bridgedBookmarkCollections]);
+  const refreshBookmarksForOwner = useCallback(async (owner?: ExplorerBookmarkScope) => {
+    // The bridge now accepts an explicit owner.  Keep the cast only for old
+    // snapshots/tests whose callback still has the zero-argument signature.
+    await (refreshBookmarks as unknown as (scope?: ExplorerBookmarkScope) => Promise<void>)(owner);
+  }, [refreshBookmarks]);
   const [launchers, setLaunchers] = useState<ExplorerLauncher[]>([]);
   const launcherDataIdentityRef = useRef<string | null>(null);
   const [activeTab, setActiveTab] = useState<SidebarTab>("bookmarks");
   const [hydrusBookmarks, setHydrusBookmarks] = useState<HydrusTagBookmark[]>([]);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [contextMenu, setContextMenu] = useState<{ item: SidebarItem; x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    item: SidebarItem | null;
+    x: number;
+    y: number;
+  } | null>(null);
+  const contextMenuRef = useRef<HTMLDivElement>(null);
   const [quickLauncherOpen, setQuickLauncherOpen] = useState(false);
+  const quickLauncherFocusFilesRef = useRef(false);
   const quickLauncherAnchorRef = useRef<HTMLSpanElement>(null);
   const [expandedFolderIds, setExpandedFolderIds] = useState<Set<string>>(() => new Set());
   const listRef = useRef<HTMLDivElement>(null);
@@ -414,9 +469,17 @@ export function FilesBookmarkLauncherSidebar() {
     ],
   );
   const launcherScopeIdentity = `${userId ?? ""}|${scopeKey}`;
+  const currentBookmarkScopeIdentity = bookmarkScopeIdentity(bookmarkScope);
+  // Readiness is about the listing that is currently displayed, not whether
+  // that listing happens to be beneath the canonical Project/User root. An
+  // authorized absolute directory is a valid Files target and must be able to
+  // receive Ctrl+D while its path is outside `scopeRoot`.
   const scopeReady = !loading && !!browseData &&
     normalizeScopePath(browseData.current_path) === normalizeScopePath(currentPath) &&
-    isPathInFilesScope(currentPath);
+    // Preserve the stale Project/Space transition guard for canonical virtual
+    // paths, while allowing a successfully loaded absolute directory to be
+    // bookmarked from the Project Files tab.
+    (isAbsolutePath(currentPath) || isPathInFilesScope(currentPath));
 
   const reloadLaunchers = useCallback(async () => {
     if (!launcherEnabled) {
@@ -517,24 +580,137 @@ export function FilesBookmarkLauncherSidebar() {
     return () => window.removeEventListener("hydrus-tag-bookmarks-changed", onHydrusChanged);
   }, [userId]);
 
-  const visibleBookmarks = useMemo(() => {
-    if (filerTab === "hydrus") return hydrusBookmarks;
-    if (filerTab === "workspace" && bookmarkScope.scope === "shared") {
-      return sortedByOrder(filterBookmarksForWorkspace(bookmarks, sameSpaceProjectIdSet));
+  const allOwnedBookmarks = useMemo(() => {
+    const rows: OwnedBookmark[] = [];
+    const seen = new Set<string>();
+    const append = (items: ExplorerBookmark[], owner: ExplorerBookmarkScope) => {
+      for (const item of items) {
+        const ownedItem = withBookmarkOwner(item, owner);
+        const effectiveOwner = resolveBookmarkOwner(ownedItem, owner);
+        const key = `${bookmarkOwnerKey(effectiveOwner)}|${normalizeBookmarkPath(item.path)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        rows.push({ item: ownedItem, owner: effectiveOwner });
+      }
+    };
+    if (bookmarkCollections.shared) {
+      append(
+        bookmarkCollections.shared.bookmarks,
+        { scope: "shared", spaceId: bookmarkCollections.shared.spaceId },
+      );
     }
-    return sortedByOrder(
-      bookmarks.filter(
-        (item) => isExplorerBookmarkFolder(item) || pathWithinScope(item.path, scopeRoot),
-      ),
-    );
-  }, [
-    bookmarkScope.scope,
-    bookmarks,
-    filerTab,
-    hydrusBookmarks,
-    sameSpaceProjectIdSet,
-    scopeRoot,
-  ]);
+    append(bookmarkCollections.personal, { scope: "personal" });
+    // Legacy snapshots may provide only `bookmarks` with no collections. The
+    // fallback collection above covers that path, but retain a final guard for
+    // malformed bridge payloads so the sidebar never renders an unowned row.
+    if (rows.length === 0 && bookmarks.length > 0) append(bookmarks, bookmarkScope);
+    return rows;
+  }, [bookmarkCollections, bookmarkScope, bookmarks]);
+
+  const visibleOwnedBookmarks = useMemo(
+    () => {
+      if (filerTab === "hydrus") return [];
+      const projected = projectExplorerBookmarks(
+        allOwnedBookmarks.map((row) => row.item),
+        {
+          owner: bookmarkScope,
+          selectedSpaceId: bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : null,
+          selectedProjectId: filesTargetProjectId ?? canonicalScopeProjectId,
+          spaceProjectIds,
+          filerTab,
+          scopeRoot,
+          includePersonalAbsolute: true,
+        },
+      );
+      const visibleItems = new Set(projected);
+      // Preserve the historical empty-folder affordance in User/HF views.
+      if (filerTab === "user" || filerTab === "hf") {
+        for (const row of allOwnedBookmarks) {
+          if (row.owner.scope === "personal" && isExplorerBookmarkFolder(row.item)) {
+            visibleItems.add(row.item);
+          }
+        }
+      }
+      return sortOwnedBookmarks(
+        allOwnedBookmarks.filter((row) => visibleItems.has(row.item)),
+      );
+    },
+    [allOwnedBookmarks, bookmarkScope, canonicalScopeProjectId, filerTab, filesTargetProjectId, scopeRoot, spaceProjectIds],
+  );
+  const bookmarkOwnerMap = useMemo(() => {
+    const byObject = new Map<ExplorerBookmark, ExplorerBookmarkScope>();
+    for (const row of allOwnedBookmarks) {
+      byObject.set(row.item, row.owner);
+    }
+    return { byObject };
+  }, [allOwnedBookmarks]);
+  const visibleBookmarks = filerTab === "hydrus"
+    ? hydrusBookmarks
+    : visibleOwnedBookmarks.map((row) => row.item);
+
+  const ownerForTargetPath = useCallback((path: string): ExplorerBookmarkScope | null => {
+    const classification = classifyBookmarkTarget(path, {
+      owner: bookmarkScope,
+      bookmarkScope,
+      selectedSpaceId: bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : null,
+      selectedProjectId: filesTargetProjectId ?? canonicalScopeProjectId,
+      spaceProjectIds,
+      filerTab,
+      scopeRoot,
+    });
+    if (classification.kind === "shared" || classification.kind === "personal") {
+      return classification.owner;
+    }
+    // The helper intentionally accepts canonical Windows/UNC absolute paths;
+    // keep POSIX absolute paths compatible with the existing Files runtime.
+    if (isAbsolutePath(path)) return { scope: "personal" };
+    return null;
+  }, [bookmarkScope, canonicalScopeProjectId, filerTab, filesTargetProjectId, scopeRoot, spaceProjectIds]);
+
+  const ownerForBookmark = useCallback((item: ExplorerBookmark): ExplorerBookmarkScope => {
+    const mapped = bookmarkOwnerMap.byObject.get(item);
+    if (mapped) return mapped;
+    const pathOwner = ownerForTargetPath(item.path);
+    if (pathOwner) return pathOwner;
+    // Legacy snapshots without collection provenance retain the active scope.
+    return resolveBookmarkOwner(item, bookmarkScope);
+  }, [bookmarkOwnerMap.byObject, bookmarkScope, ownerForTargetPath]);
+
+  const ownedRowsForOwner = useCallback((owner: ExplorerBookmarkScope) =>
+    allOwnedBookmarks.filter((row) => ownersMatch(row.owner, owner)),
+  [allOwnedBookmarks]);
+
+  // A context menu can outlive the collection that produced it (for example,
+  // when a shared Space changes before the user clicks Rename/Delete).  Clear
+  // the menu on every principal/Space/tab transition and also verify the row
+  // still exists in the current owner collection before mutating it.
+  useEffect(() => {
+    const timer = window.setTimeout(() => setContextMenu(null), 0);
+    return () => window.clearTimeout(timer);
+  }, [currentBookmarkScopeIdentity, filerTab, scopeKey, userId]);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const handleDocumentPointer = (event: globalThis.MouseEvent) => {
+      const target = event.target;
+      if (target instanceof Node && contextMenuRef.current?.contains(target)) return;
+      setContextMenu(null);
+    };
+    document.addEventListener("mousedown", handleDocumentPointer);
+    document.addEventListener("click", handleDocumentPointer);
+    return () => {
+      document.removeEventListener("mousedown", handleDocumentPointer);
+      document.removeEventListener("click", handleDocumentPointer);
+    };
+  }, [contextMenu]);
+
+  const currentOwnedBookmarkRow = useCallback((item: ExplorerBookmark) => {
+    const owner = ownerForBookmark(item);
+    return allOwnedBookmarks.find((row) =>
+      ownersMatch(row.owner, owner) &&
+      (item.id ? row.item.id === item.id : normalizeBookmarkPath(row.item.path) === normalizeBookmarkPath(item.path)),
+    ) ?? null;
+  }, [allOwnedBookmarks, ownerForBookmark]);
 
   const bookmarkTree = useMemo(
     () => (filerTab === "hydrus" ? [] : buildExplorerBookmarkTree(visibleBookmarks as ExplorerBookmark[])),
@@ -647,7 +823,14 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("このFilesタブではブックマーク登録を利用できません");
       return false;
     }
-    if (!isPathInFilesScope(path) || (!isAdmin && isAbsolutePath(path)) || isHfPath(path) !== (filerTab === "hf")) {
+    const listingAuthorizesAbsolute = browseData?.is_admin_mode === true;
+    if (
+      isHfPath(path) !== (filerTab === "hf") ||
+      // Keep the existing client-side UX guard for principals that are not
+      // allowed to browse absolute paths. The backend authorization remains
+      // authoritative; this does not grant any new filesystem access.
+      (!isAdmin && !listingAuthorizesAbsolute && isAbsolutePath(path))
+    ) {
       reportSidebarGuard("この場所はブックマーク登録の対象外です");
       return false;
     }
@@ -655,8 +838,35 @@ export function FilesBookmarkLauncherSidebar() {
       reportSidebarGuard("Filesの一覧を読み込み中です。完了後にもう一度お試しください");
       return false;
     }
+    // Registration is still restricted to the directory currently loaded in
+    // the authorized Files listing (or a directory being dropped from that
+    // listing).  This preserves the existing invalid/stale target guard while
+    // allowing external absolute paths that the backend already authorized.
+    const normalizedPath = normalizeScopePath(path);
+    const listingContainsPath =
+      normalizeScopePath(browseData?.current_path ?? "") === normalizedPath ||
+      Boolean(browseData?.directories.some((entry) => normalizeScopePath(entry.path) === normalizedPath));
+    if (!listingContainsPath) {
+      reportSidebarGuard("この場所はブックマーク登録の対象外です");
+      return false;
+    }
+    const owner = ownerForTargetPath(path);
+    if (!owner) {
+      reportSidebarGuard("この場所はブックマーク登録の対象外です");
+      return false;
+    }
+    if (parentId !== undefined) {
+      const parentRow = allOwnedBookmarks.find((row) => row.item.id === parentId);
+      if (!parentRow || !ownersMatch(owner, parentRow.owner)) {
+        reportSidebarGuard("異なる所有者のブックマーク階層へは登録できません");
+        return false;
+      }
+    }
     const fallbackName = path.split(/[\\/|]/).filter(Boolean).pop() || "Folder";
-    if (bookmarks.some((item) => item.path === path)) return false;
+    const duplicate = ownedRowsForOwner(owner).some(
+      (row) => normalizeBookmarkPath(row.item.path) === normalizeBookmarkPath(path),
+    );
+    if (duplicate) return false;
     try {
       if (parentId !== undefined) {
         assertApiSuccess(
@@ -665,7 +875,7 @@ export function FilesBookmarkLauncherSidebar() {
             path,
             undefined,
             { parent_id: parentId },
-            bookmarkScope,
+            owner,
           ),
           "ブックマーク登録",
         );
@@ -676,7 +886,7 @@ export function FilesBookmarkLauncherSidebar() {
             path,
             undefined,
             undefined,
-            bookmarkScope,
+            owner,
           ),
           "ブックマーク登録",
         );
@@ -686,12 +896,12 @@ export function FilesBookmarkLauncherSidebar() {
       return false;
     }
     try {
-      await refreshBookmarks();
+      await refreshBookmarksForOwner(owner);
     } catch (error) {
       reportSidebarError("ブックマークは登録済みですが一覧更新に失敗しました", error);
     }
     return true;
-  }, [bookmarks, bookmarkScope, canUseGenericBookmarks, filerTab, isAdmin, isPathInFilesScope, refreshBookmarks, scopeReady]);
+  }, [allOwnedBookmarks, browseData, canUseGenericBookmarks, filerTab, isAdmin, ownerForTargetPath, ownedRowsForOwner, refreshBookmarksForOwner, scopeReady]);
 
   const createBookmarkFolder = useCallback(async (parentId: string | null) => {
     if (!canUseGenericBookmarks) {
@@ -700,6 +910,25 @@ export function FilesBookmarkLauncherSidebar() {
     }
     const nextName = window.prompt("フォルダ名");
     if (nextName == null || !nextName.trim()) return;
+    const parentRow = parentId
+      ? allOwnedBookmarks.find((row) => row.item.id === parentId)
+      : null;
+    if (parentId && !parentRow) {
+      reportSidebarGuard("ブックマークの親フォルダが見つかりません");
+      return;
+    }
+    // A root folder has no parent to constrain its owner.  Prefer the loaded
+    // target's classification, but retain the active collection for the brief
+    // initial/transition render where `currentPath` is empty or virtual-root
+    // shaped and therefore cannot be classified independently.
+    const owner =
+      parentRow?.owner ??
+      ownerForTargetPath(currentPath) ??
+      (parentId === null ? bookmarkScope : null);
+    if (!owner) {
+      reportSidebarGuard("この場所はブックマーク登録の対象外です");
+      return;
+    }
     try {
       assertApiSuccess(
         await explorerAddBookmark(
@@ -707,35 +936,45 @@ export function FilesBookmarkLauncherSidebar() {
           undefined,
           undefined,
           { kind: "folder", parent_id: parentId },
-          bookmarkScope,
+          owner,
         ),
         "フォルダ作成",
       );
-      await refreshBookmarks();
+      await refreshBookmarksForOwner(owner);
     } catch (error) {
       reportSidebarError("フォルダ作成に失敗しました", error);
     }
-  }, [bookmarkScope, canUseGenericBookmarks, refreshBookmarks]);
+  }, [allOwnedBookmarks, bookmarkScope, canUseGenericBookmarks, currentPath, ownerForTargetPath, refreshBookmarksForOwner]);
 
   const moveBookmarkToParent = useCallback(async (bookmarkId: string, parentId: string | null) => {
-    const item = bookmarks.find((entry) => entry.id === bookmarkId);
-    if (!item?.id) return;
+    const row = allOwnedBookmarks.find((entry) => entry.item.id === bookmarkId);
+    const item = row?.item;
+    if (!item?.id || !row) return;
+    const owner = row.owner;
+    const parentRow = parentId
+      ? allOwnedBookmarks.find((entry) => entry.item.id === parentId)
+      : null;
+    if (parentId && (!parentRow || !ownersMatch(owner, parentRow.owner))) {
+      reportSidebarGuard("異なる所有者のブックマーク階層へは移動できません");
+      return;
+    }
     const currentParent = item.parent_id ?? null;
     if (currentParent === parentId) return;
-    if (parentId && isBookmarkDescendantOf(bookmarks, parentId, bookmarkId)) {
+    const ownerBookmarks = ownedRowsForOwner(owner).map((entry) => entry.item);
+    if (parentId && isBookmarkDescendantOf(ownerBookmarks, parentId, bookmarkId)) {
       reportSidebarGuard("自分自身または子フォルダへは移動できません");
       return;
     }
     try {
       assertApiSuccess(
-        await explorerUpdateBookmark(bookmarkId, { parent_id: parentId }, bookmarkScope),
+        await explorerUpdateBookmark(bookmarkId, { parent_id: parentId }, owner),
         "ブックマーク階層変更",
       );
-      await refreshBookmarks();
+      await refreshBookmarksForOwner(owner);
     } catch (error) {
       reportSidebarError("ブックマークの移動に失敗しました", error);
     }
-  }, [bookmarks, bookmarkScope, refreshBookmarks]);
+  }, [allOwnedBookmarks, ownedRowsForOwner, refreshBookmarksForOwner]);
 
   const addLauncher = useCallback(async (path: string, name?: string) => {
     if (!path) return false;
@@ -771,17 +1010,25 @@ export function FilesBookmarkLauncherSidebar() {
       if ("tag" in item) {
         setHydrusBookmarks(removeTagBookmark(item.tag, userId));
       } else if (activeTab === "bookmarks") {
-        if (isExplorerBookmarkFolder(item as ExplorerBookmark)) {
-          const descendantCount = item.id
-            ? countBookmarkDescendants(bookmarks, item.id)
+        const currentRow = currentOwnedBookmarkRow(item as ExplorerBookmark);
+        if (!currentRow) {
+          reportSidebarGuard("ブックマークの所有者が切り替わったため操作を中止しました");
+          return;
+        }
+        const currentItem = currentRow.item;
+        const owner = currentRow.owner;
+        if (isExplorerBookmarkFolder(currentItem)) {
+          const ownerItems = ownedRowsForOwner(owner).map((row) => row.item);
+          const descendantCount = currentItem.id
+            ? countBookmarkDescendants(ownerItems, currentItem.id)
             : 0;
           const message = descendantCount > 0
-            ? `「${item.name}」と配下の ${descendantCount} 件を削除します。よろしいですか？`
-            : `「${item.name}」を削除します。よろしいですか？`;
+            ? `「${currentItem.name}」と配下の ${descendantCount} 件を削除します。よろしいですか？`
+            : `「${currentItem.name}」を削除します。よろしいですか？`;
           if (!window.confirm(message)) return;
         }
-        assertApiSuccess(await explorerRemoveBookmark(item.path, bookmarkScope), "ブックマーク削除");
-        await refreshBookmarks();
+        assertApiSuccess(await explorerRemoveBookmark(currentItem.path, owner), "ブックマーク削除");
+        await refreshBookmarksForOwner(owner);
       } else if (item.id) {
         assertApiSuccess(await explorerRemoveLauncher(item.id, bookmarkScope), "ランチャー削除");
         await reloadLaunchers();
@@ -789,7 +1036,7 @@ export function FilesBookmarkLauncherSidebar() {
     } catch (error) {
       reportSidebarError("項目の削除に失敗しました", error);
     }
-  }, [activeTab, bookmarkScope, bookmarks, refreshBookmarks, reloadLaunchers, userId]);
+  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, ownedRowsForOwner, refreshBookmarksForOwner, reloadLaunchers, userId]);
 
   const renameItem = useCallback(async (item: SidebarItem) => {
     const nextName = window.prompt("表示名を変更", itemName(item));
@@ -798,11 +1045,17 @@ export function FilesBookmarkLauncherSidebar() {
       if ("tag" in item) {
         setHydrusBookmarks(renameTagBookmark(item.tag, nextName, userId));
       } else if (activeTab === "bookmarks" && item.id) {
+        const currentRow = currentOwnedBookmarkRow(item as ExplorerBookmark);
+        if (!currentRow) {
+          reportSidebarGuard("ブックマークの所有者が切り替わったため操作を中止しました");
+          return;
+        }
+        const owner = currentRow.owner;
         assertApiSuccess(
-          await explorerUpdateBookmark(item.id, { name: nextName.trim() }, bookmarkScope),
+          await explorerUpdateBookmark(currentRow.item.id!, { name: nextName.trim() }, owner),
           "ブックマーク名変更",
         );
-        await refreshBookmarks();
+        await refreshBookmarksForOwner(owner);
       } else if (activeTab === "launchers" && item.id) {
         assertApiSuccess(
           await explorerUpdateLauncher(item.id, { name: nextName.trim() }, bookmarkScope),
@@ -813,7 +1066,7 @@ export function FilesBookmarkLauncherSidebar() {
     } catch (error) {
       reportSidebarError("項目名の変更に失敗しました", error);
     }
-  }, [activeTab, bookmarkScope, refreshBookmarks, reloadLaunchers, userId]);
+  }, [activeTab, bookmarkScope, currentOwnedBookmarkRow, refreshBookmarksForOwner, reloadLaunchers, userId]);
 
   const reorder = useCallback(async (offset: -1 | 1) => {
     const item = visibleItems[activeIndex];
@@ -821,11 +1074,13 @@ export function FilesBookmarkLauncherSidebar() {
 
     if (activeTab === "bookmarks" && !("tag" in item) && filerTab !== "hydrus") {
       const bookmark = item as ExplorerBookmark;
+      const owner = ownerForBookmark(bookmark);
       const parentId = bookmark.parent_id ?? null;
       const siblings = sortedByOrder(
-        (visibleBookmarks as ExplorerBookmark[]).filter(
-          (entry) => (entry.parent_id ?? null) === parentId,
-        ),
+        visibleOwnedBookmarks
+          .filter((entry) => ownersMatch(entry.owner, owner))
+          .map((entry) => entry.item)
+          .filter((entry) => (entry.parent_id ?? null) === parentId),
       );
       const siblingIndex = siblings.findIndex((entry) => entry.id === bookmark.id);
       const targetSiblingIndex = siblingIndex + offset;
@@ -839,11 +1094,11 @@ export function FilesBookmarkLauncherSidebar() {
         await Promise.all(reordered.map(async (entry, index) => {
           if (!entry.id) return null;
           return assertApiSuccess(
-            await explorerUpdateBookmark(entry.id, { sort_order: index }, bookmarkScope),
+            await explorerUpdateBookmark(entry.id, { sort_order: index }, owner),
             "ブックマーク並び替え",
           );
         }));
-        await refreshBookmarks();
+        await refreshBookmarksForOwner(owner);
       } catch (error) {
         reportSidebarError("項目の並び替えに失敗しました", error);
         return;
@@ -878,18 +1133,23 @@ export function FilesBookmarkLauncherSidebar() {
       return;
     }
     setActiveIndex(targetIndex);
-  }, [activeIndex, activeTab, bookmarkFlatRows, bookmarkScope, filerTab, refreshBookmarks, reloadLaunchers, userId, visibleBookmarks, visibleItems]);
+  }, [activeIndex, activeTab, bookmarkFlatRows, bookmarkScope, filerTab, ownerForBookmark, refreshBookmarksForOwner, reloadLaunchers, userId, visibleItems, visibleOwnedBookmarks]);
 
   const runBookmark = useCallback((bookmark: ExplorerBookmark) => {
+    const owner = ownerForBookmark(bookmark);
     void executeExplorerBookmark(bookmark, {
       closeEditor,
       navigate,
       focusFilesRoot,
-      selectProjectForPath,
+      owner,
+      // Personal external bookmarks are valid local targets even while a
+      // remote/same-Space Project remains selected. Calling the Project
+      // selector for them would reject the absolute path before navigation.
+      selectProjectForPath: owner.scope === "shared" ? selectProjectForPath : undefined,
     }).catch((error: unknown) => {
       reportSidebarError("ブックマークを開けませんでした", error);
     });
-  }, [closeEditor, navigate, selectProjectForPath]);
+  }, [closeEditor, navigate, ownerForBookmark, selectProjectForPath]);
 
   const runLauncher = useCallback((launcher: ExplorerLauncher) => {
     void (async () => {
@@ -930,9 +1190,16 @@ export function FilesBookmarkLauncherSidebar() {
   }, [activeTab, runBookmark, runLauncher, toggleFolderExpanded, userId]);
 
   const handleQuickLauncherExecute = useCallback((bookmark: ExplorerBookmark) => {
+    quickLauncherFocusFilesRef.current = true;
     runBookmark(bookmark);
     setQuickLauncherOpen(false);
   }, [runBookmark]);
+
+  const handleQuickLauncherOpenChangeComplete = useCallback((open: boolean) => {
+    if (open || !quickLauncherFocusFilesRef.current) return;
+    quickLauncherFocusFilesRef.current = false;
+    focusFilesRoot();
+  }, []);
 
   useEffect(() => {
     if (!quickLauncherOpen) return;
@@ -1151,6 +1418,12 @@ export function FilesBookmarkLauncherSidebar() {
     setContextMenu({ item, x: event.clientX, y: event.clientY });
   };
 
+  const onSidebarBackgroundContextMenu = (event: MouseEvent<HTMLElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setContextMenu({ item: null, x: event.clientX, y: event.clientY });
+  };
+
   return (
     <aside
       className="flex h-full min-h-0 w-full flex-col rounded-lg border border-sidebar-border bg-sidebar-accent/20 p-2"
@@ -1158,6 +1431,7 @@ export function FilesBookmarkLauncherSidebar() {
       data-testid="files-bookmark-launcher-sidebar"
       aria-label="Filesブックマークとランチャー"
       onClick={() => contextMenu && setContextMenu(null)}
+      onContextMenu={onSidebarBackgroundContextMenu}
       onDragOver={(event) => {
         const types = event.dataTransfer.types;
         if (!types.includes(DND_MIME) && !types.includes(DND_BOOKMARK_MIME)) return;
@@ -1166,7 +1440,11 @@ export function FilesBookmarkLauncherSidebar() {
       }}
       onDrop={(event) => void handleDrop(event)}
     >
-      <DropdownMenu open={quickLauncherOpen} onOpenChange={setQuickLauncherOpen}>
+      <DropdownMenu
+        open={quickLauncherOpen}
+        onOpenChange={setQuickLauncherOpen}
+        onOpenChangeComplete={handleQuickLauncherOpenChangeComplete}
+      >
         <DropdownMenuTrigger
           className="sr-only"
           aria-hidden
@@ -1199,6 +1477,7 @@ export function FilesBookmarkLauncherSidebar() {
           data-files-bookmark-quick-launcher
           className="w-auto min-w-[12rem]"
           data-testid="files-bookmark-quick-launcher-menu"
+          finalFocus={quickLauncherFocusFilesRef.current ? false : undefined}
           tabIndex={-1}
         >
           {renderBookmarkQuickLauncherItems(bookmarkTree, handleQuickLauncherExecute)}
@@ -1214,7 +1493,7 @@ export function FilesBookmarkLauncherSidebar() {
           </button>
         )}
       </div>
-      <div className="min-h-0 flex-1 overflow-auto py-2" ref={listNodeRef} role="listbox" aria-label={activeTab === "bookmarks" ? "ブックマーク一覧" : "ランチャー一覧"} onKeyDown={handleListKeyDown} tabIndex={0} data-files-sidebar-list>
+      <div className="min-h-0 flex-1 overflow-auto py-2" ref={listNodeRef} role="listbox" aria-label={activeTab === "bookmarks" ? "ブックマーク一覧" : "ランチャー一覧"} onKeyDown={handleListKeyDown} onContextMenu={onSidebarBackgroundContextMenu} tabIndex={0} data-files-sidebar-list>
         {activeTab === "bookmarks" && filerTab !== "hydrus"
           ? bookmarkFlatRows.map((row, index) => {
             const item = row.node.item;
@@ -1309,13 +1588,30 @@ export function FilesBookmarkLauncherSidebar() {
         <span className="ml-1 text-[10px] text-sidebar-foreground/45">↑↓で並び替え</span>
       </div>
       {contextMenu && (
-        <div className="fixed z-[100] min-w-32 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md" style={{ left: contextMenu.x, top: contextMenu.y }} onClick={(event) => event.stopPropagation()}>
+        <div
+          ref={contextMenuRef}
+          role="menu"
+          data-testid="files-bookmark-launcher-context-menu"
+          className="fixed z-[100] min-w-32 rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md"
+          style={{ left: contextMenu.x, top: contextMenu.y }}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => {
+            event.preventDefault();
+            event.stopPropagation();
+          }}
+          onKeyDown={(event) => {
+            if (event.key !== "Escape") return;
+            event.preventDefault();
+            event.stopPropagation();
+            setContextMenu(null);
+          }}
+        >
           {activeTab === "bookmarks" && filerTab !== "hydrus" && canUseGenericBookmarks && (
             <button
               type="button"
               className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent"
               onClick={() => {
-                const parentId = !("tag" in contextMenu.item) && isExplorerBookmarkFolder(contextMenu.item as ExplorerBookmark)
+                const parentId = contextMenu.item && !("tag" in contextMenu.item) && isExplorerBookmarkFolder(contextMenu.item as ExplorerBookmark)
                   ? contextMenu.item.id ?? null
                   : null;
                 void createBookmarkFolder(parentId);
@@ -1325,8 +1621,12 @@ export function FilesBookmarkLauncherSidebar() {
               <FolderPlus className="size-3" />フォルダを作成
             </button>
           )}
-          <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent" onClick={() => { void renameItem(contextMenu.item); setContextMenu(null); }}><Pencil className="size-3" />名前変更</button>
-          <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-destructive hover:bg-accent" onClick={() => { void removeItem(contextMenu.item); setContextMenu(null); }}><Trash2 className="size-3" />削除</button>
+          {contextMenu.item && (
+            <>
+              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent" onClick={() => { void renameItem(contextMenu.item!); setContextMenu(null); }}><Pencil className="size-3" />名前変更</button>
+              <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-destructive hover:bg-accent" onClick={() => { void removeItem(contextMenu.item!); setContextMenu(null); }}><Trash2 className="size-3" />削除</button>
+            </>
+          )}
           <button type="button" className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-accent" onClick={() => setContextMenu(null)}><MoreHorizontal className="size-3" />閉じる</button>
         </div>
       )}

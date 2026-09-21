@@ -15,8 +15,8 @@ from urllib.parse import urlparse
 
 from src.llm.deployment_resolver import resolve_llm_deployment
 from src.llm.openai_compatible_local_profiles import (
-    llama_cpp_model_profile,
-    llama_cpp_runtime_declared,
+    managed_local_runtime_for_model,
+    openai_compatible_local_base_url,
 )
 from src.llm.sglang_url import resolve_sglang_base_url
 
@@ -80,6 +80,7 @@ class ProviderRuntimeOwnership:
     server_online: Optional[bool] = None
     server_state: str = "unknown"
     endpoint_classification: str = "external"
+    runtime: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -87,7 +88,22 @@ class ProviderRuntimeOwnership:
         return payload
 
 
-def _openai_compatible_local_managed(config: Any, *, model: str | None = None) -> bool:
+def _openai_compatible_local_runtime(
+    config: Any,
+    *,
+    model: str | None = None,
+) -> tuple[str | None, bool]:
+    # Enterprise's external backend is an operator-owned router even when a
+    # stale persisted profile or LLAMA_CPP_AUTO_START=true remains in the
+    # database/environment.  Resolve this before profile/auto-start checks so
+    # AoiTalk never claims the process or rewrites the endpoint.
+    deployment = resolve_llm_deployment(config)
+    if (
+        deployment is not None
+        and deployment.backend == "external"
+        and deployment.effective_provider == "openai_compatible_local"
+    ):
+        return None, False
     selected_model = str(
         model
         or _config_get(config, "openai_compatible_local.model", "")
@@ -95,50 +111,39 @@ def _openai_compatible_local_managed(config: Any, *, model: str | None = None) -
         or ""
     ).strip()
     if selected_model.casefold() == "local-model":
-        return False
-    auto_start = os.getenv(
-        "LLAMA_CPP_AUTO_START",
-        _config_get(config, "openai_compatible_local.llama_cpp.auto_start", True),
-    )
+        return None, False
+
+    runtime = managed_local_runtime_for_model(config, selected_model)
+    if runtime == "freetoken":
+        env_name = "FREETOKEN_AUTO_START"
+        config_key = "openai_compatible_local.freetoken.auto_start"
+    else:
+        env_name = "LLAMA_CPP_AUTO_START"
+        config_key = "openai_compatible_local.llama_cpp.auto_start"
+
+    auto_start: Any = os.getenv(env_name)
     if auto_start is None:
-        auto_start = True
+        auto_start = _config_get(config, config_key, True)
     if isinstance(auto_start, str):
         auto_start = auto_start.strip().lower() in {"1", "true", "yes", "on"}
     if not bool(auto_start):
-        # A known profile describes request capabilities, not ownership of a
-        # manually started endpoint.  Only AoiTalk's auto-start path may
-        # expose process install/delete/stop controls.
-        return False
-    if llama_cpp_model_profile(selected_model):
-        return True
-    raw_runtime = _config_get(config, "openai_compatible_local.llama_cpp", {})
-    runtime_declared = llama_cpp_runtime_declared(raw_runtime)
-    runtime_alias = str(
-        _config_get(config, "openai_compatible_local.llama_cpp.model_alias", "")
-        or _config_get(config, "openai_compatible_local.model", "")
-        or ""
-    ).strip()
-    if bool(
-        runtime_declared
-        and runtime_alias
-        and selected_model.casefold() == runtime_alias.casefold()
-    ):
-        return True
+        return runtime, False
+    if runtime is not None:
+        return runtime, True
 
-    # Personal installations historically treated the default loopback
-    # llama-server endpoint as AoiTalk-managed even before a nested runtime
-    # marker (model_alias/model_path) was persisted.  Keep that compatibility
-    # while remaining conservative for operator-owned endpoints: an explicit
-    # ``auto_start=false`` returned above, and a non-loopback configured URL
-    # is external unless a profile/alias explicitly opts into management.
+    # Preserve the pre-runtime-marker personal llama-server compatibility
+    # without inventing a typed runtime identity.  New typed selections are
+    # determined only by managed_local_runtime_for_model().
     configured_base_url = str(
         _config_get(config, "openai_compatible_local.base_url", "")
         or _config_get(config, "llm_base_url", "")
         or ""
     ).strip()
-    if not configured_base_url:
-        return True
-    return _is_loopback_host(_endpoint_host(configured_base_url))
+    return (
+        None,
+        not configured_base_url
+        or _is_loopback_host(_endpoint_host(configured_base_url)),
+    )
 
 
 def _sglang_managed(config: Any) -> bool:
@@ -230,24 +235,54 @@ def provider_runtime_ownership(
         )
 
     if provider == "openai_compatible_local":
-        managed = _openai_compatible_local_managed(config, model=model)
-        base_url = str(
-            _config_get(config, "openai_compatible_local.base_url", "")
-            or _config_get(config, "llm_base_url", "")
+        selected_model = str(
+            model
+            or _config_get(config, "openai_compatible_local.model", "")
+            or _config_get(config, "llm_model", "")
             or ""
         ).strip()
+        runtime, managed = _openai_compatible_local_runtime(
+            config,
+            model=selected_model,
+        )
+        base_url = openai_compatible_local_base_url(
+            config,
+            model=selected_model,
+        )
         host = _endpoint_host(base_url)
-        endpoint_class = "trusted_local" if _is_loopback_host(host) else "remote"
+        endpoint_class = (
+            "trusted_local"
+            if _is_loopback_host(host)
+            else "remote"
+            if host
+            else "external"
+        )
+        installer_required = bool(
+            managed and runtime == "freetoken" and _IS_WINDOWS
+        )
+        actionable = bool(managed and not installer_required)
         return ProviderRuntimeOwnership(
             provider_id=provider,
             process_owner="managed" if managed else "external",
             managed_runtime=managed,
-            supports_install=managed,
-            supports_delete=managed,
-            supports_stop=managed,
+            supports_install=actionable,
+            supports_delete=actionable,
+            supports_stop=actionable,
             platform_candidate=True,
+            platform_reason=(
+                "FreeToken requires a manual installer on Windows."
+                if installer_required
+                else ""
+            ),
             endpoint_classification=endpoint_class,
-            server_state="managed" if managed else "external",
+            server_state=(
+                "installer_required"
+                if installer_required
+                else "managed"
+                if managed
+                else "external"
+            ),
+            runtime=runtime,
         )
 
     if provider in _EXTERNAL_ONLY_PROVIDERS:

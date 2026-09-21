@@ -326,6 +326,20 @@ def _catalogize_main_route_effort(route: dict[str, Any]) -> dict[str, Any]:
 
 
 def resolve_execution_main_route(config: Any) -> dict[str, Any]:
+    # A fixed Enterprise backend owns the route that can actually execute.
+    # Keep this projection in-memory only: persisted global config and the
+    # request-scoped session override remain available for diagnostics and for
+    # a later Personal/non-fixed deployment.
+    from ..llm.deployment_resolver import resolve_llm_deployment
+
+    deployment = resolve_llm_deployment(config)
+    if deployment is not None and deployment.fixed:
+        return _catalogize_main_route_effort(
+            {
+                "provider": deployment.effective_provider,
+                "model": deployment.effective_model,
+            }
+        )
     main = _main_route(config)
     return _catalogize_main_route_effort(_apply_session_main_route_override(main))
 
@@ -621,6 +635,18 @@ def list_team_execution_profiles(config: Any, team_id: str) -> list[dict[str, An
         None,
     )
     if not team:
+        if clean == "employee":
+            # The code-owned Employee Team is explicitly selectable even in
+            # older saved topology. Offer a phone profile without requiring
+            # the deployment's ordinary chat Main model to become Realtime.
+            # A saved Team (including an empty/disabled profile set) wins.
+            from .live_voice_service import DEFAULT_REALTIME_MODEL
+
+            return [{"profile_id": "realtime", "name": "電話受付 (Realtime)", "enabled": True,
+                     "default_route": {"inherit_model": False, "provider": "openai",
+                                       "model": DEFAULT_REALTIME_MODEL,
+                                       "effort_policy": "default", "effort": ""},
+                     "overrides": {}}]
         return []
     profiles = team.get("execution_profiles") if isinstance(team.get("execution_profiles"), dict) else {}
     return sorted(

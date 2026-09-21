@@ -2,7 +2,12 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { taskApi, type RecurrenceRule, type Task } from "@/lib/task-api";
+import {
+  taskApi,
+  type RecurrenceRule,
+  type Scope,
+  type Task,
+} from "@/lib/task-api";
 import {
   buildRrule,
   parseRrule,
@@ -25,12 +30,14 @@ export function useTaskRecurrence({
   setTask,
   ensureTaskId,
   lifecycleGeneration = 0,
+  browseScope,
 }: {
   effectiveTaskId: string | null;
   onTaskUpdated: () => void;
   setTask: React.Dispatch<React.SetStateAction<Task | null>>;
   ensureTaskId: () => Promise<string | null>;
   lifecycleGeneration?: number;
+  browseScope?: Scope;
 }) {
   const [recurrenceRule, setRecurrenceRule] = useState<RecurrenceRule | null>(
     null,
@@ -131,7 +138,9 @@ export function useTaskRecurrence({
     const requestScope = requestScopeRef.current;
     const requestedTaskId = effectiveTaskId;
     try {
-      const rule = await taskApi.getRecurrence(requestedTaskId);
+      const rule = browseScope
+        ? await taskApi.getRecurrence(requestedTaskId, browseScope)
+        : await taskApi.getRecurrence(requestedTaskId);
       if (!isCurrentScope(requestScope)) return;
       setRecurrenceRule(rule);
       if (rule) {
@@ -162,7 +171,7 @@ export function useTaskRecurrence({
         console.error("繰り返し設定取得失敗:", err);
       }
     }
-  }, [effectiveTaskId, isCurrentScope]);
+  }, [browseScope, effectiveTaskId, isCurrentScope]);
 
   // 曜日トグル
   const toggleWeekday = useCallback((dayKey: string) => {

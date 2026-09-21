@@ -21,6 +21,8 @@ from .handlers.command_handler import CommandHandler
 from .handlers.session_handler import SessionHandler
 from .handlers.voice_handler import VoiceHandler
 from .logging import setup_discord_logging
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
+from ..utils.startup_console import safe_startup_reason, startup_console
 
 logger = logging.getLogger(__name__)
 
@@ -233,10 +235,10 @@ class AoiTalkBot(commands.Bot):
         if not should_sync or self._command_sync_done:
             return
 
-        self._command_sync_done = True
         should_sync_by_config = bool(self.config.get('discord.sync_commands', False))
         sync_global = scope in {'global', 'both', 'guild_and_global'}
         sync_guilds = scope in {'guild', 'both', 'guild_and_global'}
+        sync_succeeded = True
 
         if not sync_global and not sync_guilds:
             logger.warning("Unknown Discord command sync scope '%s'; falling back to guild sync", scope)
@@ -255,6 +257,7 @@ class AoiTalkBot(commands.Bot):
                 logger.info("Synced %d global Discord command(s)", len(synced))
                 _safe_print(f"✅ Discordグローバルコマンド同期: {len(synced)}件")
             except Exception as exc:
+                sync_succeeded = False
                 logger.error("Failed to sync global Discord commands: %s", exc, exc_info=True)
                 _safe_print(f"⚠️ Discordグローバルコマンド同期失敗: {exc}")
 
@@ -272,6 +275,7 @@ class AoiTalkBot(commands.Bot):
                     logger.info("Synced %d Discord command(s) to guild %s", len(synced), guild_id)
                     _safe_print(f"✅ Discordギルドコマンド同期: guild={guild_id}, {len(synced)}件")
                 except Exception as exc:
+                    sync_succeeded = False
                     logger.error(
                         "Failed to sync Discord commands to guild %s: %s",
                         guild_id,
@@ -280,6 +284,13 @@ class AoiTalkBot(commands.Bot):
                     )
                     _safe_print(f"⚠️ Discordギルドコマンド同期失敗: guild={guild_id}, {exc}")
     
+        # on_ready can run again after a reconnect. Only suppress future syncs
+        # after every requested scope actually succeeded. Previously the flag
+        # was set before any API call, so one transient Discord failure could
+        # leave slash commands stale until a full process restart.
+        if sync_succeeded:
+            self._command_sync_done = True
+
     async def on_ready(self) -> None:
         """Bot接続完了時のイベント"""
         logger.info(f'Logged in as {self.user} (ID: {self.user.id})')
@@ -983,42 +994,43 @@ async def run_bot(config: Config) -> None:
     is_debug_mode = os.getenv('DEBUG_MODE', 'false').lower() == 'true' or os.getenv('CLAUDE_CODE_ENVIRONMENT') == 'true'
     
     if not token:
-        _safe_print("\n❌ Discord Bot トークンが設定されていません")
-        _safe_print("\n設定方法:")
-        _safe_print("1. .env.sample を .env にコピーしてください")
-        _safe_print("2. DISCORD_BOT_TOKEN に Discord Bot のトークンを設定してください")
-        _safe_print("3. Discord Developer Portal (https://discord.com/developers/applications) で")
-        _safe_print("   Bot を作成してトークンを取得できます")
-        _safe_print("\n詳細は README.md を参照してください")
+        startup_console.warning(
+            "Discord Bot token is not configured; set DISCORD_BOT_TOKEN to enable it"
+        )
+        logger.info(
+            "Discord Bot token setup guidance: copy .env.sample, create a token in "
+            "the Discord Developer Portal, and review README.md",
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         
         # デバッグモードの場合はモックを使用
         if is_debug_mode:
-            _safe_print("\n🔧 デバッグモード: モックを使用します")
+            logger.info("Discord debug mode: using mock bot", extra=FILE_ONLY_LOG_EXTRA)
             from .discord_bot_mock import run_mock_bot
             await run_mock_bot(config)
             return
         else:
             raise ValueError("Discord bot token not found in environment variables")
-    
+
     # Bot作成
-    _safe_print(f"[DEBUG] Botを作成中...")
+    logger.debug("Creating Discord Bot", extra=FILE_ONLY_LOG_EXTRA)
     bot = AoiTalkBot(config)
-    _safe_print(f"[DEBUG] Bot作成完了")
-    
+    logger.debug("Discord Bot created", extra=FILE_ONLY_LOG_EXTRA)
+
     try:
-        _safe_print(f"[DEBUG] Bot.start()を呼び出し中...")
+        logger.debug("Calling Discord Bot.start()", extra=FILE_ONLY_LOG_EXTRA)
         await bot.start(token)
     except discord.LoginFailure as e:
-        _safe_print("\n❌ Discord Bot のログインに失敗しました")
-        _safe_print("\n考えられる原因:")
-        _safe_print("1. トークンが無効または期限切れです")
-        _safe_print("2. インターネット接続に問題があります")
-        _safe_print("3. Discord APIがダウンしている可能性があります")
-        _safe_print(f"\nエラー詳細: {e}")
+        startup_console.error(
+            "Discord Bot login failed; verify the token, network, and Discord API status"
+        )
+        logger.exception("Discord Bot login failed", extra=FILE_ONLY_LOG_EXTRA)
         raise
     except Exception as e:
-        logger.error(f"Failed to start bot: {e}")
-        _safe_print(f"\n❌ Discord Bot の起動に失敗しました: {e}")
+        startup_console.error(
+            f"Discord Bot startup failed: {safe_startup_reason(e)}"
+        )
+        logger.exception("Discord Bot startup failed", extra=FILE_ONLY_LOG_EXTRA)
         raise
     finally:
         # ``AoiTalkBot.close`` owns worker/session/voice cleanup and is

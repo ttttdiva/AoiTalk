@@ -27,6 +27,8 @@ import {
   Trash2,
 } from "lucide-react";
 import {
+  HydrusApiError,
+  hydrusErrorMessage,
   hydrusSearch,
   hydrusGetMetadata,
   type HydrusFileMetadata,
@@ -60,8 +62,19 @@ const HYDRUS_SORT_ASC = false;
 
 interface Props {
   onResults: (data: ExplorerListResponse) => void;
-  onError: (msg: string) => void;
+  onError: (error: HydrusSearchError) => void;
   onPagingChange?: (controller: HydrusPagingController | null) => void;
+  /** Expose a retry action without coupling the parent to search internals. */
+  onRetryChange?: (retry: (() => void) | null) => void;
+}
+
+export interface HydrusSearchError {
+  code?: string;
+  category?: string;
+  status?: number;
+  traceId?: string;
+  message: string;
+  retryable: boolean;
 }
 
 export interface HydrusPageResult {
@@ -111,7 +124,12 @@ const EMPTY_RESULT: ExplorerListResponse = {
   total_items: 0,
 };
 
-export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
+export function HydrusSearchBar({
+  onResults,
+  onError,
+  onPagingChange,
+  onRetryChange,
+}: Props) {
   const { viewMode, setViewMode, isHydrusMode, currentPath, userId } = useExplorer();
   const [stateUserId, setStateUserId] = useState<string | null>(userId);
   const [tagInput, setTagInput] = useState("");
@@ -129,6 +147,10 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
   const activeAbortRef = useRef<AbortController | null>(null);
   const pagingAbortRef = useRef(new AbortController());
   const pageCacheRef = useRef(new Map<string, Promise<HydrusPageResult>>());
+  const retryRef = useRef<(() => void) | null>(null);
+  const runSearchRef = useRef<
+    ((targetTags: string[], targetPage: number) => Promise<void>) | null
+  >(null);
   const principalReady = stateUserId === userId;
   const visibleTags = principalReady ? tags : [];
   const visibleBookmarks = principalReady ? bookmarks : [];
@@ -240,16 +262,46 @@ export function HydrusSearchBar({ onResults, onError, onPagingChange }: Props) {
         const result = await fetchPage(targetTags, targetPage, abort.signal);
         if (generation !== generationRef.current || abort.signal.aborted) return;
         pageCacheRef.current.set(`${result.queryKey}:${targetPage}`, Promise.resolve(result));
+        retryRef.current = null;
         activatePage(result, targetTags);
       } catch (e) {
         if (abort.signal.aborted) return;
-        onError(`Hydrus 検索失敗: ${String(e)}`);
+        retryRef.current = () => {
+          void runSearchRef.current?.([...targetTags], targetPage);
+        };
+        if (e instanceof HydrusApiError) {
+          onError({
+            code: String(e.code),
+            category: e.category,
+            status: e.status,
+            traceId: e.traceId,
+            message: hydrusErrorMessage(
+              e,
+              "Hydrus検索に失敗しました。設定と接続を確認して再試行してください。",
+            ),
+            retryable: e.retryable,
+          });
+        } else {
+          onError({
+            message:
+              "Hydrus検索に失敗しました。設定と接続を確認して再試行してください。",
+            retryable: true,
+          });
+        }
       } finally {
         if (generation === generationRef.current) setLoading(false);
       }
     },
     [activatePage, fetchPage, onError, onResults, queryKey],
   );
+  useEffect(() => {
+    runSearchRef.current = runSearch;
+  }, [runSearch]);
+
+  useEffect(() => {
+    onRetryChange?.(() => retryRef.current?.());
+    return () => onRetryChange?.(null);
+  }, [onRetryChange]);
 
   const loadPage = useCallback(
     async (targetPage: number, activate: boolean) => {

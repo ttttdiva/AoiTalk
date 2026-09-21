@@ -24,6 +24,10 @@ from ...services.project_context import (
     project_context_enabled_for_client,
 )
 from ...services.story_chat_context import is_story_workflow_tool_allowed
+from ...services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    get_turn_context,
+)
 from ...services.user_settings_service import get_user_custom_instructions_sync
 
 logger = logging.getLogger(__name__)
@@ -33,17 +37,33 @@ class AgentSetupMixin:
 
     def _build_instructions(self) -> str:
         """統一的なシステムプロンプトを生成（共通関数を使用）"""
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         # セッションに紐づくRPステアリング設定を取得
-        rp_settings = self._get_current_rp_settings()
+        rp_settings = (
+            None
+            if suppress_automatic_context
+            else self._get_current_rp_settings()
+        )
         project_agents_instructions = None
-        project_context = get_runtime_project_context() or {}
+        project_context = (
+            {}
+            if suppress_automatic_context
+            else get_runtime_project_context() or {}
+        )
         project_id = project_context.get("id")
         # ``runtime_project_context`` is also used by authorization and tool
         # setup.  It must not implicitly publish Project-local AGENTS.md when
         # the current turn explicitly has Project Context OFF.
         # Explicit turn-local state wins; direct provider callers that only
         # set the legacy client flag must also be respected.
-        project_context_visible = project_context_enabled_for_client(self)
+        project_context_visible = (
+            not suppress_automatic_context
+            and project_context_enabled_for_client(self)
+        )
         if project_id and project_context_visible:
             try:
                 from ...services.workspace_agents import load_project_agents_instructions
@@ -60,8 +80,10 @@ class AgentSetupMixin:
             # disables all tools (for example a tool-free free-team model).
             tool_protocol="native",
             rp_settings=rp_settings,
-            custom_instructions=get_user_custom_instructions_sync(
-                self._get_session_user_id()
+            custom_instructions=(
+                None
+                if suppress_automatic_context
+                else get_user_custom_instructions_sync(self._get_session_user_id())
             ),
             project_agents_instructions=project_agents_instructions,
         )
@@ -82,6 +104,15 @@ class AgentSetupMixin:
         return None
 
     def _build_effective_instructions(self, story_chat_context=None) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Help must win over any stale Project/Story/automation override
+            # left on a long-lived client by the preceding ordinary turn.
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+        isolated_override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if isolated_override:
+            return isolated_override
         override = str(getattr(self, "_system_prompt_override", "") or "").strip()
         if override:
             return override
@@ -159,6 +190,10 @@ class AgentSetupMixin:
     def _get_effective_tools_for_current_session(self, story_chat_context=None):
         if not getattr(self, "_native_tools_enabled", True):
             return []
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # AoiTalk Help exposes no provider tools and must not resolve the
+            # active Story session just to filter an already-empty surface.
+            return []
         story_chat_context = (
             story_chat_context or self._get_story_chat_context_sync()
         )
@@ -193,17 +228,24 @@ class AgentSetupMixin:
         previous_system_prompt_override = getattr(
             self, "_system_prompt_override", ""
         )
+        previous_isolated_system_prompt_override = getattr(
+            self, "_isolated_system_prompt_override", ""
+        )
         previous_agent = self.agent
         self.character_name = character_name
         # BaseAssistant は起動時に system prompt override を設定する。
         # これを残したまま agent だけ再生成すると、選択後も旧キャラの
         # prompt が優先され、character_name の切替が実生成へ届かない。
         self._system_prompt_override = ""
+        self._isolated_system_prompt_override = ""
         try:
             self.agent = self._create_character_agent()
         except Exception:
             self.character_name = previous_character_name
             self._system_prompt_override = previous_system_prompt_override
+            self._isolated_system_prompt_override = (
+                previous_isolated_system_prompt_override
+            )
             self.agent = previous_agent
             raise
 
@@ -221,14 +263,21 @@ class AgentSetupMixin:
                 previous_system_prompt_override = getattr(
                     self, "_system_prompt_override", ""
                 )
+                previous_isolated_system_prompt_override = getattr(
+                    self, "_isolated_system_prompt_override", ""
+                )
                 previous_agent = self.agent
                 self.character_name = new_config.get("name", yaml_filename)
                 self._system_prompt_override = ""
+                self._isolated_system_prompt_override = ""
                 try:
                     new_agent = self._create_character_agent()
                 except Exception:
                     self.character_name = previous_character_name
                     self._system_prompt_override = previous_system_prompt_override
+                    self._isolated_system_prompt_override = (
+                        previous_isolated_system_prompt_override
+                    )
                     self.agent = previous_agent
                     raise
                 # Clear conversation history when switching characters
@@ -250,7 +299,20 @@ class AgentSetupMixin:
         Args:
             prompt: System prompt
         """
+        self._isolated_system_prompt_override = ""
         self._system_prompt_override = str(prompt or "").strip()
+        self.agent = self._create_character_agent()
+
+    def set_isolated_system_prompt(self, prompt: str):
+        """Install a turn-local system prompt for isolated agent runs.
+
+        The regular ``set_system_prompt`` path remains the public character
+        prompt override.  Project Automation uses this dedicated entrypoint
+        so the effective-instructions builder can distinguish the ephemeral
+        strict prompt from ambient session state.
+        """
+
+        self._isolated_system_prompt_override = str(prompt or "").strip()
         self.agent = self._create_character_agent()
 
     def set_llm_mode(self, mode: str):
@@ -293,6 +355,8 @@ class AgentSetupMixin:
             List of tool names
         """
         if not getattr(self, "_native_tools_enabled", True):
+            return []
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             return []
         story_chat_context = self._get_story_chat_context_sync()
         apply_story_pack_auto_load(self, story_chat_context)

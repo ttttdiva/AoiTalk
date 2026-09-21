@@ -4,6 +4,12 @@ AoiTalk の Live Voice は、未公開の GPT-Live API ではなく公開中の 
 Realtime API に対する `openai_realtime` provider adapter です。ブラウザへ
 通常の `OPENAI_API_KEY` は返しません。
 
+AI社員のSIP電話受付は、同じLive Voiceのsideband・turn・tool・会話履歴を
+`TelephonyLiveRuntime` から利用します。署名付き着信、AgentRevisionへの結合、
+許可先キーによる転送と監査については
+[AI employee platform](ai_employee_platform.md#telephone-reception) を参照してください。
+以下のブラウザ用認証契約とは別に、電話着信Webhookはprovider署名で検証します。
+
 ## 接続方式
 
 - ブラウザのマイク・スピーカー: WebRTC

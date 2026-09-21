@@ -1,6 +1,6 @@
 # キャラクター音声と Irodori-TTS v3 / v4.1
 
-キャラクター設定画面の Irodori-TTS 部分は、モデル selector と参照音声資産を管理し、`character.voice_parameters` を合成条件へ渡すための統合です。既定 checkpoint は `Aratako/Irodori-TTS-v4.1-Small` ですが、Irodori-TTS v3 VoiceDesign (`Aratako/Irodori-TTS-600M-v3-VoiceDesign`) と既存の v2/v3 checkpoint の互換経路も維持しています。モデル・runtime・依存の詳細は [irodori_tts.md](irodori_tts.md) を参照してください。
+キャラクター設定画面の Irodori-TTS 部分は、モデル selector と参照音声資産を管理し、`character.voice_parameters` を合成条件へ渡すための統合です。既定 checkpoint は `Aratako/Irodori-TTS-v4.1-Small` です。追加 selector `v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` を使います。Irodori-TTS v3 VoiceDesign (`Aratako/Irodori-TTS-600M-v3-VoiceDesign`) と既存の v2/v3 checkpoint の互換経路も維持しています。モデル・runtime・依存の詳細は [irodori_tts.md](irodori_tts.md) を参照してください。
 
 ## 依存と実行時互換
 
@@ -35,7 +35,7 @@ ECC のキャラクター作成・更新 API は次の音声フィールドを�
 | キー | 型 | 意味 |
 | --- | --- | --- |
 | `caption` | string | 声質・感情・話し方の説明。参照音声と併用可能 |
-| `irodori_model` | `v4.1-small` / `v3-voice-design` | 人間向けモデル選択。未指定は v4.1 Small |
+| `irodori_model` | `v4.1-small` / `v4.1-anime` / `v3-voice-design` | 人間向けモデル選択。未指定は v4.1 Small |
 | `no_ref` | boolean | 参照を使わないことの明示。caption だけの Voice Design に使用 |
 | `ref_wav` / `ref_latent` | string | 既存互換の単一 waveform / latent パス |
 | `ref_wavs` / `ref_latents` | string[] | 順序付きの複数参照。waveform と latent は混在不可 |
@@ -129,7 +129,7 @@ prefix は `/api/characters/manage/{character_id}/voice-assets` です。
 
 | method | path | body / 結果 |
 | --- | --- | --- |
-| `POST` | `/api/characters/manage/{character_id}/voice-assets/preview` | JSON `{"text": "読み上げ文", "caption": "任意の上書き", "irodori_model": "v3-voice-design"}`。`text` は必須。selector は未保存の編集中 override として任意指定でき、`audio/wav` を返す |
+| `POST` | `/api/characters/manage/{character_id}/voice-assets/preview` | JSON `{"text": "読み上げ文", "caption": "任意の上書き", "irodori_model": "v4.1-anime"}`。`text` は必須。selector は未保存の編集中 override として任意指定でき、`audio/wav` を返す |
 
 試聴 endpoint はキャラクターの `voice_parameters.irodori_reference_assets` を ID 順に解決し、`caption`（body の値が優先）と selector（body の値が優先）を同じ Irodori engine へ渡します。既存 live engine の checkpoint が要求値と異なる場合は再利用せず、preview 専用 engine を遅延初期化します。重いモデルロードは request worker thread で実行します。
 

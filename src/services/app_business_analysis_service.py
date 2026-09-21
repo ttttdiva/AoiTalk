@@ -14,10 +14,13 @@ inference instead of pretending that a binary or opaque source was understood.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
 import re
+import uuid
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -87,6 +90,23 @@ _TEXT_EXTENSIONS = {
     ".yaml",
     ".yml",
 }
+_UNTRUSTED_ANALYSIS_INSTRUCTION_RE = re.compile(
+    r"(?i)(?:ignore\s+(?:all\s+)?previous|system\s+prompt|developer\s+message|"
+    r"assistant\s*[:=]|execute\s+(?:the\s+)?(?:command|tool|script)|"
+    r"run\s+(?:the\s+)?(?:command|shell|script)|(?:sudo|powershell|cmd\.exe)\b|"
+    r"(?:api[_ -]?key|password|passwd|access[_ -]?token|secret)\s*[:=])"
+)
+
+
+def _safe_analysis_fragment(value: Any, *, limit: int = 700) -> str:
+    """Keep provider prose out of future prompt-instruction channels."""
+
+    text = str(value or "").strip()[: max(0, int(limit))]
+    if not text:
+        return ""
+    if _UNTRUSTED_ANALYSIS_INSTRUCTION_RE.search(text):
+        return "<ADVISORY_REDACTED>"
+    return text
 _DOMAIN_LABELS: tuple[tuple[tuple[str, ...], str], ...] = (
     (("ファイアウォール", "firewall", "ネットワーク", "network", "許可", "拒否", "allow", "deny", "FW"), "ネットワーク・FW申請業務"),
     (("申請", "承認", "稟議"), "申請・承認業務"),
@@ -477,13 +497,21 @@ def _normalize_target_analysis(
         if not isinstance(raw, dict):
             return dict(fallback_pair)
         return {
-            "label": _clip(raw.get("label"), 120) or fallback_pair["label"],
-            "detail": _clip(raw.get("detail"), 500) or fallback_pair["detail"],
+            "label": _safe_analysis_fragment(raw.get("label"), limit=120) or fallback_pair["label"],
+            "detail": _safe_analysis_fragment(raw.get("detail"), limit=500) or fallback_pair["detail"],
         }
 
-    purpose = _clip(value.get("purpose"), 700) or fallback["purpose"]
-    steps = _text_list(value.get("steps"), 240) or fallback["steps"]
-    constraints = _text_list(value.get("constraints"), 240) or fallback["constraints"]
+    purpose = _safe_analysis_fragment(value.get("purpose"), limit=700) or fallback["purpose"]
+    steps = [
+        _safe_analysis_fragment(item, limit=240)
+        for item in _text_list(value.get("steps"), 240)
+    ]
+    steps = [item for item in steps if item] or fallback["steps"]
+    constraints = [
+        _safe_analysis_fragment(item, limit=240)
+        for item in _text_list(value.get("constraints"), 240)
+    ]
+    constraints = [item for item in constraints if item] or fallback["constraints"]
     allowed_evidence = set(available_files)
     evidence_files: list[str] = []
     raw_evidence = value.get("evidence_files")
@@ -652,15 +680,15 @@ def _normalized_analysis(
 ) -> dict[str, Any]:
     def text_at(key: str, fallback: str, limit: int = 700) -> str:
         candidate = value.get(key)
-        return _clip(candidate, limit) or fallback
+        return _safe_analysis_fragment(candidate, limit=limit) or fallback
 
     def pair_at(key: str, fallback_label: str, fallback_detail: str) -> dict[str, str]:
         raw = value.get(key)
         if not isinstance(raw, dict):
             raw = {}
         return {
-            "label": _clip(raw.get("label"), 120) or fallback_label,
-            "detail": _clip(raw.get("detail"), 500) or fallback_detail,
+            "label": _safe_analysis_fragment(raw.get("label"), limit=120) or fallback_label,
+            "detail": _safe_analysis_fragment(raw.get("detail"), limit=500) or fallback_detail,
         }
 
     steps = _text_list(value.get("steps"), 240)
@@ -724,6 +752,276 @@ async def _generate_text(llm_client: Any, prompt: str) -> str:
     raise RuntimeError("Configured LLM client does not support text generation")
 
 
+def _is_external_llm_client(llm_client: Any, *, config: Any | None = None) -> bool:
+    """Return whether a client would use a hosted/provider transport.
+
+    App business analysis historically accepted the long-lived Main client
+    directly.  That is safe only for a verified local runtime.  Hosted
+    analysis must use Cloud Advisor so the canonical outbound privacy
+    transaction remains the sole provider boundary.
+    """
+
+    provider = str(getattr(llm_client, "provider_label", "") or "").strip().casefold()
+    if not provider:
+        # Real runtime clients expose a provider identity.  An anonymous
+        # callback is retained only for config-free embedding/unit seams;
+        # once a runtime config exists, an unknown provider is treated as
+        # external and therefore cannot receive raw source directly.
+        return config is not None or getattr(llm_client, "config", None) is not None
+    if provider in {
+        "ollama",
+        "openai_compatible_local",
+        "llama_cpp",
+        "llama-cpp",
+        "sglang",
+        "local",
+        "local-model",
+    }:
+        # A provider label alone is not an endpoint trust decision.  Public
+        # or untrusted URLs use the Cloud Advisor path rather than direct
+        # Main analysis.
+        try:
+            from .outbound_privacy_service import provider_classification
+
+            classification = provider_classification(
+                provider,
+                base_url=str(getattr(llm_client, "base_url", "") or ""),
+                trusted_local_hosts=(),
+            )
+            return classification != "local"
+        except Exception:
+            return True
+    # CLI wrappers may invoke hosted providers despite a local process.  They
+    # are external sinks and therefore may not receive source excerpts via a
+    # direct Main call.
+    if provider in {"codex-cli", "claude-cli", "grok-cli", "antigravity-cli"}:
+        return True
+    return True
+
+
+async def _cloud_analysis_text(
+    *,
+    config: Any,
+    name: str,
+    description: str,
+    readme: str,
+    evidence: dict[str, Any],
+    session_id: str | None = None,
+    user_id: str | None = None,
+    project_id: str | None = None,
+    cloud_advisor: Any | None = None,
+) -> tuple[str, str]:
+    """Ask the canonical Cloud Advisor using a masked AppProblemIR only."""
+
+    try:
+        from .app_workflow import AppProblemIR, _bounded_json_text, _safe_advisory_text
+        from .workflow_foundation import ProtectedWorkflowContext
+        from .cloud_advisor_service import (
+            CloudAdvisorEscalationAssessment,
+            CloudAdvisorCoordinator,
+            CloudAdvisorRequest,
+            CloudAdvisorTriggerOrigin,
+        )
+        from .turn_context import reset_turn_context, set_turn_context
+
+        # Source excerpts are untrusted evidence and are masked by AppProblemIR
+        # before serialization.  File paths become safe ordinal IDs.
+        analysis_files: dict[str, Any] = {
+            "description": description,
+            "readme": readme,
+        }
+        excerpts = evidence.get("excerpts") if isinstance(evidence, Mapping) else None
+        if isinstance(excerpts, list):
+            for index, item in enumerate(excerpts[:16], start=1):
+                if not isinstance(item, Mapping):
+                    continue
+                content = item.get("content")
+                if content is None:
+                    content = item.get("text")
+                if content is not None:
+                    analysis_files[f"evidence_{index}.txt"] = content
+        # Keep only bounded structural file names; the full evidence mapping
+        # is intentionally not serialized into one untrusted JSON string.
+        problem = AppProblemIR.from_inputs(
+            kind="app",
+            # App names can themselves contain customer identifiers.  Keep
+            # provider-facing intent generic and carry only masked evidence.
+            goal="Analyze the business purpose of the selected App",
+            files=analysis_files,
+        )
+        # Require the shared canonical protected context before any Cloud
+        # Advisor call.  Long source/readme excerpts may contain unlabelled
+        # proprietary text, so regex-only App IR masking is not an egress
+        # authority.
+        foundation = ProtectedWorkflowContext(
+            workflow_kind="app_analysis",
+            config=config,
+            session_context={"session_id": session_id} if session_id else None,
+            project_metadata={"project_id": project_id} if project_id else None,
+            max_nodes=4096,
+            max_items=512,
+        )
+        registration_complete = True
+        count = 0
+        # Very short metadata values (for example a one-character README)
+        # are already represented by the App IR's evidence-token masker.  Do
+        # not register them as foundation literals: the shared boundary's
+        # bounded literal collector intentionally ignores sub-four-character
+        # fragments, and retaining such a node would make the strict workflow
+        # projection validator reject an otherwise safe analysis request.
+        foundation_material = tuple(
+            raw
+            for raw in problem.raw_material[:64]
+            if isinstance(raw, str) and raw and len(raw) >= 4
+        )
+        for index, raw in enumerate(foundation_material, start=1):
+            for offset in range(0, len(raw), 8_000):
+                if count >= 256:
+                    registration_complete = False
+                    break
+                try:
+                    foundation.register(
+                        raw[offset : offset + 8_000],
+                        kind="input",
+                        role="app_analysis_evidence",
+                        stable_key=f"{problem.workflow_id}:analysis:{index}:{offset // 8_000}",
+                        source_kind="app_business_analysis",
+                    )
+                    count += 1
+                except Exception:
+                    registration_complete = False
+            if count >= 256:
+                break
+        expected = sum(
+            max(1, (len(raw) + 7_999) // 8_000)
+            for raw in foundation_material
+        )
+        if len(problem.raw_material) > 64 or expected > 256 or count < expected:
+            registration_complete = False
+        problem = problem.with_foundation_context(
+            foundation,
+            complete=registration_complete,
+        )
+        query_payload = {
+            "schema": "aoitalk.app_business_analysis_projection.v1",
+            "task": "Return a bounded JSON overview only; do not execute actions or request raw source.",
+            "problem": problem.to_cloud_projection(),
+        }
+        query = _bounded_json_text(query_payload)
+        advisor = cloud_advisor or CloudAdvisorCoordinator(config)
+        token = None
+        if session_id or user_id or project_id:
+            token = set_turn_context(
+                user_id=user_id,
+                project_id=project_id,
+                session_id=session_id,
+                message_id=f"app-analysis-{uuid.uuid4().hex}",
+            )
+        try:
+            result = await advisor.consult(
+                CloudAdvisorRequest(
+                    query=query,
+                    trigger_origin=getattr(
+                        CloudAdvisorTriggerOrigin,
+                        "WORKFLOW_CONTROLLER",
+                        CloudAdvisorTriggerOrigin.MAIN_AGENT,
+                    ),
+                    protected_projection=True,
+                    protected_projection_digest=hashlib.sha256(
+                        query.encode("utf-8")
+                    ).hexdigest(),
+                    assessment=CloudAdvisorEscalationAssessment(
+                        multi_constraint_reasoning=True,
+                        cross_domain_synthesis=True,
+                    ),
+                )
+            )
+        finally:
+            try:
+                foundation.close()
+            except Exception:
+                pass
+            if token is not None:
+                reset_turn_context(token)
+        if isinstance(result, Mapping):
+            raw_status = result.get("status", "provider_error")
+            status = getattr(raw_status, "value", None) or str(raw_status or "provider_error")
+            advisory = str(
+                result.get("advisory_text", result.get("advice", result.get("text", "")))
+                or ""
+            )
+        else:
+            status = getattr(getattr(result, "status", None), "value", None) or str(
+                getattr(result, "status", "provider_error") or "provider_error"
+            )
+            advisory = str(getattr(result, "advisory_text", "") or "")
+        # Treat every provider field as untrusted before it reaches Manifest
+        # or README normalization.  Keep only the documented analysis shape;
+        # recursively bound strings through the workflow-aware sanitizer so a
+        # provider cannot smuggle a transformed credential/customer literal in
+        # an otherwise innocuous field.
+        parsed_advisory = _json_object(advisory)
+        if parsed_advisory is not None:
+            for wrapper_key in ("analysis", "overview", "design"):
+                nested = parsed_advisory.get(wrapper_key)
+                if isinstance(nested, Mapping):
+                    parsed_advisory = dict(nested)
+                    break
+            allowed_keys = {
+                "purpose",
+                "audience",
+                "input",
+                "process",
+                "output",
+                "steps",
+                "capabilities",
+                "limitations",
+                "confidence",
+                "targets",
+                "evidence_files",
+                "constraints",
+                "method",
+                "analysis",
+                "overview",
+                "design",
+                "label",
+                "detail",
+                "name",
+                "expected_status",
+                "evidence",
+                "source_id",
+                "path",
+            }
+
+            def sanitize(value: Any, depth: int = 0) -> Any:
+                if depth > 5:
+                    return "<ADVISORY_REDACTED>"
+                if isinstance(value, str):
+                    return _safe_advisory_text(problem, value, limit=2_000)
+                if isinstance(value, Mapping):
+                    return {
+                        str(key): sanitize(child, depth + 1)
+                        for key, child in list(value.items())[:64]
+                        if str(key) in allowed_keys
+                    }
+                if isinstance(value, list):
+                    return [sanitize(child, depth + 1) for child in value[:32]]
+                if value is None or type(value) in {bool, int, float}:
+                    return value
+                return "<ADVISORY_REDACTED>"
+
+            advisory = json.dumps(sanitize(parsed_advisory), ensure_ascii=False)
+        else:
+            advisory = _safe_advisory_text(problem, advisory, limit=120_000)
+        return status, advisory
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "App business analysis Cloud Advisor consultation failed exception_type=%s",
+            type(exc).__name__,
+        )
+        return "provider_error", ""
+
+
 def _analysis_prompt(
     name: str,
     description: str,
@@ -784,6 +1082,11 @@ async def analyze_app_workspace(
     description: str,
     readme: str,
     llm_client: Any = None,
+    config: Any | None = None,
+    cloud_advisor: Any | None = None,
+    session_id: str | None = None,
+    user_id: str | None = None,
+    project_id: str | None = None,
     manifest: dict[str, Any] | None = None,
     evidence: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -815,6 +1118,41 @@ async def analyze_app_workspace(
     )
     if existing_steps:
         fallback["steps"] = existing_steps
+    if llm_client is not None and _is_external_llm_client(llm_client, config=config):
+        # Hosted/provider Main clients are not a valid analysis authority.
+        # Route the bounded, masked projection through the sole Cloud Advisor
+        # coordinator; if it is unavailable, retain the deterministic local
+        # heuristic rather than sending a direct provider request.
+        effective_config = config or getattr(llm_client, "config", None)
+        if effective_config is not None:
+            cloud_status, cloud_text = await _cloud_analysis_text(
+                config=effective_config,
+                name=name,
+                description=description,
+                readme=readme,
+                evidence=evidence,
+                session_id=session_id,
+                user_id=user_id,
+                project_id=project_id,
+                cloud_advisor=cloud_advisor,
+            )
+            if cloud_status.casefold() in {"ok", "success", "completed"} and cloud_text.strip():
+                try:
+                    parsed = _json_object(cloud_text)
+                    if parsed:
+                        fallback = _normalized_analysis(
+                            parsed,
+                            evidence=evidence,
+                            method="cloud_advisor",
+                            target_specs=target_specs,
+                            fallback_steps=fallback.get("steps"),
+                        )
+                except Exception:
+                    logger.warning(
+                        "App business analysis Cloud Advisor result normalization failed"
+                    )
+        llm_client = None
+
     if llm_client is not None:
         raw = ""
         try:
@@ -866,21 +1204,21 @@ def _analysis_markdown(analysis: dict[str, Any]) -> str:
     lines = [
         "## 業務内容の分析",
         "",
-        f"{_clip(analysis.get('purpose'), 700)}",
+        f"{_safe_analysis_fragment(analysis.get('purpose'), limit=700)}",
         "",
-        f"- 利用者: {_clip(analysis.get('audience'), 300)}",
-        f"- 入力: {_clip(input_data.get('label'), 120)} — {_clip(input_data.get('detail'), 500)}",
-        f"- 処理: {_clip(process_data.get('label'), 120)} — {_clip(process_data.get('detail'), 500)}",
-        f"- 出力: {_clip(output_data.get('label'), 120)} — {_clip(output_data.get('detail'), 500)}",
+        f"- 利用者: {_safe_analysis_fragment(analysis.get('audience'), limit=300)}",
+        f"- 入力: {_safe_analysis_fragment(input_data.get('label'), limit=120)} — {_safe_analysis_fragment(input_data.get('detail'), limit=500)}",
+        f"- 処理: {_safe_analysis_fragment(process_data.get('label'), limit=120)} — {_safe_analysis_fragment(process_data.get('detail'), limit=500)}",
+        f"- 出力: {_safe_analysis_fragment(output_data.get('label'), limit=120)} — {_safe_analysis_fragment(output_data.get('detail'), limit=500)}",
         "",
         "### 利用手順",
-        *[f"{index}. {_clip(item, 240)}" for index, item in enumerate(analysis.get("steps", []), start=1)],
+         *[f"{index}. {_safe_analysis_fragment(item, limit=240)}" for index, item in enumerate(analysis.get("steps", []), start=1)],
         "",
         f"> 分析方法: {'LLMによるソース分析' if analysis.get('method') == 'llm' else 'ファイル構成からの初期推測'}（信頼度 {float(analysis.get('confidence') or 0):.0%}）",
     ]
     limitations = analysis.get("limitations")
     if isinstance(limitations, list) and limitations:
-        lines.extend(["", "### 分析上の注意", *[f"- {_clip(item, 240)}" for item in limitations]])
+        lines.extend(["", "### 分析上の注意", *[f"- {_safe_analysis_fragment(item, limit=240)}" for item in limitations]])
     return "\n".join(lines).strip() + "\n"
 
 
@@ -896,6 +1234,48 @@ def merge_analysis_into_readme(readme: str, analysis: dict[str, Any]) -> str:
         sections = [part for part in (prefix, generated.strip(), suffix) if part]
         return "\n\n".join(sections).strip() + "\n"
     return f"{current}\n\n{generated}".strip() + "\n"
+
+
+def _sanitize_persisted_analysis(
+    analysis: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Defensively scrub analysis text before Manifest persistence."""
+
+    raw_literals: list[str] = []
+    if isinstance(evidence, Mapping):
+        for collection_key in ("excerpts", "binary_files"):
+            collection = evidence.get(collection_key)
+            if isinstance(collection, list):
+                for item in collection[:_MAX_FILES]:
+                    if not isinstance(item, Mapping):
+                        continue
+                    for field_name in ("content", "text", "path"):
+                        candidate = item.get(field_name)
+                        if isinstance(candidate, str) and len(candidate) >= 3:
+                            raw_literals.append(candidate)
+
+    def scrub(value: Any, depth: int = 0) -> Any:
+        if depth > 6:
+            return "<ADVISORY_REDACTED>"
+        if isinstance(value, str):
+            text = _safe_analysis_fragment(value, limit=2_000)
+            for literal in sorted(set(raw_literals), key=len, reverse=True):
+                text = text.replace(literal, "<LOCAL_VALUE>")
+            return text
+        if isinstance(value, Mapping):
+            return {
+                str(key): scrub(child, depth + 1)
+                for key, child in list(value.items())[:64]
+            }
+        if isinstance(value, list):
+            return [scrub(child, depth + 1) for child in value[:64]]
+        if value is None or type(value) in {bool, int, float}:
+            return value
+        return "<ADVISORY_REDACTED>"
+
+    result = scrub(analysis)
+    return result if isinstance(result, dict) else {}
 
 
 def write_analysis_to_manifest(
@@ -917,7 +1297,7 @@ def write_analysis_to_manifest(
     if not isinstance(raw, dict):
         raise ValueError("aoitalk.app.yaml はobjectでなければなりません")
     updated = dict(raw)
-    normalized_analysis = dict(analysis)
+    normalized_analysis = _sanitize_persisted_analysis(analysis, evidence)
     previous_overview = raw.get("overview")
     if not _text_list(normalized_analysis.get("steps"), 240):
         previous_steps = _text_list(

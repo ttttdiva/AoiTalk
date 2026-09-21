@@ -12,6 +12,11 @@ import certifi
 import httpx
 
 from ..services.url_ingest_service import UrlIngestService
+from ..services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    get_privacy_policy_context,
+)
 
 
 async def safe_webhook_request(
@@ -20,24 +25,67 @@ async def safe_webhook_request(
     *,
     json_payload: Optional[Any] = None,
     timeout_seconds: float = 30.0,
+    config: Any | None = None,
+    privacy_gateway: OutboundPrivacyGateway | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
 ) -> httpx.Response:
     """公開 URL のみへ IP ピン留めした HTTP リクエストを送る。"""
     del timeout_seconds  # pinned request uses fixed connect/read timeouts
+    if privacy_gateway is None:
+        context = get_privacy_policy_context()
+        inherited_session = context.session_context or {}
+        privacy_gateway = OutboundPrivacyGateway(
+            config,
+            user_id=str(user_id or ""),
+            session_id=str(
+                session_id
+                or inherited_session.get("session_id")
+                or inherited_session.get("id")
+                or ""
+            ),
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
     current = url
+    active_payload = json_payload
     normalized_method = str(method or "POST").upper()
     for _ in range(8):
         parts, address = await UrlIngestService._resolve_public_url(current)
-        response = await asyncio.to_thread(
-            _pinned_request,
-            parts,
-            address,
-            method=normalized_method,
-            json_payload=json_payload,
+        approved_payload: dict[str, Any] = {}
+
+        async def _send(final_payload: Any) -> httpx.Response:
+            # Capture exactly what the gateway approved so a subsequent
+            # redirect is a fresh transaction over the already-approved body.
+            approved_payload["value"] = final_payload
+            return await asyncio.to_thread(
+                _pinned_request,
+                parts,
+                address,
+                method=normalized_method,
+                json_payload=final_payload,
+            )
+
+        response = await privacy_gateway.execute(
+            active_payload,
+            provider="heartbeat_webhook",
+            descriptor=EgressDescriptor(
+                action="heartbeat.webhook",
+                transport="http.client",
+                destination=parts.geturl(),
+                provider="heartbeat_webhook",
+            ),
+            base_url=parts.geturl(),
+            source_kind="heartbeat_webhook",
+            sender=_send,
         )
         if response.is_redirect:
             location = response.headers.get("location")
             if not location:
                 return response
+            if "value" in approved_payload:
+                active_payload = approved_payload["value"]
             current = urljoin(current, location)
             continue
         return response

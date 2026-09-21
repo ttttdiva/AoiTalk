@@ -6,9 +6,14 @@ import asyncio
 import queue
 import threading
 import time
+import logging
 import numpy as np
 from collections import deque
 from typing import Optional, Callable, Any
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceHandler:
@@ -80,7 +85,11 @@ class VoiceHandler:
             from ..tools.keyword.initializer import setup_keyword_detection
             setup_keyword_detection(self.config)
         except Exception as e:
-            print(f"[VoiceHandler] キーワード検出システムの初期化に失敗: {e}")
+            logger.warning(
+                "[VoiceHandler] キーワード検出システムの初期化に失敗: %s",
+                e,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             # エラーが発生してもvoice_handlerは動作を続行
         
     def set_audio_callback(self, callback: Callable):

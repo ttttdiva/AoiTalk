@@ -3,7 +3,7 @@ Pydantic models for configuration
 """
 
 from typing import Dict, Any, Optional, List
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class LLMConfig(BaseModel):
@@ -48,8 +48,18 @@ class MemoryConfig(BaseModel):
     """Configuration for memory management"""
     enabled: bool = Field(default=True, description="Enable memory")
     enable_search: bool = Field(default=True, description="Enable search")
-    embedding_model: str = Field(default="all-MiniLM-L6-v2", description="Embedding model")
     max_memory_items: int = Field(default=1000, ge=1, description="Maximum memory items")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _drop_retired_embedding_settings(cls, value):
+        """Do not retain removed embedding selectors as permitted extras."""
+        if not isinstance(value, dict):
+            return value
+        cleaned = dict(value)
+        cleaned.pop("embedding_model", None)
+        cleaned.pop("preload_embedding_model", None)
+        return cleaned
     
     model_config = ConfigDict(extra="allow")
 

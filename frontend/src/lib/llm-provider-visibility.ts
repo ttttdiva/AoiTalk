@@ -1,5 +1,3 @@
-import type { UserSettings } from "./user-settings";
-
 export const LLM_PROVIDER_VISIBILITY_KEY = "llm_provider_visibility";
 
 /**
@@ -53,10 +51,11 @@ export function normalizeProviderId(value: unknown): string | null {
 }
 
 /** Read and normalize the user's hidden provider list. */
-export function normalizeHiddenProviderIds(
-  settings: UserSettings | null | undefined,
-): string[] {
-  const rawVisibility = settings?.[LLM_PROVIDER_VISIBILITY_KEY];
+export function normalizeHiddenProviderIds(settings: unknown): string[] {
+  if (!isRecord(settings)) return [];
+  const rawVisibility = isRecord(settings[LLM_PROVIDER_VISIBILITY_KEY])
+    ? settings[LLM_PROVIDER_VISIBILITY_KEY]
+    : settings;
   if (!isRecord(rawVisibility)) return [];
 
   const rawIds = (rawVisibility as ProviderVisibilitySettings).hidden_provider_ids;
@@ -77,7 +76,7 @@ export function normalizeHiddenProviderIds(
  */
 export function filterVisibleProviders<T>(
   providers: readonly T[] | null | undefined,
-  settings: UserSettings | null | undefined,
+  settings: unknown,
   preserveProviderIds: Iterable<unknown> = [],
   getProviderId: (provider: T) => unknown = (provider) =>
     (provider as { id?: unknown }).id,
@@ -85,21 +84,21 @@ export function filterVisibleProviders<T>(
   const hiddenIds = new Set(normalizeHiddenProviderIds(settings));
   if (!hiddenIds.size) return Array.from(providers ?? []);
 
-  const preservedIds = new Set<string>();
-  for (const rawId of preserveProviderIds) {
-    const providerId = normalizeProviderId(rawId);
-    if (providerId) preservedIds.add(providerId);
-  }
+  // ``preserveProviderIds`` is retained in the signature for source
+  // compatibility, but hidden providers must not be reintroduced merely
+  // because they are currently selected.  Visibility is a presentation
+  // preference, not a route/authorization policy.
+  void preserveProviderIds;
 
   return (providers ?? []).filter((provider) => {
     const providerId = normalizeProviderId(getProviderId(provider));
-    return !providerId || !hiddenIds.has(providerId) || preservedIds.has(providerId);
+    return !providerId || !hiddenIds.has(providerId);
   });
 }
 
 export function isProviderHidden(
   providerId: unknown,
-  settings: UserSettings | null | undefined,
+  settings: unknown,
 ): boolean {
   const normalizedId = normalizeProviderId(providerId);
   return normalizedId

@@ -62,7 +62,7 @@ _TOOL_ORDER = (
 class ProjectManagementAgent(BaseAgent):
     """Specialist agent for the built-in project workspace."""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-5.6-luna"):
         super().__init__(model)
 
     def _create_agent(self) -> Agent:
@@ -100,6 +100,8 @@ Behavior rules:
 - When the user asks to add/create/register a task and provides the task content, call create_task. Do not ask for project, category, classification, or priority first.
 - Before calling create_task, derive a concise, human-readable title from the concrete action/event in the provided content.
 - Before creating any task, call search_task_candidates for the selected/current project (optionally with search) and inspect the returned parent_task_id hierarchy. Use get_task only when one candidate needs full detail. Do not repeatedly create new top-level tasks without checking existing work.
+- For a simple deterministic task mutation (including a reservation/booking email that should become one task), use the bounded flow `search_task_candidates` -> one `create_task` with every known title, description, and schedule field -> concise completion. A successful create result that contains the task id and every requested field is authoritative completion evidence: do not call get_task, update_task, or schedule_task merely to verify, reformat, or report it. Only perform a follow-up read or mutation when a required field is missing or mismatched in the create result, or when the user explicitly requests another change; keep any incidental/obsolete tool failure in the audit without reopening an already satisfied request.
+- Never use update_task or schedule_task after create_task just to add reservation dates, times, or details that were already available before creation; pass those values to create_task on the first call. If duplicate search is failed or ambiguous, fail closed and do not create a task. Keep complex project-management and explicitly requested review flows on their existing verification path.
 - If an existing task clearly represents the same outcome or a container that owns the requested work, add the new actionable work beneath it with parent_task_id. Preserve existing parent/child structure and avoid duplicate container tasks.
 - If one new user goal requires multiple actions and no suitable existing root exists, create one outcome-oriented top-level task and create the actionable steps as its subtasks. Create separate top-level tasks only for independently deliverable outcomes; a single simple action does not need an extra container.
 - Do not merge or reparent tasks merely because their titles are similar. When containment is ambiguous, keep them separate rather than guessing. Cross-cutting relationships or dependencies are not parent/child containment.

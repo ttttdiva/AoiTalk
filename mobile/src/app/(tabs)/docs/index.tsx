@@ -37,7 +37,9 @@ type SearchResult = { id: string; title: string; subtitle?: string };
 
 export default function DocsListScreen() {
   const router = useRouter();
-  const online = useNetworkStore((state) => state.online);
+  // AoiTalk may be reachable on the current LAN even when Android reports no
+  // Internet access.  This gate is for the server path, not the Internet.
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const [pages, setPages] = useState<DocsNode[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);

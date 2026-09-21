@@ -20,6 +20,12 @@ type NullableRouteFields = {
   effort?: string | null;
 };
 
+const STRICT_RUNTIME_PROVIDERS = new Set([
+  "openai_compatible_local",
+  "ollama",
+  "sglang",
+]);
+
 export function normalizeRouteFragment(
   route: SessionMainRoute | RouteFragment | NullableRouteFields | null | undefined,
 ): RouteFragment {
@@ -40,7 +46,13 @@ export function getModelEffortOptionsFromCatalog(
   const normalizedModel = model.trim();
   if (!normalizedProvider || !normalizedModel) return [];
   const providerEntry = catalog?.providers?.find((item) => item.id === normalizedProvider);
-  const modelEntry = providerEntry?.models?.find((item) => item.id === normalizedModel);
+  const modelCatalog = Array.isArray(providerEntry?.chat_models)
+    ? providerEntry.chat_models
+    : providerEntry &&
+        !STRICT_RUNTIME_PROVIDERS.has(providerEntry.id.trim().toLowerCase())
+      ? providerEntry.models
+      : undefined;
+  const modelEntry = modelCatalog?.find((item) => item.id === normalizedModel);
   if (normalizedProvider === "openai_compatible_local") {
     const modelHasProfileContract = Boolean(
       modelEntry?.reasoning_effort_default && modelEntry?.reasoning_effort_wire,
@@ -184,7 +196,13 @@ export function resolveEffortForModel(
   const options = getModelEffortOptionsFromCatalog(catalog, provider, model);
   if (options.length === 0) return undefined;
   const providerEntry = catalog?.providers?.find((item) => item.id === provider.trim().toLowerCase());
-  const modelEntry = providerEntry?.models?.find((item) => item.id === model.trim());
+  const modelCatalog = Array.isArray(providerEntry?.chat_models)
+    ? providerEntry.chat_models
+    : providerEntry &&
+        !STRICT_RUNTIME_PROVIDERS.has(providerEntry.id.trim().toLowerCase())
+      ? providerEntry.models
+      : undefined;
+  const modelEntry = modelCatalog?.find((item) => item.id === model.trim());
   const preferred = previousEffort?.trim()
     || modelEntry?.reasoning_effort_default
     || providerEntry?.settings?.reasoning_effort_default

@@ -1,5 +1,6 @@
 import { eq, like } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runBackgroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import {
   docsSqliteAsyncAvailable,
   encodeDocsBoolean,
@@ -61,6 +62,7 @@ import {
   applyRemoteDocsPlacements,
   applyRemoteDocsSupertagFields,
   applyRemoteDocsSupertags,
+  rollbackDocsArchiveOptimistic,
   deleteLocalDocsFieldValue,
   deleteLocalDocsNodeSupertag,
   reconcileDocsFieldsWithServer,
@@ -93,7 +95,7 @@ import type {
   TaskOccurrence,
   TimeEntry,
 } from "../types/api";
-import { useNetworkStore } from "../stores/network";
+import { canAttemptAoiTalkServer } from "../stores/network";
 import { getCachedToken, getToken, getTokenAuthScope } from "../lib/auth";
 import { isApiConnectionError, isApiHttpError } from "../lib/api-client";
 import {
@@ -203,6 +205,145 @@ function enqueueExclusive(operation: () => Promise<void>): Promise<void> {
 
 function getSyncStateKey(authScope: string): string {
   return `__global__:${authScope.slice("auth:".length)}`;
+}
+
+const GENERAL_SYNC_PAGINATION_VERSION = 1;
+// A defensive upper bound for a corrupt/malicious server that keeps issuing
+// fresh cursors forever.  Normal full pulls (including the current 1k+ message
+// device dataset) complete in well under 100 pages; exceeding this bound is a
+// recoverable sync failure rather than an unbounded battery/network loop.
+const GENERAL_SYNC_MAX_PAGES = 2_048;
+
+type GeneralSyncCheckpoint = {
+  version: number;
+  /** Missing on checkpoints written by the first v1 build; those are active. */
+  state?: "in_progress" | "complete";
+  since: string | null;
+  serverTime: string | null;
+  /** Safe incremental watermark; null means replay from a full bootstrap. */
+  watermark: string | null;
+  snapshotToken: string | null;
+  pendingTables: SyncTable[];
+  cursors: Record<string, string>;
+};
+
+function getGeneralSyncStateKey(authScope: string): string {
+  return `__general_v1__:${authScope.slice("auth:".length)}`;
+}
+
+async function getGeneralSyncCheckpoint(
+  authScope: string,
+): Promise<GeneralSyncCheckpoint | null> {
+  const db = getDb();
+  const rows = await db
+    .select()
+    .from(schema.syncState)
+    .where(eq(schema.syncState.tableName, getGeneralSyncStateKey(authScope)));
+  const raw = rows[0]?.cursor;
+  if (!raw) return null;
+  const parsed = parseJsonRecord<Partial<GeneralSyncCheckpoint> | null>(raw, null);
+  if (!parsed || parsed.version !== GENERAL_SYNC_PAGINATION_VERSION) return null;
+  if (
+    parsed.state != null
+    && parsed.state !== "in_progress"
+    && parsed.state !== "complete"
+  ) {
+    return null;
+  }
+  if (
+    !Array.isArray(parsed.pendingTables)
+    || parsed.pendingTables.some(
+      (table) => !TABLES.includes(table as SyncTable),
+    )
+  ) {
+    return null;
+  }
+  // Completion markers written before the late-commit safeguard did not
+  // record whether their wall-clock watermark was safe.  Treat those rows as
+  // legacy state and bootstrap afresh rather than trusting a value that may
+  // have skipped an in-flight transaction.
+  if (
+    parsed.state === "complete"
+    && !Object.prototype.hasOwnProperty.call(parsed, "watermark")
+  ) {
+    return null;
+  }
+  const pendingTables = parsed.pendingTables as SyncTable[];
+  const cursors = parsed.cursors && typeof parsed.cursors === "object"
+    ? Object.fromEntries(
+        Object.entries(parsed.cursors).filter(
+          ([table, cursor]) =>
+            TABLES.includes(table as SyncTable) && typeof cursor === "string",
+        ),
+      )
+    : {};
+  return {
+    version: GENERAL_SYNC_PAGINATION_VERSION,
+    state: parsed.state === "complete" ? "complete" : "in_progress",
+    since: typeof parsed.since === "string" ? parsed.since : null,
+    serverTime: typeof parsed.serverTime === "string" ? parsed.serverTime : null,
+    watermark:
+      typeof parsed.watermark === "string" ? parsed.watermark : null,
+    snapshotToken:
+      typeof parsed.snapshotToken === "string" ? parsed.snapshotToken : null,
+    pendingTables,
+    cursors,
+  };
+}
+
+async function saveGeneralSyncCheckpoint(
+  authScope: string,
+  checkpoint: GeneralSyncCheckpoint,
+): Promise<void> {
+  const db = getDb();
+  const tableName = getGeneralSyncStateKey(authScope);
+  await db
+    .insert(schema.syncState)
+    .values({
+      tableName,
+      lastPulledAt: null,
+      lastPushedAt: null,
+      cursor: JSON.stringify(checkpoint),
+    })
+    .onConflictDoUpdate({
+      target: schema.syncState.tableName,
+      set: { cursor: JSON.stringify(checkpoint) },
+    });
+}
+
+async function markGeneralSyncCheckpointComplete(
+  authScope: string,
+  serverTime: string,
+  watermark: string | null,
+): Promise<void> {
+  const db = getDb();
+  const tableName = getGeneralSyncStateKey(authScope);
+  // Keep a durable completion marker instead of clearing the row.  A missing
+  // marker means this account may still carry a legacy one-shot watermark that
+  // truncated a large pull; the first v1 run must therefore bootstrap from
+  // since=null.  Subsequent runs can safely use the global incremental clock.
+  const marker = JSON.stringify({
+    version: GENERAL_SYNC_PAGINATION_VERSION,
+    state: "complete",
+    since: null,
+    serverTime,
+    watermark,
+    snapshotToken: null,
+    pendingTables: [],
+    cursors: {},
+  });
+  await db
+    .insert(schema.syncState)
+    .values({
+      tableName,
+      lastPulledAt: null,
+      lastPushedAt: null,
+      cursor: marker,
+    })
+    .onConflictDoUpdate({
+      target: schema.syncState.tableName,
+      set: { cursor: marker },
+    });
 }
 
 // v2 は、旧実装が5,000件で打ち切ったまま進めたDocs同期時刻を一度だけ無効化する。
@@ -809,7 +950,7 @@ async function getLastPulledAt(
 
 async function setLastPulledAt(
   authScope: string,
-  value: string,
+  value: string | null,
   docs = false,
   docsScopeId?: string,
   docsProjectId?: string | null,
@@ -818,7 +959,7 @@ async function setLastPulledAt(
     ? getDocsSyncStateKey(authScope, docsScopeId, docsProjectId)
     : getSyncStateKey(authScope);
   const db = getDb();
-  await db
+  await runBackgroundSqliteWrite(() => db
     .insert(schema.syncState)
     .values({
       tableName,
@@ -829,7 +970,7 @@ async function setLastPulledAt(
     .onConflictDoUpdate({
       target: schema.syncState.tableName,
       set: { lastPulledAt: value },
-    });
+    }));
 }
 
 async function applyPullResponse(
@@ -841,6 +982,7 @@ async function applyPullResponse(
   options: { forceDocs?: boolean; stageDocs?: boolean } = {},
 ): Promise<void> {
   assertSyncExecutionActive(context);
+  await runBackgroundSqliteWrite(async () => {
   const projects = response.tables.projects;
   if (projects) {
     await applyRemoteProjects(projects.changes as unknown as Project[]);
@@ -913,6 +1055,8 @@ async function applyPullResponse(
     await applyRemoteRecordRows(recordRows.changes as unknown as RecordRow[]);
     await applyRecordRowTombstones(recordRows.tombstones);
   }
+
+  });
 
   // ---------- Docs ----------
   // A staged Docs pull is committed by promoteDocsSyncRun only after all
@@ -1437,18 +1581,199 @@ async function applyDocsPullOnce(
   return discoveredScopes;
 }
 
-async function applyGeneralPull(
+async function resetGeneralSyncCheckpoint(authScope: string): Promise<void> {
+  const db = getDb();
+  const tableName = getGeneralSyncStateKey(authScope);
+  await db
+    .insert(schema.syncState)
+    .values({
+      tableName,
+      lastPulledAt: null,
+      lastPushedAt: null,
+      cursor: null,
+    })
+    .onConflictDoUpdate({
+      target: schema.syncState.tableName,
+      set: { cursor: null },
+    });
+}
+
+function isGeneralCheckpointRestartError(error: unknown): boolean {
+  return Boolean(
+    isApiHttpError(error)
+    && (error.status === 400 || error.status === 409)
+    && /general sync/i.test(
+      `${error.message} ${error.responseBody}`,
+    ),
+  );
+}
+
+async function applyGeneralPullOnce(
   authScope: string,
   context: SyncExecutionContext,
 ): Promise<void> {
   assertSyncExecutionActive(context);
-  const since = await getLastPulledAt(authScope);
-  assertSyncExecutionActive(context);
-  const response = await pullSync({ since, tables: TABLES });
-  assertSyncExecutionActive(context);
-  await applyPullResponse(authScope, response, context);
-  assertSyncExecutionActive(context);
-  await setLastPulledAt(authScope, response.server_time);
+  const saved = await getGeneralSyncCheckpoint(authScope);
+  // A terminal checkpoint means every page was committed but the final
+  // lastPulledAt write was interrupted.  Finalize without issuing another
+  // network request; replaying the terminal page is also safe, but avoiding it
+  // keeps process-restart recovery bounded and deterministic.
+  if (
+    saved
+    && saved.state !== "complete"
+    && saved.pendingTables.length === 0
+    && saved.serverTime
+  ) {
+    await setLastPulledAt(authScope, saved.watermark);
+    await markGeneralSyncCheckpointComplete(
+      authScope,
+      saved.serverTime,
+      saved.watermark,
+    );
+    return;
+  }
+
+  // Never trust the legacy global watermark until one bounded v1 run has
+  // completed.  The old one-shot endpoint advanced that watermark even when
+  // its 5,000-row cap truncated the response, so using it here could make
+  // omitted historical rows permanently invisible.
+  const since = saved?.state === "complete"
+    ? await getLastPulledAt(authScope)
+    : saved
+      ? saved.since
+      : null;
+  const hasCompletedMarker = saved?.state === "complete";
+  let pendingTables = !hasCompletedMarker && saved?.pendingTables.length
+    ? [...saved.pendingTables]
+    : [...TABLES];
+  let cursors = !hasCompletedMarker ? { ...(saved?.cursors ?? {}) } : {};
+  let snapshotToken = !hasCompletedMarker ? saved?.snapshotToken ?? null : null;
+  let serverTime = !hasCompletedMarker ? saved?.serverTime ?? null : null;
+  let watermark = !hasCompletedMarker ? saved?.watermark ?? null : null;
+  let watermarkInitialized = Boolean(
+    saved
+    && Object.prototype.hasOwnProperty.call(saved, "watermark"),
+  );
+  const seenPageStates = new Set<string>();
+  let pageCount = 0;
+
+  while (pendingTables.length) {
+    assertSyncExecutionActive(context);
+    pageCount += 1;
+    if (pageCount > GENERAL_SYNC_MAX_PAGES) {
+      throw new Error("一般テーブル同期のページ数上限を超えました");
+    }
+    const pageState = JSON.stringify({
+      pendingTables,
+      cursors,
+      snapshotToken,
+    });
+    if (seenPageStates.has(pageState)) {
+      throw new Error("一般テーブル同期cursorが進みませんでした");
+    }
+    seenPageStates.add(pageState);
+    const response = await pullSync({
+      since,
+      tables: pendingTables,
+      general_pagination: true,
+      ...(snapshotToken ? { general_snapshot_token: snapshotToken } : {}),
+      ...(Object.keys(cursors).length ? { general_cursors: cursors } : {}),
+    });
+    assertSyncExecutionActive(context);
+
+    const isBoundedResponse =
+      response.general_pagination_version === GENERAL_SYNC_PAGINATION_VERSION
+      || Boolean(response.general_snapshot_token);
+    // A response without the additive marker is unsafe: the legacy endpoint
+    // may have truncated a large table at its fixed limit while still
+    // returning a successful HTTP response.  Never advance lastPulledAt from
+    // such a payload; a rolling deployment must be upgraded before v1 sync is
+    // allowed to proceed.
+    if (!isBoundedResponse) {
+      throw new Error("サーバーが一般テーブル分割同期に対応していません");
+    }
+    if (
+      response.general_pagination_version != null
+      && response.general_pagination_version !== GENERAL_SYNC_PAGINATION_VERSION
+    ) {
+      throw new Error("サーバーが一般テーブル分割同期に対応していません");
+    }
+    if (
+      response.general_pagination_version === GENERAL_SYNC_PAGINATION_VERSION
+      && !response.general_snapshot_token
+    ) {
+      throw new Error("一般テーブル同期snapshot tokenがありません");
+    }
+    if (!Object.prototype.hasOwnProperty.call(response, "general_watermark")) {
+      throw new Error("一般テーブル同期watermarkがありません");
+    }
+    const responseWatermark = response.general_watermark ?? null;
+    if (watermarkInitialized && responseWatermark !== watermark) {
+      throw new Error("一般テーブル同期watermarkがページ間で変わりました");
+    }
+    watermark = responseWatermark;
+    watermarkInitialized = true;
+    if (
+      snapshotToken
+      && response.general_snapshot_token
+      && snapshotToken !== response.general_snapshot_token
+    ) {
+      throw new Error("一般テーブル同期snapshot tokenがページ間で変わりました");
+    }
+    snapshotToken = response.general_snapshot_token ?? snapshotToken;
+    serverTime ??= response.server_time;
+
+    for (const table of pendingTables) {
+      if (!response.tables[table]) {
+        throw new Error(`一般テーブル同期ページが欠落しています: ${table}`);
+      }
+    }
+    await applyPullResponse(authScope, response, context);
+    assertSyncExecutionActive(context);
+
+    const nextCursors: Record<string, string> = {};
+    for (const table of pendingTables) {
+      const cursor = response.tables[table]?.cursor;
+      if (cursor) nextCursors[table] = cursor;
+    }
+    const nextPendingTables = Object.keys(nextCursors) as SyncTable[];
+    await saveGeneralSyncCheckpoint(authScope, {
+      version: GENERAL_SYNC_PAGINATION_VERSION,
+      state: "in_progress",
+      since,
+      serverTime,
+      watermark,
+      snapshotToken,
+      pendingTables: nextPendingTables,
+      cursors: nextCursors,
+    });
+    pendingTables = nextPendingTables;
+    cursors = nextCursors;
+  }
+
+  if (!serverTime) {
+    throw new Error("一般テーブル同期server_timeがありません");
+  }
+  await setLastPulledAt(authScope, watermark);
+  await markGeneralSyncCheckpointComplete(authScope, serverTime, watermark);
+}
+
+async function applyGeneralPull(
+  authScope: string,
+  context: SyncExecutionContext,
+): Promise<void> {
+  // ACL membership can change between pages.  The server rejects a stale
+  // scope-bound snapshot; discard that checkpoint and restart once from a
+  // fresh, bounded run rather than leaving the account permanently stuck on
+  // the same 409 response.
+  try {
+    await applyGeneralPullOnce(authScope, context);
+  } catch (error) {
+    if (!isGeneralCheckpointRestartError(error)) throw error;
+    await resetGeneralSyncCheckpoint(authScope);
+    assertSyncExecutionActive(context);
+    await applyGeneralPullOnce(authScope, context);
+  }
 }
 
 async function saveDocsWorkspaceId(
@@ -1699,7 +2024,7 @@ async function applyDocsPull(
 export async function forceDocsResync(
   onProgress?: DocsResyncProgressHandler,
 ): Promise<void> {
-  if (!useNetworkStore.getState().online) {
+  if (!canAttemptAoiTalkServer()) {
     throw new Error("サーバーに接続してからDocsを再構築してください");
   }
   const token = await getToken();
@@ -1720,7 +2045,7 @@ export async function forceDocsResync(
     if (!currentToken || getTokenAuthScope(currentToken) !== authScope) {
       throw new Error("認証状態が変わったため、Docs再構築を中止しました");
     }
-    if (!useNetworkStore.getState().online) {
+    if (!canAttemptAoiTalkServer()) {
       throw new Error("サーバー接続が失われたため、Docs再構築を中止しました");
     }
     assertSyncExecutionActive(context);
@@ -2185,6 +2510,31 @@ async function flushReorderOutbox(
   }
 }
 
+async function rollbackRejectedDocsDelete(
+  operation: SyncPushOperation | undefined,
+  pendingOperation: PendingOutbox | undefined,
+  result: { entity?: Record<string, unknown> },
+): Promise<boolean> {
+  if (
+    operation?.table !== "knowledge_nodes"
+    || operation.action !== "delete"
+    || result.entity?.archived_at
+  ) {
+    return false;
+  }
+  try {
+    await rollbackDocsArchiveOptimistic(
+      operation.entity_id,
+      pendingOperation?.payload ?? operation.payload,
+    );
+  } catch (error) {
+    // Keep the original server error/conflict visible.  A failed rollback is
+    // logged for diagnostics but must not make the sync loop crash.
+    console.warn("[sync] failed to roll back rejected Docs archive", error instanceof Error ? error.name : "UnknownError");
+  }
+  return true;
+}
+
 async function pushOutbox(
   authScope: string,
   context: SyncExecutionContext,
@@ -2267,6 +2617,20 @@ async function pushOutbox(
           result.status === "conflict" &&
           operation?.table?.startsWith("knowledge_")
         ) {
+          if (await rollbackRejectedDocsDelete(operation, pendingOperation, result)) {
+            await recordOutboxServerSnapshot(
+              currentOperation.tableName,
+              currentOperation.entityId,
+              result.entity ?? { deleted: true },
+              authScope,
+            );
+            await markOutboxConflict(
+              result.op_id,
+              result.reason ?? result.status,
+              result.entity,
+            );
+            continue;
+          }
           const resolution = await resolveDocsConflict(
             currentOperation,
             result.entity,
@@ -2351,6 +2715,20 @@ async function pushOutbox(
 
     if (result.status === "conflict") {
       if (pendingOperation && operation?.table?.startsWith("knowledge_")) {
+        if (await rollbackRejectedDocsDelete(operation, pendingOperation, result)) {
+          await recordOutboxServerSnapshot(
+            operation.table,
+            operation.entity_id,
+            result.entity ?? { deleted: true },
+            authScope,
+          );
+          await markOutboxConflict(
+            result.op_id,
+            result.reason ?? result.status,
+            result.entity,
+          );
+          continue;
+        }
         const resolution = await resolveDocsConflict(
           pendingOperation,
           result.entity,
@@ -2407,6 +2785,7 @@ async function pushOutbox(
     }
 
     if (result.status === "error") {
+      await rollbackRejectedDocsDelete(operation, pendingOperation, result);
       await markOutboxError(result.op_id, result.reason ?? result.status);
     }
   }
@@ -2463,7 +2842,7 @@ function runSyncForToken(token: string | null): Promise<void> {
   if (
     !token ||
     !syncExecutionActive ||
-    !useNetworkStore.getState().online
+    !canAttemptAoiTalkServer()
   ) {
     return completedSync;
   }
@@ -2501,7 +2880,7 @@ function runSyncForToken(token: string | null): Promise<void> {
  */
 export function runSync(): Promise<void> {
   syncRequestCount += 1;
-  if (!syncExecutionActive || !useNetworkStore.getState().online) {
+  if (!syncExecutionActive || !canAttemptAoiTalkServer()) {
     return completedSync;
   }
 

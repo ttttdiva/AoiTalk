@@ -45,6 +45,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
@@ -54,11 +55,14 @@ from src.llm.openai_compatible_local_profiles import (
     MLX_LM_BASE_URL,
     is_macos,
     local_server_profile_for_model,
+    managed_local_runtime_for_model,
     normalize_openai_compatible_base_url,
     openai_compatible_local_base_url,
 )
 from src.features import Features
 from src.utils.startup_timing import get_startup_timer
+from src.utils.startup_console import startup_console
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 
 _startup_timer = get_startup_timer()
@@ -102,6 +106,7 @@ from ._frontend_build import (
     _iter_static_refs_from_text,
     _missing_next_static_assets,
     _next_bin_path,
+    _normalize_frontend_tsconfig_for_fingerprint,
     _normalize_next_static_asset_ref,
     _npm_command,
     _read_frontend_build_fingerprint,
@@ -120,6 +125,16 @@ from ._local_llm_servers import (
     _configured_path,
     _env_bool,
     _env_or_default,
+    _freetoken_base_url,
+    _freetoken_launch_plan,
+    _freetoken_readiness_ready,
+    _freetoken_settings,
+    _should_start_freetoken,
+    _start_freetoken_server,
+    _wait_for_freetoken_readiness,
+    freetoken_managed_launch_configured,
+    freetoken_managed_launch_configuration_error,
+    resolve_freetoken_runtime,
     _exo_launch_plan,
     _is_openai_compatible_local_server_running,
     _LLAMA_CPP_MIN_MUSE_BUILD,
@@ -168,6 +183,10 @@ logger = logging.getLogger(__name__)
 
 _ENTERPRISE_CADDYFILE_MAX_BYTES = 1024 * 1024
 _LLAMA_CPP_ENSURE_LOCK = threading.RLock()
+# A managed llama.cpp launch is allowed to take a long time while the model is
+# loaded.  The startup path only needs a listener before it can continue; the
+# request/generation path performs the stricter /v1/models alias check.
+_LLAMA_CPP_STARTUP_LISTENER_TIMEOUT_SECONDS = 10.0
 _LLAMA_CPP_LEASE_CONDITION = threading.Condition()
 # endpoint -> {"alias": str, "count": int}
 _LLAMA_CPP_GENERATION_LEASES: dict[str, dict[str, object]] = {}
@@ -199,12 +218,26 @@ def _llama_cpp_generation_lease_timeout(
     model: str | None = None,
     overrides: dict[str, object] | None = None,
 ) -> float:
-    settings = _llama_cpp_settings(
+    selected_model = str(
+        model or _openai_compatible_local_model_id(config) or ""
+    ).strip()
+    managed_runtime = managed_local_runtime_for_model(
         config,
-        model=model,
-        overrides=overrides,
-        is_windows=_IS_WINDOWS,
+        selected_model,
     )
+    if managed_runtime == "freetoken":
+        settings = _freetoken_settings(
+            config,
+            model=selected_model,
+            is_windows=_IS_WINDOWS,
+        )
+    else:
+        settings = _llama_cpp_settings(
+            config,
+            model=model,
+            overrides=overrides,
+            is_windows=_IS_WINDOWS,
+        )
     try:
         timeout = float(settings["readiness_timeout"])
     except (KeyError, TypeError, ValueError):
@@ -221,6 +254,35 @@ def _llama_cpp_generation_lease_identity(
     overrides: dict[str, object] | None = None,
 ) -> tuple[str, str] | None:
     """Return (endpoint, alias) when this selection is a managed auto-start target."""
+
+    selected_model = str(
+        model or _openai_compatible_local_model_id(config) or ""
+    ).strip()
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        selected_model,
+    )
+    if managed_runtime == "freetoken":
+        if not _should_start_freetoken(
+            config,
+            model=selected_model,
+            is_windows=_IS_WINDOWS,
+        ):
+            return None
+        settings = _freetoken_settings(
+            config,
+            model=selected_model,
+            is_windows=_IS_WINDOWS,
+        )
+        alias = str(settings.get("model_alias") or "").strip()
+        endpoint = _normalize_llama_cpp_lease_endpoint(
+            _freetoken_base_url(
+                config,
+                model=selected_model,
+                is_windows=_IS_WINDOWS,
+            )
+        )
+        return (endpoint, alias) if endpoint and alias else None
 
     if not _should_start_llama_cpp(
         config,
@@ -266,7 +328,10 @@ def _iter_owned_llama_cpp_lease_endpoints() -> list[str]:
     endpoints: list[str] = []
     seen: set[str] = set()
     for proc in list(_openai_compatible_local_processes):
-        recorded = getattr(proc, "_aoi_llama_cpp_base_url", None)
+        recorded = (
+            getattr(proc, "_aoi_local_base_url", None)
+            or getattr(proc, "_aoi_llama_cpp_base_url", None)
+        )
         if not recorded:
             continue
         endpoint = _normalize_llama_cpp_lease_endpoint(str(recorded))
@@ -629,7 +694,7 @@ def _llama_cpp_launch_args(
     overrides: dict[str, object] | None = None,
     is_windows: bool | None = None,
 ) -> list[str]:
-    """Facade wrapper that respects tests/desktop callers patching _IS_WINDOWS."""
+    """Facade wrapper that lets tests patch _IS_WINDOWS."""
 
     return _build_llama_cpp_launch_args(
         config,
@@ -785,6 +850,127 @@ def _llama_cpp_runtime_conflict(
             "host/portを変更してください。"
         )
     return True, base_url, served_ids
+
+
+def _owned_llama_cpp_process_at(
+    base_url: str,
+    expected_alias: str,
+) -> object | None:
+    """Return a live AoiTalk-owned llama.cpp process for an exact target.
+
+    The persisted runtime settings are mutable (for example during a model
+    hot-switch), so ownership must be established from metadata captured on
+    the tracked process itself.  Endpoint comparison uses the same canonical
+    normalizer as the rest of the local OpenAI-compatible runtime; aliases are
+    intentionally compared exactly because ``/v1/models`` alias matching is
+    case-sensitive.
+    """
+
+    normalized_endpoint = normalize_openai_compatible_base_url(
+        str(base_url or "").strip()
+    )
+    target_alias = str(expected_alias or "").strip()
+    if not normalized_endpoint or not target_alias:
+        return None
+
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            # A process whose liveness cannot be established is not trusted
+            # for ownership decisions.
+            continue
+        if str(getattr(proc, "_aoi_local_runtime", "") or "") != "llama_cpp":
+            continue
+        recorded_endpoint = str(
+            getattr(proc, "_aoi_local_base_url", None)
+            or getattr(proc, "_aoi_llama_cpp_base_url", "")
+            or ""
+        ).strip()
+        if not recorded_endpoint:
+            continue
+        if (
+            normalize_openai_compatible_base_url(recorded_endpoint)
+            != normalized_endpoint
+        ):
+            continue
+        recorded_alias = str(
+            getattr(proc, "_aoi_local_model_alias", "") or ""
+        ).strip()
+        if recorded_alias == target_alias:
+            return proc
+    return None
+
+
+def _wait_for_llama_cpp_startup_listener(
+    proc: object,
+    config: object | None,
+    *,
+    model: str | None = None,
+    overrides: dict[str, object] | None = None,
+) -> None:
+    """Wait only for a newly launched llama-server listener.
+
+    Loading a large GGUF can take substantially longer than the service
+    startup critical path.  This gate deliberately checks the launcher and
+    TCP listener only; strict ``/v1/models`` alias readiness remains the
+    responsibility of request-time recovery (or an explicitly strict launch).
+    """
+
+    settings = _llama_cpp_settings(
+        config,
+        model=model,
+        overrides=overrides,
+        is_windows=_IS_WINDOWS,
+    )
+    base_url = _llama_cpp_base_url(
+        config,
+        model=model,
+        overrides=overrides,
+        is_windows=_IS_WINDOWS,
+    )
+    expected_alias = str(settings.get("model_alias") or "").strip()
+    host, port = _base_url_host_port(base_url)
+    log_path = Path(__file__).resolve().parents[2] / "logs" / "models" / "llama_cpp.log"
+
+    try:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                "llama-serverがlistener起動前に終了しました。"
+                f" endpoint={base_url!r}, expected_alias={expected_alias!r};"
+                f" logs/models/llama_cpp.logを確認してください。"
+            )
+    except AttributeError:
+        # Lightweight process doubles used by integrations may not expose
+        # ``poll``.  _wait_for_process_port still performs the normal probe.
+        pass
+
+    if _wait_for_process_port(
+        proc,
+        host,
+        port,
+        timeout_seconds=_LLAMA_CPP_STARTUP_LISTENER_TIMEOUT_SECONDS,
+    ):
+        return
+
+    try:
+        exited = proc.poll() is not None
+    except AttributeError:
+        exited = False
+    if exited:
+        raise RuntimeError(
+            "llama-serverがlistener起動前に終了しました。"
+            f" endpoint={base_url!r}, expected_alias={expected_alias!r};"
+            f" logs/models/llama_cpp.logを確認してください。"
+        )
+    raise RuntimeError(
+        "llama-serverのlistener起動がtimeoutしました。"
+        f" {_LLAMA_CPP_STARTUP_LISTENER_TIMEOUT_SECONDS:g}秒以内に"
+        f"{host}:{port}で待ち受けを確認できませんでした。"
+        f" expected_alias={expected_alias!r};"
+        f" logs/models/llama_cpp.log tail:\n{_read_log_tail(log_path)}"
+    )
 
 
 def _wait_for_llama_cpp_readiness(
@@ -970,6 +1156,7 @@ def _ensure_llama_cpp_server_unlocked(
 ) -> bool:
     project_root = Path(__file__).resolve().parents[2]
     proc = None
+    started_here = False
     try:
         _validate_llama_cpp_model_alias(
             config,
@@ -977,6 +1164,17 @@ def _ensure_llama_cpp_server_unlocked(
             overrides=overrides,
             is_windows=_IS_WINDOWS,
         )
+        # Resolve the target runtime once for this lifecycle transition.  In
+        # particular, the alias is captured before probing /v1/models so a
+        # process that is still loading can be identified from its own launch
+        # metadata without consulting mutable persisted settings again.
+        runtime_settings = _llama_cpp_settings(
+            config,
+            model=model,
+            overrides=overrides,
+            is_windows=_IS_WINDOWS,
+        )
+        expected_alias = str(runtime_settings.get("model_alias") or "").strip()
         should_start = True
         _base_url = _llama_cpp_base_url(
             config,
@@ -985,12 +1183,6 @@ def _ensure_llama_cpp_server_unlocked(
             is_windows=_IS_WINDOWS,
         )
         if force_restart:
-            runtime_settings = _llama_cpp_settings(
-                config,
-                model=model,
-                overrides=overrides,
-                is_windows=_IS_WINDOWS,
-            )
             # Validate the target before stopping any tracked process.  This
             # rejects an external listener while still permitting an owned
             # old process, including a changed-port transition.
@@ -1012,6 +1204,31 @@ def _ensure_llama_cpp_server_unlocked(
             is_windows=_IS_WINDOWS,
         ):
             return False
+        if not force_restart:
+            # A best-effort startup may have already handed control back while
+            # llama-server is loading its model.  Reuse that exact owned
+            # process rather than treating its empty /v1/models response as a
+            # conflict and launching a second server.  Strict callers wait for
+            # the alias; startup callers intentionally do not.
+            proc = _owned_llama_cpp_process_at(_base_url, expected_alias)
+            if proc is not None:
+                if raise_on_launch_error:
+                    _wait_for_llama_cpp_readiness(
+                        proc,
+                        config,
+                        model=model,
+                        overrides=overrides,
+                    )
+                    setattr(proc, "_aoi_local_readiness_state", "ready")
+                    logger.info("llama-serverの起動とalias確認が完了しました")
+                else:
+                    logger.warning(
+                        "llama-serverはlistener起動済みですがmodelをloading中です。"
+                        " AoiTalkはdegraded状態で起動を継続します: alias=%r, endpoint=%s",
+                        expected_alias,
+                        _base_url,
+                    )
+                return False
         if not force_restart:
             should_start, _base_url, _served_ids = _llama_cpp_runtime_conflict(
                 config,
@@ -1035,22 +1252,256 @@ def _ensure_llama_cpp_server_unlocked(
             overrides=overrides,
             is_windows=_IS_WINDOWS,
         )
-        _wait_for_llama_cpp_readiness(
-            proc,
-            config,
-            model=model,
-            overrides=overrides,
-        )
-        logger.info("llama-serverの起動とalias確認が完了しました")
+        started_here = True
+        if raise_on_launch_error:
+            _wait_for_llama_cpp_readiness(
+                proc,
+                config,
+                model=model,
+                overrides=overrides,
+            )
+            setattr(proc, "_aoi_local_readiness_state", "ready")
+            logger.info("llama-serverの起動とalias確認が完了しました")
+        else:
+            _wait_for_llama_cpp_startup_listener(
+                proc,
+                config,
+                model=model,
+                overrides=overrides,
+            )
+            # This is deliberately a single non-blocking observation.  It can
+            # improve diagnostics when a very fast load has already exposed
+            # the alias, but it must never turn best-effort startup back into
+            # the strict readiness loop.
+            try:
+                observed_ids = _llama_cpp_model_ids_exact(_base_url)
+            except Exception:
+                observed_ids = set()
+            setattr(proc, "_aoi_local_readiness_state", "loading")
+            logger.warning(
+                "llama-server listener起動済み。modelをloading中のため"
+                " AoiTalkはdegraded状態で起動を継続します: alias=%r, endpoint=%s,"
+                " observed_ids=%r",
+                expected_alias,
+                _base_url,
+                sorted(observed_ids),
+            )
         return True
     except Exception as exc:
-        if proc is not None:
+        if started_here and proc is not None:
             _terminate_process_tree(proc)
             _remove_tracked_process(proc)
         if raise_on_launch_error:
             raise
         logger.warning("llama-serverの起動を延期します: %s", exc)
         return False
+
+
+def _owned_local_process_at(
+    base_url: str,
+    *,
+    runtime: str,
+) -> bool:
+    normalized = normalize_openai_compatible_base_url(base_url)
+    for proc in list(_openai_compatible_local_processes):
+        try:
+            if proc.poll() is not None:
+                continue
+        except Exception:
+            continue
+        if str(getattr(proc, "_aoi_local_runtime", "") or "") != runtime:
+            continue
+        recorded = str(
+            getattr(proc, "_aoi_local_base_url", "") or ""
+        ).strip()
+        if recorded and normalize_openai_compatible_base_url(recorded) == normalized:
+            return True
+    return False
+
+
+def _validate_freetoken_manual_connection(
+    config: object | None,
+    *,
+    model: str,
+    base_url: str | None = None,
+) -> None:
+    resolved_base_url = normalize_openai_compatible_base_url(
+        base_url
+        or openai_compatible_local_base_url(
+            config,
+            model=model,
+        )
+    )
+    settings = _freetoken_settings(
+        config,
+        model=model,
+        is_windows=_IS_WINDOWS,
+    )
+    expected_alias = str(settings.get("model_alias") or model).strip()
+    served_ids = _llama_cpp_model_ids_exact(resolved_base_url)
+    if expected_alias in served_ids:
+        return
+    host, port = _base_url_host_port(resolved_base_url)
+    if served_ids:
+        raise RuntimeError(
+            "FreeToken manual接続先は別モデルを提供中です。"
+            f"期待={expected_alias!r}, 実際={sorted(served_ids)!r}。"
+        )
+    if _is_port_open(host, port, timeout_seconds=0.5):
+        raise RuntimeError(
+            "FreeToken manual接続先は応答しましたが、"
+            f"/v1/modelsに期待model {expected_alias!r} がありません。"
+        )
+    raise RuntimeError(
+        "FreeToken manual接続先が起動していません。"
+        f" endpoint={resolved_base_url}"
+    )
+
+
+def _ensure_freetoken_server(
+    config: object | None,
+    *,
+    raise_on_launch_error: bool = False,
+    force_restart: bool = False,
+    model: str | None = None,
+    acquire_generation_lease: bool = False,
+    lease_holder: object | None = None,
+    lease_tickets: list | None = None,
+) -> bool:
+    selected_model = str(
+        model or _openai_compatible_local_model_id(config) or ""
+    ).strip()
+    timeout_seconds = _llama_cpp_generation_lease_timeout(
+        config,
+        model=selected_model,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    identity = _llama_cpp_generation_lease_identity(
+        config,
+        model=selected_model,
+    )
+
+    while True:
+        remaining = max(0.0, deadline - time.monotonic())
+        for endpoint in _llama_cpp_endpoints_requiring_lease_drain(
+            config,
+            model=selected_model,
+            force_restart=force_restart,
+        ):
+            _wait_for_llama_cpp_generation_lease_idle(endpoint, remaining)
+            remaining = max(0.0, deadline - time.monotonic())
+
+        with _LLAMA_CPP_ENSURE_LOCK:
+            drain_endpoints = _llama_cpp_endpoints_requiring_lease_drain(
+                config,
+                model=selected_model,
+                force_restart=force_restart,
+            )
+            if drain_endpoints:
+                if time.monotonic() >= deadline:
+                    _wait_for_llama_cpp_generation_lease_idle(
+                        drain_endpoints[0],
+                        0.0,
+                    )
+                continue
+
+            proc = None
+            try:
+                settings = _freetoken_settings(
+                    config,
+                    model=selected_model,
+                    is_windows=_IS_WINDOWS,
+                )
+                if not bool(settings.get("auto_start")):
+                    _validate_freetoken_manual_connection(
+                        config,
+                        model=selected_model,
+                    )
+                    return False
+
+                if not _should_start_freetoken(
+                    config,
+                    model=selected_model,
+                    is_windows=_IS_WINDOWS,
+                ):
+                    error = freetoken_managed_launch_configuration_error(
+                        config,
+                        model=selected_model,
+                        is_windows=_IS_WINDOWS,
+                    )
+                    if error:
+                        raise RuntimeError(error)
+                    return False
+
+                base_url = _freetoken_base_url(
+                    config,
+                    model=selected_model,
+                    is_windows=_IS_WINDOWS,
+                )
+                alias = str(settings.get("model_alias") or "").strip()
+
+                if not force_restart and _freetoken_readiness_ready(
+                    base_url,
+                    alias,
+                ):
+                    started = False
+                else:
+                    host, port = _base_url_host_port(base_url)
+                    port_open = _is_port_open(host, port, timeout_seconds=0.5)
+                    owned_target = _owned_local_process_at(
+                        base_url,
+                        runtime="freetoken",
+                    )
+
+                    if force_restart and _openai_compatible_local_processes:
+                        stop_openai_compatible_local_servers()
+                    elif port_open and not owned_target:
+                        raise RuntimeError(
+                            "FreeTokenの対象portは外部プロセスが使用中です。"
+                            f"{host}:{port} は停止しません。"
+                        )
+                    elif port_open and owned_target:
+                        _stop_owned_openai_compatible_local_servers_if_unleased(
+                            base_url
+                        )
+
+                    project_root = Path(__file__).resolve().parents[2]
+                    proc = _start_freetoken_server(
+                        project_root,
+                        config=config,
+                        model=selected_model,
+                        is_windows=_IS_WINDOWS,
+                    )
+                    _wait_for_freetoken_readiness(
+                        proc,
+                        config,
+                        model=selected_model,
+                        is_windows=_IS_WINDOWS,
+                    )
+                    logger.info(
+                        "FreeTokenの起動とhealth/model確認が完了しました"
+                    )
+                    started = True
+
+                if acquire_generation_lease and identity is not None:
+                    endpoint, alias = identity
+                    if started or _freetoken_readiness_ready(endpoint, alias):
+                        ticket = _acquire_llama_cpp_generation_lease(
+                            endpoint,
+                            alias,
+                            holder=lease_holder,
+                        )
+                        if lease_tickets is not None:
+                            lease_tickets.append(ticket)
+                return started
+            except Exception as exc:
+                if proc is not None:
+                    _terminate_process_tree(proc)
+                    _remove_tracked_process(proc)
+                if raise_on_launch_error:
+                    raise
+                logger.warning("FreeTokenの起動を延期します: %s", exc)
+                return False
 
 
 def validate_openai_compatible_local_launch_selection(
@@ -1069,6 +1520,43 @@ def validate_openai_compatible_local_launch_selection(
         return
 
     selected_model_id = str(model or _openai_compatible_local_model_id(config)).strip()
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        selected_model_id,
+    )
+
+    if managed_runtime == "freetoken":
+        resolved = resolve_freetoken_runtime(
+            config,
+            model=selected_model_id,
+            is_windows=_IS_WINDOWS,
+        )
+        settings = resolved.get("settings")
+        settings = settings if isinstance(settings, dict) else {}
+        if not bool(settings.get("auto_start", resolved.get("auto_start"))):
+            _validate_freetoken_manual_connection(
+                config,
+                model=selected_model_id,
+                base_url=base_url,
+            )
+            return
+        if resolved.get("state") != "ready":
+            error = freetoken_managed_launch_configuration_error(
+                config,
+                model=selected_model_id,
+                is_windows=_IS_WINDOWS,
+            )
+            raise RuntimeError(
+                error
+                or "選択したFreeToken managed runtimeが未構成です。"
+            )
+        _freetoken_launch_plan(
+            config,
+            model=selected_model_id,
+            is_windows=_IS_WINDOWS,
+        )
+        return
+
     project_root = Path(__file__).resolve().parents[2]
     profile = local_server_profile_for_model(selected_model_id)
     if profile:
@@ -1185,8 +1673,44 @@ def ensure_openai_compatible_local_server(
     when the selected model is still loading or the helper process fails to
     launch; generation-time health handling reports that state to the user.
     """
+    # Enterprise external deployments are owned by the operator.  This guard
+    # is intentionally before runtime/profile resolution so stale managed
+    # settings cannot trigger a local llama.cpp/FreeToken launch.
+    try:
+        from src.llm.deployment_resolver import resolve_llm_deployment
+
+        deployment = resolve_llm_deployment(config)
+        if (
+            deployment is not None
+            and deployment.backend == "external"
+            and deployment.effective_provider == "openai_compatible_local"
+        ):
+            return False
+    except Exception:
+        # Lightweight personal/test configs may not define a deployment; keep
+        # the existing local-runtime path in that case.
+        pass
+
     project_root = Path(__file__).resolve().parents[2]
     base_url = _openai_compatible_local_base_url(config)
+    selected_model = str(
+        model or _openai_compatible_local_model_id(config) or ""
+    ).strip()
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        selected_model,
+    )
+
+    if managed_runtime == "freetoken":
+        return _ensure_freetoken_server(
+            config,
+            model=selected_model,
+            raise_on_launch_error=raise_on_launch_error,
+            force_restart=force_restart,
+            acquire_generation_lease=acquire_generation_lease,
+            lease_holder=lease_holder,
+            lease_tickets=lease_tickets,
+        )
 
     if _should_start_exo_server(config):
         resolved_base_url = _profile_base_url_for_model(config)
@@ -1220,7 +1744,10 @@ def ensure_openai_compatible_local_server(
             return False
         return True
 
-    if _should_start_llama_cpp(config, model=model, is_windows=_IS_WINDOWS):
+    if (
+        managed_runtime == "llama_cpp"
+        or _should_start_llama_cpp(config, model=model, is_windows=_IS_WINDOWS)
+    ):
         return _ensure_llama_cpp_server(
             config,
             model=model,
@@ -1234,8 +1761,8 @@ def ensure_openai_compatible_local_server(
     return False
 
 
-def _should_skip_caddy_for_desktop() -> bool:
-    return _env_bool("AOITALK_SKIP_CADDY") or _env_bool("AOITALK_DESKTOP")
+def _should_skip_caddy() -> bool:
+    return _env_bool("AOITALK_SKIP_CADDY")
 
 
 def _frontend_bind_host() -> str:
@@ -1294,6 +1821,222 @@ def _service_port(
     return port if 1 <= port <= 65535 else default
 
 
+def _site_identity(value: object | None) -> str | None:
+    """Return a hostname/IP identity from a configured Caddy endpoint."""
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").strip().rstrip(".").lower()
+    if host in {"", "0.0.0.0", "::", "*", "localhost"}:
+        return None
+    return host
+
+
+def _windows_certificate_identity(config: object | None = None) -> str | None:
+    """Resolve the explicitly configured public identity used by setup_https."""
+    for value in (
+        os.getenv("AOITALK_CADDY_PUBLIC_URL"),
+        os.getenv("AOITALK_CADDY_SITE_ADDRESS"),
+        os.getenv("AOITALK_CADDY_SITE_LABEL"),
+        _config_get(config, "caddy.public_url", None),
+        _config_get(config, "caddy.site_address", None),
+        _config_get(config, "web_interface.public_host", None),
+    ):
+        identity = _site_identity(value)
+        if identity:
+            return identity
+    domain = os.getenv("DDNS_NOW_DOMAIN", "").strip().lower().rstrip(".")
+    if domain:
+        return domain if domain.endswith(".f5.si") else f"{domain}.f5.si"
+    return None
+
+
+def _discover_windows_certificate_pair(
+    config: object | None = None,
+    *,
+    project_root: Path | None = None,
+) -> tuple[str, str] | None:
+    """Find the valid canonical lego pair for the configured site identity.
+
+    Only the runtime-owned canonical ``certs/certificates`` directory is
+    inspected.  Certificate metadata is public; private-key bytes are never
+    read.  An unconfigured identity or missing pair leaves ownership with
+    Caddy-native HTTPS, while equally ranked matches fail closed.
+    """
+    if not _IS_WINDOWS:
+        return None
+    identity = _windows_certificate_identity(config)
+    root = project_root or Path(__file__).resolve().parents[2]
+    certificate_dir = root / "certs" / "certificates"
+    now = datetime.now(timezone.utc)
+    matches: list[tuple[Path, Path]] = []
+    try:
+        from cryptography import x509
+    except Exception:
+        return None
+    for certificate in sorted(certificate_dir.glob("*.crt")):
+        key = certificate.with_suffix(".key")
+        if not key.is_file():
+            continue
+        try:
+            cert = x509.load_pem_x509_certificate(certificate.read_bytes())
+            not_before = cert.not_valid_before_utc
+            not_after = cert.not_valid_after_utc
+            names = set()
+            try:
+                san = cert.extensions.get_extension_for_class(
+                    x509.SubjectAlternativeName
+                ).value
+                names.update(name.lower().rstrip(".") for name in san.get_values_for_type(x509.DNSName))
+                names.update(str(name).lower() for name in san.get_values_for_type(x509.IPAddress))
+            except x509.ExtensionNotFound:
+                pass
+            cn = cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)
+            names.update(attr.value.lower().rstrip(".") for attr in cn)
+            if not_before <= now <= not_after and (not identity or identity in names):
+                matches.append((certificate, key))
+        except Exception:
+            continue
+    if len(matches) == 1:
+        return tuple(map(str, matches[0]))
+    if len(matches) > 1:
+        labels = ", ".join(path.name for path, _ in matches)
+        raise RuntimeError(
+            "Windows HTTPS証明書候補が同じsite identityに複数あります: "
+            f"{labels}。AOITALK_CERT_CRTとAOITALK_CERT_KEYを指定してください。"
+        )
+    return None
+
+
+def get_caddy_public_url(config: object | None = None) -> str | None:
+    """Return the operator-facing URL exposed by the managed Caddy process.
+
+    FastAPI reports its loopback listener URL, but native startup normally
+    publishes the Web UI through Caddy on a different port/hostname.  Keep
+    URL resolution next to the Caddy topology so the readiness callback can
+    return the same effective endpoint that was configured for the process.
+    Explicit public URL settings take precedence; otherwise derive the URL
+    from Caddy's site address and port without exposing credentials or paths.
+    """
+
+    if _should_skip_caddy():
+        return None
+
+    def _configured(*env_names: str, config_keys: tuple[str, ...] = ()) -> str | None:
+        for name in env_names:
+            value = os.getenv(name)
+            if value and str(value).strip():
+                return str(value).strip()
+        for key in config_keys:
+            value = _config_get(config, key, None)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return None
+
+    explicit = _configured(
+        "AOITALK_CADDY_PUBLIC_URL",
+        "AOITALK_PUBLIC_URL",
+        config_keys=("caddy.public_url", "web_interface.public_url"),
+    )
+    site_label = _configured("AOITALK_CADDY_SITE_LABEL")
+    address = _configured(
+        "AOITALK_CADDY_SITE_ADDRESS",
+        config_keys=("caddy.site_address", "web_interface.public_host"),
+    )
+    port = _service_port(
+        config,
+        env_names=("AOITALK_CADDY_PORT",),
+        config_key="caddy.port",
+        default=6002,
+    )
+
+    # Explicit certificate paths remain a supported way to name the endpoint.
+    if not address and _IS_WINDOWS:
+        configured_certificate = os.getenv("AOITALK_CERT_CRT")
+        if configured_certificate and str(configured_certificate).strip():
+            address = Path(configured_certificate).stem
+        else:
+            address = _windows_certificate_identity(config)
+            if not address:
+                discovered = _discover_windows_certificate_pair(config)
+                if discovered:
+                    address = Path(discovered[0]).stem
+
+    # Explicit public URLs are trusted configuration, but strip trailing
+    # slashes so browser/open-url and API consumers agree on one identity.
+    candidate = explicit or site_label or address or "localhost"
+    candidate = str(candidate).strip().rstrip("/")
+    if not candidate:
+        candidate = "localhost"
+
+    parsed = urlparse(candidate if "://" in candidate else f"https://{candidate}")
+    scheme = (parsed.scheme or "https").lower()
+    host = parsed.hostname or "localhost"
+    if parsed.username or parsed.password:
+        # Never propagate credentials into an operator-facing URL.
+        host = "localhost"
+    host_text = f"[{host}]" if ":" in host and not host.startswith("[") else host
+
+    # A site label such as ``https://:6002`` deliberately binds all hosts and
+    # is not a usable browser destination.  Wildcard bind addresses are also
+    # not valid destinations for a browser, so fall back to the configured
+    # site address/certificate name (or loopback) in those cases.
+    wildcard_hosts = {"", "0.0.0.0", "::", "[::]", "*"}
+    if (not parsed.hostname or not host_text.strip("[]")) or host.lower() in wildcard_hosts:
+        fallback = address if address and address.strip().lower() not in wildcard_hosts else "localhost"
+        fallback_parsed = urlparse(
+            fallback if "://" in fallback else f"{scheme}://{fallback}"
+        )
+        host = fallback_parsed.hostname or "localhost"
+        host_text = f"[{host}]" if ":" in host and not host.startswith("[") else host
+        if fallback_parsed.scheme:
+            scheme = fallback_parsed.scheme.lower()
+
+    try:
+        parsed_port = parsed.port
+    except ValueError:
+        parsed_port = None
+
+    # An explicit public URL owns its own default port (for example
+    # ``https://chat.example``); do not append the internal Caddy port to it.
+    if explicit and parsed_port is None:
+        return f"{scheme}://{host_text}"
+    effective_port = parsed_port or port
+    return f"{scheme}://{host_text}:{effective_port}"
+
+
+# Keep a descriptive alias for integrations that call the resolver directly.
+resolve_caddy_public_url = get_caddy_public_url
+
+
+def get_operator_web_url(config: object | None = None) -> str:
+    """Return the URL an operator can use for the currently managed topology.
+
+    Caddy is the normal public boundary.  When it is explicitly skipped, the
+    Next.js listener is the browser-facing service and must be reported instead
+    of falling back to the FastAPI API port.
+    """
+
+    if not _should_skip_caddy():
+        return get_caddy_public_url(config) or "http://127.0.0.1:3002"
+
+    next_port = _service_port(
+        config,
+        env_names=("AOITALK_NEXT_PORT", "AOITALK_FRONTEND_PORT"),
+        config_key="frontend.port",
+        default=3002,
+    )
+    host = _frontend_bind_host().strip()
+    if host in {"", "0.0.0.0", "::", "[::]"}:
+        host = "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{next_port}"
+
+
 def _read_env_value_from_dotenv(project_root: Path, key: str) -> str | None:
     """`.env` から単一キーの値を読む（dotenv 未ロードの起動経路向けフォールバック）。"""
     env_path = project_root / ".env"
@@ -1316,6 +2059,14 @@ def _build_frontend_env(project_root: Path) -> dict[str, str]:
     フロント側での `.env` 手読みフォールバックを不要にする。
     """
     env = dict(os.environ)
+    # Startup always builds and serves the canonical production artifact.  A
+    # stale NEXT_DIST_DIR inherited from a verification/QA process would make
+    # Next write generated types into a custom `.next-*` directory instead.
+    env["NEXT_DIST_DIR"] = ".next"
+    # This process always launches the production Next server. Do not let a
+    # QA/dev shell's NODE_ENV select development behavior for the canonical
+    # artifact or make `next start` run in development mode.
+    env["NODE_ENV"] = "production"
     if not env.get("INTERNAL_API_KEY"):
         value = _read_env_value_from_dotenv(project_root, "INTERNAL_API_KEY")
         if value:
@@ -1325,6 +2076,14 @@ def _build_frontend_env(project_root: Path) -> dict[str, str]:
                 "INTERNAL_API_KEY が環境変数にも .env にも見つかりません。"
                 "Next.js から Python API への内部委譲が失敗します。"
             )
+    if not env.get("PYTHON_API_URL"):
+        fastapi_port = _service_port(
+            None,
+            env_names=("AOITALK_WEB_PORT", "AOITALK_FASTAPI_PORT"),
+            config_key="web_interface.port",
+            default=3000,
+        )
+        env["PYTHON_API_URL"] = f"http://127.0.0.1:{fastapi_port}"
     return env
 
 
@@ -1540,7 +2299,7 @@ def start_caddy(
     ready_fastapi_port: int | None = None,
 ) -> subprocess.Popen | None:
     """Start Caddy only after the FastAPI upstream is ready."""
-    if _should_skip_caddy_for_desktop():
+    if _should_skip_caddy():
         return None
 
     fastapi_port = _service_port(
@@ -1628,38 +2387,63 @@ def start_caddy(
         # topology explicitly, so this does not affect Docker publication.
         caddy_env["AOITALK_BOOTSTRAP_BIND_ADDRESS"] = "127.0.0.1"
     if _IS_WINDOWS:
-        # Windowsでは証明書ファイル名（legoのドメイン名）からサイト名を解決する。
-        # 特定ホスト名を起動コードへ固定せず、Linux/Composeの既定も変更しない。
+        # WindowsのTLS ownershipは3状態に分ける。
+        #
+        # * 完全な AOITALK_CERT_CRT/KEY は、既存の明示的な証明書
+        #   override としてCaddyへ渡す。
+        # * 片方だけは曖昧な設定なのでfail-closedにする。
+        # * どちらも無い場合は、canonical lego stateがsite identityと
+        #   metadata上で一致するときだけCaddyへ渡す。
+        #
+        # certs/ はruntime-owned/ignored dataであり、globの個数を起動条件
+        # にしてはいけない。明示されたTLS directiveだけは既存のCaddy
+        # 設定として尊重し、その場合のみexplicit-cert用のcatch-all/bind
+        # defaultsを適用する。
         cert_path = caddy_env.get("AOITALK_CERT_CRT")
         key_path = caddy_env.get("AOITALK_CERT_KEY")
-        if not cert_path and not key_path:
-            certificate_dir = project_root / "certs" / "certificates"
-            certificate_pairs = [
-                (certificate, certificate.with_suffix(".key"))
-                for certificate in sorted(certificate_dir.glob("*.crt"))
-                if certificate.with_suffix(".key").is_file()
-            ]
-            if len(certificate_pairs) != 1:
-                raise RuntimeError(
-                    "Windows HTTPS証明書を一意に特定できません。"
-                    "AOITALK_CERT_CRTとAOITALK_CERT_KEYを指定してください。"
-                )
-            cert_path, key_path = map(str, certificate_pairs[0])
-        elif not cert_path or not key_path:
+        if bool(cert_path) != bool(key_path):
             raise RuntimeError(
                 "AOITALK_CERT_CRTとAOITALK_CERT_KEYは両方指定してください。"
             )
-        caddy_env.setdefault("AOITALK_CADDY_SITE_ADDRESS", Path(cert_path).stem)
-        caddy_env.setdefault(
-            "AOITALK_CADDY_TLS_DIRECTIVE",
-            f"tls {json.dumps(cert_path)} {json.dumps(key_path)}",
-        )
-        # Windows personalは証明書のSNIを受けつつ、site labelによるHost制約を
-        # 公開入口へ持ち込まない。IPv4で全インターフェースを明示的に待ち受ける。
-        caddy_env.setdefault(
-            "AOITALK_CADDY_SITE_LABEL", f"https://:{caddy_port}"
-        )
-        caddy_env.setdefault("AOITALK_CADDY_BIND_DIRECTIVE", "bind 0.0.0.0")
+        if not cert_path and not key_path:
+            discovered = _discover_windows_certificate_pair(
+                config, project_root=project_root
+            )
+            if discovered:
+                cert_path, key_path = discovered
+                caddy_env["AOITALK_CERT_CRT"] = cert_path
+                caddy_env["AOITALK_CERT_KEY"] = key_path
+        if cert_path and key_path:
+            caddy_env.setdefault("AOITALK_CADDY_SITE_ADDRESS", Path(cert_path).stem)
+            caddy_env.setdefault(
+                "AOITALK_CADDY_TLS_DIRECTIVE",
+                f"tls {json.dumps(cert_path)} {json.dumps(key_path)}",
+            )
+            # Windows personalは明示証明書のSNIを受けつつ、site labelによる
+            # Host制約を公開入口へ持ち込まない。IPv4で全インターフェースを
+            # 明示的に待ち受ける。
+            caddy_env.setdefault(
+                "AOITALK_CADDY_SITE_LABEL", f"https://:{caddy_port}"
+            )
+            caddy_env.setdefault("AOITALK_CADDY_BIND_DIRECTIVE", "bind 0.0.0.0")
+        elif caddy_env.get("AOITALK_CADDY_TLS_DIRECTIVE", "").strip():
+            # A deployment-specific Caddyfile directive is an explicit TLS
+            # override even when the pair is not represented by the legacy
+            # AOITALK_CERT_* variables.  Keep it verbatim and preserve the
+            # established Windows catch-all/bind defaults.
+            caddy_env.setdefault(
+                "AOITALK_CADDY_SITE_LABEL", f"https://:{caddy_port}"
+            )
+            caddy_env.setdefault("AOITALK_CADDY_BIND_DIRECTIVE", "bind 0.0.0.0")
+        else:
+            # No matching canonical pair: retain Caddy-native HTTPS.  When a
+            # configured DDNS/site identity exists, keep that identity rather
+            # than silently changing the public URL to localhost.
+            native_address = _windows_certificate_identity(config)
+            caddy_env.setdefault(
+                "AOITALK_CADDY_SITE_LABEL",
+                f"{native_address or caddy_env.get('AOITALK_CADDY_SITE_ADDRESS', 'localhost')}:{caddy_port}",
+            )
     else:
         # Linux nativeは従来どおり名前付きsite labelで自動HTTPSを利用する。
         caddy_env.setdefault(
@@ -1700,9 +2484,14 @@ def start_caddy(
                 f"caddy-runtime.log tail:\n{_read_log_tail(caddy_runtime_log)}"
             )
 
-    print(
-        f"Started Caddy (PID {caddy_proc.pid}) after FastAPI became ready "
-        f"(runtime log: {caddy_runtime_log})"
+    # Keep the operator console concise; the runtime-log path and process
+    # details remain available in the application log for diagnostics.
+    startup_console.stage("[OK] Caddy")
+    logger.info(
+        "Started Caddy (PID %s) after FastAPI became ready (runtime log: %s)",
+        caddy_proc.pid,
+        caddy_runtime_log,
+        extra=FILE_ONLY_LOG_EXTRA,
     )
     return caddy_proc
 
@@ -1725,8 +2514,13 @@ def _start_services(config: object | None = None) -> None:
 
     layout = get_log_layout(project_root)
     layout.migrate_legacy_paths()
-    run_log_housekeeping(layout)
-    skip_caddy = _should_skip_caddy_for_desktop()
+    active_log_path = os.getenv("AOITALK_APP_LOG_PATH", "").strip()
+    try:
+        active_paths = {Path(active_log_path).resolve()} if active_log_path else None
+    except Exception:
+        active_paths = None
+    run_log_housekeeping(layout, active_paths=active_paths)
+    skip_caddy = _should_skip_caddy()
     fastapi_port = _service_port(
         config,
         env_names=("AOITALK_WEB_PORT", "AOITALK_FASTAPI_PORT"),
@@ -1761,21 +2555,32 @@ def _start_services(config: object | None = None) -> None:
         _ensure_frontend_dependencies(project_root, frontend_log_path)
 
     # `_ensure_frontend_build` は stale な canonical `.next` を作り直す際に
-    # 旧ディレクトリを削除する。稼働中の `next start` がそのディレクトリを
+    # 旧成果物を削除する。稼働中の `next start` がそのディレクトリを
     # 参照している間に削除しないよう、stale/missing の場合だけ frontend
     # listener を先に停止し、その後 production build を行う。
     frontend_port_killed_for_build = False
+    frontend_build_elapsed: float | None = None
     frontend_dir = project_root / "frontend"
     with _startup_timer.phase("startup.services.frontend.rebuild_check"):
-        build_reason, _ = _frontend_build_rebuild_reason(frontend_dir)
+        build_reason, build_fingerprint = _frontend_build_rebuild_reason(frontend_dir)
     if build_reason:
+        startup_console.stage("[BUILD] Web UI を更新しています...")
         with _startup_timer.phase("startup.services.frontend.port_cleanup_for_build"):
             _kill_existing_on_port(next_port)
         frontend_port_killed_for_build = True
+        build_started_at = time.monotonic()
         with _startup_timer.phase("startup.services.frontend.build"):
-            _ensure_frontend_build(project_root, frontend_log_path, frontend_env)
+            _ensure_frontend_build(
+                project_root, frontend_log_path, frontend_env,
+                prepared_check=(build_reason, build_fingerprint),
+            )
+        frontend_build_elapsed = max(0.0, time.monotonic() - build_started_at)
     with _startup_timer.phase("startup.services.frontend.artifact_validation"):
         _validate_frontend_startup_artifacts(project_root)
+    if frontend_build_elapsed is None:
+        frontend_ready_message = "[OK] Web UI"
+    else:
+        frontend_ready_message = f"[OK] Web UI ({frontend_build_elapsed:.1f}s)"
 
     with _startup_timer.phase("startup.services.port_cleanup"):
         _kill_existing_on_port(fastapi_port)
@@ -1866,8 +2671,13 @@ def _start_services(config: object | None = None) -> None:
                 )
         _startup_timer.mark("startup.services.next.listener_ready")
 
+    # Only report the Web UI as ready after the Next.js listener has actually
+    # accepted connections. A successful build/artifact check alone is not a
+    # usable frontend and must not produce a premature [OK] line.
+    startup_console.stage(frontend_ready_message)
+
     caddy_status = (
-        "Caddy skipped for desktop"
+        "Caddy skipped (AOITALK_SKIP_CADDY)"
         if skip_caddy
         else "Caddy waiting for FastAPI readiness"
     )
@@ -1878,22 +2688,22 @@ def _start_services(config: object | None = None) -> None:
     )
 
     if should_start_exo and local_server_launch_started:
-        print(
+        startup_console.stage(
             f"Started {frontend_status} / "
             f"{caddy_status} / exo server starting"
         )
     elif should_start_mlx_lm and local_server_launch_started:
-        print(
+        startup_console.stage(
             f"Started {frontend_status} / "
             f"{caddy_status} / MLX LM server starting"
         )
     elif should_start_llama_cpp and local_server_launch_started:
-        print(
+        startup_console.stage(
             f"Started {frontend_status} / "
             f"{caddy_status} / llama-server起動中"
         )
     else:
-        print(f"Started {frontend_status} / {caddy_status}")
+        startup_console.stage(f"Started {frontend_status} / {caddy_status}")
 
 
 def start_services(config: object | None = None) -> None:

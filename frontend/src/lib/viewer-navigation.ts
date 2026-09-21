@@ -18,6 +18,26 @@ export function boundaryViewerFile(
   return direction === 1 ? items[0] : items.at(-1)!;
 }
 
+/**
+ * Return the viewer-compatible file adjacent to a path.
+ *
+ * Paths are the viewer identity (rather than array indexes) because the
+ * displayed list can be replaced asynchronously (for example by an HF
+ * search) while an arrow key event is still being handled.  Keeping this
+ * lookup path based lets callers maintain a synchronous cursor and avoids a
+ * stale React render skipping or repeating an item during rapid navigation.
+ */
+export function adjacentViewerFile(
+  files: ExplorerFile[],
+  currentPath: string,
+  direction: -1 | 1,
+): ExplorerFile | null {
+  const items = viewerFiles(files);
+  const index = items.findIndex((item) => item.path === currentPath);
+  if (index < 0) return null;
+  return items[index + direction] ?? null;
+}
+
 export function preloadViewerFiles(
   files: ExplorerFile[],
   currentPath: string,

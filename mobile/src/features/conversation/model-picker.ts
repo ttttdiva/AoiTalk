@@ -1,6 +1,7 @@
 import type { ChatResponseModelOption } from "../../types/api";
 import {
   getProviderLabel,
+  isForbiddenModelId,
   type DirectMobileLlmProvider,
 } from "../../lib/cloud-model-catalog";
 
@@ -65,6 +66,7 @@ export function buildModelPickerGroups(
   };
 
   for (const option of directOptions) {
+    if (isForbiddenModelId(option.model)) continue;
     const provider = option.provider;
     const group = ensureGroup(provider, getProviderLabel(provider));
     group.kind = group.kind === "server" && group.models.length > 0
@@ -89,6 +91,7 @@ export function buildModelPickerGroups(
   }
 
   for (const option of serverOptions) {
+    if (isForbiddenModelId(option.model)) continue;
     const provider = option.provider;
     const group = ensureGroup(provider, option.providerLabel || provider);
     group.kind = group.kind === "direct" ? "mixed" : "server";

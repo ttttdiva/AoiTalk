@@ -45,12 +45,42 @@ export async function lockTaskProjectIds(
 ): Promise<string[]> {
   const ordered = [...new Set([...projectIds].filter((id): id is string => Boolean(id)))]
     .sort();
+  // Keep rolling-deploy/legacy test doubles that predate the shared advisory
+  // protocol usable. Real Drizzle transactions always expose execute().
+  if (typeof transaction.execute !== "function") return ordered;
   for (const projectId of ordered) {
     await transaction.execute(
       sql`select pg_advisory_xact_lock(hashtext(${`${TASK_PROJECT_LOCK_NAMESPACE}${projectId}`}))`,
     );
   }
   return ordered;
+}
+
+/**
+ * Acquire the concrete Project row locks that correspond to the advisory
+ * locks above.  Every task/dependency mutation must take these rows before
+ * locking a Task row; this keeps the cross-runtime order identical to the
+ * Python task invariant service (advisory -> Project -> Task).
+ */
+export async function lockTaskProjectRows(
+  transaction: ProjectMoveTransaction,
+  projectIds: Iterable<string | null | undefined>,
+): Promise<void> {
+  const ordered = [...new Set([...projectIds].filter((id): id is string => Boolean(id)))].sort();
+  if (ordered.length === 0) return;
+  if (typeof transaction.execute !== "function" || typeof sql.join !== "function") {
+    return;
+  }
+  // Use a single deterministic SQL statement rather than one SELECT per
+  // project.  Besides reducing round trips, this prevents two-project moves
+  // from acquiring the rows in opposite orders.
+  await transaction.execute(
+    sql`select id
+        from projects
+        where id in (${sql.join(ordered.map((id) => sql`${id}`), sql`, `)})
+        order by id
+        for update`,
+  );
 }
 
 /**
@@ -73,6 +103,7 @@ export async function lockTaskParentUpdate(
   parent: typeof tasks.$inferSelect | null;
 }> {
   await lockTaskProjectIds(transaction, [options.expectedProjectId]);
+  await lockTaskProjectRows(transaction, [options.expectedProjectId]);
 
   if (options.parentTaskId === options.taskId) {
     throw new TaskProjectMoveInvariantError(
@@ -139,6 +170,10 @@ async function lockTaskProjectMove(
   },
 ): Promise<typeof tasks.$inferSelect> {
   await lockTaskProjectIds(transaction, [
+    options.expectedProjectId,
+    options.targetProjectId,
+  ]);
+  await lockTaskProjectRows(transaction, [
     options.expectedProjectId,
     options.targetProjectId,
   ]);

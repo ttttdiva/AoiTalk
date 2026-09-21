@@ -267,13 +267,26 @@ function fastForwardCursor(
   }
 }
 
-export function computeOccurrencesInRange(
+export type RecurrenceOccurrenceCandidate = {
+  /** Raw RRULE occurrence start, before weekend/holiday adjustment. */
+  canonicalStart: Date;
+  /** Display/materialized start after weekend/holiday adjustment. */
+  occurrenceStart: Date;
+};
+
+/**
+ * Generate canonical/actual pairs for a range.  The existing public helper
+ * returns only actual dates for picker callers; server-side recurrence routes
+ * need the canonical identity as well so schedule segments and exceptions do
+ * not diverge when skip-forward is enabled.
+ */
+export function computeOccurrenceCandidatesInRange(
   startDate: Date,
   cfg: RecurrencePreviewConfig,
   rangeStart: Date,
   rangeEnd: Date,
   maxCount: number,
-): Date[] {
+): RecurrenceOccurrenceCandidate[] {
   if (!startDate || isNaN(startDate.getTime())) return [];
   if (isNaN(rangeStart.getTime()) || isNaN(rangeEnd.getTime())) return [];
   if (rangeEnd.getTime() < rangeStart.getTime()) return [];
@@ -289,23 +302,57 @@ export function computeOccurrencesInRange(
   if (until) until.setHours(23, 59, 59, 999);
 
   // COUNT needs the same ordinal accounting as computeUpcomingOccurrences.
-  // Keep that path exact; the unbounded path below is optimized for calendar ranges.
+  // Keep the canonical cursor and the shifted display date together here.
   if (cfg.endCount && cfg.endCount > 0) {
-    return computeUpcomingOccurrences(startDate, normCfg, maxCount)
-      .map((date) => copyTimeFrom(date, startDate))
-      .filter(
-        (date) =>
-          date.getTime() >= rangeStart.getTime() &&
-          date.getTime() <= rangeEnd.getTime(),
-      );
+    const result: RecurrenceOccurrenceCandidate[] = [];
+    const remaining = Math.max(0, cfg.endCount - 1);
+    let budget = remaining;
+    let cursor = new Date(anchor);
+    let guard = 0;
+    let lastShiftedTime: number | null = null;
+    const guardLimit = Math.min(20000, Math.max(400, maxCount * 4));
+    while (result.length < maxCount && budget > 0 && guard < guardLimit) {
+      guard++;
+      const nextBase =
+        normCfg.freq === "WEEKLY" && normCfg.byDay.length > 0
+          ? nextWeeklyByDay(cursor, anchor, normCfg)
+          : advanceBase(cursor, normCfg.freq, interval);
+      cursor = nextBase;
+      if (until && cursor.getTime() > until.getTime()) break;
+      budget--;
+      const skipped = applySkip(cursor, normCfg);
+      if (skipped === null) continue;
+      const shifted = copyTimeFrom(skipped, startDate);
+      if (until && shifted.getTime() > until.getTime()) break;
+      if (lastShiftedTime === shifted.getTime()) continue;
+      lastShiftedTime = shifted.getTime();
+      if (
+        shifted.getTime() >= rangeStart.getTime() &&
+        shifted.getTime() <= rangeEnd.getTime()
+      ) {
+        result.push({
+          canonicalStart: copyTimeFrom(nextBase, startDate),
+          occurrenceStart: shifted,
+        });
+      }
+    }
+    return result;
   }
 
   const effectiveEnd =
     until && until.getTime() < rangeEnd.getTime() ? until : rangeEnd;
   if (effectiveEnd.getTime() < rangeStart.getTime()) return [];
 
-  const result: Date[] = [];
-  let cursor = fastForwardCursor(anchor, rangeStart, normCfg);
+  const result: RecurrenceOccurrenceCandidate[] = [];
+  // Shift-forward can move up to the next business day (the same 14-day
+  // guard used by applySkip).  Start the canonical search slightly earlier
+  // than the requested range so a Saturday/Sunday occurrence that lands on
+  // Monday retains its first canonical identity regardless of query window.
+  const canonicalSearchStart =
+    normCfg.skipWeekend || normCfg.skipHoliday
+      ? addDays(rangeStart, -14)
+      : rangeStart;
+  let cursor = fastForwardCursor(anchor, canonicalSearchStart, normCfg);
   let guard = 0;
   let lastShiftedTime: number | null = null;
   const guardLimit = Math.min(20000, Math.max(400, maxCount * 4));
@@ -334,9 +381,28 @@ export function computeOccurrencesInRange(
     lastShiftedTime = shifted.getTime();
 
     if (shifted.getTime() >= rangeStart.getTime()) {
-      result.push(shifted);
+      result.push({
+        canonicalStart: copyTimeFrom(nextBase, startDate),
+        occurrenceStart: shifted,
+      });
     }
   }
 
   return result;
+}
+
+export function computeOccurrencesInRange(
+  startDate: Date,
+  cfg: RecurrencePreviewConfig,
+  rangeStart: Date,
+  rangeEnd: Date,
+  maxCount: number,
+): Date[] {
+  return computeOccurrenceCandidatesInRange(
+    startDate,
+    cfg,
+    rangeStart,
+    rangeEnd,
+    maxCount,
+  ).map((candidate) => candidate.occurrenceStart);
 }

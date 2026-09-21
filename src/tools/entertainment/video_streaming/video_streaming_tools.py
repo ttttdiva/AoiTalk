@@ -86,7 +86,12 @@ def search_and_play_youtube(query: str) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Search for videos
             search_query = f"ytsearch5:{query}"
-            search_results = ydl.extract_info(search_query, download=False)
+            manager = get_stream_manager()
+            search_results = manager.execute_yt_dlp(
+                search_query,
+                lambda target: ydl.extract_info(target, download=False),
+                action="youtube.search",
+            )
             
             if not search_results or 'entries' not in search_results or not search_results['entries']:
                 return f"❌ 「{query}」に関する動画が見つかりませんでした。"
@@ -214,7 +219,14 @@ def search_and_play_niconico(query: str) -> str:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             # Search for videos on Niconico
             search_query = f"nicosearch:{query}"
-            search_results = ydl.extract_info(search_query, download=False)
+            manager = get_stream_manager()
+            search_results = manager.execute_yt_dlp(
+                search_query,
+                lambda target: ydl.extract_info(target, download=False),
+                action="niconico.search",
+                provider="niconico",
+                destination="https://www.nicovideo.jp/",
+            )
             
             if not search_results or 'entries' not in search_results or not search_results['entries']:
                 return f"❌ 「{query}」に関するニコニコ動画が見つかりませんでした。"

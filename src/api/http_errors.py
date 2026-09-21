@@ -18,6 +18,20 @@ logger = logging.getLogger(__name__)
 INTERNAL_ERROR_CATEGORY = "internal_error"
 INTERNAL_ERROR_CODE = "internal_error"
 LLM_UNAVAILABLE_CATEGORY = "llm_unavailable"
+HYDRUS_ERROR_CATEGORY = "hydrus"
+_SAFE_HYDRUS_ERROR_MESSAGES = {
+    "hydrus_not_configured": "Hydrus接続が設定されていません。Settingsで接続を設定してください",
+    "hydrus_legacy_owner_ambiguous": "既存のHydrus設定を安全に移行できません。現在のユーザーとして明示的に取り込んでください",
+    "hydrus_legacy_owner_conflict": "既存のHydrus設定の所有者を確認できません",
+    "hydrus_endpoint_policy_rejected": "Hydrus API URLが許可されていません",
+    "hydrus_endpoint_resolution_failed": "Hydrus API URLの名前解決に失敗しました",
+    "hydrus_credential_unreadable": "Hydrus接続設定を読み取れません",
+    "hydrus_credential_store_unavailable": "Hydrus接続設定を一時的に読み取れません",
+    "hydrus_auth_failed": "Hydrus Clientの認証または権限を確認してください",
+    "hydrus_unreachable": "Hydrus Clientに接続できません",
+    "hydrus_upstream_error": "Hydrus APIエラー",
+}
+_SAFE_HYDRUS_ERROR_CODES = frozenset(_SAFE_HYDRUS_ERROR_MESSAGES)
 _SAFE_LLM_ERROR_CODES = frozenset(
     {
         GenerationErrorKind.INSUFFICIENT_QUOTA,
@@ -48,10 +62,11 @@ _SAFE_ERROR_CATEGORIES = frozenset(
         INTERNAL_ERROR_CATEGORY,
         "not_found",
         LLM_UNAVAILABLE_CATEGORY,
+        HYDRUS_ERROR_CATEGORY,
         *(member.value for member in CharacterLookupErrorCategory),
     }
 )
-_SAFE_ERROR_CODES = _SAFE_ERROR_CATEGORIES | frozenset({"character_not_found"})
+_SAFE_ERROR_CODES = _SAFE_ERROR_CATEGORIES | frozenset({"character_not_found"}) | _SAFE_HYDRUS_ERROR_CODES
 _SAFE_DETAIL_FIELDS = frozenset(
     {"category", "code", "trace_id", "request_id", "message"}
 )
@@ -140,7 +155,17 @@ def whitelist_error_detail(
 
     message = f"An unexpected internal error occurred. trace_id={trace_id}"
     retryable: bool | None = None
-    if category == LLM_UNAVAILABLE_CATEGORY:
+    if category == HYDRUS_ERROR_CATEGORY:
+        # Hydrus routes may expose only one of the static machine-code/message
+        # pairs below.  Ignore arbitrary upstream exception text and downgrade
+        # malformed pairs to the generic internal payload.
+        expected_message = _SAFE_HYDRUS_ERROR_MESSAGES.get(code)
+        if expected_message is None or detail.get("message") != expected_message:
+            category = INTERNAL_ERROR_CATEGORY
+            code = INTERNAL_ERROR_CODE
+        else:
+            message = expected_message
+    elif category == LLM_UNAVAILABLE_CATEGORY:
         # A typed LLM error may expose only the exact static message generated
         # by ``classify_generation_error``.  Valid category/code pairs with a
         # caller-supplied message are treated as untrusted and downgraded to

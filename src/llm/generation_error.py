@@ -167,6 +167,17 @@ def _error_code(exc: BaseException) -> str:
     value = getattr(exc, "code", None)
     if isinstance(value, str) and value.strip():
         return value.strip().lower()
+    # Some gateways flatten the JSON body into the exception message.  Keep a
+    # narrow allowlist so the billing exhaustion marker is still classified
+    # correctly without treating arbitrary provider prose as an error code.
+    lowered_message = str(exc or "").strip().lower()
+    for candidate in (
+        "credit_balance_exhausted",
+        "insufficient_quota",
+        "rate_limit_exceeded",
+    ):
+        if candidate in lowered_message:
+            return candidate
     return ""
 
 
@@ -191,6 +202,9 @@ def _classify_by_code(code: str) -> Optional[str]:
         "project_spend_limit_exceeded",
         "organization_spend_limit_exceeded",
         "quota_exceeded",
+        # AoiTalk/OpenAI gateway responses may expose the billing exhaustion
+        # reason under this code instead of OpenAI's ``insufficient_quota``.
+        "credit_balance_exhausted",
     }:
         return GenerationErrorKind.INSUFFICIENT_QUOTA
     if code in {"rate_limit_exceeded", "requests", "tokens"}:

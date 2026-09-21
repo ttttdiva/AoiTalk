@@ -6,6 +6,7 @@ import {
   type Task,
 } from "@/lib/task-api";
 import {
+  hasExplicitTimeComponent,
   parseLocalDateTime,
   toLocalDateTimeInputValue,
   toTaskDatePayloadValue,
@@ -234,6 +235,7 @@ export function getTaskOccurrenceContext(
     original_start_at:
       task.effective_occurrence_original_start_at ??
       task.effective_occurrence_start_at,
+    all_day: task.effective_all_day ?? task.all_day ?? null,
     source_kind: task.effective_occurrence_source_kind ?? "task_schedule",
     status: task.effective_occurrence_status ?? task.status ?? null,
   };
@@ -279,10 +281,7 @@ export function isOverdue(task: Task): boolean {
   if (!endAt || getTaskDisplayStatus(task) === "closed") return false;
   const due = parseTaskDateValue(endAt);
   if (!due) return false;
-  if (
-    getTaskDisplayAllDay(task) ||
-    (due.getHours() === 0 && due.getMinutes() === 0)
-  ) {
+  if (getTaskDisplayAllDay(task)) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const dueDay = new Date(due);
@@ -307,7 +306,7 @@ export function formatDuration(seconds: number): string {
 
 /**
  * 日付が「過去」かを判定する。
- * - 終日 or 00:00 の場合は日単位で比較
+ * - 終日の場合は日単位で比較
  * - それ以外は時分単位で比較
  */
 export function isDatePast(
@@ -317,7 +316,7 @@ export function isDatePast(
   const d = parseTaskDateValue(dateStr);
   if (!d) return false;
   const allDay = task.effective_all_day ?? task.all_day;
-  if (allDay || (d.getHours() === 0 && d.getMinutes() === 0)) {
+  if (allDay) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const day = new Date(d);
@@ -376,13 +375,6 @@ export function dateButtonColor(
   );
 }
 
-export function hasNonMidnightTime(value: string | null | undefined): boolean {
-  if (!value) return false;
-  const d = parseTaskDateValue(value);
-  if (!d) return false;
-  return d.getHours() !== 0 || d.getMinutes() !== 0;
-}
-
 export type TaskDateUpdate = {
   start_at?: string | null;
   end_at?: string | null;
@@ -406,8 +398,8 @@ export function buildTaskDateUpdate(
   const updates: TaskDateUpdate = {
     all_day:
       hasAnyDate &&
-      !hasNonMidnightTime(nextStart) &&
-      !hasNonMidnightTime(nextEnd),
+      !hasExplicitTimeComponent(nextStart) &&
+      !hasExplicitTimeComponent(nextEnd),
   };
 
   if (hasStart) {

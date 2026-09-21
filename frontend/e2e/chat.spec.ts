@@ -1,5 +1,25 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page } from "@playwright/test";
 import { addAuthCookie, mockAuthenticatedApis } from "./support/auth";
+import type { ConversationMessage } from "../src/lib/chat-api";
+
+async function openStableChatSession(page: Page) {
+  await page.route("**/api/python-proxy/characters", (route) => route.fulfill({
+    json: { characters: ["aoi"], current: "aoi" },
+  }));
+  await page.route("**/api/python-proxy/llm/session-settings*", (route) => route.fulfill({
+    json: {
+      settings: { main_route: { provider: "mock", model: "mock-model" }, special_routing: {} },
+      effective_main: { provider: "mock", model: "mock-model" },
+    },
+  }));
+  await page.route("**/api/python-proxy/conversations/session-e2e/generation/status", (route) => route.fulfill({
+    json: { session_id: "session-e2e", running: false, status: "idle" },
+  }));
+  // Socket delivery is outside this fixture; exercise deterministic REST persistence.
+  await page.routeWebSocket(/\/ws(?:\?|$)/, (socket) => socket.close());
+  await page.goto("/chat?s=session-e2e");
+  await expect(page.getByText("この会話にはまだメッセージがありません。", { exact: true })).toBeVisible();
+}
 
 test.describe("チャットページ", () => {
   test.beforeEach(async ({ page }) => {
@@ -36,6 +56,60 @@ test.describe("チャットページ", () => {
     await expect(page.getByText("History", { exact: true })).toBeVisible({
       timeout: 5000,
     });
+  });
+
+  test("送信行は保存確定後も同じDOMを維持する", async ({ page }) => {
+    let releaseSave: () => void = () => {};
+    const saveGate = new Promise<void>((resolve) => { releaseSave = resolve; });
+    let saved: ConversationMessage | null = null;
+    await page.route("**/api/conversations/session-e2e/messages", async (route) => {
+      await route.fulfill({ json: { messages: saved ? [saved] : [] } });
+    });
+    await page.route("**/api/python-proxy/conversations/session-e2e/dispatch", async (route) => {
+      const body = route.request().postDataJSON();
+      await saveGate;
+      saved = {
+        id: "saved-flicker-check", session_id: "session-e2e",
+        role: "user", content: body.message,
+        metadata: { client_message_id: body.client_message_id },
+        branch_index: 0, is_active_branch: true,
+      };
+      await route.fulfill({ json: { success: true, queued: false, session_id: "session-e2e" } });
+    });
+    await openStableChatSession(page);
+    const composer = page.getByRole("textbox", { name: "メッセージ入力", exact: true });
+    await composer.fill("保存時の描画確認");
+    await page.getByRole("button", { name: "送信", exact: true }).click();
+    const pending = page.locator('[data-chat-message-id^="temp-user-"]');
+    await expect(pending).toBeVisible();
+    await pending.evaluate((element) => element.setAttribute("data-stability-probe", "retained"));
+    releaseSave();
+    await expect(page.locator('[data-chat-message-id="saved-flicker-check"]'))
+      .toHaveAttribute("data-stability-probe", "retained");
+  });
+
+  test("右側の関連タスクは定期更新中も空状態と位置を維持する", async ({ page }) => {
+    let holdRefresh = false;
+    let releaseRefresh: () => void = () => {};
+    const refreshGate = new Promise<void>((resolve) => { releaseRefresh = resolve; });
+    await page.route("**/api/conversations/session-e2e/related-tasks", async (route) => {
+      if (holdRefresh) await refreshGate;
+      await route.fulfill({ json: { tasks: [] } });
+    });
+    await openStableChatSession(page);
+    const rail = page.getByTestId("chat-context-rail");
+    const empty = rail.getByText("このチャットに関連するタスクはありません", { exact: true });
+    await expect(empty).toBeVisible();
+    const before = await empty.boundingBox();
+    holdRefresh = true;
+    await page.waitForRequest((request) => request.url().endsWith("/related-tasks"));
+    try {
+      await expect(empty).toBeVisible();
+      await expect(rail.getByText("関連タスクを読み込み中…", { exact: true })).toBeHidden();
+      expect(await empty.boundingBox()).toEqual(before);
+    } finally {
+      releaseRefresh();
+    }
   });
 });
 

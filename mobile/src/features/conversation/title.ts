@@ -17,11 +17,60 @@ function compactText(value: string): string {
   return value.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * A masking turn is intentionally excluded from title context.  The backend
+ * records the source/result role as `metadata.privacy_masking.source` or
+ * `.result`; the scalar aliases below keep this guard compatible with older
+ * mobile sync payloads without treating arbitrary metadata as sensitive.
+ */
+export function isPrivacyMaskingMessage(
+  message: Pick<ConversationMessage, "metadata"> | null | undefined,
+): boolean {
+  const metadata = message?.metadata;
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return false;
+  }
+  const marker = metadata.privacy_masking;
+  if (marker === true || marker === "source" || marker === "result") {
+    return true;
+  }
+  if (marker && typeof marker === "object" && !Array.isArray(marker)) {
+    const record = marker as Record<string, unknown>;
+    // Match the backend's authoritative marker semantics: only a real
+    // boolean ``true`` is a server-issued marker.  Arbitrary truthy strings
+    // (for example ``"false"``) are user/legacy data, not authority.
+    const sourceMarked = record.source === true;
+    const resultMarked = record.result === true;
+    if (
+      sourceMarked ||
+      resultMarked ||
+      record.source === "source" ||
+      record.source === "result" ||
+      record.result === "source" ||
+      record.result === "result" ||
+      record.kind === "source" ||
+      record.kind === "result" ||
+      record.role === "source" ||
+      record.role === "result"
+    ) {
+      return true;
+    }
+  }
+  return (
+    metadata.privacy_masking_source === true ||
+    metadata.privacy_masking_source === "source" ||
+    metadata.privacy_masking_result === true ||
+    metadata.privacy_masking_result === "result"
+  );
+}
+
 function firstUserMessage(messages: ConversationMessage[]): ConversationMessage | null {
   return (
     messages.find(
       (message) =>
-        message.role === "user" && compactText(message.content).length > 0,
+        message.role === "user" &&
+        !isPrivacyMaskingMessage(message) &&
+        compactText(message.content).length > 0,
     ) ?? null
   );
 }
@@ -30,6 +79,7 @@ function hasTitleContext(messages: ConversationMessage[]): boolean {
   let userCount = 0;
   let hasAssistant = false;
   for (const message of messages) {
+    if (isPrivacyMaskingMessage(message)) continue;
     if (!compactText(message.content)) continue;
     if (message.role === "user") userCount += 1;
     if (message.role === "assistant") hasAssistant = true;
@@ -78,6 +128,7 @@ export function buildConversationTitlePrompt(
   let userCount = 0;
   let assistantCount = 0;
   for (const message of messages) {
+    if (isPrivacyMaskingMessage(message)) continue;
     if (!compactText(message.content)) continue;
     if (message.role === "user") {
       if (userCount >= 2) continue;

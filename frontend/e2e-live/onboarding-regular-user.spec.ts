@@ -12,6 +12,12 @@ import {
   attachLiveObservability,
   type LiveObservability,
 } from "./support/live-observability";
+import {
+  assertVerificationStorageIsolated,
+  cleanupVerificationRun,
+  createVerificationRun,
+  installVerificationRun,
+} from "../e2e/support/auth";
 
 const liveAdmin = loadLiveAdmin();
 
@@ -90,6 +96,22 @@ async function createRegularUserViaUi(
 }
 
 async function cleanupUser(page: Page, userId: string) {
+  // UserRepository's canonical lifecycle is soft-delete followed by an
+  // explicit purge.  Execute both steps unconditionally for this unique
+  // fixture identity; a soft-delete without the subsequent purge would leave
+  // verification garbage as an inactive account.
+  const softDelete = await page.request.delete(
+    `/api/users/${encodeURIComponent(userId)}`,
+    {
+      failOnStatusCode: false,
+    },
+  );
+  if (softDelete.status() === 404) return;
+  if (!softDelete.ok()) {
+    throw new Error(
+      `onboarding cleanup failed: canonical soft-delete HTTP ${softDelete.status()} ${await softDelete.text()}`,
+    );
+  }
   const purge = await page.request.delete(
     `/api/users/${encodeURIComponent(userId)}/purge`,
     {
@@ -97,21 +119,9 @@ async function cleanupUser(page: Page, userId: string) {
     },
   );
   if (purge.ok() || purge.status() === 404) return;
-
-  // Purge may be blocked by a server-side relation (for example, login audit
-  // retention). Soft-delete the unique test identity instead of touching any
-  // shared account.
-  const softDelete = await page.request.delete(
-    `/api/users/${encodeURIComponent(userId)}`,
-    {
-      failOnStatusCode: false,
-    },
+  throw new Error(
+    `onboarding cleanup failed: canonical purge HTTP ${purge.status()} ${await purge.text()}`,
   );
-  if (!softDelete.ok() && softDelete.status() !== 404) {
-    throw new Error(
-      `onboarding cleanup failed: purge HTTP ${purge.status()}, soft-delete HTTP ${softDelete.status()}`,
-    );
-  }
 }
 
 async function ensureAdminSession(page: Page) {
@@ -134,6 +144,15 @@ test.describe("regular user onboarding live flow", () => {
     page,
   }) => {
     test.skip(!liveAdmin, "live admin credentials are not available");
+    test.skip(
+      (process.env.AOITALK_VERIFICATION_HARNESS_KEY?.trim().length ?? 0) < 16,
+      "AOITALK_VERIFICATION_HARNESS_KEY is required for provenance-tagged live writes",
+    );
+    // The onboarding flow deliberately exercises real user creation. Refuse
+    // to run it against the ordinary application database even when a cleanup
+    // endpoint is unavailable; use a prefixed ephemeral DB or non-public
+    // schema configured by the harness instead.
+    assertVerificationStorageIsolated();
 
     const suffix = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const username = `e2e_onboarding_${suffix}`;
@@ -143,10 +162,15 @@ test.describe("regular user onboarding live flow", () => {
       username,
       password: initialPassword,
     };
+    const verificationRun = createVerificationRun(
+      "frontend/e2e-live/onboarding-regular-user.spec.ts",
+    );
+    await installVerificationRun(page, verificationRun);
     let userId = "";
     const adminIssues = attachLiveObservability(page);
     const userContext = await browser.newContext();
     const userPage = await userContext.newPage();
+    await installVerificationRun(userPage, verificationRun);
     let userIssues: LiveObservability | null = null;
 
     try {
@@ -196,13 +220,42 @@ test.describe("regular user onboarding live flow", () => {
       );
       await logoutThroughUi(userPage);
     } finally {
-      await userContext.close();
-      if (userId) {
-        await ensureAdminSession(page);
-        await cleanupUser(page, userId);
-        await logoutThroughUi(page);
+      try {
+        await userContext.close();
+      } finally {
+        try {
+          // The server-owned run cleanup is the primary teardown.  Purge the
+          // unique user through its canonical soft-delete + purge lifecycle;
+          // never retain an inactive soft-delete as a fallback.
+          await ensureAdminSession(page);
+          try {
+            await cleanupVerificationRun(page, verificationRun);
+          } finally {
+            // The server closes a run after cleanup and rejects any subsequent
+            // non-maintenance request that still carries its signed headers.
+            // Clear page-level extras before the canonical user purge/logout;
+            // those operations must not be interpreted as writes in a
+            // terminal verification run.
+            await page.setExtraHTTPHeaders({});
+            if (userId) {
+              try {
+                await cleanupUser(page, userId);
+              } finally {
+                await logoutThroughUi(page);
+              }
+            }
+          }
+        } finally {
+          // Even if admin re-authentication or run cleanup fails, never leave
+          // a terminal-run header on the page (the next teardown/retry could
+          // otherwise be rejected by verification middleware).
+          await page.setExtraHTTPHeaders({});
+        }
+        assertNoLiveObservabilityIssues(
+          adminIssues,
+          "admin onboarding session",
+        );
       }
-      assertNoLiveObservabilityIssues(adminIssues, "admin onboarding session");
     }
   });
 });

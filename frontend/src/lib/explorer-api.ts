@@ -274,6 +274,31 @@ function parseProjectWorkspacePath(
   return { projectId: match[1], relativePath: match[2] ?? "" };
 }
 
+function isProjectWorkspaceNamespacePath(path: string): boolean {
+  const normalized = path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  return /^_projects(?:\/|$)/i.test(normalized);
+}
+
+function resolveProjectMutationPath(
+  path: string,
+  operation: "移動" | "コピー",
+  allowRoot = false,
+): { projectId: string; relativePath: string } | null {
+  const projectPath = parseProjectWorkspacePath(path);
+  if (!projectPath && isProjectWorkspaceNamespacePath(path)) {
+    throw new Error(
+      `プロジェクトファイルの${operation}には _projects/project_<uuid> 形式のパスが必要です`,
+    );
+  }
+  if (projectPath) {
+    if (!allowRoot && !projectPath.relativePath) {
+      throw new Error(`プロジェクトルート自体は${operation}できません`);
+    }
+    return projectPath;
+  }
+  return null;
+}
+
 export async function explorerMkdir(path: string, name: string) {
   const projectPath = parseProjectWorkspacePath(path);
   if (projectPath) {
@@ -763,16 +788,19 @@ export async function explorerRename(path: string, newName: string) {
 }
 
 export async function explorerMove(src: string, dest: string) {
-  const srcProject = parseProjectWorkspacePath(src);
-  const destProject = parseProjectWorkspacePath(dest);
-  if (
+  const srcProject = resolveProjectMutationPath(src, "移動");
+  const destProject = resolveProjectMutationPath(dest, "移動", true);
+  const sameProject =
     srcProject &&
     destProject &&
-    srcProject.projectId === destProject.projectId
-  ) {
+    srcProject.projectId.toLowerCase() === destProject.projectId.toLowerCase();
+  if (sameProject) {
     const result = await pyFetchJson<{ success: boolean; new_path: string }>(
       `/projects/${encodeURIComponent(srcProject.projectId)}/files/move`,
-      { src: srcProject.relativePath, dest: destProject.relativePath },
+      {
+        src: srcProject.relativePath,
+        dest: destProject.relativePath,
+      },
     );
     return {
       ...result,
@@ -788,12 +816,12 @@ export async function explorerMove(src: string, dest: string) {
 }
 
 export async function explorerCopy(src: string, dest: string) {
-  const srcProject = parseProjectWorkspacePath(src);
-  const destProject = parseProjectWorkspacePath(dest);
+  const srcProject = resolveProjectMutationPath(src, "コピー");
+  const destProject = resolveProjectMutationPath(dest, "コピー", true);
   const sameProject =
     srcProject &&
     destProject &&
-    srcProject.projectId === destProject.projectId;
+    srcProject.projectId.toLowerCase() === destProject.projectId.toLowerCase();
   const result = await pyFetchJson<{
     success: boolean;
     new_path: string;
@@ -803,7 +831,10 @@ export async function explorerCopy(src: string, dest: string) {
       ? `/projects/${encodeURIComponent(srcProject.projectId)}/files/copy`
       : "/explorer/copy",
     sameProject
-      ? { src: srcProject.relativePath, dest: destProject.relativePath }
+      ? {
+          src: srcProject.relativePath,
+          dest: destProject.relativePath,
+        }
       : { src, dest },
   );
   return sameProject
@@ -1049,6 +1080,11 @@ export async function explorerSearch(
   limit?: number,
   options?: ExplorerSearchOptions,
 ): Promise<ExplorerSearchResponse> {
+  if (isHfPath(root ?? "")) {
+    throw new Error(
+      "HF仮想パスはHugging Face検索プロバイダーを使用してください",
+    );
+  }
   const remote = parseRemoteWorkspacePath(root ?? "");
   if (remote) {
     const results = await searchRemoteWorkspace(

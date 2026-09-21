@@ -11,12 +11,13 @@ import os
 import re
 import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import unquote
 
 from ._process_utils import _IS_WINDOWS, _read_log_tail
 
-_FRONTEND_BUILD_FINGERPRINT_VERSION = 1
+_FRONTEND_BUILD_FINGERPRINT_VERSION = 2
 _FRONTEND_BUILD_FINGERPRINT_REL_PATH = Path(".next") / "aoitalk-build-fingerprint.json"
 _FRONTEND_BUILD_EXCLUDED_DIR_NAMES = {
     ".git",
@@ -29,7 +30,14 @@ _FRONTEND_BUILD_EXCLUDED_DIR_NAMES = {
 }
 _FRONTEND_BUILD_EXCLUDED_FILE_NAMES = {
     ".DS_Store",
+    # Next.js rewrites this ignored shim to point at the active distDir's
+    # generated route declarations.  It is build output, not source input.
+    "next-env.d.ts",
 }
+_FRONTEND_TRANSIENT_QA_FILE_PATTERNS = (
+    re.compile(r"^\.playwright-focus[^/]*\.cjs$"),
+    re.compile(r"^e2e/\.focus-live[^/]*\.spec\.ts$"),
+)
 _FRONTEND_BUILD_INPUT_SUFFIXES = {
     ".cjs",
     ".css",
@@ -75,6 +83,10 @@ _FRONTEND_STATIC_ASSET_SUFFIXES = {
 }
 _FRONTEND_STATIC_REF_PATTERN = re.compile(
     r"(?:/_next/|_next/)?static/[^\s\"'`<>)\]}]+"
+)
+_FRONTEND_NEXT_GENERATED_TYPES_INCLUDE_PATTERN = re.compile(
+    r"[\"']\.next(?:-[^/\"'\\]+)?[\\/](?:[^/\"'\\]+[\\/])*"
+    r"types[\\/]\*\*[\\/]\*\.ts[\"']"
 )
 
 
@@ -136,6 +148,17 @@ def _is_frontend_build_input(path: Path, frontend_dir: Path) -> bool:
         return False
     if path.name in _FRONTEND_BUILD_EXCLUDED_FILE_NAMES:
         return False
+    # Computer-use/Playwright QA may leave hidden focus harness files in the
+    # frontend tree while a live session is being debugged.  They are never
+    # imported by the production bundle, and including them here makes every
+    # subsequent startup rebuild the otherwise valid .next output.  Keep this
+    # exclusion deliberately narrow so ordinary tracked source and test files
+    # remain part of the production TypeScript fingerprint.
+    if any(
+        pattern.fullmatch(relative.as_posix())
+        for pattern in _FRONTEND_TRANSIENT_QA_FILE_PATTERNS
+    ):
+        return False
     if path.name.startswith(".env"):
         return False
     return path.suffix.lower() in _FRONTEND_BUILD_INPUT_SUFFIXES
@@ -160,23 +183,227 @@ def _iter_frontend_build_input_files(frontend_dir: Path) -> list[Path]:
     return sorted(input_files)
 
 
-def _frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object]:
+def _skip_jsonc_trivia(text: str, index: int) -> int:
+    """Skip whitespace and JSONC comments beginning at ``index``."""
+    length = len(text)
+    while index < length:
+        if text[index].isspace():
+            index += 1
+            continue
+        if text.startswith("//", index):
+            newline = text.find("\n", index + 2)
+            index = length if newline < 0 else newline + 1
+            continue
+        if text.startswith("/*", index):
+            end = text.find("*/", index + 2)
+            index = length if end < 0 else end + 2
+            continue
+        break
+    return index
+
+
+def _scan_jsonc_string_end(text: str, index: int) -> int:
+    """Return the first index after a quoted JSONC string."""
+    quote = text[index]
+    cursor = index + 1
+    escaped = False
+    while cursor < len(text):
+        char = text[cursor]
+        if escaped:
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == quote:
+            return cursor + 1
+        cursor += 1
+    return len(text)
+
+
+def _scan_jsonc_comment_end(text: str, index: int) -> int | None:
+    """Return the first index after a JSONC comment, or ``None``."""
+    if text.startswith("//", index):
+        newline = text.find("\n", index + 2)
+        return len(text) if newline < 0 else newline + 1
+    if text.startswith("/*", index):
+        end = text.find("*/", index + 2)
+        return len(text) if end < 0 else end + 2
+    return None
+
+
+def _find_jsonc_array_end(text: str, opening_index: int) -> int | None:
+    """Find the closing bracket for a JSONC array.
+
+    A character scanner is used instead of a regular expression so brackets in
+    strings or comments cannot be mistaken for the array terminator.
+    """
+    depth = 1
+    cursor = opening_index + 1
+    while cursor < len(text):
+        char = text[cursor]
+        if char in {"\"", "'"}:
+            cursor = _scan_jsonc_string_end(text, cursor)
+            continue
+        comment_end = _scan_jsonc_comment_end(text, cursor)
+        if comment_end is not None:
+            cursor = comment_end
+            continue
+        if char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    return None
+
+
+def _find_jsonc_include_body(text: str) -> tuple[int, int] | None:
+    """Locate the body span of the root ``include`` array in JSONC text."""
+    cursor = 0
+    object_depth = 0
+    while cursor < len(text):
+        cursor = _skip_jsonc_trivia(text, cursor)
+        if cursor >= len(text):
+            break
+        char = text[cursor]
+        if char in {"\"", "'"}:
+            string_end = _scan_jsonc_string_end(text, cursor)
+            if (
+                object_depth == 1
+                and text[cursor + 1 : max(cursor + 1, string_end - 1)]
+                == "include"
+            ):
+                value_cursor = _skip_jsonc_trivia(text, string_end)
+                if value_cursor < len(text) and text[value_cursor] == ":":
+                    value_cursor = _skip_jsonc_trivia(text, value_cursor + 1)
+                    if value_cursor < len(text) and text[value_cursor] == "[":
+                        closing_index = _find_jsonc_array_end(text, value_cursor)
+                        if closing_index is not None:
+                            return value_cursor + 1, closing_index
+            cursor = string_end
+            continue
+        comment_end = _scan_jsonc_comment_end(text, cursor)
+        if comment_end is not None:
+            cursor = comment_end
+            continue
+        if char == "{":
+            object_depth += 1
+        elif char == "}":
+            object_depth = max(0, object_depth - 1)
+        cursor += 1
+    return None
+
+
+def _iter_jsonc_array_entries(body: str) -> list[str]:
+    """Split a JSONC array body at top-level commas."""
+    entries: list[str] = []
+    entry_start = 0
+    cursor = 0
+    nested_depth = 0
+    while cursor < len(body):
+        char = body[cursor]
+        if char in {"\"", "'"}:
+            cursor = _scan_jsonc_string_end(body, cursor)
+            continue
+        comment_end = _scan_jsonc_comment_end(body, cursor)
+        if comment_end is not None:
+            cursor = comment_end
+            continue
+        if char in "[{":
+            nested_depth += 1
+        elif char in "]}":
+            nested_depth = max(0, nested_depth - 1)
+        elif char == "," and nested_depth == 0:
+            entries.append(body[entry_start:cursor])
+            entry_start = cursor + 1
+        cursor += 1
+    entries.append(body[entry_start:])
+    return entries
+
+
+def _is_next_generated_types_include_entry(entry: str) -> bool:
+    """Return whether one JSONC include entry is a Next generated type glob."""
+    cursor = _skip_jsonc_trivia(entry, 0)
+    if cursor >= len(entry) or entry[cursor] not in {"\"", "'"}:
+        return False
+    string_end = _scan_jsonc_string_end(entry, cursor)
+    if not _FRONTEND_NEXT_GENERATED_TYPES_INCLUDE_PATTERN.fullmatch(
+        entry[cursor:string_end]
+    ):
+        return False
+    return _skip_jsonc_trivia(entry, string_end) == len(entry)
+
+
+def _normalize_frontend_tsconfig_for_fingerprint(text: str) -> str:
+    """Remove only Next.js generated type include entries from tsconfig.
+
+    Next.js adds the active ``distDir``'s route type glob to ``include``.  The
+    active distDir may be ``.next`` or any ``.next-*`` QA/verification path, so
+    retaining that generated path would make a production fingerprint change
+    every time another build profile runs.  Keep all other tsconfig content
+    byte-for-byte so genuine compiler/include setting changes remain tracked.
+    """
+    include_span = _find_jsonc_include_body(text)
+    if include_span is None:
+        return text
+
+    body_start, body_end = include_span
+    body = text[body_start:body_end]
+    entries = _iter_jsonc_array_entries(body)
+    kept_entries = [
+        entry
+        for entry in entries
+        if not _is_next_generated_types_include_entry(entry)
+    ]
+    normalized_body = ",".join(kept_entries)
+    return (
+        text[:body_start]
+        + normalized_body
+        + text[body_end:]
+    )
+
+
+def _frontend_build_input_bytes(path: Path) -> bytes:
+    """Read one fingerprint input, normalizing Next-generated tsconfig paths."""
+    content = path.read_bytes()
+    if path.name != "tsconfig.json":
+        return content
+    try:
+        text = content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    return _normalize_frontend_tsconfig_for_fingerprint(text).encode("utf-8")
+
+
+def _frontend_build_input_hash(path: Path) -> bytes:
     digest = hashlib.sha256()
-    file_count = 0
-    for path in _iter_frontend_build_input_files(frontend_dir):
-        relative = path.relative_to(frontend_dir).as_posix()
-        digest.update(relative.encode("utf-8"))
-        digest.update(b"\0")
+    if path.name == "tsconfig.json":
+        digest.update(_frontend_build_input_bytes(path))
+    else:
         with path.open("rb") as file:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
-        digest.update(b"\0")
-        file_count += 1
+    return digest.digest()
+
+
+def _frontend_build_fingerprint(frontend_dir: Path) -> dict[str, object]:
+    # Cold Windows file reads dominated startup. Read a bounded number in
+    # parallel, retaining content-based checks (including same-size edits with
+    # preserved timestamps), and combine hashes in deterministic path order.
+    digest = hashlib.sha256()
+    paths = _iter_frontend_build_input_files(frontend_dir)
+    with ThreadPoolExecutor(max_workers=8, thread_name_prefix="frontend-input") as pool:
+        for path, file_hash in zip(paths, pool.map(_frontend_build_input_hash, paths)):
+            relative = path.relative_to(frontend_dir).as_posix()
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(file_hash)
+            digest.update(b"\0")
 
     return {
         "version": _FRONTEND_BUILD_FINGERPRINT_VERSION,
         "digest": digest.hexdigest(),
-        "file_count": file_count,
+        "file_count": len(paths),
     }
 
 
@@ -358,10 +585,15 @@ def _ensure_frontend_build(
     project_root: Path,
     log_path: Path,
     env: dict[str, str],
+    *,
+    prepared_check: tuple[str | None, dict[str, object]] | None = None,
 ) -> None:
     """Ensure the canonical ``.next`` production build matches the frontend tree."""
     frontend_dir = project_root / "frontend"
-    reason, fingerprint = _frontend_build_rebuild_reason(frontend_dir)
+    reason, fingerprint = (
+        prepared_check if prepared_check is not None
+        else _frontend_build_rebuild_reason(frontend_dir)
+    )
     if not reason:
         return
 
@@ -373,19 +605,43 @@ def _ensure_frontend_build(
         )
         log_file.flush()
 
-        if next_dir.exists():
-            try:
-                shutil.rmtree(next_dir)
-            except OSError as exc:
-                raise RuntimeError(
-                    "Failed to remove stale Next.js build artifacts before rebuild.\n"
-                    f"frontend.log tail:\n{_read_log_tail(log_path)}"
-                ) from exc
+        try:
+            # Invalidate all served artifacts and the verified marker,
+            # but preserve Next's compiler cache for incremental builds.
+            # Refuse redirected output roots; never traverse links while
+            # removing children of the known frontend/.next directory.
+            expected = frontend_dir.resolve() / ".next"
+            if next_dir.is_symlink() or next_dir.is_junction() or next_dir.resolve() != expected:
+                raise OSError("Frontend output directory is redirected")
+            if next_dir.exists():
+                for child in next_dir.iterdir():
+                    if child.is_junction():
+                        raise OSError("Frontend output child is redirected")
+                    if child.name == "cache" and child.is_dir() and not child.is_symlink():
+                        if not child.resolve().is_relative_to(expected):
+                            raise OSError("Frontend cache directory is redirected")
+                        continue
+                    if child.is_symlink():
+                        child.unlink()
+                    elif child.is_dir():
+                        if not child.resolve().is_relative_to(expected):
+                            raise OSError("Frontend output child is redirected")
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+        except OSError as exc:
+            raise RuntimeError(
+                "Failed to remove stale Next.js build artifacts before rebuild.\n"
+                f"frontend.log tail:\n{_read_log_tail(log_path)}"
+            ) from exc
 
+        build_env = dict(env)
+        build_env["NEXT_DIST_DIR"] = ".next"
+        build_env["NODE_ENV"] = "production"
         result = subprocess.run(
             [_npm_command(), "run", "build:production"],
             cwd=str(frontend_dir),
-            env=env,
+            env=build_env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,

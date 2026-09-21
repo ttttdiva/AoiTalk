@@ -4,11 +4,13 @@ import { conversationMessages, conversationSessions } from "@/db/schema";
 import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import {
+  canWriteLockedConversationSession,
   canWriteConversationSession,
   getLiveConversationSession,
   messageToSnake,
 } from "@/lib/server/conversation-route-utils";
-import { encryptText } from "@/lib/server/field-crypto";
+import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
+import { toDbLocalTimestamp } from "@/lib/server/db-time";
 import { jsonWithConditional } from "@/lib/server/http-cache";
 
 export const dynamic = "force-dynamic";
@@ -212,13 +214,131 @@ async function projectBranchInfo(
   return { branchInfo: projection, parentLinks };
 }
 
+type RouteErrorCode =
+  | "unauthenticated"
+  | "invalid_request"
+  | "session_not_found"
+  | "forbidden"
+  | "idempotency_conflict"
+  | "message_persistence_failed";
+
+class ConversationMessageRouteError extends Error {
+  constructor(
+    readonly code: RouteErrorCode,
+    readonly status: number,
+    message: string,
+    readonly retryable = false,
+  ) {
+    super(message);
+    this.name = "ConversationMessageRouteError";
+  }
+}
+
+function requestIdFor(request: NextRequest): string {
+  const supplied = request.headers.get("x-request-id")?.trim() ?? "";
+  // Preserve a trusted correlation id when it is already present, while
+  // preventing arbitrary control characters/oversized values from being
+  // reflected into a response body or header.
+  if (/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(supplied)) return supplied;
+  return crypto.randomUUID();
+}
+
+function structuredErrorResponse(
+  requestId: string,
+  status: number,
+  code: RouteErrorCode,
+  message: string,
+  retryable = false,
+) {
+  return NextResponse.json(
+    {
+      error: {
+        code,
+        message,
+        retryable,
+        request_id: requestId,
+      },
+    },
+    {
+      status,
+      headers: { "x-request-id": requestId },
+    },
+  );
+}
+
+function routeErrorResponse(requestId: string, error: ConversationMessageRouteError) {
+  return structuredErrorResponse(
+    requestId,
+    error.status,
+    error.code,
+    error.message,
+    error.retryable,
+  );
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const code = (error as { code?: unknown }).code;
+  const constraint = (error as { constraint?: unknown }).constraint;
+  return (
+    code === "23505" &&
+    (constraint === undefined ||
+      constraint === "uq_conversation_messages_session_client_message_id")
+  );
+}
+
+function messageContentMatches(
+  row: typeof conversationMessages.$inferSelect,
+  role: string,
+  content: string,
+  actorId: string,
+): boolean {
+  // client_message_id is scoped to both the conversation and the
+  // authenticated actor.  A missing sender id is intentionally not treated
+  // as a match: replaying a legacy/foreign row without actor provenance
+  // would let one participant claim another participant's message.
+  if (row.role !== role || row.senderId !== actorId) return false;
+  try {
+    return decryptTextIfNeeded(
+      row.content,
+      "conversation_messages.content",
+    ) === content;
+  } catch {
+    // An existing row that cannot be decrypted is not safe to treat as an
+    // idempotent replay.  The caller receives a conflict rather than a raw
+    // crypto/storage error.
+    return false;
+  }
+}
+
+function messagePayload(row: typeof conversationMessages.$inferSelect) {
+  const payload = messageToSnake(row) as Record<string, unknown>;
+  if (!row.clientMessageId) return payload;
+  const metadata =
+    payload.metadata && typeof payload.metadata === "object"
+      ? { ...(payload.metadata as Record<string, unknown>) }
+      : {};
+  metadata.client_message_id = row.clientMessageId;
+  return {
+    ...payload,
+    metadata,
+    client_message_id: row.clientMessageId,
+  };
+}
+
 export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const requestId = requestIdFor(request);
   const user = await getSession();
   if (!user) {
-    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+    return structuredErrorResponse(
+      requestId,
+      401,
+      "unauthenticated",
+      "認証が必要です",
+    );
   }
 
   const { id } = await params;
@@ -229,9 +349,11 @@ export async function GET(
   if (sinceParam !== null) {
     const parsed = new Date(sinceParam);
     if (Number.isNaN(parsed.getTime())) {
-      return NextResponse.json(
-        { detail: "since は ISO8601 形式で指定してください" },
-        { status: 400 },
+      return structuredErrorResponse(
+        requestId,
+        400,
+        "invalid_request",
+        "since は ISO8601 形式で指定してください",
       );
     }
     sinceDate = parsed;
@@ -239,9 +361,11 @@ export async function GET(
 
   const session = await getLiveConversationSession(id, user.id);
   if (!session) {
-    return NextResponse.json(
-      { detail: "セッションが見つかりません" },
-      { status: 404 },
+    return structuredErrorResponse(
+      requestId,
+      404,
+      "session_not_found",
+      "セッションが見つかりません",
     );
   }
 
@@ -300,7 +424,7 @@ export async function GET(
   );
   const parentLinks = projection.parentLinks ?? legacyParentLinks;
   const messages = rows.map((row) => ({
-    ...messageToSnake(row),
+    ...messagePayload(row),
     ...(parentLinks?.has(row.id)
       ? { parent_message_id: parentLinks.get(row.id) }
       : {}),
@@ -336,73 +460,273 @@ export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const requestId = requestIdFor(request);
   const user = await getSession();
   if (!user) {
-    return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+    return structuredErrorResponse(
+      requestId,
+      401,
+      "unauthenticated",
+      "認証が必要です",
+    );
   }
 
   const { id } = await params;
   const body = await request.json().catch(() => null);
   const role = body?.role;
   const content = typeof body?.content === "string" ? body.content : "";
+  const rawClientMessageId = body?.client_message_id ?? body?.clientMessageId;
+  const clientMessageId =
+    typeof rawClientMessageId === "string" && rawClientMessageId.trim()
+      ? rawClientMessageId.trim()
+      : null;
 
   if (role !== "user" && role !== "assistant") {
-    return NextResponse.json(
-      { detail: "role は user または assistant を指定してください" },
-      { status: 400 },
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "role は user または assistant を指定してください",
     );
   }
 
   if (!content.trim()) {
-    return NextResponse.json({ detail: "content は必須です" }, { status: 400 });
-  }
-
-  const session = await getLiveConversationSession(id, user.id);
-  if (!session) {
-    return NextResponse.json(
-      { detail: "セッションが見つかりません" },
-      { status: 404 },
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "content は必須です",
     );
   }
-  if (!(await canWriteConversationSession(id, user))) {
-    return NextResponse.json(
-      { detail: "会話への書き込み権限がありません" },
-      { status: 403 },
+
+  if (rawClientMessageId != null && typeof rawClientMessageId !== "string") {
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "client_message_id は文字列で指定してください",
+    );
+  }
+
+  if (clientMessageId && clientMessageId.length > 512) {
+    return structuredErrorResponse(
+      requestId,
+      400,
+      "invalid_request",
+      "client_message_id は512文字以内で指定してください",
+    );
+  }
+
+  try {
+    const session = await getLiveConversationSession(id, user.id);
+    if (!session) {
+      return structuredErrorResponse(
+        requestId,
+        404,
+        "session_not_found",
+        "セッションが見つかりません",
+      );
+    }
+    if (!(await canWriteConversationSession(id, user))) {
+      return structuredErrorResponse(
+        requestId,
+        403,
+        "forbidden",
+        "会話への書き込み権限がありません",
+      );
+    }
+  } catch {
+    return structuredErrorResponse(
+      requestId,
+      503,
+      "message_persistence_failed",
+      "会話の状態を確認できませんでした",
+      true,
     );
   }
 
   const now = new Date();
-  const [message] = await db
-    .insert(conversationMessages)
-    .values({
+  const nowSql = toDbLocalTimestamp(now);
+
+  try {
+    const result = await db.transaction(async (tx) => {
+      // Lock the canonical session row and revalidate it inside the same
+      // transaction as the message write.  This serializes retries and
+      // prevents a concurrent delete/restore from producing a partial write.
+      const [lockedSession] = await tx
+        .select()
+        .from(conversationSessions)
+        .where(
+          and(
+            eq(conversationSessions.id, id),
+            isNull(conversationSessions.deletedAt),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!lockedSession) {
+        throw new ConversationMessageRouteError(
+          "session_not_found",
+          404,
+          "セッションが見つかりません",
+        );
+      }
+      // The request-level ACL check above is only an early rejection.  Re-run
+      // the authoritative participant/project check after the session lock so
+      // a permission revocation racing this write cannot still insert a row.
+      if (
+        !(
+          await canWriteLockedConversationSession(
+            tx as unknown as typeof db,
+            lockedSession,
+            user,
+          )
+        )
+      ) {
+        throw new ConversationMessageRouteError(
+          "forbidden",
+          403,
+          "会話への書き込み権限がありません",
+        );
+      }
+
+      let existing:
+        | typeof conversationMessages.$inferSelect
+        | undefined;
+      if (clientMessageId) {
+        [existing] = await tx
+          .select()
+          .from(conversationMessages)
+          .where(
+            and(
+              eq(conversationMessages.sessionId, id),
+              eq(conversationMessages.clientMessageId, clientMessageId),
+            ),
+          )
+          .limit(1);
+        if (existing) {
+          if (!messageContentMatches(existing, role, content, user.id)) {
+            throw new ConversationMessageRouteError(
+              "idempotency_conflict",
+              409,
+              "同じclient_message_idの内容が一致しません",
+            );
+          }
+          return { message: existing, replayed: true };
+        }
+      }
+
+      const [message] = await tx
+        .insert(conversationMessages)
+        .values({
+          sessionId: id,
+          role,
+          content: encryptText(content, "conversation_messages.content"),
+          messageMetadata: clientMessageId
+            ? { client_message_id: clientMessageId }
+            : {},
+          senderType: role === "user" ? "user" : null,
+          senderId: (clientMessageId || role === "user") ? user.id : null,
+          senderDisplayName:
+            role === "user"
+              ? user.displayName || user.username || user.email || user.id
+              : null,
+          clientMessageId,
+          createdAt: now,
+          branchIndex: 0,
+          isActiveBranch: true,
+        })
+        .returning();
+      if (!message) {
+        throw new ConversationMessageRouteError(
+          "message_persistence_failed",
+          500,
+          "メッセージを保存できませんでした",
+          true,
+        );
+      }
+
+      await tx
+        .update(conversationSessions)
+        .set({
+          // A delayed/duplicated writer must not regress the canonical
+          // activity marker used by the history ordering.  Convert the
+          // timestamp at the DB boundary instead of interpolating a Date
+          // object into postgres-js' raw SQL template.
+          lastActivity: sql`case
+            when ${conversationSessions.lastActivity} is null
+              or ${conversationSessions.lastActivity} < ${nowSql}
+            then ${nowSql}
+            else ${conversationSessions.lastActivity}
+          end`,
+          messageCount: sql`coalesce(${conversationSessions.messageCount}, 0) + 1`,
+        })
+        .where(eq(conversationSessions.id, id));
+
+      return { message, replayed: false };
+    });
+
+    return NextResponse.json(
+      {
+        success: true,
+        replayed: result.replayed,
+        message: messagePayload(result.message),
+      },
+      { headers: { "x-request-id": requestId } },
+    );
+  } catch (error) {
+    if (error instanceof ConversationMessageRouteError) {
+      return routeErrorResponse(requestId, error);
+    }
+
+    // A legacy writer may race the new partial unique index without taking
+    // the session lock.  Resolve that race into the same replay/conflict
+    // contract rather than leaking a postgres error to the browser.
+    if (clientMessageId && isUniqueViolation(error)) {
+      try {
+        const [existing] = await db
+          .select()
+          .from(conversationMessages)
+          .where(
+            and(
+              eq(conversationMessages.sessionId, id),
+              eq(conversationMessages.clientMessageId, clientMessageId),
+            ),
+          )
+          .limit(1);
+        if (existing && messageContentMatches(existing, role, content, user.id)) {
+          return NextResponse.json(
+            {
+              success: true,
+              replayed: true,
+              message: messagePayload(existing),
+            },
+            { headers: { "x-request-id": requestId } },
+          );
+        }
+        if (existing) {
+          return structuredErrorResponse(
+            requestId,
+            409,
+            "idempotency_conflict",
+            "同じclient_message_idの内容が一致しません",
+          );
+        }
+      } catch {
+        // Fall through to the generic sanitized persistence failure.
+      }
+    }
+
+    console.error("conversation message persistence failed", {
+      requestId,
       sessionId: id,
-      role,
-      content: encryptText(content, "conversation_messages.content"),
-      messageMetadata: {},
-      senderType: role === "user" ? "user" : null,
-      senderId: role === "user" ? user.id : null,
-      senderDisplayName:
-        role === "user" ? user.displayName || user.username || user.email || user.id : null,
-      createdAt: now,
-      branchIndex: 0,
-      isActiveBranch: true,
-    })
-    .returning();
-
-  await db
-    .update(conversationSessions)
-    .set({
-      // A delayed/duplicated writer must not regress the canonical activity
-      // marker used by the history ordering.
-      lastActivity: sql`case
-        when ${conversationSessions.lastActivity} is null
-          or ${conversationSessions.lastActivity} < ${now}
-        then ${now}
-        else ${conversationSessions.lastActivity}
-      end`,
-      messageCount: sql`coalesce(${conversationSessions.messageCount}, 0) + 1`,
-    })
-    .where(eq(conversationSessions.id, id));
-
-  return NextResponse.json({ success: true, message: messageToSnake(message) });
+    });
+    return structuredErrorResponse(
+      requestId,
+      500,
+      "message_persistence_failed",
+      "メッセージを保存できませんでした",
+      true,
+    );
+  }
 }

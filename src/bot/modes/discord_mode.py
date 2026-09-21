@@ -24,7 +24,7 @@ from ...assistant.base import BaseAssistant
 from ...config import Config
 from ...llm.generation_policy import GenerationProfile, generation_policy_for_profile
 from ...memory.history import HistoryManager
-from ...services.outbound_privacy_service import OutboundPrivacyGateway
+from ...services.outbound_privacy_service import EgressDescriptor, OutboundPrivacyGateway
 
 logger = logging.getLogger(__name__)
 
@@ -2047,20 +2047,53 @@ class DiscordMode(BaseAssistant):
                         request_usage_context, "project_metadata", None
                     ),
                 )
-                protected = privacy_gateway.protect_sync(
+                descriptor = EgressDescriptor(
+                    action="discord.vision.generate",
+                    transport="google.generativeai",
+                    destination="https://generativelanguage.googleapis.com",
+                    provider="gemini",
+                    tool="discord_vision",
+                    model=vision_model,
+                )
+
+                def send_gemini_vision(protected_payload: Any) -> Any:
+                    if not isinstance(protected_payload, Mapping):
+                        raise RuntimeError(
+                            "privacy protection returned no Discord vision payload"
+                        )
+                    if "text" not in protected_payload:
+                        raise RuntimeError(
+                            "privacy protection returned no Discord vision text"
+                        )
+                    outbound_text = str(protected_payload.get("text") or "")
+                    outbound_media = protected_payload.get("media")
+                    if not isinstance(outbound_media, list):
+                        raise RuntimeError(
+                            "privacy protection returned no Discord vision media"
+                        )
+                    outbound_parts: list[Any] = [outbound_text]
+                    for img_data in outbound_media:
+                        if not isinstance(img_data, Mapping):
+                            continue
+                        raw = img_data.get("data")
+                        if not isinstance(raw, (bytes, bytearray)):
+                            continue
+                        try:
+                            outbound_parts.append(Image.open(io.BytesIO(bytes(raw))))
+                        except Exception:
+                            logger.warning("Discord image decode failed for Gemini payload")
+                    return model.generate_content(outbound_parts)
+
+                # Generate inside the same synchronous privacy transaction.
+                response = await asyncio.to_thread(
+                    privacy_gateway.execute_sync,
                     {"text": content_parts[0], "media": images_data},
                     provider="gemini",
+                    descriptor=descriptor,
+                    sender=send_gemini_vision,
+                    base_url="https://generativelanguage.googleapis.com",
                     source_kind="discord_vision",
-                )
-                if isinstance(protected.payload, dict):
-                    content_parts[0] = str(
-                        protected.payload.get("text") or content_parts[0]
-                    )
-                
-                # 生成実行
-                response = await asyncio.to_thread(
-                    model.generate_content,
-                    content_parts
+                    model=vision_model,
                 )
 
                 # This direct Gemini call is not routed through llm_client's
@@ -2084,7 +2117,12 @@ class DiscordMode(BaseAssistant):
             else:
                 # OpenAI APIを使用 (GPT-4oなど)
                 import openai
-                client = openai.OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+                # The provider SDK otherwise retries implicitly; every
+                # attempt must be an explicit gateway transaction.
+                client = openai.OpenAI(
+                    api_key=os.getenv('OPENAI_API_KEY'),
+                    max_retries=0,
+                )
                 
                 # システム指示（Responses APIのinstructionsへ）
                 instructions = self.character_config.get('personality', {}).get('details', 'あなたは親切なAIアシスタントです。')
@@ -2134,25 +2172,39 @@ class DiscordMode(BaseAssistant):
                         request_usage_context, "project_metadata", None
                     ),
                 )
-                protected = privacy_gateway.protect_sync(
-                    {"instructions": instructions, "input": input_messages},
+                descriptor = EgressDescriptor(
+                    action="discord.vision.generate",
+                    transport="openai.responses",
+                    destination="https://api.openai.com/v1/responses",
                     provider="openai",
-                    source_kind="discord_vision",
+                    tool="discord_vision",
+                    model=vision_model,
                 )
-                if isinstance(protected.payload, dict):
-                    instructions = str(protected.payload.get("instructions") or instructions)
-                    input_messages = protected.payload.get("input") or input_messages
 
-                # GPT-4oで応答生成
-                # The OpenAI SDK call is synchronous.  Run it off the event
-                # loop so a slow network request cannot block every Discord
-                # session worker.
+                def send_openai_vision(protected_payload: Any) -> Any:
+                    if not isinstance(protected_payload, Mapping):
+                        raise RuntimeError(
+                            "privacy protection returned no Discord vision payload"
+                        )
+                    return client.responses.create(**dict(protected_payload))
+
+                # The OpenAI SDK call is synchronous.  Run the complete
+                # gateway transaction off the event loop so both review and
+                # provider I/O cannot block other Discord sessions.
                 response = await asyncio.to_thread(
-                    client.responses.create,
-                    model=vision_model,  # configから取得したモデル名を使用
-                    instructions=instructions,
-                    input=input_messages,
-                    max_output_tokens=1000,
+                    privacy_gateway.execute_sync,
+                    {
+                        "model": vision_model,
+                        "instructions": instructions,
+                        "input": input_messages,
+                        "max_output_tokens": 1000,
+                    },
+                    provider="openai",
+                    descriptor=descriptor,
+                    sender=send_openai_vision,
+                    base_url="https://api.openai.com/v1",
+                    source_kind="discord_vision",
+                    model=vision_model,
                 )
 
                 # OpenAI Responses usage is available as response.usage when

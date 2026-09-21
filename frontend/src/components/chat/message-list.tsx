@@ -1,6 +1,6 @@
 "use client";
 
-import { memo, useEffect, useRef, useMemo, useState, useCallback } from "react";
+import { memo, useLayoutEffect, useRef, useMemo, useState, useCallback } from "react";
 import {
   Pencil,
   Check,
@@ -66,7 +66,13 @@ import {
 import { cn, formatBytes } from "@/lib/utils";
 import Link from "next/link";
 
-const AUTO_SCROLL_BOTTOM_THRESHOLD_PX = 96;
+// 保存確定でサーバーIDが付いても、送信済みの行とスクロール位置を維持する。
+function messageRenderKey(message: ConversationMessage): string {
+  const clientId = message.client_message_id || message.metadata?.client_message_id;
+  return message.role === "user" && typeof clientId === "string" && clientId
+    ? `user:${message.session_id}:${clientId}`
+    : message.id;
+}
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -212,6 +218,10 @@ type MessageListProps = {
     message: ConversationMessage,
     responseModel?: ChatResponseModelSelection,
   ) => void;
+  /** Retry only the durable assistant-message write for a completed report. */
+  onRetryMessagePersistence?: (
+    clientMessageId: string,
+  ) => void | Promise<unknown>;
   responseModelOptions?: ChatResponseModelOption[];
   responseModelOptionsLoading?: boolean;
 };
@@ -761,6 +771,7 @@ export function MessageList({
   onForkStoryMessage,
   onSwitchBranch,
   onRerunMessage,
+  onRetryMessagePersistence,
   responseModelOptions = [],
   responseModelOptionsLoading = false,
 }: MessageListProps) {
@@ -1175,7 +1186,7 @@ export function MessageList({
     return result;
   }, [visibleMessages]);
   const visibleMessageIds = useMemo(
-    () => visibleMessages.map((message) => message.id),
+    () => visibleMessages.map(messageRenderKey),
     [visibleMessages],
   );
 
@@ -1192,16 +1203,12 @@ export function MessageList({
   }, []);
 
   const scrollToBottom = useCallback((behavior: ScrollBehavior = "auto") => {
-    if (!isPinnedToBottomRef.current) return;
-    requestAnimationFrame(() => {
-      if (!isPinnedToBottomRef.current) return;
-      const scrollContainer = scrollContainerRef.current;
-      if (!scrollContainer) return;
-      scrollContainer.scrollTo({
-        top: scrollContainer.scrollHeight,
-        behavior,
-      });
-      isPinnedToBottomRef.current = true;
+    if (!isPinnedToBottomRef.current) return false;
+    const scrollContainer = scrollContainerRef.current;
+    if (!scrollContainer) return false;
+    scrollContainer.scrollTo({
+      top: scrollContainer.scrollHeight,
+      behavior,
     });
     return true;
   }, []);
@@ -1241,7 +1248,7 @@ export function MessageList({
   );
   const previousVisibleMessageIdsRef = useRef<string[]>([]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const previousIds = previousVisibleMessageIdsRef.current;
     const isAppendOnlyUpdate =
       previousIds.length <= visibleMessageIds.length &&
@@ -1254,8 +1261,8 @@ export function MessageList({
     previousVisibleMessageIdsRef.current = visibleMessageIds;
   }, [visibleMessageIds]);
 
-  // 自動スクロール
-  useEffect(() => {
+  // 更新前のスクロール位置を一度描画してから移動すると、送信・streamごとに跳ねる。
+  useLayoutEffect(() => {
     scrollToBottom();
   }, [
     visibleMessagesScrollKey,
@@ -1299,7 +1306,7 @@ export function MessageList({
           if (msg.role === "system") {
             return (
               <div
-                key={msg.id}
+                key={messageRenderKey(msg)}
                 id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
                 className="py-2 text-center text-xs text-muted-foreground"
@@ -1332,7 +1339,7 @@ export function MessageList({
             const messageTime = formatMessageTime(msg.created_at);
             return (
               <div
-                key={msg.id}
+                key={messageRenderKey(msg)}
                 id={getChatMessageDomId(msg.id)}
                 data-chat-message-id={msg.id}
                 className="group/msg flex min-w-0 flex-col items-end gap-1"
@@ -1435,9 +1442,16 @@ export function MessageList({
               ? msg.metadata.character_name
               : "");
           const messageTime = formatMessageTime(msg.created_at);
+          const persistenceFailed = msg.metadata?.persistence_failed === true;
+          const persistenceRetryable =
+            msg.metadata?.persistence_retryable !== false;
+          const persistenceClientMessageId =
+            typeof msg.metadata?.client_message_id === "string"
+              ? msg.metadata.client_message_id
+              : msg.client_message_id ?? null;
           return (
             <div
-              key={msg.id}
+              key={messageRenderKey(msg)}
               id={getChatMessageDomId(msg.id)}
               data-chat-message-id={msg.id}
               className="group/msg flex justify-start gap-3"
@@ -1478,6 +1492,33 @@ export function MessageList({
                     <MessageContent content={msg.content} />
                   </div>
                 )}
+                {persistenceFailed && (
+                  <div
+                    data-testid="assistant-persistence-warning"
+                    className="flex flex-wrap items-center gap-2 text-xs text-warning"
+                  >
+                    <span className="inline-flex items-center gap-1">
+                      <AlertTriangle className="size-3.5" aria-hidden="true" />
+                      結果は表示されていますが、会話への保存に失敗しました。
+                    </span>
+                    {onRetryMessagePersistence &&
+                      persistenceRetryable &&
+                      persistenceClientMessageId && (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() =>
+                            void onRetryMessagePersistence(
+                              persistenceClientMessageId,
+                            )
+                          }
+                        >
+                          保存を再試行
+                        </Button>
+                      )}
+                  </div>
+                )}
                 {agentRunId && (
                   <AgentResourceMutationList
                     runId={agentRunId}
@@ -1507,8 +1548,8 @@ export function MessageList({
           );
         })}
 
-        {/* ストリーミング中のメッセージ */}
-        {isStreaming && streamingContent && (
+        {/* 待機→stream開始→本文受信でも同じ行・実行ログを維持する。 */}
+        {(isStreaming || showGenerationActivity) && (
           <div className="flex justify-start gap-3">
             <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
               <Bot className="size-4" />
@@ -1522,45 +1563,21 @@ export function MessageList({
                 activityMessage={activityMessage}
                 onContentChange={scrollToBottom}
               />
-              <div className="min-w-0 max-w-full overflow-hidden rounded-none border-0 bg-transparent px-0 py-0 text-[14px] leading-6 text-on-surface [overflow-wrap:anywhere] prose-sm">
-                <MessageContent content={streamingContent} />
-                {!activeAgentRunId &&
-                  !activeTool &&
-                  (activityMessage ? (
-                    <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
-                      <Loader2 className="size-3 animate-spin" />
-                      {activityMessage}
-                    </span>
-                  ) : (
-                    <TypingIndicator />
-                  ))}
-              </div>
-              {!activeAgentRunId && (
-                <ToolResultDetails results={liveToolResults} />
-              )}
-              {!activeAgentRunId && activeTool && (
-                <ToolIndicator toolName={activeTool} />
-              )}
-            </div>
-          </div>
-        )}
-
-        {/* ストリーミング開始直後（内容なし）またはツール実行中 */}
-        {isStreaming && !streamingContent && (
-          <div className="flex justify-start gap-3">
-            <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
-              <Bot className="size-4" />
-            </div>
-            <div className="flex min-w-0 max-w-full flex-col gap-1">
-              <AgentRunTimeline
-                runId={activeAgentRunId}
-                live
-                generationKey={generationKey}
-                generationStartedAt={generationStartedAt}
-                activityMessage={activityMessage}
-                onContentChange={scrollToBottom}
-              />
-              {!activeAgentRunId && (
+              {isStreaming && streamingContent ? (
+                <div className="min-w-0 max-w-full overflow-hidden rounded-none border-0 bg-transparent px-0 py-0 text-[14px] leading-6 text-on-surface [overflow-wrap:anywhere] prose-sm">
+                  <MessageContent content={streamingContent} />
+                  {!activeAgentRunId &&
+                    !activeTool &&
+                    (activityMessage ? (
+                      <span className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                        <Loader2 className="size-3 animate-spin" />
+                        {activityMessage}
+                      </span>
+                    ) : (
+                      <TypingIndicator />
+                    ))}
+                </div>
+              ) : !activeAgentRunId && (isStreaming || activeTool) ? (
                 <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border-subtle bg-surface-container-low px-3 py-2.5 text-sm text-on-surface [overflow-wrap:anywhere] prose-sm">
                   {activeTool ? (
                     <ToolIndicator toolName={activeTool} />
@@ -1573,36 +1590,17 @@ export function MessageList({
                     <TypingIndicator />
                   )}
                 </div>
+              ) : null}
+              {isStreaming && streamingContent && !activeAgentRunId && (
+                <ToolResultDetails results={liveToolResults} />
+              )}
+              {isStreaming && streamingContent && !activeAgentRunId && activeTool && (
+                <ToolIndicator toolName={activeTool} />
               )}
             </div>
           </div>
         )}
 
-        {/* 応答待ち（送信済み〜stream_start受信前） */}
-        {showGenerationActivity &&
-          !isStreaming &&
-          (
-            <div className="flex justify-start gap-3">
-              <div className="mt-1 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/60 bg-primary-container/15 text-primary" aria-hidden="true">
-                <Bot className="size-4" />
-              </div>
-              <div className="flex min-w-0 max-w-full flex-col gap-1">
-                <AgentRunTimeline
-                  runId={activeAgentRunId}
-                  live
-                  generationKey={generationKey}
-                  generationStartedAt={generationStartedAt}
-                  activityMessage={activityMessage}
-                  onContentChange={scrollToBottom}
-                />
-                {!activeAgentRunId && activeTool && (
-                  <div className="min-w-0 max-w-full overflow-hidden rounded-md border border-border-subtle bg-surface-container-low px-3 py-2.5 text-sm text-on-surface [overflow-wrap:anywhere] prose-sm">
-                    <ToolIndicator toolName={activeTool} />
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
         </div>
       </div>
       <ChatMessageHistoryRail messages={visibleMessages} />

@@ -7,9 +7,17 @@ import time
 import os
 import socket
 import psutil
+from collections.abc import Mapping
 from typing import Optional, Dict, Any
 import requests
 import aiohttp
+
+from ...services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
 
 from ..engine_startup import (
     DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
@@ -37,6 +45,8 @@ class VoicevoxEngine:
         host: str = "127.0.0.1",
         port: int = 50021,
         startup_timeout_seconds: float = DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+        config: Any | None = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
     ):
         """Initialize VOICEVOX engine
         
@@ -51,9 +61,74 @@ class VoicevoxEngine:
         self.port = port
         self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds))
         self.base_url = f"http://{host}:{port}"
+        self.config = config
+        self._privacy_gateway = privacy_gateway
         self.process = None
         self.client = None
         self.session = None  # aiohttp session for connection pooling
+
+    def _gateway(self) -> OutboundPrivacyGateway:
+        """Return the active request-scoped privacy gateway."""
+
+        if self._privacy_gateway is not None:
+            return self._privacy_gateway
+        try:
+            from ...services.turn_context import get_turn_context
+
+            turn = get_turn_context()
+        except Exception:
+            turn = None
+        scope = get_privacy_policy_context()
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(getattr(turn, "user_id", "") or ""),
+            session_id=str(getattr(turn, "session_id", "") or ""),
+            session_context=scope.session_context,
+            project_metadata=scope.project_metadata,
+        )
+
+    def _descriptor(self, *, action: str, path: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="aiohttp",
+            destination=f"{self.base_url}{path}",
+            provider="voicevox",
+            tool="tts.voicevox",
+        )
+
+    async def _execute_async(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        path: str,
+        sender,
+    ) -> Any:
+        return await self._gateway().execute(
+            payload,
+            provider="voicevox",
+            descriptor=self._descriptor(action=action, path=path),
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=action,
+        )
+
+    def _execute_sync(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        path: str,
+        sender,
+    ) -> Any:
+        return self._gateway().execute_sync(
+            payload,
+            provider="voicevox",
+            descriptor=self._descriptor(action=action, path=path),
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=action,
+        )
 
     def _create_client(self):
         if VoicevoxClient is None:
@@ -202,7 +277,16 @@ class VoicevoxEngine:
             )
             if started:
                 try:
-                    response = requests.get(f"{self.base_url}/version", timeout=2)
+                    response = self._execute_sync(
+                        {},
+                        action="tts.voicevox.version",
+                        path="/version",
+                        sender=lambda _payload: requests.get(
+                            f"{self.base_url}/version",
+                            timeout=2,
+                            allow_redirects=False,
+                        ),
+                    )
                     version_info = response.text.strip().replace('"', '')
                 except requests.exceptions.RequestException:
                     version_info = "unknown"
@@ -292,33 +376,49 @@ class VoicevoxEngine:
             print("[VOICEVOX] Client not initialized")
             return None
             
-        # Check if engine is still running
+        # Check if engine is still running.  Reinitialization/retry is left to
+        # an explicit caller so every provider request has one auditable
+        # gateway transaction.
         if self.process and self.process.poll() is not None:
             print(f"[VOICEVOX] Engine process died (exit code: {self.process.returncode})")
-            # Try to reinitialize
-            print("[VOICEVOX] Attempting to restart engine...")
-            if self.start_engine() and await self.initialize():
-                print("[VOICEVOX] Engine restarted successfully")
-            else:
-                print("[VOICEVOX] Failed to restart engine")
-                return None
+            return None
             
-        # Retry logic for connection errors
-        max_retries = 3
-        retry_delay = 1.0
+        # No hidden retries: retrying here could bypass a fresh review
+        # decision and make provider request counts opaque.
+        max_retries = 1
         
         for attempt in range(max_retries):
             try:
-                # Test connection first
-                try:
-                    response = requests.get(f"{self.base_url}/version", timeout=1)
-                    if response.status_code != 200:
-                        raise Exception(f"Engine not responding (status: {response.status_code})")
-                except requests.exceptions.RequestException as e:
-                    raise Exception(f"Cannot connect to engine: {e}")
-                
                 # Create audio query
-                audio_query = await self.client.create_audio_query(text, speaker=speaker_id)
+                def send_audio_query(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "VOICEVOX audio-query payload is malformed"
+                        )
+                    outbound_text = protected_payload.get("text")
+                    if not isinstance(outbound_text, str):
+                        raise PrivacyError(
+                            "VOICEVOX audio-query text is unavailable"
+                        )
+                    try:
+                        outbound_speaker = int(
+                            protected_payload.get("speaker", speaker_id)
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise PrivacyError(
+                            "VOICEVOX audio-query speaker is invalid"
+                        ) from exc
+                    return self.client.create_audio_query(
+                        outbound_text,
+                        speaker=outbound_speaker,
+                    )
+
+                audio_query = await self._execute_async(
+                    {"text": text, "speaker": speaker_id},
+                    action="tts.voicevox.audio_query",
+                    path="/audio_query",
+                    sender=send_audio_query,
+                )
                 
                 # Apply voice parameters
                 self._set_audio_query_value(audio_query, 'speed_scale', 'speedScale', speed)
@@ -326,59 +426,53 @@ class VoicevoxEngine:
                 self._set_audio_query_value(audio_query, 'intonation_scale', 'intonationScale', intonation)
                 self._set_audio_query_value(audio_query, 'volume_scale', 'volumeScale', volume)
                 
-                # Synthesize audio
-                audio_data = await audio_query.synthesis(speaker=speaker_id)
+                # Synthesize audio through the gateway as a separate request.
+                def send_synthesis(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "VOICEVOX synthesis payload is malformed"
+                        )
+                    outbound_query = protected_payload.get("audio_query")
+                    if outbound_query is not audio_query:
+                        # ``audio_query`` is the object returned by the first
+                        # provider transaction.  A reviewer may redact scalar
+                        # fields in a mapping copy, but the SDK's synthesis
+                        # method requires that approved object; never fall
+                        # back to the pre-review value when it is omitted.
+                        if outbound_query is None:
+                            raise PrivacyError(
+                                "VOICEVOX synthesis audio query is unavailable"
+                            )
+                    try:
+                        outbound_speaker = int(
+                            protected_payload.get("speaker", speaker_id)
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise PrivacyError(
+                            "VOICEVOX synthesis speaker is invalid"
+                        ) from exc
+                    # The SDK method is bound to the query object returned by
+                    # ``create_audio_query``.  Preserve this exact approved
+                    # object rather than reaching back to raw request state.
+                    query_to_send = outbound_query
+                    synth = getattr(query_to_send, "synthesis", None)
+                    if not callable(synth):
+                        raise PrivacyError(
+                            "VOICEVOX synthesis audio query is not sendable"
+                        )
+                    return synth(speaker=outbound_speaker)
+
+                audio_data = await self._execute_async(
+                    {"speaker": speaker_id, "audio_query": audio_query},
+                    action="tts.voicevox.synthesis",
+                    path="/synthesis",
+                    sender=send_synthesis,
+                )
                 return audio_data
                 
             except Exception as e:
-                error_msg = str(e)
-                if "ConnectError" in error_msg or "connection" in error_msg.lower():
-                    if attempt < max_retries - 1:
-                        print(f"[VOICEVOX] Connection error (attempt {attempt + 1}/{max_retries}): {error_msg}")
-                        await asyncio.sleep(retry_delay)
-                        retry_delay *= 2  # Exponential backoff
-                        
-                        # Try to reinitialize client
-                        try:
-                            # Close existing client properly before creating new one
-                            if self.client:
-                                try:
-                                    await self.client.close()
-                                except:
-                                    pass
-                            
-                            # Close and recreate session
-                            if self.session and not self.session.closed:
-                                await self.session.close()
-                            
-                            # Create new session with Windows-optimized settings
-                            connector = aiohttp.TCPConnector(
-                                limit=20,
-                                limit_per_host=10,
-                                ttl_dns_cache=300,
-                                force_close=False,
-                                enable_cleanup_closed=True
-                            )
-                            timeout = aiohttp.ClientTimeout(total=30, connect=5)
-                            self.session = aiohttp.ClientSession(
-                                connector=connector,
-                                timeout=timeout,
-                                headers={'Connection': 'keep-alive'}
-                            )
-                            
-                            # Create new client
-                            self.client = self._create_client()
-                            await self._attach_session()
-                                
-                            print("[VOICEVOX] Client reinitialized")
-                        except Exception as reinit_error:
-                            print(f"[VOICEVOX] Failed to reinitialize client: {reinit_error}")
-                    else:
-                        print(f"[VOICEVOX] Synthesis error after {max_retries} attempts: {type(e).__name__}: {e}")
-                        return None
-                else:
-                    print(f"[VOICEVOX] Synthesis error: {type(e).__name__}: {e}")
-                    return None
+                print(f"[VOICEVOX] Synthesis error: {type(e).__name__}: {e}")
+                return None
                     
         return None
             
@@ -393,7 +487,12 @@ class VoicevoxEngine:
 
         try:
             if hasattr(self.client, 'fetch_speakers'):
-                return await self.client.fetch_speakers()
+                return await self._execute_async(
+                    {},
+                    action="tts.voicevox.speakers",
+                    path="/speakers",
+                    sender=lambda _payload: self.client.fetch_speakers(),
+                )
 
             session = self.session
             owns_session = False
@@ -402,9 +501,20 @@ class VoicevoxEngine:
                 owns_session = True
 
             try:
-                async with session.get(f"{self.base_url}/speakers") as response:
-                    response.raise_for_status()
-                    return await response.json()
+                async def send_speakers(_payload: Any) -> Any:
+                    async with session.get(
+                        f"{self.base_url}/speakers",
+                        allow_redirects=False,
+                    ) as response:
+                        response.raise_for_status()
+                        return await response.json()
+
+                return await self._execute_async(
+                    {},
+                    action="tts.voicevox.speakers",
+                    path="/speakers",
+                    sender=send_speakers,
+                )
             finally:
                 if owns_session:
                     await session.close()

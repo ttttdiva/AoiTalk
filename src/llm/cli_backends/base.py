@@ -81,6 +81,29 @@ def _decode_cli_output(data: bytes | str | None) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+def _scoped_output_limit(scope: Any, *, default: int = 32_768) -> int:
+    """Return the server-issued capture limit without trusting a lower scope."""
+
+    try:
+        from ...security.harness_execution_scope import (
+            get_current_harness_execution_scope,
+        )
+
+        upper = get_current_harness_execution_scope()
+        limits = getattr(upper, "resource_limits", None)
+        value = getattr(limits, "max_output_bytes", default)
+        return max(1, int(value))
+    except (ImportError, TypeError, ValueError):
+        return max(1, int(default))
+
+
+def _append_bounded_bytes(buffer: bytearray, chunk: bytes, limit: int) -> None:
+    buffer.extend(chunk)
+    overflow = len(buffer) - limit
+    if overflow > 0:
+        del buffer[:overflow]
+
+
 def _create_windows_process_job(process: subprocess.Popen) -> int | None:
     if os.name != "nt":
         return None
@@ -267,6 +290,18 @@ class CLIBackendBase(ABC):
     def get_session_capabilities(self) -> CLISessionCapabilities:
         """Return the native session contract implemented by this backend."""
         return CLISessionCapabilities()
+
+    def supports_isolated_tool_free_invocation(self) -> bool:
+        """Whether Help can invoke this CLI with all native tools disabled.
+
+        The default is deliberately conservative. Provider CLIs may expose
+        shell/filesystem tools, native MCP configuration, or user-level
+        plugins that AoiTalk cannot revoke per request. A backend must opt in
+        only after proving that every such capability is disabled for the
+        invocation, including native sessions and global/user configuration.
+        """
+
+        return False
 
     @staticmethod
     def cli_help_contains(
@@ -708,7 +743,12 @@ class CLIBackendBase(ABC):
         logger.debug(f"[{self.provider_name}] Prompt length: {len(prompt)} chars")
         subprocess_env = self.get_subprocess_env()
 
-        max_retries = 3
+        # The caller's OutboundPrivacyGateway owns approval and retry
+        # semantics.  Once an invocation is inside that transaction, an
+        # implicit subprocess retry would be a second provider send that the
+        # user never approved.  Keep the historical retry budget for direct
+        # legacy callers, but make the gated path one-shot.
+        max_retries = 1 if getattr(self, "_aoitalk_egress_transaction", False) else 3
         retry_delay = 1.0
 
         for attempt in range(max_retries):
@@ -983,8 +1023,14 @@ class CLIBackendBase(ABC):
     ) -> tuple[int, str, str]:
         """Stream a backend-owned WSL process without host ``Popen``."""
 
-        stdout_queue: queue.Queue[bytes | None] = queue.Queue()
-        stdout_chunks: list[bytes] = []
+        max_output_bytes = _scoped_output_limit(scope)
+        # A bounded queue applies pipe backpressure when event handling is
+        # slower than the child.  Reading fixed-size chunks also avoids one
+        # attacker-controlled no-newline record becoming a giant allocation.
+        stdout_queue: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        reader_stop = threading.Event()
+        stdout_tail = bytearray()
+        pending_line = bytearray()
         process = backend.spawn(
             scope,
             command,
@@ -1008,10 +1054,20 @@ class CLIBackendBase(ABC):
             try:
                 if process.stdout is None:
                     return
-                for chunk in iter(process.stdout.readline, b""):
-                    stdout_queue.put(chunk)
+                for chunk in iter(lambda: process.stdout.read(8192), b""):
+                    while not reader_stop.is_set():
+                        try:
+                            stdout_queue.put(chunk, timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
             finally:
-                stdout_queue.put(None)
+                while not reader_stop.is_set():
+                    try:
+                        stdout_queue.put(None, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
 
         reader = threading.Thread(target=_reader, daemon=True)
         reader.start()
@@ -1030,6 +1086,7 @@ class CLIBackendBase(ABC):
                 cancellation_handle is not None
                 and cancellation_handle.cancel_requested.is_set()
             ):
+                reader_stop.set()
                 _terminate_cli_process_tree(process)
                 reader.join(timeout=1.0)
                 raise GenerationCancelled("CLI generation cancelled")
@@ -1037,6 +1094,7 @@ class CLIBackendBase(ABC):
                 cancellation_handle is not None
                 and cancellation_handle.interrupt_requested.is_set()
             ):
+                reader_stop.set()
                 _terminate_cli_process_tree(process)
                 reader.join(timeout=1.0)
                 raise_if_generation_interrupted()
@@ -1045,6 +1103,7 @@ class CLIBackendBase(ABC):
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    reader_stop.set()
                     _terminate_cli_process_tree(process)
                     reader.join(timeout=1.0)
                     raise subprocess.TimeoutExpired(command, timeout)
@@ -1056,25 +1115,48 @@ class CLIBackendBase(ABC):
             if chunk is None:
                 reader_done = True
                 continue
-            stdout_chunks.append(chunk)
-            line = _decode_cli_output(chunk).rstrip("\r\n")
-            if not line:
-                continue
-            try:
-                self.handle_stream_output_line(line, event_callback)
-            except GenerationInterrupted:
-                _terminate_cli_process_tree(process)
-                reader.join(timeout=1.0)
-                raise
-            except Exception:
-                logger.debug(
-                    "[%s] Scoped stream event handling failed",
-                    self.provider_name,
-                    exc_info=True,
-                )
+            _append_bounded_bytes(stdout_tail, chunk, max_output_bytes)
+            pending_line.extend(chunk)
+            while b"\n" in pending_line:
+                raw_line, _, remainder = pending_line.partition(b"\n")
+                pending_line = bytearray(remainder)
+                line = _decode_cli_output(raw_line).rstrip("\r")
+                if not line:
+                    continue
+                try:
+                    self.handle_stream_output_line(line, event_callback)
+                except GenerationInterrupted:
+                    reader_stop.set()
+                    _terminate_cli_process_tree(process)
+                    reader.join(timeout=1.0)
+                    raise
+                except Exception:
+                    logger.debug(
+                        "[%s] Scoped stream event handling failed",
+                        self.provider_name,
+                        exc_info=True,
+                    )
+            if len(pending_line) > max_output_bytes:
+                del pending_line[:-max_output_bytes]
 
         return_code = process.wait()
-        return return_code, _decode_cli_output(b"".join(stdout_chunks)), ""
+        reader_stop.set()
+        reader.join(timeout=1.0)
+        if pending_line:
+            line = _decode_cli_output(bytes(pending_line)).rstrip("\r\n")
+            if line:
+                try:
+                    self.handle_stream_output_line(line, event_callback)
+                except GenerationInterrupted:
+                    _terminate_cli_process_tree(process)
+                    raise
+                except Exception:
+                    logger.debug(
+                        "[%s] Scoped stream event handling failed",
+                        self.provider_name,
+                        exc_info=True,
+                    )
+        return return_code, _decode_cli_output(bytes(stdout_tail)), ""
 
     def _run_streaming_process(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
@@ -14,12 +15,25 @@ from sqlalchemy.orm import Session
 
 from ..models.ecc_models import Character
 from ..utils.startup_timing import get_startup_timer
+from .config import postgres_search_path
 
 
 _startup_timer = get_startup_timer()
+_UNSET_SCHEMA = object()
 
 
-def run_migrations(sync_database_url: str) -> bool:
+def _schema_connect_args(postgres_schema: object = _UNSET_SCHEMA) -> dict[str, str]:
+    """Return libpq options for the optional isolated runtime schema."""
+
+    schema = os.getenv("POSTGRES_SCHEMA") if postgres_schema is _UNSET_SCHEMA else postgres_schema
+    search_path = postgres_search_path(schema if isinstance(schema, str) or schema is None else None)
+    return {"options": f"-c search_path={search_path}"} if search_path else {}
+
+
+def run_migrations(
+    sync_database_url: str,
+    postgres_schema: str | None | object = _UNSET_SCHEMA,
+) -> bool:
     """Run and verify Alembic upgrades against the configured database.
 
     Runtime code must never silently replace a failed migration with
@@ -44,6 +58,12 @@ def run_migrations(sync_database_url: str) -> bool:
     config.set_main_option(
         "sqlalchemy.url", sync_database_url.replace("%", "%%")
     )
+    resolved_schema = (
+        os.getenv("POSTGRES_SCHEMA")
+        if postgres_schema is _UNSET_SCHEMA
+        else postgres_schema
+    )
+    config.attributes["postgres_schema"] = resolved_schema
     with _startup_timer.phase("startup.database.migrations.alembic_upgrade"):
         command.upgrade(config, "head")
 
@@ -54,7 +74,11 @@ def run_migrations(sync_database_url: str) -> bool:
         raise RuntimeError("Alembic migration head is not defined")
 
     with _startup_timer.phase("startup.database.migrations.revision_verify"):
-        verify_engine = create_engine(sync_database_url, pool_pre_ping=True)
+        verify_engine = create_engine(
+            sync_database_url,
+            pool_pre_ping=True,
+            connect_args=_schema_connect_args(resolved_schema),
+        )
         try:
             with verify_engine.connect() as connection:
                 current_heads = MigrationContext.configure(connection).get_current_heads()
@@ -67,13 +91,21 @@ def run_migrations(sync_database_url: str) -> bool:
             f"expected=({expected_head},), current={current_heads}"
         )
     with _startup_timer.phase("startup.database.migrations.default_character"):
-        _ensure_default_character(sync_database_url)
+        _ensure_default_character(sync_database_url, postgres_schema=resolved_schema)
     return True
 
 
-def _ensure_default_character(sync_database_url: str) -> None:
+def _ensure_default_character(
+    sync_database_url: str,
+    *,
+    postgres_schema: str | None | object = _UNSET_SCHEMA,
+) -> None:
     """Ensure a fresh Linux/Enterprise database has a usable chat character."""
-    seed_engine = create_engine(sync_database_url, pool_pre_ping=True)
+    seed_engine = create_engine(
+        sync_database_url,
+        pool_pre_ping=True,
+        connect_args=_schema_connect_args(postgres_schema),
+    )
     try:
         with Session(seed_engine) as session:
             existing = session.scalar(

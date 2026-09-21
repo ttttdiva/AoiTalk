@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import inspect
 import shutil
-import tempfile
 import threading
 import uuid
 from typing import Any, Awaitable, Callable, Mapping
@@ -701,52 +700,25 @@ async def launch_playwright_qa_transport(
     if scope.lane_name != "qa":
         raise ValueError("Playwright QA transport requires a QA scope")
     scope._ensure_active()
-    profile_dir = tempfile.mkdtemp(prefix=f"aoi-qa-{scope.run_id}-")
-    context: Any = None
+    from .playwright_browser import launch_scoped_playwright_browser
+
+    lease = await launch_scoped_playwright_browser(scope, playwright, headless=headless)
     try:
-        from ..utils.subprocess_env import build_aoitalk_subprocess_env
-
-        context = await _maybe_await(
-            playwright.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                headless=headless,
-                env=build_aoitalk_subprocess_env(),
-            )
-        )
-
-        async def guard(route: Any, request: Any) -> None:
-            try:
-                scope.assert_navigation_allowed(str(request.url))
-            except Exception:
-                await _maybe_await(route.abort())
-                return
-            await _maybe_await(route.continue_())
-
-        await _maybe_await(context.route("**/*", guard))
-        page = (
-            context.pages[0]
-            if context.pages
-            else await _maybe_await(context.new_page())
-        )
         return QABrowserTransport(
             scope,
             _PlaywrightQADriver(
-                context,
-                page,
-                profile_dir,
+                lease.context,
+                lease.page,
+                lease.profile_dir,
                 upload_locator=upload_locator,
                 upload_file_chooser=upload_file_chooser,
                 download_trigger=download_trigger,
             ),
         )
-    except Exception:
-        if context is not None:
-            try:
-                await _maybe_await(context.close())
-            except Exception:
-                pass
-        shutil.rmtree(profile_dir, ignore_errors=True)
+    except BaseException:
+        await lease.close()
         raise
+
 
 
 __all__ = [

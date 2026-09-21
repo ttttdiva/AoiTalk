@@ -1,0 +1,18 @@
+name: masking
+description: 入力したテキストや添付ファイルの機密情報をマスキングし、元データを変更せずに安全なコピーを返す
+prompt_template: |
+  この Skill は AoiTalk の信頼済み組み込み /masking 操作の宣言です。
+  実際の入力処理と機密情報の検出は、サーバー側のローカルなマスキング境界が担当します。
+  入力を要約・改変したり、外部 LLM・ツール・プロバイダーへ送信したりせず、
+  機密部分だけを置換した結果を返してください。添付ファイルは元ファイルを変更せず、
+  同じ形式の _masked コピーを作成します。
+trigger_mode: manual
+aliases: []
+bound_tools: []
+examples:
+  - "/masking 山田太郎のメールは yamada@example.com"
+  - "/masking 添付した契約書の機密情報を置換"
+tags:
+  - privacy
+  - masking
+parameters: {}

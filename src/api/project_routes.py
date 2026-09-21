@@ -620,13 +620,14 @@ def create_project_router(
                     project_metadata=normalize_project_metadata(payload.project_metadata)
                     if payload.project_metadata is not None
                     else None,
+                    commit=False,
                 )
 
                 # Initialize the canonical Project information node in the
-                # owner's Personal Docs Library. The repository create path
-                # commits its project/member rows internally, so this repair
-                # is intentionally idempotent and can be retried from the
-                # Project tab if a transient Docs error occurs.
+                # owner's Personal Docs Library in the same transaction as
+                # the Project/member rows.  A failed canonical bootstrap
+                # therefore rolls the whole create back instead of returning
+                # a Project with a missing identity root.
                 from ..services.project_information_docs import (
                     ensure_project_information_doc,
                     is_default_inbox_project,
@@ -637,8 +638,8 @@ def create_project_router(
                         project=project,
                         user_id=UUID(user_info["id"]),
                     )
-                    await session.commit()
-                    await session.refresh(project)
+                await session.commit()
+                await session.refresh(project)
                 
                 # ワークスペースディレクトリを即座に作成
                 storage_root = await ProjectRepository.get_storage_path(project.id)
@@ -861,18 +862,28 @@ def create_project_router(
                 
                 # Update
                 update_data = payload.model_dump(exclude_unset=True)
+                existing_project = await ProjectRepository.get_by_id(
+                    session,
+                    UUID(project_id),
+                )
+                if not existing_project:
+                    raise HTTPException(status_code=404, detail="Project not found")
+                if (
+                    "name" in update_data
+                    and existing_project.is_completed
+                    and str(update_data["name"] or "").strip()
+                    != str(existing_project.name or "").strip()
+                ):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="完了済みProjectの名前は変更できません。再開してから変更してください",
+                    )
                 if "storage_quota_mb" in update_data and update_data["storage_quota_mb"] is None:
                     raise HTTPException(
                         status_code=400,
                         detail="storage_quota_mb must be a non-negative integer",
                     )
                 if "project_metadata" in update_data:
-                    existing_project = await ProjectRepository.get_by_id(
-                        session,
-                        UUID(project_id),
-                    )
-                    if not existing_project:
-                        raise HTTPException(status_code=404, detail="Project not found")
                     update_data["project_metadata"] = merge_project_metadata(
                         existing_project.project_metadata,
                         update_data["project_metadata"],
@@ -900,11 +911,24 @@ def create_project_router(
                 project = await ProjectRepository.update_project(
                     session,
                     project_id=UUID(project_id),
+                    commit=("name" not in update_data),
                     **update_data
                 )
                 
                 if not project:
                     raise HTTPException(status_code=404, detail="Project not found")
+                if "name" in update_data:
+                    from ..services.project_information_docs import (
+                        ensure_project_information_doc,
+                        is_default_inbox_project,
+                    )
+                    if not is_default_inbox_project(project):
+                        await ensure_project_information_doc(
+                            session,
+                            project=project,
+                            user_id=UUID(user_info["id"]),
+                        )
+                    await session.commit()
                 
                 return JSONResponse({
                     "success": True,

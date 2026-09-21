@@ -2,8 +2,13 @@
 キーワード検出器管理システム
 """
 
+import logging
 from typing import List, Optional, Dict, Any
+from ...utils.logging_config import FILE_ONLY_LOG_EXTRA
 from .base import KeywordDetectorBase, KeywordDetectionResult
+
+
+logger = logging.getLogger(__name__)
 
 
 class KeywordDetectorManager:
@@ -23,13 +28,23 @@ class KeywordDetectorManager:
         """
         if detector.tool_name in self._detector_map:
             existing_detector = self._detector_map[detector.tool_name]
-            print(f"[キーワード管理] 警告: {detector.tool_name} は既に登録されています")
-            print(f"[キーワード管理] 既存のインスタンスID: {id(existing_detector)}, 新しいインスタンスID: {id(detector)}")
+            logger.warning(
+                "Keyword detector %s is already registered (existing=%s, new=%s)",
+                detector.tool_name,
+                id(existing_detector),
+                id(detector),
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             return
         
         self.detectors.append(detector)
         self._detector_map[detector.tool_name] = detector
-        print(f"[キーワード管理] {detector.tool_name} 検出器を登録しました (インスタンスID: {id(detector)})")
+        logger.info(
+            "Keyword detector registered: %s (instance=%s)",
+            detector.tool_name,
+            id(detector),
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     
     def unregister_detector(self, tool_name: str) -> bool:
         """
@@ -47,7 +62,11 @@ class KeywordDetectorManager:
         detector = self._detector_map[tool_name]
         self.detectors.remove(detector)
         del self._detector_map[tool_name]
-        print(f"[キーワード管理] {tool_name} 検出器を登録解除しました")
+        logger.info(
+            "Keyword detector unregistered: %s",
+            tool_name,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         return True
     
     def get_detector(self, tool_name: str) -> Optional[KeywordDetectorBase]:
@@ -88,10 +107,19 @@ class KeywordDetectorManager:
                     if process_message:
                         result.message = process_message
                     
-                    print(f"[キーワード管理] {detector.tool_name} でキーワード検出: {result.action}")
+                    logger.info(
+                        "Keyword detected by %s: %s",
+                        detector.tool_name,
+                        result.action,
+                    )
                     return result
             except Exception as e:
-                print(f"[キーワード管理] {detector.tool_name} 処理エラー: {e}")
+                logger.warning(
+                    "Keyword detector %s processing failed: %s",
+                    detector.tool_name,
+                    e,
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
                 continue
         
         return None
@@ -113,7 +141,12 @@ class KeywordDetectorManager:
         
         detector.set_enabled(enabled)
         status = "有効" if enabled else "無効"
-        print(f"[キーワード管理] {tool_name} を{status}に設定しました")
+        logger.info(
+            "Keyword detector %s enabled=%s",
+            tool_name,
+            enabled,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         return True
     
     def get_status(self) -> Dict[str, Any]:
@@ -145,9 +178,17 @@ def get_keyword_manager() -> KeywordDetectorManager:
     global _keyword_manager
     if _keyword_manager is None:
         _keyword_manager = KeywordDetectorManager()
-        print(f"[キーワード管理] マネージャーインスタンスを作成しました (ID: {id(_keyword_manager)})")
+        logger.info(
+            "Keyword detector manager created (instance=%s)",
+            id(_keyword_manager),
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     else:
-        print(f"[キーワード管理] 既存のマネージャーインスタンスを返します (ID: {id(_keyword_manager)})")
+        logger.debug(
+            "Reusing keyword detector manager (instance=%s)",
+            id(_keyword_manager),
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     return _keyword_manager
 
 

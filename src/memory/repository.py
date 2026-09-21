@@ -311,6 +311,35 @@ class ConversationRepository:
             conversation = conversation_result.scalar_one_or_none()
             if conversation is None:
                 raise ValueError(f"Conversation session not found: {session_id}")
+            message_metadata = dict(metadata or {})
+            raw_client_message_id = message_metadata.get("client_message_id")
+            client_message_id = (
+                str(raw_client_message_id).strip()
+                if raw_client_message_id not in (None, "")
+                else None
+            )
+            if client_message_id and len(client_message_id) > 512:
+                raise ValueError("client_message_id exceeds 512 characters")
+            if client_message_id:
+                existing = await session.scalar(
+                    select(ConversationMessage).where(
+                        and_(
+                            ConversationMessage.session_id == session_id,
+                            ConversationMessage.client_message_id
+                            == client_message_id,
+                        )
+                    ).limit(1)
+                )
+                if existing is not None:
+                    if (
+                        existing.role != role
+                        or existing.content != content
+                        or existing.sender_id != sender_id
+                    ):
+                        raise ValueError("client_message_id idempotency conflict")
+                    setattr(existing, "_idempotency_replayed", True)
+                    return existing
+
             await self._ensure_linear_parent_links(session, session_id)
 
             parent_message_id: Optional[uuid.UUID] = None
@@ -347,7 +376,8 @@ class ConversationRepository:
                 role=role,
                 content=content,
                 # embedding removed - using Qdrant for vector search instead
-                message_metadata=metadata or {},
+                message_metadata=message_metadata,
+                client_message_id=client_message_id,
                 sender_type=sender_type,
                 sender_id=sender_id,
                 sender_display_name=sender_display_name,
@@ -907,23 +937,6 @@ class ConversationRepository:
             await session.commit()
             await session.refresh(archive)
             return archive
-    
-    async def search_archives(self, user_id: str, character_name: str, 
-                            query_embedding: List[float], similarity_threshold: float = 0.3,
-                            limit: int = 5) -> List[Tuple[ConversationArchive, float]]:
-        """Search conversation archives by semantic similarity
-        
-        Args:
-            user_id: User identifier
-            character_name: Character name
-            query_embedding: Query embedding vector
-            similarity_threshold: Minimum similarity score
-            limit: Maximum results to return
-            
-        Returns:
-            List[Tuple[ConversationArchive, float]]: Archives with similarity scores
-        """
-        return []
     
     async def add_to_history(self, user_id: str, session_id: str, character_name: str,
                            role: str, content: str, metadata: Optional[Dict[str, Any]] = None,

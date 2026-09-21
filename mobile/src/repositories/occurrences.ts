@@ -43,6 +43,7 @@ function toApiShape(
     status: row.status,
     start_at: row.startAt,
     end_at: row.endAt ?? null,
+    original_start_at: row.originalStartAt ?? null,
     all_day: Boolean(row.allDay),
     reminder_offsets: (row.reminderOffsets as number[] | null) ?? [],
     source_kind: row.sourceKind ?? null,
@@ -67,10 +68,23 @@ export async function applyRemoteOccurrences(
     // deleted locally (including when only the missing-row ledger exists).
     if (await isTaskTombstoned(occurrence.task_id)) continue;
     const existing = await db
-      .select({ deletedAt: schema.taskOccurrences.deletedAt, updatedAt: schema.taskOccurrences.updatedAt })
+      .select({
+        deletedAt: schema.taskOccurrences.deletedAt,
+        updatedAt: schema.taskOccurrences.updatedAt,
+        originalStartAt: schema.taskOccurrences.originalStartAt,
+      })
       .from(schema.taskOccurrences)
       .where(eq(schema.taskOccurrences.id, occurrence.id));
     const current = existing[0];
+    // Keep the cached canonical identity when talking to an older server that
+    // omits the additive field.  An explicit null remains authoritative.
+    const hasIncomingOriginalStartAt = Object.prototype.hasOwnProperty.call(
+      occurrence,
+      "original_start_at",
+    );
+    const originalStartAt = hasIncomingOriginalStartAt
+      ? occurrence.original_start_at ?? null
+      : current?.originalStartAt ?? null;
     const incomingUpdatedAt = occurrence.updated_at ?? now;
     const hasIncomingVersion =
       typeof occurrence.updated_at === "string" && occurrence.updated_at.trim().length > 0;
@@ -108,6 +122,7 @@ export async function applyRemoteOccurrences(
         taskId: occurrence.task_id,
         startAt: occurrence.start_at,
         endAt: occurrence.end_at ?? null,
+        originalStartAt,
         status: occurrence.status,
         allDay: Boolean(occurrence.all_day),
         reminderOffsets: occurrence.reminder_offsets ?? [],
@@ -123,6 +138,7 @@ export async function applyRemoteOccurrences(
           taskId: occurrence.task_id,
           startAt: occurrence.start_at,
           endAt: occurrence.end_at ?? null,
+          originalStartAt,
           status: occurrence.status,
           allDay: Boolean(occurrence.all_day),
           reminderOffsets: occurrence.reminder_offsets ?? [],

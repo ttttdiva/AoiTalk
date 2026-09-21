@@ -35,6 +35,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { Project, Task } from "@/lib/task-api";
+import type { TaskBrowseScope } from "@/lib/task-browse-scope";
 import { getTaskDisplayStatus, isFutureTask } from "@/lib/tasks-page-utils";
 import { cn } from "@/lib/utils";
 import {
@@ -62,6 +63,7 @@ type TaskScheduleViewProps = {
   loadError: string | null;
   remoteReadOnly: boolean;
   onOpenTask: (task: Task) => void;
+  browseScope?: TaskBrowseScope | null;
 };
 
 type PhaseNodeData = {
@@ -418,6 +420,7 @@ function TaskScheduleContent({
   loadError,
   remoteReadOnly,
   onOpenTask,
+  browseScope = null,
 }: TaskScheduleViewProps) {
   const [phases, setPhases] = useState<SchedulePhase[]>([]);
   const [placements, setPlacements] = useState<
@@ -433,7 +436,18 @@ function TaskScheduleContent({
   const [editingPhaseId, setEditingPhaseId] = useState<string | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const shelfRef = useRef<HTMLDivElement>(null);
-  const selectedProjectIdRef = useRef<string | null>(selectedProjectId);
+  const browseProjectIds = useMemo(() => {
+    if (!browseScope) return null;
+    if (browseScope.kind === "project") return new Set([browseScope.id]);
+    return new Set(
+      projects
+        .filter((project) => project.space_id === browseScope.id)
+        .map((project) => project.id),
+    );
+  }, [browseScope, projects]);
+  const scheduleProjectId =
+    browseScope?.kind === "project" ? browseScope.id : selectedProjectId;
+  const selectedProjectIdRef = useRef<string | null>(scheduleProjectId);
   const projectGenerationRef = useRef(0);
   const scheduleGetTokenRef = useRef(0);
   const activeScheduleGetRef = useRef<{
@@ -441,7 +455,7 @@ function TaskScheduleContent({
     projectId: string;
     generation: number;
   } | null>(null);
-  selectedProjectIdRef.current = selectedProjectId;
+  selectedProjectIdRef.current = scheduleProjectId;
 
   useEffect(() => {
     projectGenerationRef.current += 1;
@@ -453,7 +467,7 @@ function TaskScheduleContent({
     setNewPhase({ name: "", start_on: "", end_on: "" });
     setEditingPhaseId(null);
     setSelectedTaskId(null);
-  }, [selectedProjectId]);
+  }, [scheduleProjectId]);
 
   const isCurrentProject = useCallback(
     (projectId: string, generation: number) =>
@@ -478,13 +492,15 @@ function TaskScheduleContent({
   );
 
   const scheduleProject =
-    projects.find((project) => project.id === selectedProjectId) ?? null;
+    projects.find((project) => project.id === scheduleProjectId) ?? null;
   const scheduleReadOnly =
-    remoteReadOnly || scheduleProject?.can_write === false;
+    Boolean(browseScope) || remoteReadOnly || scheduleProject?.can_write === false;
   const projectScopedSelection = useTaskViewSelection({
     tasks,
     projects,
-    projectTab: selectedProjectId ?? "__no_schedule_project__",
+    projectTab: browseScope
+      ? "all"
+      : scheduleProjectId ?? "__no_schedule_project__",
     appFilterId,
     appTaskIds,
     filterState,
@@ -495,14 +511,15 @@ function TaskScheduleContent({
     () =>
       visibleTasks.filter(
         (task) =>
+          (!browseProjectIds || browseProjectIds.has(task.project_id)) &&
           (filterState.showClosed || getTaskDisplayStatus(task) !== "closed") &&
           (filterState.showFuture || !isFutureTask(task)),
       ),
-    [filterState.showClosed, filterState.showFuture, visibleTasks],
+    [browseProjectIds, filterState.showClosed, filterState.showFuture, visibleTasks],
   );
 
   const refreshSchedule = useCallback(async () => {
-    const projectId = selectedProjectId;
+    const projectId = scheduleProjectId;
     const generation = projectGenerationRef.current;
     const token = ++scheduleGetTokenRef.current;
     activeScheduleGetRef.current = {
@@ -548,7 +565,7 @@ function TaskScheduleContent({
         setScheduleLoading(false);
       }
     }
-  }, [isCurrentProject, scheduleProject, selectedProjectId]);
+  }, [isCurrentProject, scheduleProject, scheduleProjectId]);
 
   useEffect(() => {
     void refreshSchedule();
@@ -556,7 +573,7 @@ function TaskScheduleContent({
 
   const setPlacementOptimistically = useCallback(
     async (task: Task, next: TaskSchedulePlacement | null) => {
-      const projectId = selectedProjectId;
+      const projectId = scheduleProjectId;
       const generation = projectGenerationRef.current;
       if (!projectId || scheduleReadOnly || isRemoteProject(scheduleProject))
         return;
@@ -599,7 +616,7 @@ function TaskScheduleContent({
       placements,
       scheduleReadOnly,
       scheduleProject,
-      selectedProjectId,
+      scheduleProjectId,
     ],
   );
 
@@ -621,7 +638,7 @@ function TaskScheduleContent({
     (event: DragEvent<HTMLDivElement>, phaseId: string) => {
       const taskId = event.dataTransfer.getData("text/task-id");
       const task = scheduleTasks.find((item) => item.id === taskId);
-      if (!task || !selectedProjectId || scheduleReadOnly) return;
+      if (!task || !scheduleProjectId || scheduleReadOnly) return;
       const phasePositionValue = phasePositionsForDrop.get(phaseId);
       const bounds = event.currentTarget.getBoundingClientRect();
       const ratio =
@@ -641,7 +658,7 @@ function TaskScheduleContent({
       phasePositionsForDrop,
       scheduleReadOnly,
       scheduleTasks,
-      selectedProjectId,
+      scheduleProjectId,
       setPlacementOptimistically,
     ],
   );
@@ -649,7 +666,7 @@ function TaskScheduleContent({
   const dragStop = useCallback(
     (task: Task, position: { x: number; y: number }) => {
       const current = placements.get(task.id);
-      if (!current || !selectedProjectId || scheduleReadOnly) return;
+      if (!current || !scheduleProjectId || scheduleReadOnly) return;
       let targetPhaseId = current.phase_id;
       for (const phase of phases) {
         const bounds = phasePositionsForDrop.get(phase.id);
@@ -680,7 +697,7 @@ function TaskScheduleContent({
       phases,
       placements,
       scheduleReadOnly,
-      selectedProjectId,
+      scheduleProjectId,
       setPlacementOptimistically,
     ],
   );
@@ -705,9 +722,13 @@ function TaskScheduleContent({
     estimateSize: () => 48,
     overscan: 4,
   });
+  // jsdom and first paint can report no measurable scroll viewport. Keep the
+  // read-only browse shelf useful in that state instead of hiding every task
+  // until a later measurement pass.
+  const shelfVirtualItems = shelfVirtualizer.getVirtualItems();
 
   const addPhase = async () => {
-    const projectId = selectedProjectId;
+    const projectId = scheduleProjectId;
     const generation = projectGenerationRef.current;
     if (!projectId || scheduleReadOnly || isRemoteProject(scheduleProject))
       return;
@@ -730,7 +751,7 @@ function TaskScheduleContent({
   };
 
   const deletePhase = async (phase: SchedulePhase) => {
-    const projectId = selectedProjectId;
+    const projectId = scheduleProjectId;
     const generation = projectGenerationRef.current;
     if (!projectId || scheduleReadOnly) return;
     invalidateCurrentScheduleGet(projectId, generation);
@@ -758,7 +779,7 @@ function TaskScheduleContent({
     phase: SchedulePhase,
     patch: Partial<SchedulePhase>,
   ) => {
-    const projectId = selectedProjectId;
+    const projectId = scheduleProjectId;
     const generation = projectGenerationRef.current;
     if (!projectId || scheduleReadOnly) return;
     invalidateCurrentScheduleGet(projectId, generation);
@@ -777,7 +798,7 @@ function TaskScheduleContent({
     }
   };
 
-  if (!selectedProjectId) {
+  if (!scheduleProjectId) {
     return (
       <div
         className="flex h-full min-h-72 items-center justify-center p-6 text-center"
@@ -1058,7 +1079,19 @@ function TaskScheduleContent({
                 className="relative mt-2"
                 style={{ height: `${shelfVirtualizer.getTotalSize()}px` }}
               >
-                {shelfVirtualizer.getVirtualItems().map((item) => {
+                {(scheduleReadOnly
+                  ? unplacedTasks.map((_, index) => ({
+                      index,
+                      start: index * 48,
+                    }))
+                  : shelfVirtualItems.length > 0
+                    ? shelfVirtualItems
+                    : unplacedTasks
+                        .slice(0, expandedShelf ? undefined : 8)
+                        .map((_, index) => ({
+                          index,
+                          start: index * 48,
+                        }))).map((item) => {
                   const task = unplacedTasks[item.index];
                   return (
                     <div

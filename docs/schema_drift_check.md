@@ -50,7 +50,7 @@ venv\Scripts\python.exe scripts\check_schema_drift.py
 
 `.github/workflows/ci.yml` の schema-drift 系 job が、空の PostgreSQL service に migration を適用したうえで checker を実行します。job 名や package 数をこの文書へ固定せず、workflow file を正本とします。
 
-通常の変更では `AGENTS.md` / `CLAUDE.md` に従って local targeted verification → `main` push → GitHub Actions を確認します。`scripts/run_canonical_verification.ps1` は手動専用の用途に限定します。
+通常の変更では [AGENTS.md](../AGENTS.md) に従って local targeted verification → `main` push → GitHub Actions を確認します。`scripts/run_canonical_verification.ps1` は手動専用の用途に限定します。
 
 ## 関連文書
 

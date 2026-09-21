@@ -39,6 +39,34 @@ CHARACTER_TOOL_OWNER = "character"
 WORKSPACE_MANIFEST_TOOL_PREFIX = "ws_"
 APPS_TOOL_OWNER = "apps"
 APPS_TOOL_PACK_ID = "apps"
+
+
+def _strict_config_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return False
+# App bootstrap/provisioning is deliberately separate from the contextual
+# development pack.  These tools do not require an active App context, but
+# still enforce authenticated principal and Project ACL checks at invocation.
+APPS_BOOTSTRAP_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "create_app",
+        "list_apps",
+    }
+)
+# Singular alias kept for callers that use the phrase from the product
+# requirement rather than the historical ``APPS_*`` naming convention.
+APP_BOOTSTRAP_TOOL_NAMES = APPS_BOOTSTRAP_TOOL_NAMES
 APPS_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "create_app",
@@ -71,6 +99,14 @@ APPS_TOOL_NAMES: frozenset[str] = frozenset(
         "link_app_to_task",
     }
 )
+# The 26 context-bound App Development tools.  Keep ``APPS_TOOL_NAMES`` as
+# the historical complete roster for compatibility; the deferred pack itself
+# uses this development-only subset so bootstrap remains visible in normal
+# turns.
+APPS_DEVELOPMENT_TOOL_NAMES: frozenset[str] = frozenset(
+    APPS_TOOL_NAMES - APPS_BOOTSTRAP_TOOL_NAMES
+)
+APP_DEVELOPMENT_TOOL_NAMES = APPS_DEVELOPMENT_TOOL_NAMES
 
 
 @dataclass(frozen=True)
@@ -137,13 +173,19 @@ _PROJECT_TABLES_FRAGMENT = "\n".join(
 
 DEFERRED_TOOL_PACKS: tuple[ToolPack, ...] = (
     ToolPack(
-        # App tools are registered only for a server-resolved App scope.  The
-        # pack remains deferred so a normal/project-only turn never publishes
-        # the 28 App schemas, while an active App turn auto-loads it below.
+        pack_id="browser",
+        summary="選択した接続PCのEdgeとWindowsデスクトップを操作する",
+        tool_names=frozenset({"browser_agent", "computer_use"}),
+        prompt_fragment="browser_agentは既存Edgeの拡張接続を使う。現在のタブの作業ではstart_url省略可。Jevは任意で、利用不能なら現在のLLMへ切り替わる。返却された観測で結果を説明する。",
+    ),
+    ToolPack(
+        # App Development tools are registered alongside the root registry but
+        # remain deferred so a normal/project-only turn never publishes the 26
+        # context-bound schemas.  Bootstrap tools are registered separately and
+        # are not part of this pack.
         pack_id=APPS_TOOL_PACK_ID,
         summary="選択中AppのManifest、Workspace、Git、Job、Release操作",
-        tool_names=APPS_TOOL_NAMES,
-        owners=frozenset({APPS_TOOL_OWNER}),
+        tool_names=APPS_DEVELOPMENT_TOOL_NAMES,
         prompt_fragment=(
             "選択中のApp contextに対して、Manifest、Workspace、Git、Job、"
             "Release、Project/Task binding操作を行う。対象App・Projectの権限、"
@@ -405,22 +447,78 @@ def contextual_tool_pack_allowed(
     decision, including when a fixed registry is reused across turns.
     """
 
-    if str(pack_id or "").strip() != APPS_TOOL_PACK_ID:
-        return True
     effective_config = config
     if effective_config is None:
         effective_config = getattr(client, "config", None)
+
+    pack_name = str(pack_id or "").strip()
     if effective_config is not None:
         try:
-            apps_section = effective_config.get("apps", {})
-            if isinstance(apps_section, dict):
-                apps_enabled = apps_section.get("enabled", True)
-            else:
-                apps_enabled = effective_config.get("apps.enabled", True)
-            if not bool(apps_enabled):
+            getter = getattr(effective_config, "get", None)
+
+            def _get(key: str, default: Any = None) -> Any:
+                if isinstance(effective_config, Mapping):
+                    if key in effective_config:
+                        return effective_config[key]
+                    current: Any = effective_config
+                    for part in key.split("."):
+                        if not isinstance(current, Mapping) or part not in current:
+                            return default
+                        current = current[part]
+                    return current
+                if callable(getter):
+                    return getter(key, default)
+                return default
+
+            if pack_name == APPS_TOOL_PACK_ID and not _strict_config_bool(
+                _get("apps.enabled", True), default=True
+            ):
+                return False
+            if pack_name == "spotify" and not _strict_config_bool(
+                _get("integrations.spotify.enabled", False), default=False
+            ):
+                return False
+            if pack_name == "browser":
+                try:
+                    from ..services.browser_agent_models import BrowserAgentSettings
+                    browser = BrowserAgentSettings.from_config(effective_config)
+                except Exception:
+                    return False
+                if not browser.enabled:
+                    return False
+            if pack_name == "media":
+                try:
+                    from ..features import Features
+
+                    if Features.is_enterprise():
+                        return False
+                except Exception:
+                    # A failed profile probe must not re-enable a removed
+                    # specialist module.
+                    return False
+                if not _strict_config_bool(
+                    _get("agents.media.enabled", True), default=True
+                ):
+                    return False
+            if pack_name == "agent_team" and not agent_team_v3_delegation_enabled(
+                effective_config
+            ):
                 return False
         except (AttributeError, TypeError):
-            pass
+            # Malformed persisted config should not make optional packs
+            # executable.  The Apps/Spotify/Media/Team branches above are
+            # explicit capability gates and therefore fail closed.
+            if pack_name in {
+                APPS_TOOL_PACK_ID,
+                "spotify",
+                "media",
+                "agent_team",
+                "browser",
+            }:
+                return False
+
+    if pack_name != APPS_TOOL_PACK_ID:
+        return True
     scope = contextual_scope
     if scope is None:
         scope = contextual_agent_team_scope(

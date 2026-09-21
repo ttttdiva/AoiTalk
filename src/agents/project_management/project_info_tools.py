@@ -296,7 +296,7 @@ def build_project_info_tools() -> list:
         limit_record_tables: int = 8,
         docs_node_chars: int = 2000,
     ) -> str:
-        """Read the canonical project information Docs source of truth before answering or editing project facts. Prefer detail_level='full' before a write. The response includes Docs body, accepted/candidate Q&A, record tables, and references; use it as grounded evidence and do not invent missing facts."""
+        """Read the canonical project information Docs source of truth before answering or editing project facts. Prefer detail_level='full' before a write. The response includes Docs body, accepted Q&A, record tables, and references; review-only candidates are exposed only through the dedicated candidate queue. Use it as grounded evidence and do not invent missing facts."""
         from ...memory.database import get_database_manager
         from ...memory.models import KnowledgeNode, Project, ProjectQaEntry, RecordTable
         from ...services.project_information_docs import (
@@ -353,6 +353,7 @@ def build_project_info_tools() -> list:
                 qa_stmt = select(ProjectQaEntry).where(
                     ProjectQaEntry.project_id == resolved_project_id,
                     ProjectQaEntry.deleted_at.is_(None),
+                    ProjectQaEntry.review_state == "accepted",
                 )
                 if not include_archived:
                     qa_stmt = qa_stmt.where(ProjectQaEntry.status != "archived")
@@ -471,23 +472,6 @@ def build_project_info_tools() -> list:
                     source_refs=source_refs,
                 )
                 await session.commit()
-                # Schedule projection rebuild only after the canonical Docs
-                # mutation commits; a queue failure must not hide the tool's
-                # successful write result.
-                from ...services.project_context_pack_job_service import (
-                    enqueue_project_context_pack_rebuild,
-                )
-
-                try:
-                    await enqueue_project_context_pack_rebuild(
-                        resolved_project_id,
-                        user_id,
-                        "project_information_doc_patched",
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to enqueue ProjectContextPack rebuild after tool Docs patch"
-                    )
                 return {
                     "success": True,
                     "node": serialize_project_information_node(node),
@@ -788,6 +772,8 @@ def build_project_info_tools() -> list:
                         knowledge_node_id=node.id,
                         created_by=user_id,
                         asked_count=0,
+                        origin="manual",
+                        version=1,
                     )
                     session.add(entry)
 
@@ -802,7 +788,11 @@ def build_project_info_tools() -> list:
                     answer_was_provided=bool(answer.strip()),
                     clear_answer=clear_answer,
                     status=status,
-                    review_state=review_state,
+                    # This is an explicit tool mutation, never an inferred
+                    # candidate.  Ignore a caller-supplied candidate state so
+                    # the canonical Project Information record cannot be
+                    # accidentally routed into the review queue.
+                    review_state="accepted",
                 )
                 entry.confidence = max(0.0, min(1.0, float(confidence or 1.0)))
                 entry.asked_count = max(1, int(entry.asked_count or 0) + 1)
@@ -819,7 +809,18 @@ def build_project_info_tools() -> list:
                 entry.updated_by = user_id
                 entry.last_asked_at = now
                 entry.updated_at = now
-                entry.created_by_agent = True
+                # This tool is invoked only after the authorized actor has
+                # explicitly requested the Q&A mutation.  Keep its
+                # provenance distinct from inferred/background candidates so
+                # cleanup cannot classify a durable manual fact as legacy
+                # automation.  Existing rows get a fresh optimistic version
+                # token before the transaction commits.
+                if hasattr(entry, "origin"):
+                    entry.origin = "manual"
+                if hasattr(entry, "created_by_agent"):
+                    entry.created_by_agent = False
+                if not is_new_entry and hasattr(entry, "version"):
+                    entry.version = max(1, int(entry.version or 1)) + 1
                 await session.commit()
                 return {"success": True, "qa_entry": entry.to_dict()}
             except Exception:

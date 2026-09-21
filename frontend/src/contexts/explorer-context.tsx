@@ -39,7 +39,9 @@ import {
 } from "@/lib/explorer/filer-capabilities";
 import {
   clearFilerUndoHistory,
+  registerExplorerDeleteViewHandlers,
   registerHydrusViewHandlers,
+  type ExplorerDeleteViewOperation,
 } from "@/lib/explorer/filer-operations";
 import { parseHydrusFileId } from "@/lib/hydrus/virtual-path";
 import {
@@ -60,6 +62,37 @@ import {
 
 export type ViewMode = "grid" | "list";
 export type FilerTab = "workspace" | "user" | "hf" | "hydrus";
+
+/**
+ * In-memory view snapshot associated with a directory navigation history
+ * entry.  Paths are used as item identities so the snapshot survives sort
+ * changes and directory contents being re-rendered in a different order.
+ */
+export type ExplorerHistoryEntry = {
+  path: string;
+  focusedItemPath: string | null;
+  selectedItemPaths: string[];
+};
+
+export type ExplorerHistoryScrollRestore = {
+  navigationEpoch: number;
+  directoryPath: string;
+  focusedItemPath: string;
+};
+
+/**
+ * Bookmark collections loaded for the authenticated principal and, when the
+ * active Files context is a local Project workspace, its selected Space.
+ *
+ * Keep the provenance on the shared collection instead of flattening the two
+ * arrays.  The sidebar uses that provenance to route CRUD operations to the
+ * collection that owns an item; `bookmarks` below remains the compatibility
+ * view for callers that only need the active collection.
+ */
+export type ExplorerBookmarkCollections = {
+  personal: ExplorerBookmark[];
+  shared: { spaceId: string; bookmarks: ExplorerBookmark[] } | null;
+};
 
 /** Stable user-facing labels for the Files source switcher.
  *
@@ -86,6 +119,8 @@ interface ExplorerContextType {
   goForward: () => void;
   goUp: () => void;
   refresh: () => Promise<boolean>;
+  /** One-shot signal for the Files UI to scroll a restored item into view. */
+  historyScrollRestore: ExplorerHistoryScrollRestore | null;
 
   // Data
   browseData: ExplorerListResponse | null;
@@ -109,7 +144,7 @@ interface ExplorerContextType {
   toggleSelect: (path: string) => void;
   selectRange: (path: string, orderedPaths: string[], additive?: boolean) => void;
   selectAll: (paths?: string[]) => void;
-  clearSelection: () => void;
+  clearSelection: (paths?: string[]) => void;
 
   // Clipboard
   clipboard: ClipboardState | null;
@@ -117,7 +152,8 @@ interface ExplorerContextType {
 
   // Bookmarks
   bookmarks: ExplorerBookmark[];
-  refreshBookmarks: () => void;
+  bookmarkCollections: ExplorerBookmarkCollections;
+  refreshBookmarks: (owner?: ExplorerBookmarkScope) => Promise<void>;
   /** Scope sent to every bookmark/launcher API operation. */
   bookmarkScope: ExplorerBookmarkScope;
 
@@ -160,9 +196,9 @@ const EXPLORER_SORT_DIR_STORAGE_KEY = "explorer-sort-dir";
 const FILER_TAB_STORAGE_KEY = "filer-tab";
 const FILER_PATH_STORAGE_PREFIX = "filer-last-path";
 
-// ブックマーク一覧の SWR キャッシュキー。ファイラー全体で一意なので固定文字列を使う。
-// 取得タイミングは従来どおり呼び出し側の refreshBookmarks（= 手動 revalidate）で駆動し、
-// SWR の自動 revalidation は全て無効化して表示挙動を不変に保つ。
+// ブックマーク一覧の SWR キャッシュキー。個人/Space と principal を後続の
+// tuple 要素に含め、同じブラウザでのユーザー/Space 切り替え時にキャッシュを
+// 共有しない。取得タイミングは従来どおり手動 revalidate で駆動する。
 const BOOKMARKS_SWR_KEY = "explorer/bookmarks";
 const EMPTY_BOOKMARKS: ExplorerBookmark[] = [];
 
@@ -182,8 +218,8 @@ export function useExplorer() {
 function isAbsolutePath(p: string): boolean {
   if (!p) return false;
   if (/^[A-Za-z]:[\\/]/.test(p)) return true;
-  if (p.startsWith("/")) return true;
-  return false;
+  // POSIX-rooted and Windows UNC paths are both valid local Files targets.
+  return /^[/\\]{1,2}/.test(p);
 }
 
 function readLocalStorage(key: string): string | null {
@@ -264,6 +300,50 @@ function remoteWorkspaceRelativePath(path: string): string {
   return parts.slice(2).join("/");
 }
 
+function normalizeExplorerPath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+}
+
+function explorerParentPath(path: string): string {
+  const normalized = normalizeExplorerPath(path);
+  const index = normalized.lastIndexOf("/");
+  return index < 0 ? "" : normalized.slice(0, index);
+}
+
+function historyEntriesEqual(
+  left: ExplorerHistoryEntry | null | undefined,
+  right: ExplorerHistoryEntry | null | undefined,
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  if (
+    normalizeExplorerPath(left.path) !== normalizeExplorerPath(right.path) ||
+    left.focusedItemPath !== right.focusedItemPath ||
+    left.selectedItemPaths.length !== right.selectedItemPaths.length
+  ) {
+    return false;
+  }
+  return left.selectedItemPaths.every(
+    (path, index) => path === right.selectedItemPaths[index],
+  );
+}
+
+function cloneHistoryEntry(entry: ExplorerHistoryEntry): ExplorerHistoryEntry {
+  return {
+    path: entry.path,
+    focusedItemPath: entry.focusedItemPath,
+    selectedItemPaths: [...entry.selectedItemPaths],
+  };
+}
+
+function emptyHistoryEntry(path: string): ExplorerHistoryEntry {
+  return {
+    path,
+    focusedItemPath: null,
+    selectedItemPaths: [],
+  };
+}
+
 type DirectoryFetchRequest = {
   path: string;
   /** Principal whose session authorized the request. */
@@ -271,11 +351,26 @@ type DirectoryFetchRequest = {
   generation: number;
   /** Navigation identity that initiated this request. */
   navigationEpoch: number;
+  /** Optional view snapshot to restore after this request succeeds. */
+  restoreViewState: ExplorerHistoryEntry | null;
 };
 
 type ActiveDirectoryFetch = {
   generation: number;
   promise: Promise<void>;
+};
+
+type LogicalNavigationHistorySnapshot = {
+  back: ExplorerHistoryEntry[];
+  forward: ExplorerHistoryEntry[];
+};
+
+type LogicalNavigationCursor = {
+  entry: ExplorerHistoryEntry;
+  navigationEpoch: number;
+  pending: boolean;
+  /** Stack state before the pending intent, used to roll back failures. */
+  historyBefore?: LogicalNavigationHistorySnapshot;
 };
 
 export function ExplorerProvider({ children }: { children: React.ReactNode }) {
@@ -308,6 +403,23 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [hydrusHiddenFileIds, setHydrusHiddenFileIds] = useState<Set<number>>(
     () => new Set(),
   );
+  // 通常の Files 削除中に一覧から先行して隠す tombstone。Hydrus/HF は
+  // 専用の表示キャッシュを持つため、この state を適用しない。
+  const pendingDeletedPathsRef = useRef<Set<string>>(new Set());
+  const committedDeletedPathsRef = useRef<Set<string>>(new Set());
+  // Multiple delete operations may overlap on the same path.  Keep every
+  // operation owner so that settling one operation cannot clear another
+  // operation's pending tombstone.
+  const pendingDeleteOwnersRef = useRef<Map<string, Set<symbol>>>(new Map());
+  // Opaque delete handles capture this generation.  Principal/tab changes and
+  // unmount advance it so late API completions become no-ops.
+  const deleteScopeGenerationRef = useRef(0);
+  const [pendingDeletedPaths, setPendingDeletedPaths] = useState<Set<string>>(
+    () => new Set(pendingDeletedPathsRef.current),
+  );
+  const [committedDeletedPaths, setCommittedDeletedPaths] =
+    useState<Set<string>>(() => new Set(committedDeletedPathsRef.current));
+  const [deleteScopeVersion, setDeleteScopeVersion] = useState(0);
   const loadedRepoKeyRef = useRef<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -322,6 +434,19 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [sortDir, setSortDirState] = useState<SortDir>(DEFAULT_SORT_DIR);
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set());
   const [focusedItemPath, setFocusedItemPath] = useState<string | null>(null);
+  const [historyScrollRestore, setHistoryScrollRestore] =
+    useState<ExplorerHistoryScrollRestore | null>(null);
+  // Keep the committed view synchronously available to navigation handlers.
+  // State setters are asynchronous, and a select/open gesture can invoke
+  // `navigate` before React has committed the selection render.
+  const currentPathRef = useRef(currentPath);
+  const selectedItemsRef = useRef(selectedItems);
+  const focusedItemPathRef = useRef(focusedItemPath);
+  useEffect(() => {
+    currentPathRef.current = currentPath;
+    selectedItemsRef.current = selectedItems;
+    focusedItemPathRef.current = focusedItemPath;
+  }, [currentPath, focusedItemPath, selectedItems]);
   const selectionAnchorPathRef = useRef<string | null>(null);
   const previousShiftRangeRef = useRef<Set<string>>(new Set());
   const [clipboard, setClipboard] = useState<ClipboardState | null>(null);
@@ -333,8 +458,12 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   const [isHydrusMode, setIsHydrusMode] = useState(false);
   const [filerTab, setFilerTabState] = useState<FilerTab>("workspace");
   const activeFilerTabRef = useRef<FilerTab>("workspace");
-  const historyBackRef = useRef<string[]>([]);
-  const historyForwardRef = useRef<string[]>([]);
+  const historyBackRef = useRef<ExplorerHistoryEntry[]>([]);
+  const historyForwardRef = useRef<ExplorerHistoryEntry[]>([]);
+  // Unlike currentPathRef, this cursor advances synchronously with a user
+  // navigation intent.  It is authoritative while a request is pending so
+  // rapid A→B→C and Back/Forward gestures cannot duplicate or skip entries.
+  const logicalNavigationCursorRef = useRef<LogicalNavigationCursor | null>(null);
   const [userId, setUserId] = useState<string | null>(() =>
     sessionUserId === undefined ? null : sessionUserId,
   );
@@ -385,7 +514,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // HF 検索クエリで絞り込んだ browseData（HFモード時のみフィルタ）。
-  // Hydrus モードでは削除済み file_id を除外する。
+  // Hydrus モードでは削除済み file_id を除外する。通常の Files では
+  // 削除中 tombstone を適用し、API refresh 完了を待たずに表示を確定する。
   const browseData = useMemo<ExplorerListResponse | null>(() => {
     if (!browseDataState || dataPrincipalId !== userId) return null;
     if (isHydrusMode) {
@@ -400,20 +530,40 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         total_items: browseDataState.directories.length + files.length,
       };
     }
-    if (!isHfMode) return browseDataState;
-    const q = hfSearchQuery.trim().toLowerCase();
-    if (!q) return browseDataState;
-    const filteredDirs = browseDataState.directories.filter((d) =>
-      creatorMatchesQuery(hfCreatorMapping, d.name, q),
+    if (isHfMode) {
+      const q = hfSearchQuery.trim().toLowerCase();
+      if (!q) return browseDataState;
+      const filteredDirs = browseDataState.directories.filter((d) =>
+        creatorMatchesQuery(hfCreatorMapping, d.name, q),
+      );
+      const filteredFiles = browseDataState.files.filter((f) =>
+        f.name.toLowerCase().includes(q),
+      );
+      return {
+        ...browseDataState,
+        directories: filteredDirs,
+        files: filteredFiles,
+        total_items: filteredDirs.length + filteredFiles.length,
+      };
+    }
+    if (pendingDeletedPaths.size === 0 && committedDeletedPaths.size === 0) {
+      return browseDataState;
+    }
+    const hiddenPaths = new Set([
+      ...pendingDeletedPaths,
+      ...committedDeletedPaths,
+    ]);
+    const directories = browseDataState.directories.filter(
+      (directory) => !hiddenPaths.has(directory.path),
     );
-    const filteredFiles = browseDataState.files.filter((f) =>
-      f.name.toLowerCase().includes(q),
+    const files = browseDataState.files.filter(
+      (file) => !hiddenPaths.has(file.path),
     );
     return {
       ...browseDataState,
-      directories: filteredDirs,
-      files: filteredFiles,
-      total_items: filteredDirs.length + filteredFiles.length,
+      directories,
+      files,
+      total_items: directories.length + files.length,
     };
   }, [
     browseDataState,
@@ -422,8 +572,10 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     isHfMode,
     isHydrusMode,
     hydrusHiddenFileIds,
+    pendingDeletedPaths,
     hfSearchQuery,
     hfCreatorMapping,
+    committedDeletedPaths,
   ]);
 
   const setBrowseDataForPrincipal = useCallback(
@@ -431,6 +583,33 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       data: ExplorerListResponse | null,
       principalId: string | null = userId,
     ) => {
+      // A successful delete is represented by a committed tombstone until a
+      // current-directory response proves that the server no longer returns
+      // the path.  A stale response that still contains it therefore cannot
+      // resurrect the item, while a later response which omits it clears the
+      // tombstone and lets future refreshes become authoritative again.
+      if (data && principalId === userId) {
+        const currentDirectory = normalizeExplorerPath(data.current_path);
+        const responsePaths = new Set([
+          ...data.directories.map((directory) => normalizeExplorerPath(directory.path)),
+          ...data.files.map((file) => normalizeExplorerPath(file.path)),
+        ]);
+        const nextCommitted = new Set(committedDeletedPathsRef.current);
+        let changed = false;
+        for (const path of nextCommitted) {
+          if (
+            explorerParentPath(path) === currentDirectory &&
+            !responsePaths.has(normalizeExplorerPath(path))
+          ) {
+            nextCommitted.delete(path);
+            changed = true;
+          }
+        }
+        if (changed) {
+          committedDeletedPathsRef.current = nextCommitted;
+          setCommittedDeletedPaths(nextCommitted);
+        }
+      }
       setBrowseDataState(data);
       setDataPrincipalId(principalId);
     },
@@ -458,19 +637,252 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     });
   }, []);
 
-  useEffect(
-    () =>
-      registerHydrusViewHandlers({
-        prune: pruneHydrusFiles,
-        restore: restoreHydrusFiles,
-      }),
-    [pruneHydrusFiles, restoreHydrusFiles],
+  const invalidateExplorerDeleteScope = useCallback(
+    (clearState = true) => {
+      deleteScopeGenerationRef.current += 1;
+      pendingDeleteOwnersRef.current.clear();
+      pendingDeletedPathsRef.current = new Set();
+      committedDeletedPathsRef.current = new Set();
+      if (clearState) {
+        setPendingDeletedPaths(new Set());
+        setCommittedDeletedPaths(new Set());
+        setDeleteScopeVersion((version) => version + 1);
+      }
+    },
+    [],
   );
+
+  const noopDeleteOperation = useCallback((): ExplorerDeleteViewOperation => ({
+    commit: () => undefined,
+    rollback: () => undefined,
+  }), []);
+
+  const hideExplorerDeletePaths = useCallback(
+    (
+      paths: string[],
+      expectedScopeGeneration = deleteScopeGenerationRef.current,
+    ): ExplorerDeleteViewOperation => {
+      if (
+        paths.length === 0 ||
+        expectedScopeGeneration !== deleteScopeGenerationRef.current
+      ) {
+        return noopDeleteOperation();
+      }
+      const owner = Symbol("explorer-delete");
+      const ownedPaths = new Set<string>();
+      const nextPending = new Set(pendingDeletedPathsRef.current);
+      for (const path of paths) {
+        // A committed tombstone already keeps this path hidden.  Otherwise
+        // every overlapping operation records its own owner so one
+        // operation cannot settle another operation's pending state.
+        if (committedDeletedPathsRef.current.has(path)) continue;
+        let owners = pendingDeleteOwnersRef.current.get(path);
+        if (!owners) {
+          owners = new Set<symbol>();
+          pendingDeleteOwnersRef.current.set(path, owners);
+        }
+        owners.add(owner);
+        ownedPaths.add(path);
+        nextPending.add(path);
+      }
+      if (ownedPaths.size > 0) {
+        pendingDeletedPathsRef.current = nextPending;
+        setPendingDeletedPaths(nextPending);
+      }
+
+      const settle = (pathsToSettle: string[], commit: boolean) => {
+        if (expectedScopeGeneration !== deleteScopeGenerationRef.current) return;
+        const requested = new Set(pathsToSettle);
+        const settled = [...ownedPaths].filter((path) => requested.has(path));
+        if (settled.length === 0) return;
+        for (const path of settled) {
+          ownedPaths.delete(path);
+          const owners = pendingDeleteOwnersRef.current.get(path);
+          if (owners) {
+            owners.delete(owner);
+            if (owners.size === 0) pendingDeleteOwnersRef.current.delete(path);
+          }
+        }
+        const nextPendingState = new Set(pendingDeletedPathsRef.current);
+        const nextCommittedState = new Set(committedDeletedPathsRef.current);
+        for (const path of settled) {
+          if (commit) {
+            // A successful owner commits the path even while another owner is
+            // still in flight.  The committed tombstone is authoritative, so
+            // no pending tombstone is needed after this point.
+            nextCommittedState.add(path);
+            nextPendingState.delete(path);
+            continue;
+          }
+          const owners = pendingDeleteOwnersRef.current.get(path);
+          // Only the final rollback of an uncommitted path may reveal it.
+          if (!owners?.size && !nextCommittedState.has(path)) {
+            nextPendingState.delete(path);
+          }
+        }
+        pendingDeletedPathsRef.current = nextPendingState;
+        committedDeletedPathsRef.current = nextCommittedState;
+        setPendingDeletedPaths(nextPendingState);
+        if (commit) setCommittedDeletedPaths(nextCommittedState);
+        if (!commit) return;
+
+        const deletedPaths = new Set(settled);
+        setBrowseDataState((previous) => {
+          if (!previous) return previous;
+          const directories = previous.directories.filter(
+            (directory) => !deletedPaths.has(directory.path),
+          );
+          const files = previous.files.filter(
+            (file) => !deletedPaths.has(file.path),
+          );
+          if (
+            directories.length === previous.directories.length &&
+            files.length === previous.files.length
+          ) {
+            return previous;
+          }
+          return {
+            ...previous,
+            directories,
+            files,
+            total_items: directories.length + files.length,
+          };
+        });
+      };
+
+      return {
+        commit: (pathsToCommit) => settle(pathsToCommit, true),
+        rollback: (pathsToRollback) => settle(pathsToRollback, false),
+      };
+    },
+    [noopDeleteOperation],
+  );
+
+  const restoreExplorerDeletePaths = useCallback(
+    (
+      paths: string[],
+      expectedScopeGeneration = deleteScopeGenerationRef.current,
+    ) => {
+      if (
+        paths.length === 0 ||
+        expectedScopeGeneration !== deleteScopeGenerationRef.current
+      ) {
+        return;
+      }
+      const nextCommitted = new Set(committedDeletedPathsRef.current);
+      let changed = false;
+      for (const path of paths) {
+        if (nextCommitted.delete(path)) changed = true;
+      }
+      if (changed) {
+        committedDeletedPathsRef.current = nextCommitted;
+        setCommittedDeletedPaths(nextCommitted);
+      }
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const registrationGeneration = deleteScopeGenerationRef.current;
+    const unregister = registerHydrusViewHandlers({
+      prune: (fileIds) => {
+        if (registrationGeneration !== deleteScopeGenerationRef.current) return;
+        pruneHydrusFiles(fileIds);
+      },
+      restore: (fileIds) => {
+        if (registrationGeneration !== deleteScopeGenerationRef.current) return;
+        restoreHydrusFiles(fileIds);
+      },
+    });
+    return unregister;
+  }, [
+    deleteScopeVersion,
+    pruneHydrusFiles,
+    restoreHydrusFiles,
+  ]);
+
+  useEffect(() => {
+    const registrationGeneration = deleteScopeGenerationRef.current;
+    const handlers = {
+      hide: (paths: string[]) =>
+        hideExplorerDeletePaths(paths, registrationGeneration),
+      restore: (paths: string[]) =>
+        restoreExplorerDeletePaths(paths, registrationGeneration),
+    };
+    const unregister = registerExplorerDeleteViewHandlers(handlers);
+    return () => {
+      // Do not let a handle retained by an unmounted Provider touch a future
+      // Provider.  State setters are intentionally skipped during unmount.
+      if (deleteScopeGenerationRef.current === registrationGeneration) {
+        invalidateExplorerDeleteScope(false);
+      }
+      unregister();
+    };
+  }, [
+    hideExplorerDeletePaths,
+    invalidateExplorerDeleteScope,
+    restoreExplorerDeletePaths,
+    deleteScopeVersion,
+  ]);
 
   const clearNavigationHistory = useCallback(() => {
     historyBackRef.current = [];
     historyForwardRef.current = [];
+    logicalNavigationCursorRef.current = null;
+    setHistoryScrollRestore(null);
+    // Navigation history is scoped to the active source/project.  Clear the
+    // associated virtual view state at the same boundary so a tab or project
+    // switch cannot briefly render the previous source's focused item.
+    if (
+      selectedItemsRef.current.size > 0 ||
+      focusedItemPathRef.current !== null
+    ) {
+      const nextSelection = new Set<string>();
+      selectedItemsRef.current = nextSelection;
+      focusedItemPathRef.current = null;
+      setSelectedItems(nextSelection);
+      setFocusedItemPath(null);
+    }
+    selectionAnchorPathRef.current = null;
+    previousShiftRangeRef.current = new Set();
   }, []);
+
+  const captureCurrentView = useCallback(
+    (): ExplorerHistoryEntry => {
+      const logicalCursor = logicalNavigationCursorRef.current;
+      if (logicalCursor?.pending) {
+        return cloneHistoryEntry(logicalCursor.entry);
+      }
+      return {
+        path:
+          currentPathRef.current || logicalCursor?.entry.path || "",
+        focusedItemPath: focusedItemPathRef.current,
+        selectedItemPaths: Array.from(selectedItemsRef.current),
+      };
+    },
+    [],
+  );
+
+  const captureStableHistoryBefore = useCallback(
+    (): LogicalNavigationHistorySnapshot => {
+      // A burst of intents is one logical transaction until the latest
+      // request commits.  Reuse the first intent's snapshot so a failure in a
+      // later queued request rolls the entire burst back atomically.
+      const logicalCursor = logicalNavigationCursorRef.current;
+      const source =
+        logicalCursor?.pending && logicalCursor.historyBefore
+          ? logicalCursor.historyBefore
+          : {
+              back: historyBackRef.current,
+              forward: historyForwardRef.current,
+            };
+      return {
+        back: source.back.map(cloneHistoryEntry),
+        forward: source.forward.map(cloneHistoryEntry),
+      };
+    },
+    [],
+  );
 
   // A logout/login switch must not leave the previous user's in-memory HF or
   // Hydrus data visible while the new principal is loading. Persistent state is
@@ -491,9 +903,13 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       setDataPrincipalId(null);
       setLoading(false);
       setCurrentPath("");
+      currentPathRef.current = "";
       setHydrusHiddenFileIds(new Set());
+      invalidateExplorerDeleteScope();
       setSelectedItems(new Set());
+      selectedItemsRef.current = new Set();
       setFocusedItemPath(null);
+      focusedItemPathRef.current = null;
       setHfCreatorMapping(null);
       setHfSearchQuery("");
       clearNavigationHistory();
@@ -502,7 +918,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       setHfOwnedAccountIds(new Set());
     }
     previousUserIdRef.current = userId;
-  }, [clearNavigationHistory, userId]);
+  }, [clearNavigationHistory, invalidateExplorerDeleteScope, userId]);
 
   // Account ownership is resolved from the authenticated user's DB-backed
   // account list; the opaque account id is never trusted from the URL alone.
@@ -693,6 +1109,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       path: string,
       requestedPrincipalId: string | null = userId,
       requestedNavigationEpoch: number = navigationEpochRef.current,
+      restoreViewState: ExplorerHistoryEntry | null = null,
     ) => {
       const generation = principalGenerationRef.current;
       const request: DirectoryFetchRequest = {
@@ -700,7 +1117,12 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         principalId: requestedPrincipalId,
         generation,
         navigationEpoch: requestedNavigationEpoch,
+        restoreViewState,
       };
+      // A restore signal describes exactly one completed request.  Clear any
+      // prior signal as soon as a newer request supersedes it; a successful
+      // restore below will publish a fresh, request-scoped signal.
+      setHistoryScrollRestore(null);
       const activeFetch = activeFetchRef.current;
       if (activeFetch?.generation === generation) {
         const pending = pendingFetchRef.current;
@@ -709,7 +1131,8 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           pending.path !== request.path ||
           pending.principalId !== request.principalId ||
           pending.generation !== request.generation ||
-          pending.navigationEpoch !== request.navigationEpoch
+          pending.navigationEpoch !== request.navigationEpoch ||
+          !historyEntriesEqual(pending.restoreViewState, request.restoreViewState)
         ) {
           pendingFetchRef.current = request;
         }
@@ -722,12 +1145,36 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       // promise after the stale branch has released the active slot.
       let completedSynchronously = false;
       const run = async () => {
+        const rollbackPendingNavigation = (requestNavigationEpoch: number) => {
+          const logicalCursor = logicalNavigationCursorRef.current;
+          if (
+            !logicalCursor?.pending ||
+            logicalCursor.navigationEpoch !== requestNavigationEpoch
+          ) {
+            return;
+          }
+          const historyBefore = logicalCursor.historyBefore;
+          if (historyBefore) {
+            historyBackRef.current = historyBefore.back.map(cloneHistoryEntry);
+            historyForwardRef.current = historyBefore.forward.map(cloneHistoryEntry);
+          }
+          logicalNavigationCursorRef.current = {
+            entry: {
+              path: currentPathRef.current,
+              focusedItemPath: focusedItemPathRef.current,
+              selectedItemPaths: Array.from(selectedItemsRef.current),
+            },
+            navigationEpoch: requestNavigationEpoch,
+            pending: false,
+          };
+        };
         let nextRequest: DirectoryFetchRequest | null = request;
         while (nextRequest !== null) {
           const targetPath = nextRequest.path;
           const targetPrincipalId = nextRequest.principalId;
           const requestGeneration: number = nextRequest.generation;
           const requestNavigationEpoch = nextRequest.navigationEpoch;
+          const requestRestoreViewState = nextRequest.restoreViewState;
           nextRequest = null;
           if (requestNavigationEpoch !== navigationEpochRef.current) {
             // A request can become stale while it is queued (for example,
@@ -760,6 +1207,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           const useAbsoluteFilerPath = !useHf && isAbsolutePath(targetPath);
 
           try {
+            let successfulData: ExplorerListResponse | null = null;
             if (useHf) {
               const data = await hfExplorerList(targetPath);
               if (
@@ -771,7 +1219,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
+              currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
+              successfulData = data;
 
               // creator_mapping.json はリポごとに一度だけロード（内部キャッシュも併用）
               const parsed = parseHfPath(data.current_path);
@@ -864,7 +1314,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
+              currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
+              successfulData = data;
             } else if (useAbsoluteFilerPath && isAdmin) {
               const data = await explorerList(targetPath);
               if (
@@ -876,7 +1328,9 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
+              currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
+              successfulData = data;
             } else if (useAbsoluteFilerPath) {
               await filerBrowse(targetPath);
               if (
@@ -895,18 +1349,107 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
               setIsHydrusMode(false);
               setBrowseDataForPrincipal(data, targetPrincipalId);
               setCurrentPath(data.current_path);
+              currentPathRef.current = data.current_path;
               rememberCurrentPath(data.current_path, targetPrincipalId);
+              successfulData = data;
             }
-            setSelectedItems(new Set());
-            setFocusedItemPath(null);
-            selectionAnchorPathRef.current = null;
-            previousShiftRangeRef.current = new Set();
+            if (!successfulData) {
+              // All successful directory branches above provide a response;
+              // retain the existing selection if a future source adds a
+              // branch that does not return one.
+              rollbackPendingNavigation(requestNavigationEpoch);
+              logicalNavigationCursorRef.current = {
+                entry: {
+                  path: currentPathRef.current,
+                  focusedItemPath: focusedItemPathRef.current,
+                  selectedItemPaths: Array.from(selectedItemsRef.current),
+                },
+                navigationEpoch: requestNavigationEpoch,
+                pending: false,
+              };
+              setHistoryScrollRestore(null);
+              continue;
+            }
+            const restoreViewState = requestRestoreViewState;
+            const canRestoreViewState =
+              restoreViewState !== null &&
+              normalizeExplorerPath(restoreViewState.path) ===
+                normalizeExplorerPath(successfulData.current_path);
+            if (canRestoreViewState && restoreViewState) {
+              const canonicalItems = new Map<string, string>();
+              const hiddenRestorePaths = new Set([
+                ...pendingDeletedPathsRef.current,
+                ...committedDeletedPathsRef.current,
+              ].map(normalizeExplorerPath));
+              for (const item of [
+                ...successfulData.directories,
+                ...successfulData.files,
+              ]) {
+                const normalizedPath = normalizeExplorerPath(item.path);
+                if (!hiddenRestorePaths.has(normalizedPath)) {
+                  canonicalItems.set(normalizedPath, item.path);
+                }
+              }
+              const restoredSelectedPaths: string[] = [];
+              for (const path of restoreViewState.selectedItemPaths) {
+                const canonicalPath = canonicalItems.get(normalizeExplorerPath(path));
+                if (canonicalPath && !restoredSelectedPaths.includes(canonicalPath)) {
+                  restoredSelectedPaths.push(canonicalPath);
+                }
+              }
+              const restoredFocusedPath = restoreViewState.focusedItemPath
+                ? canonicalItems.get(
+                    normalizeExplorerPath(restoreViewState.focusedItemPath),
+                  ) ?? null
+                : null;
+              const nextFocusedPath =
+                restoredFocusedPath ?? restoredSelectedPaths[0] ?? null;
+              const nextSelectedItems = new Set(restoredSelectedPaths);
+              selectedItemsRef.current = nextSelectedItems;
+              focusedItemPathRef.current = nextFocusedPath;
+              setSelectedItems(nextSelectedItems);
+              setFocusedItemPath(nextFocusedPath);
+              selectionAnchorPathRef.current = nextFocusedPath;
+              previousShiftRangeRef.current = new Set();
+              logicalNavigationCursorRef.current = {
+                entry: {
+                  path: successfulData.current_path,
+                  focusedItemPath: nextFocusedPath,
+                  selectedItemPaths: [...restoredSelectedPaths],
+                },
+                navigationEpoch: requestNavigationEpoch,
+                pending: false,
+              };
+              setHistoryScrollRestore(
+                nextFocusedPath
+                  ? {
+                      navigationEpoch: requestNavigationEpoch,
+                      directoryPath: successfulData.current_path,
+                      focusedItemPath: nextFocusedPath,
+                    }
+                  : null,
+              );
+            } else {
+              selectedItemsRef.current = new Set();
+              focusedItemPathRef.current = null;
+              setSelectedItems(new Set());
+              setFocusedItemPath(null);
+              selectionAnchorPathRef.current = null;
+              previousShiftRangeRef.current = new Set();
+              logicalNavigationCursorRef.current = {
+                entry: emptyHistoryEntry(successfulData.current_path),
+                navigationEpoch: requestNavigationEpoch,
+                pending: false,
+              };
+              setHistoryScrollRestore(null);
+            }
           } catch {
             if (
               requestGeneration === principalGenerationRef.current &&
               requestNavigationEpoch === navigationEpochRef.current
             ) {
               setError("ディレクトリの読み込みに失敗しました");
+              rollbackPendingNavigation(requestNavigationEpoch);
             }
           } finally {
             if (
@@ -953,39 +1496,105 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   const navigate = useCallback(
     (path: string) => {
-      if (currentPath && currentPath !== path) {
-        historyBackRef.current = [...historyBackRef.current, currentPath];
+      const currentView = captureCurrentView();
+      const historyBefore = captureStableHistoryBefore();
+      if (
+        currentView.path &&
+        normalizeExplorerPath(currentView.path) !== normalizeExplorerPath(path)
+      ) {
+        historyBackRef.current = [
+          ...historyBackRef.current,
+          currentView,
+        ];
         historyForwardRef.current = [];
       }
       const navigationEpoch = bumpNavigationEpoch();
+      logicalNavigationCursorRef.current = {
+        entry: emptyHistoryEntry(path),
+        navigationEpoch,
+        pending: true,
+        historyBefore,
+      };
       fetchDirectory(path, userId, navigationEpoch);
     },
-    [bumpNavigationEpoch, currentPath, fetchDirectory, userId],
+    [
+      bumpNavigationEpoch,
+      captureCurrentView,
+      captureStableHistoryBefore,
+      fetchDirectory,
+      userId,
+    ],
   );
 
   const goBack = useCallback(() => {
-    const previousPath = historyBackRef.current.at(-1);
-    if (!previousPath) return;
+    const previousEntry = historyBackRef.current.at(-1);
+    if (!previousEntry) return;
 
+    const historyBefore = captureStableHistoryBefore();
     historyBackRef.current = historyBackRef.current.slice(0, -1);
-    if (currentPath && currentPath !== previousPath) {
-      historyForwardRef.current = [currentPath, ...historyForwardRef.current];
+    const currentView = captureCurrentView();
+    if (
+      currentView.path &&
+      normalizeExplorerPath(currentView.path) !==
+        normalizeExplorerPath(previousEntry.path)
+    ) {
+      historyForwardRef.current = [
+        currentView,
+        ...historyForwardRef.current,
+      ];
     }
     const navigationEpoch = bumpNavigationEpoch();
-    fetchDirectory(previousPath, userId, navigationEpoch);
-  }, [bumpNavigationEpoch, currentPath, fetchDirectory, userId]);
+    logicalNavigationCursorRef.current = {
+      entry: cloneHistoryEntry(previousEntry),
+      navigationEpoch,
+      pending: true,
+      historyBefore,
+    };
+    fetchDirectory(
+      previousEntry.path,
+      userId,
+      navigationEpoch,
+      previousEntry,
+    );
+  }, [
+    bumpNavigationEpoch,
+    captureCurrentView,
+    captureStableHistoryBefore,
+    fetchDirectory,
+    userId,
+  ]);
 
   const goForward = useCallback(() => {
-    const nextPath = historyForwardRef.current[0];
-    if (!nextPath) return;
+    const nextEntry = historyForwardRef.current[0];
+    if (!nextEntry) return;
 
+    const historyBefore = captureStableHistoryBefore();
     historyForwardRef.current = historyForwardRef.current.slice(1);
-    if (currentPath && currentPath !== nextPath) {
-      historyBackRef.current = [...historyBackRef.current, currentPath];
+    const currentView = captureCurrentView();
+    if (
+      currentView.path &&
+      normalizeExplorerPath(currentView.path) !== normalizeExplorerPath(nextEntry.path)
+    ) {
+      historyBackRef.current = [
+        ...historyBackRef.current,
+        currentView,
+      ];
     }
     const navigationEpoch = bumpNavigationEpoch();
-    fetchDirectory(nextPath, userId, navigationEpoch);
-  }, [bumpNavigationEpoch, currentPath, fetchDirectory, userId]);
+    logicalNavigationCursorRef.current = {
+      entry: cloneHistoryEntry(nextEntry),
+      navigationEpoch,
+      pending: true,
+      historyBefore,
+    };
+    fetchDirectory(nextEntry.path, userId, navigationEpoch, nextEntry);
+  }, [
+    bumpNavigationEpoch,
+    captureCurrentView,
+    captureStableHistoryBefore,
+    fetchDirectory,
+    userId,
+  ]);
 
   const goUp = useCallback(() => {
     // コンテキストルートより上には行かせない（管理者・絶対パス閲覧時は制限なし）
@@ -1021,19 +1630,22 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   // 選択
   const selectItem = useCallback((path: string) => {
-    setSelectedItems(new Set([path]));
+    const next = new Set([path]);
+    selectedItemsRef.current = next;
+    focusedItemPathRef.current = path;
+    setSelectedItems(next);
     setFocusedItemPath(path);
     selectionAnchorPathRef.current = path;
     previousShiftRangeRef.current = new Set();
   }, []);
 
   const toggleSelect = useCallback((path: string) => {
-    setSelectedItems((prev) => {
-      const next = new Set(prev);
-      if (next.has(path)) next.delete(path);
-      else next.add(path);
-      return next;
-    });
+    const next = new Set(selectedItemsRef.current);
+    if (next.has(path)) next.delete(path);
+    else next.add(path);
+    selectedItemsRef.current = next;
+    focusedItemPathRef.current = path;
+    setSelectedItems(next);
     setFocusedItemPath(path);
     selectionAnchorPathRef.current = path;
     previousShiftRangeRef.current = new Set();
@@ -1041,19 +1653,19 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
 
   const selectRange = useCallback(
     (path: string, orderedPaths: string[], additive = false) => {
-      setSelectedItems((prev) => {
-        const result = buildExplorerRangeSelection({
-          orderedPaths,
-          anchorPath: selectionAnchorPathRef.current,
-          targetPath: path,
-          selectedPaths: prev,
-          previousShiftRange: previousShiftRangeRef.current,
-          additive,
-        });
-        selectionAnchorPathRef.current = result.anchorPath;
-        previousShiftRangeRef.current = result.shiftRange;
-        return result.selectedPaths;
+      const result = buildExplorerRangeSelection({
+        orderedPaths,
+        anchorPath: selectionAnchorPathRef.current,
+        targetPath: path,
+        selectedPaths: selectedItemsRef.current,
+        previousShiftRange: previousShiftRangeRef.current,
+        additive,
       });
+      selectedItemsRef.current = result.selectedPaths;
+      focusedItemPathRef.current = path;
+      setSelectedItems(result.selectedPaths);
+      selectionAnchorPathRef.current = result.anchorPath;
+      previousShiftRangeRef.current = result.shiftRange;
       setFocusedItemPath(path);
     },
     [],
@@ -1068,133 +1680,266 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         ...(browseData?.files ?? []).map((f) => f.path),
       ];
     const all = new Set(allPaths);
+    const nextFocusedPath =
+      focusedItemPathRef.current && all.has(focusedItemPathRef.current)
+        ? focusedItemPathRef.current
+        : allPaths[0] ?? null;
+    selectedItemsRef.current = all;
+    focusedItemPathRef.current = nextFocusedPath;
     setSelectedItems(all);
-    setFocusedItemPath((current) =>
-      current && all.has(current) ? current : allPaths[0] ?? null,
-    );
+    setFocusedItemPath(nextFocusedPath);
     selectionAnchorPathRef.current =
-      focusedItemPath && all.has(focusedItemPath)
-        ? focusedItemPath
-        : (allPaths[0] ?? null);
+      nextFocusedPath;
     previousShiftRangeRef.current = new Set();
-  }, [browseData, focusedItemPath]);
+  }, [browseData]);
 
-  const clearSelection = useCallback(() => {
-    setSelectedItems(new Set());
-    setFocusedItemPath(null);
-    selectionAnchorPathRef.current = null;
-    previousShiftRangeRef.current = new Set();
+  const clearSelection = useCallback((paths?: string[]) => {
+    if (paths === undefined) {
+      const next = new Set<string>();
+      selectedItemsRef.current = next;
+      focusedItemPathRef.current = null;
+      setSelectedItems(next);
+      setFocusedItemPath(null);
+      selectionAnchorPathRef.current = null;
+      previousShiftRangeRef.current = new Set();
+      return;
+    }
+    if (paths.length === 0) return;
+    const deletedPaths = new Set(paths);
+    const nextSelected = new Set(selectedItemsRef.current);
+    for (const path of deletedPaths) nextSelected.delete(path);
+    const nextFocused =
+      focusedItemPathRef.current && deletedPaths.has(focusedItemPathRef.current)
+        ? null
+        : focusedItemPathRef.current;
+    selectedItemsRef.current = nextSelected;
+    focusedItemPathRef.current = nextFocused;
+    setSelectedItems(nextSelected);
+    setFocusedItemPath(nextFocused);
+    if (
+      selectionAnchorPathRef.current &&
+      deletedPaths.has(selectionAnchorPathRef.current)
+    ) {
+      selectionAnchorPathRef.current = null;
+    }
+    previousShiftRangeRef.current = new Set(
+      [...previousShiftRangeRef.current].filter(
+        (path) => !deletedPaths.has(path),
+      ),
+    );
   }, []);
 
   // ブックマーク（取得・キャッシュ・重複排除を SWR に委譲）。
+  //
+  // Project Files の表示中は Space 共有コレクションを主コレクションと
+  // して扱いながら、個人コレクションも常に同時に取得する。これにより、
+  // 外部/local パスを個人所有として表示・操作でき、Space の共有境界を
+  // 越えて個人項目を誤って扱うこともない。
   // 取得失敗を空配列へ変換すると、登録直後の一時的なGET失敗が既存項目を
   // 消えたように見せてしまう。例外をSWRへ返し、前回データを保持させる。
-  const bookmarksCurrentPrincipalRef = useRef(userId);
-  const bookmarksCurrentScopeIdentityRef = useRef(bookmarkScopeIdentity(bookmarkScope));
-  const bookmarksRevalidatedIdentityRef = useRef(
-    `${userId ?? ""}|${bookmarkScopeIdentity(bookmarkScope)}`,
+  type BookmarkSWRKey = readonly [
+    typeof BOOKMARKS_SWR_KEY,
+    string,
+    string,
+    string | null,
+  ];
+  // `null` is a valid principal in the auth-disabled development runtime.
+  // Keep the cache identity distinct from authenticated UUIDs while still
+  // allowing that runtime to use the personal/default collection.  During the
+  // initial `undefined` shell hand-off, defer fetching until the provider has
+  // supplied an explicit value so an anonymous first render cannot race the
+  // authenticated principal.
+  const bookmarkPrincipalReady = sessionUserId !== undefined || userId !== null;
+  const bookmarkPrincipalIdentity = userId ?? "anonymous";
+  const bookmarksCurrentPrincipalRef = useRef(bookmarkPrincipalIdentity);
+  const bookmarksCurrentSharedIdentityRef = useRef<string | null>(
+    bookmarkScope.scope === "shared"
+      ? bookmarkScopeIdentity(bookmarkScope)
+      : null,
   );
-  // Keep the latest principal/scope available to an old mutate/fetcher closure
-  // even in the render→effect window during an auth or Space switch.
-  bookmarksCurrentPrincipalRef.current = userId;
-  bookmarksCurrentScopeIdentityRef.current = bookmarkScopeIdentity(bookmarkScope);
+  // Keep the latest principal and active Space available to an old
+  // mutate/fetcher closure even in the render→effect window during an auth or
+  // Space switch. Personal responses intentionally do not depend on Space.
+  bookmarksCurrentPrincipalRef.current = bookmarkPrincipalIdentity;
+  bookmarksCurrentSharedIdentityRef.current =
+    bookmarkScope.scope === "shared" ? bookmarkScopeIdentity(bookmarkScope) : null;
+
   const bookmarksFetcher = useCallback(
-    async (
-      key: readonly [string, string | null, string, string | null],
-    ): Promise<ExplorerBookmark[]> => {
+    async (key: BookmarkSWRKey): Promise<ExplorerBookmark[]> => {
       const requestPrincipal = key[1];
       const requestScopeIdentity = key[2];
       const requestSpaceId = key[3];
-      if (
-        requestPrincipal !== bookmarksCurrentPrincipalRef.current ||
-        requestScopeIdentity !== bookmarksCurrentScopeIdentityRef.current
-      ) {
-        return [];
-      }
       const requestScope: ExplorerBookmarkScope =
         requestScopeIdentity.startsWith("shared:") && requestSpaceId
           ? { scope: "shared", spaceId: requestSpaceId }
           : { scope: "personal" };
-    try {
-      const data = await explorerBookmarks(requestScope);
-      if (!data.success) {
-        throw new Error("ブックマーク一覧の取得に失敗しました");
+      const isCurrentRequest = () =>
+        requestPrincipal === bookmarksCurrentPrincipalRef.current &&
+        (requestScope.scope !== "shared" ||
+          requestScopeIdentity === bookmarksCurrentSharedIdentityRef.current);
+
+      if (!isCurrentRequest()) return [];
+      try {
+        const data = await explorerBookmarks(requestScope);
+        if (!data.success) {
+          throw new Error("ブックマーク一覧の取得に失敗しました");
+        }
+        if (!Array.isArray(data.bookmarks)) {
+          throw new Error("ブックマーク一覧の形式が不正です");
+        }
+        // A principal/Space switch while the request was in flight must not
+        // write the old response into the new user's or Space's UI/cache.
+        if (!isCurrentRequest()) return [];
+        return data.bookmarks;
+      } catch (error) {
+        if (!isCurrentRequest()) return [];
+        console.error("[Files] ブックマーク一覧の取得に失敗しました:", error);
+        toast.error(
+          `ブックマーク一覧を取得できませんでした: ${
+            error instanceof Error ? error.message : "不明なエラーです"
+          }`,
+        );
+        throw error;
       }
-      if (!Array.isArray(data.bookmarks)) {
-        throw new Error("ブックマーク一覧の形式が不正です");
-      }
-      // A principal switch while the request was in flight must not write the
-      // old response into the new user's cache/request path.
-      if (
-        requestPrincipal !== bookmarksCurrentPrincipalRef.current ||
-        requestScopeIdentity !== bookmarksCurrentScopeIdentityRef.current
-      ) {
-        return [];
-      }
-      return data.bookmarks;
-    } catch (error) {
-      if (
-        requestPrincipal !== bookmarksCurrentPrincipalRef.current ||
-        requestScopeIdentity !== bookmarksCurrentScopeIdentityRef.current
-      ) {
-        return [];
-      }
-      console.error("[Files] ブックマーク一覧の取得に失敗しました:", error);
-      toast.error(
-        `ブックマーク一覧を取得できませんでした: ${
-          error instanceof Error ? error.message : "不明なエラーです"
-        }`,
-      );
-      throw error;
-    }
     },
     [],
   );
 
-  // Keep SWR's cache principal + scope scoped.  A user-only key would let a
-  // Space A response survive a rapid A→B switch and briefly render into B.
   const bookmarksScopeIdentity = bookmarkScopeIdentity(bookmarkScope);
-  const bookmarksSWRKey = [
-    BOOKMARKS_SWR_KEY,
-    userId,
-    bookmarksScopeIdentity,
-    bookmarkScope.scope === "shared" ? bookmarkScope.spaceId : null,
-  ] as const;
-  const { data: bookmarksData, mutate: mutateBookmarks } = useSWR<
-    ExplorerBookmark[]
-  >(bookmarksSWRKey, bookmarksFetcher, {
+  const personalBookmarksSWRKey = bookmarkPrincipalReady
+    ? ([BOOKMARKS_SWR_KEY, bookmarkPrincipalIdentity, "personal:", null] as const)
+    : null;
+  // Only the active local Project Space has a shared collection in this
+  // provider. Remote, User, HF, and Hydrus tabs intentionally expose null.
+  const sharedBookmarksSWRKey =
+    bookmarkPrincipalReady && bookmarkScope.scope === "shared"
+      ? ([
+          BOOKMARKS_SWR_KEY,
+          bookmarkPrincipalIdentity,
+          bookmarksScopeIdentity,
+          bookmarkScope.spaceId,
+        ] as const)
+      : null;
+  const swrOptions = {
     // 取得タイミングを従来実装（refreshBookmarks 呼び出し）に一致させるため、
-    // SWR の自動 revalidation は全て無効化し、全ての取得を refreshBookmarks 経由にする。
+    // SWR の自動 revalidation は全て無効化し、全ての取得を refreshBookmarks
+    // または下記の scope 切り替え effect 経由にする。
     revalidateOnMount: false,
     revalidateOnFocus: false,
     revalidateOnReconnect: false,
     revalidateIfStale: false,
     keepPreviousData: false,
     dedupingInterval: 0,
-  });
-  const bookmarks = bookmarksData ?? EMPTY_BOOKMARKS;
+  } as const;
+  const { data: personalBookmarksData, mutate: mutatePersonalBookmarks } = useSWR<
+    ExplorerBookmark[]
+  >(personalBookmarksSWRKey, bookmarksFetcher, swrOptions);
+  const { data: sharedBookmarksData, mutate: mutateSharedBookmarks } = useSWR<
+    ExplorerBookmark[]
+  >(sharedBookmarksSWRKey, bookmarksFetcher, swrOptions);
 
+  const personalBookmarks = personalBookmarksData ?? EMPTY_BOOKMARKS;
+  const sharedBookmarks = sharedBookmarksData ?? EMPTY_BOOKMARKS;
+  const bookmarkCollections = useMemo<ExplorerBookmarkCollections>(
+    () => ({
+      personal: personalBookmarks,
+      shared:
+        bookmarkScope.scope === "shared"
+          ? { spaceId: bookmarkScope.spaceId, bookmarks: sharedBookmarks }
+          : null,
+    }),
+    [bookmarkScope, personalBookmarks, sharedBookmarks],
+  );
+  // `bookmarks` remains the compatibility view used by existing callers. Its
+  // owner is explicit in `bookmarkScope`; the bridge additionally publishes
+  // both collections above for owner-aware CRUD in the sidebar.
+  const bookmarks =
+    bookmarkScope.scope === "shared" ? sharedBookmarks : personalBookmarks;
+
+  // Start empty so the first authenticated render revalidates both required
+  // collections. Subsequent renders are deduplicated by principal/Space
+  // identity rather than by callback identity.
+  const bookmarksPersonalRevalidatedPrincipalRef = useRef<string | null>(null);
+  const bookmarksSharedRevalidatedIdentityRef = useRef<string | null>(null);
   useEffect(() => {
-    const identity = `${userId ?? ""}|${bookmarksScopeIdentity}`;
-    if (bookmarksRevalidatedIdentityRef.current === identity) return;
-    bookmarksRevalidatedIdentityRef.current = identity;
-    // The key switch intentionally starts with an empty value.  Revalidate
-    // the new principal immediately; handle the rejection here because this
-    // effect runs outside the sidebar's action promise chain.
-    void mutateBookmarks().catch((error: unknown) => {
-      console.error("[Files] principal変更後のブックマーク取得に失敗しました:", error);
+    if (!bookmarkPrincipalReady) {
+      bookmarksPersonalRevalidatedPrincipalRef.current = null;
+      bookmarksSharedRevalidatedIdentityRef.current = null;
+      return;
+    }
+
+    if (
+      bookmarksPersonalRevalidatedPrincipalRef.current !== bookmarkPrincipalIdentity
+    ) {
+      bookmarksPersonalRevalidatedPrincipalRef.current = bookmarkPrincipalIdentity;
+      // Personal bookmarks are fetched for every authenticated principal,
+      // including while the active tab is a shared Project workspace. The
+      // explicit anonymous identity is also used by auth-disabled development.
+      void mutatePersonalBookmarks().catch((error: unknown) => {
+        console.error("[Files] principal変更後の個人ブックマーク取得に失敗しました:", error);
+        toast.error(
+          `ブックマーク一覧を取得できませんでした: ${
+            error instanceof Error ? error.message : "不明なエラーです"
+          }`,
+        );
+      });
+    }
+
+    const sharedIdentity =
+      bookmarkScope.scope === "shared"
+        ? `${bookmarkPrincipalIdentity}|${bookmarksScopeIdentity}`
+        : null;
+    if (!sharedIdentity) {
+      bookmarksSharedRevalidatedIdentityRef.current = null;
+      return;
+    }
+    if (bookmarksSharedRevalidatedIdentityRef.current === sharedIdentity) return;
+    bookmarksSharedRevalidatedIdentityRef.current = sharedIdentity;
+    void mutateSharedBookmarks().catch((error: unknown) => {
+      console.error("[Files] Space変更後の共有ブックマーク取得に失敗しました:", error);
       toast.error(
         `ブックマーク一覧を取得できませんでした: ${
           error instanceof Error ? error.message : "不明なエラーです"
         }`,
       );
     });
-  }, [bookmarksScopeIdentity, mutateBookmarks, userId]);
+  }, [
+    bookmarkScope,
+    bookmarksScopeIdentity,
+    mutatePersonalBookmarks,
+    mutateSharedBookmarks,
+    bookmarkPrincipalIdentity,
+    bookmarkPrincipalReady,
+  ]);
 
-  // revalidate を実行（従来の refreshBookmarks と同じ呼び出し駆動）。
-  const refreshBookmarks = useCallback(async () => {
-    await mutateBookmarks();
-  }, [mutateBookmarks]);
+  // Revalidate one owning collection.  Callers mutating a personal item while
+  // Project Files are active must pass `{ scope: "personal" }`; omitting the
+  // owner preserves the historical active-collection behavior.
+  const refreshBookmarks = useCallback(
+    async (owner: ExplorerBookmarkScope = bookmarkScope): Promise<void> => {
+      if (!bookmarkPrincipalReady) return;
+      if (owner.scope === "personal") {
+        await mutatePersonalBookmarks();
+        return;
+      }
+      if (
+        bookmarkScope.scope !== "shared" ||
+        owner.spaceId !== bookmarkScope.spaceId
+      ) {
+        // The provider only mounts the selected Space's shared collection. Do
+        // not accidentally refresh a different Space's endpoint during a
+        // transition; its provider will revalidate once it becomes active.
+        return;
+      }
+      await mutateSharedBookmarks();
+    },
+    [
+      bookmarkPrincipalReady,
+      bookmarkScope,
+      mutatePersonalBookmarks,
+      mutateSharedBookmarks,
+    ],
+  );
 
   // タブ / パス種別ごとの操作可否。削除・リネーム・移動の判定はここに一元化する。
   const capabilities = useMemo(
@@ -1233,6 +1978,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       // タブをまたいだ Undo は復元先が食い違うためスタックを全消去する
       clearFilerUndoHistory();
       setHydrusHiddenFileIds(new Set());
+      invalidateExplorerDeleteScope();
       clearNavigationHistory();
       activeFilerTabRef.current = tab;
       setFilerTabState(tab);
@@ -1267,6 +2013,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           total_items: 0,
         });
         setCurrentPath("Hydrus");
+        currentPathRef.current = "Hydrus";
         setLoading(false);
       }
     },
@@ -1275,6 +2022,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       clearNavigationHistory,
       fetchDirectory,
       initialPathForTab,
+      invalidateExplorerDeleteScope,
       setBrowseDataForPrincipal,
       userId,
     ],
@@ -1399,14 +2147,6 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     (async () => {
       const userInfo = await fetchUserInfo();
-      try {
-        await refreshBookmarks();
-      } catch (error) {
-        // bookmarksFetcher already emits the user-facing notification.  Keep
-        // the rejection handled here so an initial network outage does not
-        // become an unhandled promise while SWR retains its previous data.
-        console.error("[Files] 初期ブックマーク取得を継続できませんでした:", error);
-      }
 
       // 保存されていたタブを復元
       const savedTab = readLocalStorage(FILER_TAB_STORAGE_KEY);
@@ -1443,6 +2183,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
           total_items: 0,
         }, uid);
         setCurrentPath("Hydrus");
+        currentPathRef.current = "Hydrus";
         setLoading(false);
         initDoneRef.current = true;
       }
@@ -1530,6 +2271,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         // Admin-only local Projects are valid shared Files targets, but they
         // must not become the canonical header Project.  Fetch the root
         // directly and let the caller navigate to the stored child path.
+        clearNavigationHistory();
         setFilesTargetProjectId(null);
         const navigationEpoch = bumpNavigationEpoch();
         await fetchDirectory(expectedRoot, userId, navigationEpoch);
@@ -1560,9 +2302,36 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         return false;
       }
       setFilesTargetProjectId(null);
+      const normalizedExpectedRoot = expectedRoot
+        .replace(/\\/g, "/")
+        .replace(/^\/+|\/+$/g, "");
+      const currentState = projectNavigationStateRef.current;
+      const currentStatePath = currentState.currentPath
+        .replace(/\\/g, "/")
+        .replace(/^\/+|\/+$/g, "");
+      const currentBrowsePath = currentState.browseData?.current_path
+        ?.replace(/\\/g, "/")
+        .replace(/^\/+|\/+$/g, "");
+      const targetRootAlreadyLoaded =
+        currentState.selectedSpaceId === bookmarkScope.spaceId &&
+        currentState.selectedProjectId === targetProjectId &&
+        !currentState.loading &&
+        (currentStatePath === normalizedExpectedRoot ||
+          currentStatePath.startsWith(`${normalizedExpectedRoot}/`)) &&
+        currentBrowsePath === currentStatePath;
+      if (selectedProjectId === targetProjectId && !targetRootAlreadyLoaded) {
+        // The user may have opened a personal absolute bookmark while keeping
+        // the same Project selected.  In that state the normal ProjectContext
+        // setter is a no-op, so explicitly restore the canonical root before
+        // waiting below; otherwise shared bookmarks in this Project time out.
+        clearNavigationHistory();
+        const navigationEpoch = bumpNavigationEpoch();
+        await fetchDirectory(expectedRoot, userId, navigationEpoch);
+      }
       if (selectedProjectId !== targetProjectId) {
         // Always use ProjectContext's canonical setter.  The provider then
         // owns the Space synchronization and root fetch lifecycle.
+        clearNavigationHistory();
         setSelectedProjectId(targetProjectId);
       }
 
@@ -1590,6 +2359,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     [
       bookmarkScope,
       bumpNavigationEpoch,
+      clearNavigationHistory,
       fetchDirectory,
       filerTab,
       accessibleProjects,
@@ -1635,6 +2405,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
       isAdmin,
       isRemoteWorkspace,
       bookmarks,
+      bookmarkCollections,
       bookmarkScope,
       navigate,
       selectProjectForPath,
@@ -1653,6 +2424,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
     isAdmin,
     isRemoteWorkspace,
     bookmarkScope,
+    bookmarkCollections,
     navigate,
     refreshBookmarks,
     selectProjectForPath,
@@ -1675,6 +2447,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         goForward,
         goUp,
         refresh,
+        historyScrollRestore,
         browseData,
         setBrowseData,
         loading,
@@ -1694,6 +2467,7 @@ export function ExplorerProvider({ children }: { children: React.ReactNode }) {
         clipboard,
         setClipboard,
         bookmarks,
+        bookmarkCollections,
         refreshBookmarks,
         bookmarkScope,
         filerTab,

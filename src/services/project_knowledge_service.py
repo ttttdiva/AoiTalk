@@ -19,7 +19,7 @@ from ..memory.database import get_db_session
 from ..memory.models import KnowledgeNode, Project, ProjectKnowledgeRef
 from ..memory.project_repository import ProjectRepository
 from .docs_acl import can_read_node
-from .project_context_pack_service import invalidate_project_context_pack
+from .docs_workspace import get_canonical_project_information_node
 
 
 PROJECT_KNOWLEDGE_RELATION_TYPES = frozenset({"canonical", "related", "reference"})
@@ -146,6 +146,17 @@ async def attach_project_knowledge_ref(
         node = await session.get(KnowledgeNode, node_uuid)
         if node is None or not await can_read_node(session, node, actor_uuid):
             raise ProjectKnowledgeNotFound("knowledge node not found or inaccessible")
+        if relation == "canonical":
+            canonical = await get_canonical_project_information_node(
+                session,
+                project_id=project_uuid,
+            )
+            if canonical is None or canonical.id != node.id:
+                # Do not let a caller manufacture a second canonical pointer
+                # to an arbitrary readable/project-tagged node.
+                raise ProjectKnowledgeNotFound(
+                    "knowledge node not found or inaccessible"
+                )
 
         existing = await session.scalar(
             select(ProjectKnowledgeRef).where(
@@ -167,11 +178,6 @@ async def attach_project_knowledge_ref(
             updated_at=datetime.utcnow(),
         )
         session.add(ref)
-        await invalidate_project_context_pack(
-            session=session,
-            project_id=project_uuid,
-            reason="project_knowledge_ref_attached",
-        )
         try:
             await session.commit()
         except IntegrityError as exc:
@@ -181,18 +187,6 @@ async def attach_project_knowledge_ref(
             ) from exc
         await session.refresh(ref)
         result = _ref_dict(ref, node)
-    # Scheduling is deliberately outside the source transaction.  If commit
-    # above rolled back, this code is never reached and no orphan job exists.
-    from .project_context_pack_job_service import enqueue_project_context_pack_rebuild
-
-    try:
-        await enqueue_project_context_pack_rebuild(
-            project_uuid,
-            actor_uuid,
-            "project_knowledge_ref_attached",
-        )
-    except Exception:
-        logger.exception("Failed to enqueue ProjectContextPack rebuild after attach")
     return result
 
 
@@ -219,11 +213,6 @@ async def remove_project_knowledge_ref(
         if ref is None:
             raise ProjectKnowledgeNotFound("project knowledge reference not found")
         await session.delete(ref)
-        await invalidate_project_context_pack(
-            session=session,
-            project_id=project_uuid,
-            reason="project_knowledge_ref_removed",
-        )
         await session.commit()
         result = {
             "success": True,
@@ -231,16 +220,6 @@ async def remove_project_knowledge_ref(
             "knowledge_node_id": str(node_uuid),
             "removed": True,
         }
-    from .project_context_pack_job_service import enqueue_project_context_pack_rebuild
-
-    try:
-        await enqueue_project_context_pack_rebuild(
-            project_uuid,
-            actor_uuid,
-            "project_knowledge_ref_removed",
-        )
-    except Exception:
-        logger.exception("Failed to enqueue ProjectContextPack rebuild after remove")
     return result
 
 
@@ -255,6 +234,11 @@ async def list_project_knowledge_refs(
     actor_uuid = _uuid(actor_user_id, field="actor_user_id")
     async with await get_db_session() as session:
         await _authorized_project(session, project_uuid, actor_uuid, write=False)
+        canonical_node = await get_canonical_project_information_node(
+            session,
+            project_id=project_uuid,
+            actor_user_id=actor_uuid,
+        )
         rows = (
             await session.execute(
                 select(ProjectKnowledgeRef, KnowledgeNode)
@@ -268,6 +252,10 @@ async def list_project_knowledge_refs(
         ).all()
         visible: list[dict[str, Any]] = []
         for ref, node in rows:
+            if ref.relation_type == "canonical" and (
+                canonical_node is None or node.id != canonical_node.id
+            ):
+                continue
             if await can_read_node(session, node, actor_uuid):
                 visible.append(_ref_dict(ref, node))
         return visible
@@ -286,11 +274,26 @@ async def resolve_project_knowledge(
         project = await _authorized_project(session, project_uuid, actor_uuid, write=False)
         canonical_nodes: list[dict[str, Any]] = []
         seen_canonical: set[UUID] = set()
-        if project.knowledge_node_id:
-            node = await session.get(KnowledgeNode, project.knowledge_node_id)
-            if node is not None and await can_read_node(session, node, actor_uuid):
-                canonical_nodes.append(_node_dict(node, relation_type="canonical", priority=0))
-                seen_canonical.add(node.id)
+        # ``Project.knowledge_node_id`` is denormalized and may be stale or
+        # forged.  Only the strict canonical pointer resolver may project it
+        # into Work Intelligence; arbitrary readable nodes are never promoted
+        # to canonical merely because they carry a project/share ACL.
+        canonical_node = await get_canonical_project_information_node(
+            session,
+            project_id=project_uuid,
+            actor_user_id=actor_uuid,
+        )
+        if canonical_node is not None and await can_read_node(
+            session, canonical_node, actor_uuid
+        ):
+            canonical_nodes.append(
+                _node_dict(
+                    canonical_node,
+                    relation_type="canonical",
+                    priority=0,
+                )
+            )
+            seen_canonical.add(canonical_node.id)
 
         rows = (
             await session.execute(
@@ -306,6 +309,14 @@ async def resolve_project_knowledge(
         related_nodes: list[dict[str, Any]] = []
         for ref, node in rows:
             if not await can_read_node(session, node, actor_uuid):
+                continue
+            # A stale/forged canonical reference is not allowed to bypass the
+            # pointer contract.  Keep only the exact validated canonical node
+            # for that relation type; ordinary related/reference links retain
+            # their existing ACL-visible semantics.
+            if ref.relation_type == "canonical" and (
+                canonical_node is None or node.id != canonical_node.id
+            ):
                 continue
             payload = _node_dict(
                 node,

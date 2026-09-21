@@ -1,6 +1,6 @@
-"""Deterministic security gates for the two browser lanes.
+"""Deterministic security gates for three isolated browser lanes.
 
-The application has two deliberately different browser responsibilities:
+The application has three deliberately different browser responsibilities:
 
 ``director``
     The existing Playwright browser used to talk to ChatGPT Web.  It belongs
@@ -10,6 +10,10 @@ The application has two deliberately different browser responsibilities:
     A short-lived browser used by a local UI-QA worker.  It receives an exact
     allow-list of the AoiTalk origins for the current run.  A QA scope never
     permits ChatGPT Web, ``file://``, or an unconfigured external service.
+
+``browser_agent``
+    A parent-issued, short-lived browser for operator-allowlisted websites.
+    It cannot acquire Director or QA state and never permits ChatGPT Web.
 
 This module is a policy/gate API, not a browser transport.  A Playwright or
 MCP adapter should call :meth:`BrowserRunScope.assert_navigation_allowed`
@@ -61,7 +65,7 @@ class BrowserLifecycleViolation(RuntimeError, BrowserScopeError):
 
 
 class BrowserLane(str, Enum):
-    """The two security-separated browser lanes."""
+    """Security-separated browser responsibilities."""
 
     DIRECTOR = "director"
     QA = "qa"
@@ -483,11 +487,11 @@ class BrowserRunScope:
             )
         # A caller must not smuggle a Director profile identifier into a QA
         # run, or vice versa.  Generated IDs naturally satisfy this check.
-        if lane is BrowserLane.QA and "director" in profile_id.casefold():
+        if lane is not BrowserLane.DIRECTOR and "director" in profile_id.casefold():
             raise BrowserLaneViolation(
                 "QA browser cannot use a Director profile identifier"
             )
-        if lane is BrowserLane.QA and "director" in process_id.casefold():
+        if lane is not BrowserLane.DIRECTOR and "director" in process_id.casefold():
             raise BrowserLaneViolation(
                 "QA browser cannot use a Director process identifier"
             )
@@ -625,7 +629,7 @@ class BrowserRunScope:
         try:
             self._ensure_active()
             origin = origin_for_url(url)
-            if self.lane is BrowserLane.QA and _is_chatgpt_host(origin.host):
+            if self.lane is not BrowserLane.DIRECTOR and _is_chatgpt_host(origin.host):
                 return BrowserDecision(
                     False,
                     "navigation",

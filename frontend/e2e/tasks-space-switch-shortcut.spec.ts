@@ -192,7 +192,7 @@ async function expectSpaceWide(
       : spaceId === "space-b"
         ? (["project-b1", "project-b2"] as const)
         : (["project-c1", "project-c2"] as const);
-  const visibleTaskIds =
+  const visibleTaskIds: readonly string[] =
     spaceId === "space-a"
       ? (["task-a1", "task-a2"] as const)
       : spaceId === "space-b"
@@ -200,7 +200,7 @@ async function expectSpaceWide(
         : (["task-c1", "task-c2"] as const);
   const hiddenTaskIds = allTasks
     .map((task) => task.id)
-    .filter((id) => !visibleTaskIds.includes(id as (typeof visibleTaskIds)[number]));
+    .filter((id) => !visibleTaskIds.includes(id));
 
   await expect(page.getByTestId(`task-space-${spaceId}`)).toHaveAttribute(
     "aria-selected",
@@ -340,6 +340,40 @@ test.describe("タスクのスペース切替ショートカット", () => {
     await expect(spaceSelect).toContainText("Space A");
     await expect(projectSelect).toContainText("Project A2");
     await expectSpaceWide(page, "space-a");
+  });
+
+  test("ヘッダーselector shortcutはcontrolled openでキー操作とfocus契約を維持する", async ({
+    page,
+  }) => {
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await openTasksAtSpaceA(page);
+
+    const taskRow = page.getByTestId("task-row-task-a1");
+    const spaceSelect = page.getByRole("combobox", { name: "スペース選択" });
+    const projectSelect = page.getByRole("combobox", { name: "プロジェクト選択" });
+
+    await taskRow.focus();
+    await expect(taskRow).toBeFocused();
+    await page.keyboard.press("Control+Alt+S");
+    const visibleSelectPopup = page.locator('[data-slot="select-content"]:visible');
+    await expect(
+      visibleSelectPopup.getByRole("option", { name: "Space A" }),
+    ).toBeVisible();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Escape");
+    await expect(visibleSelectPopup).toHaveCount(0);
+    await expect(taskRow).toBeFocused();
+
+    await page.keyboard.press("Control+Alt+P");
+    await expect(
+      visibleSelectPopup.getByRole("option", { name: "Project A1" }),
+    ).toBeVisible();
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+    await expect(visibleSelectPopup).toHaveCount(0);
+    await expect(projectSelect).toBeFocused();
+    await expect(taskRow).toHaveCount(0);
+    await expect(spaceSelect).toContainText("Space A");
   });
 
   test("ショートカット連続切替でも毎回切替先スペース全体になる", async ({

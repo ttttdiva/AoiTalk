@@ -136,6 +136,19 @@ class Project(Base):
         uselist=False,
         passive_deletes=True,
     )
+    overview = relationship(
+        "ProjectOverview",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        uselist=False,
+    )
+    overview_refresh_jobs = relationship(
+        "ProjectOverviewRefreshJob",
+        back_populates="project",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     notification_deliveries = relationship(
         "NotificationDelivery",
         back_populates="project",
@@ -146,18 +159,6 @@ class Project(Base):
         "RecordTable",
         back_populates="project",
         cascade="all, delete-orphan",
-        passive_deletes=True,
-    )
-    context_pack = relationship(
-        "ProjectContextPack",
-        back_populates="project",
-        cascade="all, delete-orphan",
-        passive_deletes=True,
-        uselist=False,
-    )
-    context_pack_rebuild_jobs = relationship(
-        "ProjectContextPackRebuildJob",
-        back_populates="project",
         passive_deletes=True,
     )
     context_memories = relationship(
@@ -244,10 +245,10 @@ class ProjectKnowledgeRef(Base):
     )
 
 
-class ProjectContextPack(Base):
-    """Short canonical prompt context for a project."""
+class ProjectOverview(Base):
+    """Last-known-good generated display layout for one Project."""
 
-    __tablename__ = "project_context_packs"
+    __tablename__ = "project_overviews"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id = Column(
@@ -257,20 +258,17 @@ class ProjectContextPack(Base):
         unique=True,
         index=True,
     )
-    summary_md = Column(Text, default="", nullable=False)
-    goals = Column(JSON, default=list, nullable=False)
-    constraints = Column(JSON, default=list, nullable=False)
-    current_status = Column(JSON, default=dict, nullable=False)
-    active_task_snapshot = Column(JSON, default=list, nullable=False)
-    decisions = Column(JSON, default=list, nullable=False)
-    open_questions = Column(JSON, default=list, nullable=False)
-    manual_notes = Column(Text, default="", nullable=False)
-    generated_from = Column(JSON, default=dict, nullable=False)
-    # Projection metadata.  The pack body remains the last known projection;
-    # ``status`` tells readers whether the canonical sources changed after it
-    # was generated.  Keep this as a plain String so service-level validation
-    # remains portable across PostgreSQL/SQLite test databases.
-    source_digest = Column(String(64), nullable=True)
+    _layout_json = Column(
+        "layout_json",
+        JSON,
+        default=dict,
+        nullable=False,
+    )
+    layout_json = _encrypted_json_property(
+        "_layout_json",
+        "project_overviews.layout_json",
+    )
+    source_digest = Column(String(64), nullable=True, index=True)
     generated_at = Column(DateTime, nullable=True)
     generation_version = Column(
         Integer,
@@ -280,51 +278,58 @@ class ProjectContextPack(Base):
     )
     status = Column(
         String(16),
-        default="fresh",
-        server_default="fresh",
+        default="pending",
+        server_default="pending",
+        nullable=False,
+        index=True,
+    )
+    error_message = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
         nullable=False,
     )
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
     )
+
+    project = relationship("Project", back_populates="overview")
 
     __table_args__ = (
-        Index(
-            "ix_project_context_packs_project_status",
-            "project_id",
-            "status",
+        CheckConstraint(
+            "status IN ('pending', 'building', 'fresh', 'failed')",
+            name="ck_project_overviews_status",
         ),
     )
-
-    project = relationship("Project", back_populates="context_pack")
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": str(self.id),
             "project_id": str(self.project_id),
-            "summary_md": self.summary_md or "",
-            "goals": self.goals or [],
-            "constraints": self.constraints or [],
-            "current_status": self.current_status or {},
-            "active_task_snapshot": self.active_task_snapshot or [],
-            "decisions": self.decisions or [],
-            "open_questions": self.open_questions or [],
-            "manual_notes": self.manual_notes or "",
-            "generated_from": self.generated_from or {},
+            "layout": self.layout_json or {},
             "source_digest": self.source_digest,
-            "generated_at": self.generated_at.isoformat() if self.generated_at else None,
+            "generated_at": (
+                self.generated_at.isoformat() if self.generated_at else None
+            ),
             "generation_version": int(self.generation_version or 1),
-            "status": self.status or "fresh",
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "status": self.status,
+            "error_message": self.error_message,
+            "created_at": (
+                self.created_at.isoformat() if self.created_at else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat() if self.updated_at else None
+            ),
         }
 
 
-class ProjectContextPackRevision(Base):
-    """Recoverable generation captured before replacing a context pack."""
+class ProjectOverviewRefreshJob(Base):
+    """Durable Project Overview refresh request."""
 
-    __tablename__ = "project_context_pack_revisions"
+    __tablename__ = "project_overview_refresh_jobs"
 
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     project_id = Column(
@@ -333,98 +338,65 @@ class ProjectContextPackRevision(Base):
         nullable=False,
         index=True,
     )
-    context_pack_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("project_context_packs.id", ondelete="CASCADE"),
-        nullable=False,
-        index=True,
-    )
-    revision_number = Column(Integer, nullable=False)
-    snapshot = Column(JSON, default=dict, nullable=False)
-    change_reason = Column(String(255), nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-    __table_args__ = (
-        Index(
-            "ix_project_context_pack_revisions_pack_revision",
-            "context_pack_id",
-            "revision_number",
-            unique=True,
-        ),
-    )
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "id": str(self.id),
-            "project_id": str(self.project_id),
-            "context_pack_id": str(self.context_pack_id),
-            "revision_number": self.revision_number,
-            "snapshot": self.snapshot or {},
-            "change_reason": self.change_reason,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-        }
-
-
-class ProjectContextPackRebuildJob(Base):
-    """Durable metadata-only ProjectContextPack rebuild request."""
-
-    __tablename__ = "project_context_pack_rebuild_jobs"
-
-    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    project_id = Column(
-        UUID(as_uuid=True),
-        ForeignKey("projects.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
-    requested_by = Column(
-        UUID(as_uuid=True),
-        ForeignKey("users.id", ondelete="RESTRICT"),
-        nullable=False,
-    )
+    requested_by = Column(String(120), nullable=False)
     status = Column(
         String(16),
         default="pending",
         server_default="pending",
         nullable=False,
+        index=True,
     )
     reason = Column(String(128), nullable=True)
-    error_message = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    error_message = Column(String(500), nullable=True)
+    created_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        nullable=False,
+    )
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     updated_at = Column(
-        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
     )
+
+    project = relationship("Project", back_populates="overview_refresh_jobs")
 
     __table_args__ = (
         CheckConstraint(
             "status IN ('pending', 'running', 'completed', 'failed')",
-            name="ck_project_context_pack_rebuild_jobs_status",
+            name="ck_project_overview_refresh_jobs_status",
         ),
         Index(
-            "ix_project_context_pack_rebuild_jobs_project_status",
+            "ix_project_overview_refresh_jobs_project_status",
             "project_id",
             "status",
         ),
     )
 
-    project = relationship("Project", back_populates="context_pack_rebuild_jobs")
-    requester = relationship("User", foreign_keys=[requested_by])
-
     def to_dict(self) -> Dict[str, Any]:
         return {
             "id": str(self.id),
             "project_id": str(self.project_id),
-            "requested_by": str(self.requested_by),
+            "requested_by": self.requested_by,
             "status": self.status,
             "reason": self.reason,
             "error_message": self.error_message,
-            "created_at": self.created_at.isoformat() if self.created_at else None,
-            "started_at": self.started_at.isoformat() if self.started_at else None,
-            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
-            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "created_at": (
+                self.created_at.isoformat() if self.created_at else None
+            ),
+            "started_at": (
+                self.started_at.isoformat() if self.started_at else None
+            ),
+            "completed_at": (
+                self.completed_at.isoformat() if self.completed_at else None
+            ),
+            "updated_at": (
+                self.updated_at.isoformat() if self.updated_at else None
+            ),
         }
-
 
 class ContextMemory(Base):
     """General scoped memory for user, project, task, and session context."""
@@ -643,6 +615,162 @@ class ScopedMemoryJob(Base):
     )
 
 
+class DreamingMemoryState(Base):
+    """Durable per-user cursor and health state for Dreaming consolidation."""
+
+    __tablename__ = "dreaming_memory_states"
+
+    # ``user_id`` intentionally remains the external/scoped identifier used by
+    # the existing memory services rather than a foreign key to ``users``.
+    user_id = Column(String(100), primary_key=True)
+    backfill_before_at = Column(DateTime, nullable=True)
+    backfill_before_message_id = Column(UUID(as_uuid=True), nullable=True)
+    backfill_complete = Column(
+        Boolean,
+        default=False,
+        server_default="false",
+        nullable=False,
+    )
+    last_incremental_at = Column(DateTime, nullable=True)
+    last_dreamed_at = Column(DateTime, nullable=True)
+    last_history_digest = Column(String(64), nullable=True)
+    last_full_reconcile_at = Column(DateTime, nullable=True)
+    next_retry_at = Column(DateTime, nullable=True)
+    consecutive_failures = Column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    last_error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "user_id": self.user_id,
+            "backfill_before_at": (
+                self.backfill_before_at.isoformat()
+                if self.backfill_before_at
+                else None
+            ),
+            "backfill_before_message_id": (
+                str(self.backfill_before_message_id)
+                if self.backfill_before_message_id
+                else None
+            ),
+            "backfill_complete": self.backfill_complete,
+            "last_incremental_at": (
+                self.last_incremental_at.isoformat()
+                if self.last_incremental_at
+                else None
+            ),
+            "last_dreamed_at": (
+                self.last_dreamed_at.isoformat() if self.last_dreamed_at else None
+            ),
+            "last_history_digest": self.last_history_digest,
+            "last_full_reconcile_at": (
+                self.last_full_reconcile_at.isoformat()
+                if self.last_full_reconcile_at
+                else None
+            ),
+            "next_retry_at": (
+                self.next_retry_at.isoformat() if self.next_retry_at else None
+            ),
+            "consecutive_failures": self.consecutive_failures,
+            "last_error": self.last_error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class DreamingMemoryRun(Base):
+    """Append-only execution ledger for Dreaming consolidation runs."""
+
+    __tablename__ = "dreaming_memory_runs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(String(100), nullable=False, index=True)
+    trigger = Column(String(32), nullable=False)
+    status = Column(String(32), nullable=False)
+    # Keep only source identifiers in the run ledger; source content belongs
+    # to the canonical conversation tables and must not be copied here.
+    source_message_ids = Column(
+        JSON,
+        default=list,
+        server_default="[]",
+        nullable=False,
+    )
+    source_count = Column(Integer, default=0, server_default="0", nullable=False)
+    source_digest = Column(String(64), nullable=True)
+    backfill = Column(Boolean, default=False, server_default="false", nullable=False)
+    candidate_count = Column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    mutation_count = Column(
+        Integer,
+        default=0,
+        server_default="0",
+        nullable=False,
+    )
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+    error = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger IN ('idle', 'startup', 'reconcile')",
+            name="ck_dreaming_memory_runs_trigger",
+        ),
+        CheckConstraint(
+            "status IN ('running', 'completed', 'skipped', 'failed')",
+            name="ck_dreaming_memory_runs_status",
+        ),
+        Index(
+            "ix_dreaming_memory_runs_user_status_created",
+            "user_id",
+            "status",
+            "created_at",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "user_id": self.user_id,
+            "trigger": self.trigger,
+            "status": self.status,
+            "source_message_ids": self.source_message_ids or [],
+            "source_count": self.source_count,
+            "source_digest": self.source_digest,
+            "backfill": self.backfill,
+            "candidate_count": self.candidate_count,
+            "mutation_count": self.mutation_count,
+            "started_at": self.started_at.isoformat() if self.started_at else None,
+            "completed_at": (
+                self.completed_at.isoformat() if self.completed_at else None
+            ),
+            "error": self.error,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class ProjectQaEntry(Base):
     """Question and answer entries derived from project conversations."""
 
@@ -680,9 +808,31 @@ class ProjectQaEntry(Base):
     source_agent_run_ids = Column(JSON, default=list)
     source_tool_call_ids = Column(JSON, default=list)
     answer_source_refs = Column(JSON, default=list)
+    # ``origin`` distinguishes an explicit user/agent-authorized write from
+    # inferred background intake.  Keep it separate from ``created_by_agent``:
+    # older rows (and explicit agent tools) may have that legacy boolean set
+    # even though they are accepted, durable project facts and must never be
+    # selected by the automatic cleanup path.
+    origin = Column(
+        String(32),
+        default="manual",
+        server_default="manual",
+        nullable=False,
+        index=True,
+    )
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     updated_by = Column(UUID(as_uuid=True), ForeignKey("users.id"))
     created_by_agent = Column(Boolean, default=False, nullable=False)
+    # Optimistic lifecycle token used by the review queue.  Every candidate
+    # transition (accept/reject/archive) increments this value while the row
+    # lock and expected-version predicate prevent stale browser tabs from
+    # clobbering a newer decision.
+    version = Column(
+        Integer,
+        default=1,
+        server_default="1",
+        nullable=False,
+    )
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
     updated_at = Column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
@@ -698,6 +848,13 @@ class ProjectQaEntry(Base):
             "project_id",
             "review_state",
             "status",
+        ),
+        Index(
+            "ix_project_qa_entries_project_origin_review",
+            "project_id",
+            "origin",
+            "review_state",
+            "deleted_at",
         ),
     )
 
@@ -722,9 +879,17 @@ class ProjectQaEntry(Base):
             "source_agent_run_ids": self.source_agent_run_ids or [],
             "source_tool_call_ids": self.source_tool_call_ids or [],
             "answer_source_refs": self.answer_source_refs or [],
+            "origin": self.origin or (
+                "legacy_auto"
+                if self.created_by_agent
+                and str(self.review_state or "").strip().lower()
+                in {"candidate", "rejected"}
+                else "manual"
+            ),
             "created_by": str(self.created_by) if self.created_by else None,
             "updated_by": str(self.updated_by) if self.updated_by else None,
             "created_by_agent": self.created_by_agent,
+            "version": int(self.version or 1),
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
             "last_asked_at": (

@@ -7,7 +7,9 @@ import asyncio
 import copy
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from datetime import datetime
 import inspect
+import json
 import logging
 import threading
 import time
@@ -28,6 +30,9 @@ from ..conversation_context import (
 )
 from ..generation_policy import GenerationProfile, get_client_generation_policy
 from ..agentic_completion import (
+    AUTHORITATIVE_TASK_MUTATION_TOOLS,
+    DETERMINISTIC_TASK_MUTATION_TOOLS,
+    _simple_task_request_is_explicit,
     agentic_completion_enabled,
     agentic_max_rounds,
     build_agentic_continuation_context,
@@ -35,12 +40,20 @@ from ..agentic_completion import (
     format_tool_execution_evidence,
     parse_agentic_review_decision,
     render_messages_for_review,
+    requested_deterministic_task_mutation_tools,
     required_project_mutation_tools_missing,
     run_agentic_completion_loop_async,
+    successful_empty_task_search,
+    _simple_task_has_unexpected_successful_mutation,
+    _simple_task_post_create_has_blocked_work,
     tool_loop_completion_confirmed,
 )
 from ..agent_runtime import build_tool_hint_context_async
-from ..context_snapshot import sanitized_snapshot_series
+from ..context_snapshot import (
+    capture_context_manifest_before_context_clear,
+    context_manifest_metadata,
+    sanitized_snapshot_series,
+)
 from ..tool_exposure import filtered_registry_for_client
 from ..tool_packs import ensure_load_tool_pack_tool, tool_pack_session_for_client
 from ..tool_policy import (
@@ -76,6 +89,7 @@ from ...services.agent_team_service import (
     set_current_continuation_state,
 )
 from ...services.story_chat_context import StoryChatContextBuildError
+from ...services.turn_context import get_turn_context
 from ...services.outbound_privacy_service import (
     OutboundPrivacyGateway,
     reset_privacy_policy_context,
@@ -232,6 +246,305 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
             current = current[part]
         return current
     return default
+
+
+def _turn_tool_record_name(record: Any) -> str:
+    """Return a normalized tool name from native or compatibility records."""
+
+    if isinstance(record, dict):
+        for key in ("tool", "name", "tool_name"):
+            value = str(record.get(key) or "").strip()
+            if value:
+                return value
+        return ""
+    for attribute in ("tool", "name", "tool_name"):
+        value = str(getattr(record, attribute, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _turn_tool_record_result(record: Any) -> Any:
+    if isinstance(record, dict):
+        if record.get("result") is not None:
+            return record.get("result")
+        if record.get("output") is not None:
+            return record.get("output")
+        return record.get("model_output")
+    result = getattr(record, "result", None)
+    if result is not None:
+        return result
+    result = getattr(record, "output", None)
+    if result is not None:
+        return result
+    return getattr(record, "model_output", None)
+
+
+def _turn_tool_record_arguments(record: Any) -> dict[str, Any]:
+    raw = (
+        record.get("arguments")
+        if isinstance(record, dict)
+        else getattr(record, "arguments", None)
+    )
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _turn_tool_result_payload(record: Any) -> Any:
+    result = _turn_tool_record_result(record)
+    if isinstance(result, (dict, list)):
+        return result
+    text = str(result or "").strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _turn_success_marker(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "ok",
+        "success",
+        "succeeded",
+    }
+
+
+def _turn_tool_record_successful(record: Any) -> bool:
+    """Classify a record without trusting a stale/implicit success marker."""
+
+    if isinstance(record, dict):
+        explicit = record.get("successful")
+        if explicit is None:
+            explicit = record.get("success")
+        error = record.get("error")
+        if error in (None, ""):
+            error = record.get("failure") or record.get("error_message")
+    else:
+        explicit = getattr(record, "successful", None)
+        if explicit is None:
+            explicit = getattr(record, "success", None)
+        error = getattr(record, "error", None)
+        if error in (None, ""):
+            error = getattr(record, "failure", None)
+    # A contradictory success marker plus an error is not a usable receipt.
+    # Prefer fail-closed semantics over trusting whichever field happened to
+    # be populated first by a provider adapter.
+    if str(error or "").strip():
+        return False
+    explicit_marker = _turn_success_marker(explicit)
+    if explicit_marker is False:
+        return False
+
+    result = _turn_tool_record_result(record)
+    if isinstance(result, dict):
+        if (
+            _turn_success_marker(result.get("success")) is False
+            or str(result.get("error") or "").strip()
+        ):
+            return False
+    payload = _turn_tool_result_payload(record)
+    if isinstance(payload, dict) and (
+        _turn_success_marker(payload.get("success")) is False
+        or str(payload.get("error") or "").strip()
+    ):
+        return False
+    lowered = str(result or "").strip().casefold()
+    return not lowered.startswith(
+        (
+            "error:",
+            "tool execution error:",
+            "tool not found:",
+        )
+    )
+
+
+def _turn_task_result_payload(record: Any) -> dict[str, Any] | None:
+    """Unwrap common task-tool result envelopes for postcondition checks."""
+
+    payload = _turn_tool_result_payload(record)
+    if not isinstance(payload, dict):
+        return None
+    for key in ("task", "data", "item", "result"):
+        nested = payload.get(key)
+        if isinstance(nested, dict):
+            # Preserve top-level success/id fields when an envelope only puts
+            # task attributes in the nested object.
+            merged = dict(payload)
+            merged.update(nested)
+            return merged
+    return payload
+
+
+def _turn_task_record_postcondition_verified(record: Any) -> bool:
+    """Check that a successful deterministic mutation returned usable state.
+
+    The native tool result is the authoritative receipt only when it contains
+    a success payload and (for task create/update) a durable task identifier.
+    When a requested field is echoed by the service, it must match the
+    arguments sent to the tool; this prevents a generic ``success`` string
+    from being treated as proof of the requested schedule/title.
+    """
+
+    if not _turn_tool_record_successful(record):
+        return False
+    name = _turn_tool_record_name(record).casefold()
+    if name not in DETERMINISTIC_TASK_MUTATION_TOOLS:
+        return False
+    payload = _turn_task_result_payload(record)
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("success") is False:
+        return False
+    arguments = _turn_tool_record_arguments(record)
+    if name in {"create_task", "update_task", "delete_task", "assign_task", "schedule_task"}:
+        task_id = payload.get("id") or payload.get("task_id")
+        if not task_id:
+            return False
+    requested_title = str(arguments.get("title") or "").strip()
+    if name == "create_task" and not requested_title:
+        return False
+    if requested_title and (
+        "title" not in payload
+        or str(payload.get("title") or "").strip() != requested_title
+    ):
+        return False
+    # The authoritative fast path is intentionally limited to the fields
+    # whose Task.to_dict projection is stable across providers.  Recurrence,
+    # assignee, and opt-in auto-close mutations retain the normal verifier
+    # route until their nested receipt schemas are independently validated.
+    if (
+        bool(arguments.get("auto_close_on_due"))
+        or str(arguments.get("assignee_ids") or "").strip()
+        or str(arguments.get("recurrence_rrule") or "").strip()
+    ):
+        return False
+    # Compare fields only when the result exposes them.  Some compatibility
+    # providers return a compact receipt (success + id); the durable native
+    # task service returns the full task and is checked field-by-field.  A
+    # compact receipt remains valid only when no concrete task field was
+    # requested; requested schedule/description fields must be echoed.
+    field_aliases = {
+        "title": ("title",),
+        "description": ("description",),
+        "start_at": ("start_at", "starts_at"),
+        "end_at": ("end_at", "ends_at"),
+        "due_date": ("due_date",),
+        "all_day": ("all_day",),
+        "project": ("project", "project_id"),
+        "project_id": ("project_id", "project"),
+        "parent_task_id": ("parent_task_id", "parent_id"),
+        "status": ("status",),
+        "priority": ("priority",),
+    }
+    observed_fields = {
+        alias
+        for aliases in field_aliases.values()
+        for alias in aliases
+        if alias in payload
+    }
+    if not observed_fields:
+        if any(
+            arguments.get(key) not in (None, "")
+            for key in (
+                "description",
+                "title",
+                "start_at",
+                "end_at",
+                "due_date",
+                "parent_task_id",
+                "all_day",
+                "project",
+                "project_id",
+            )
+        ):
+            return False
+        return True
+
+    def _normalized_expected_value(key: str, value: Any) -> str:
+        text = str(value).strip()
+        if key in {"start_at", "end_at"}:
+            candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+            try:
+                # Task tools persist wall-clock datetimes without timezone;
+                # compare the normalized naive ISO representation rather than
+                # treating an equivalent ``Z``/offset spelling as different.
+                parsed = datetime.fromisoformat(candidate)
+                return parsed.replace(tzinfo=None).isoformat()
+            except (TypeError, ValueError):
+                return text.casefold()
+        if key == "due_date":
+            return text[:10].casefold()
+        return text.casefold()
+
+    # ``due_date`` is normalized by the task tool into a date-only start_at
+    # plus all_day=True, so a service result need not expose a dedicated
+    # due_date key.  Validate the normalized representation explicitly.
+    requested_due_date = arguments.get("due_date")
+    if requested_due_date not in (None, ""):
+        observed_due_date = payload.get("due_date")
+        if observed_due_date in (None, ""):
+            observed_due_date = payload.get("start_at")
+        if observed_due_date in (None, ""):
+            return False
+        if str(observed_due_date).strip()[:10].casefold() != str(
+            requested_due_date
+        ).strip()[:10].casefold():
+            return False
+        if "all_day" not in payload or not bool(payload.get("all_day")):
+            return False
+
+    for argument_key, aliases in field_aliases.items():
+        if argument_key == "due_date" and requested_due_date not in (None, ""):
+            continue
+        expected = arguments.get(argument_key)
+        if argument_key == "all_day" and arguments.get("due_date") not in (
+            None,
+            "",
+        ):
+            expected = True
+        if expected in (None, ""):
+            continue
+        observed_key = next((key for key in aliases if key in payload), None)
+        if observed_key is None:
+            # A compact success receipt is insufficient when the caller sent
+            # a concrete field.  The mutation may have succeeded in the
+            # database, but without the requested field echoed back there is
+            # no authoritative postcondition proof for this turn.
+            return False
+        observed = payload.get(observed_key)
+        if argument_key == "all_day":
+            if bool(observed) != bool(expected):
+                return False
+            continue
+        if argument_key in {"project", "project_id"}:
+            observed_project_id = str(payload.get("project_id") or "").strip()
+            observed_project_name = str(
+                payload.get("project_name") or payload.get("project") or ""
+            ).strip()
+            if argument_key == "project_id":
+                if not observed_project_id or observed_project_id.casefold() != str(
+                    expected
+                ).strip().casefold():
+                    return False
+            elif str(expected).strip().casefold() not in {
+                observed_project_id.casefold(),
+                observed_project_name.casefold(),
+            }:
+                return False
+            continue
+        if _normalized_expected_value(argument_key, observed) != (
+            _normalized_expected_value(argument_key, expected)
+        ):
+            return False
+    return True
 
 
 class TurnExecutionMixin:
@@ -515,6 +828,35 @@ class TurnExecutionMixin:
     ) -> str:
         # Snapshot this immutable policy before any await.  Do not read the
         # shared client attribute again while the runner is active.
+        turn = get_turn_context()
+        suppress_automatic_context = bool(
+            getattr(turn, "suppress_automatic_context", False)
+        )
+        effective_user_id = str(
+            getattr(turn, "user_id", None)
+            or self._get_session_user_id()
+            or ""
+        )
+        effective_session_id = str(
+            getattr(turn, "session_id", None)
+            or self.current_session_id
+            or ""
+        )
+        effective_project_id = (
+            None if suppress_automatic_context else self.current_project_id
+        )
+        # A reserved Help turn is a controller request, not a continuation of
+        # the provider conversation.  Keep the runner's ordinary state so it
+        # can be restored after this turn, while forcing this invocation to
+        # use a stateless request with no provider-managed response id.
+        runner_state_snapshot: tuple[Any, Any, Any, Any] | None = None
+        if suppress_automatic_context:
+            runner_state_snapshot = (
+                getattr(self._turn_runner, "conversation_state_mode", None),
+                getattr(self._turn_runner, "provider_state", None),
+                getattr(self._turn_runner, "prompt_cache_key", None),
+                getattr(self._turn_runner, "prompt_cache_retention", None),
+            )
         run_generation_policy = (
             generation_policy
             if generation_policy is not None
@@ -529,8 +871,8 @@ class TurnExecutionMixin:
         # retain stale contextual entries when a fixed provider registry is
         # reused across turns.  Required-tool turns intentionally keep their
         # already narrow allowlist.
-        cache_tools = list(getattr(agent, "tools", []))
-        if required_tool_name is None:
+        cache_tools = [] if suppress_automatic_context else list(getattr(agent, "tools", []))
+        if required_tool_name is None and not suppress_automatic_context:
             try:
                 cache_tools = list(self._get_effective_tools_for_current_session())
             except Exception:  # noqa: BLE001 - preserve legacy lightweight clients
@@ -550,9 +892,9 @@ class TurnExecutionMixin:
             for tool in cache_tools
         ]
         cache_key = stable_cache_key(
-            user_id=self._get_session_user_id(),
-            session_id=self.current_session_id,
-            project_id=self.current_project_id,
+            user_id=effective_user_id,
+            session_id=effective_session_id,
+            project_id=effective_project_id,
             character=self.character_name,
             model=str(agent.model or self.model_name),
             system_prompt=str(agent.instructions or ""),
@@ -578,16 +920,25 @@ class TurnExecutionMixin:
             # client-wide scope as max_tool_rounds.  A waiting turn must not
             # overwrite the active turn's context snapshot or provider state
             # before the active request has finished.
-            state_mode_before = self._provider_state_mode
+            state_mode_before = (
+                "stateless" if suppress_automatic_context else self._provider_state_mode
+            )
             # Re-scope reversible aliases to the active conversation.  The
             # gateway never persists raw alias mappings and must not leak one
             # user's/session's aliases into the next turn of a shared client.
             privacy_gateway = getattr(self._turn_runner, "privacy_gateway", None)
-            expected_session_id = str(self.current_session_id or "")
-            try:
-                expected_user_id = str(self._get_session_user_id() or "")
-            except Exception:  # noqa: BLE001
-                expected_user_id = ""
+            expected_session_id = effective_session_id
+            expected_user_id = effective_user_id
+            privacy_session_context = (
+                {}
+                if suppress_automatic_context
+                else getattr(self, "_privacy_session_context", None)
+            )
+            privacy_project_metadata = (
+                {}
+                if suppress_automatic_context
+                else getattr(self, "_privacy_project_metadata", None)
+            )
             if not isinstance(privacy_gateway, OutboundPrivacyGateway) or (
                 privacy_gateway.session_id != expected_session_id
                 or privacy_gateway.user_id != expected_user_id
@@ -596,17 +947,21 @@ class TurnExecutionMixin:
                     self.config,
                     session_id=expected_session_id,
                     user_id=expected_user_id,
-                    session_context=getattr(self, "_privacy_session_context", None),
-                    project_metadata=getattr(self, "_privacy_project_metadata", None),
+                    session_context=privacy_session_context,
+                    project_metadata=privacy_project_metadata,
                 )
             else:
                 privacy_gateway.update_policy_context(
-                    session_context=getattr(self, "_privacy_session_context", None),
-                    project_metadata=getattr(self, "_privacy_project_metadata", None),
+                    session_context=privacy_session_context,
+                    project_metadata=privacy_project_metadata,
                 )
             state = ProviderState(
                 mode=state_mode_before,
-                previous_response_id=self._provider_state.get("previous_response_id"),
+                previous_response_id=(
+                    None
+                    if suppress_automatic_context
+                    else self._provider_state.get("previous_response_id")
+                ),
                 fingerprint=self._provider_state.get("fingerprint"),
             )
             if state.fingerprint and state.fingerprint != cache_key:
@@ -673,9 +1028,9 @@ class TurnExecutionMixin:
             # Agent Team delegate) is exposed as an actual function schema.
             # Required-tool turns intentionally keep their narrow allowlist.
             dynamic_story_context = (
-                self._get_story_chat_context_sync()
-                if required_tool_name is None
-                else None
+                None
+                if suppress_automatic_context or required_tool_name is not None
+                else self._get_story_chat_context_sync()
             )
 
             def _native_tools_provider(_agent: Agent):
@@ -709,7 +1064,8 @@ class TurnExecutionMixin:
             # NativeRunResult can classify an empty final response without
             # raising. Reset the attempt-local marker before running so a
             # previous turn cannot leak its failure into this one.
-            self._last_generation_failure = None
+            if not suppress_automatic_context:
+                self._last_generation_failure = None
             try:
                 result = await self._turn_runner.run(
                     agent,
@@ -719,6 +1075,19 @@ class TurnExecutionMixin:
             finally:
                 if previous_max_tool_rounds is not None:
                     self._turn_runner.max_tool_rounds = previous_max_tool_rounds
+                if runner_state_snapshot is not None:
+                    (
+                        previous_runner_mode,
+                        previous_runner_provider_state,
+                        previous_runner_cache_key,
+                        previous_runner_cache_retention,
+                    ) = runner_state_snapshot
+                    self._turn_runner.conversation_state_mode = previous_runner_mode
+                    self._turn_runner.provider_state = previous_runner_provider_state
+                    self._turn_runner.prompt_cache_key = previous_runner_cache_key
+                    self._turn_runner.prompt_cache_retention = (
+                        previous_runner_cache_retention
+                    )
             runner_state_mode = getattr(
                 self._turn_runner,
                 "conversation_state_mode",
@@ -728,18 +1097,32 @@ class TurnExecutionMixin:
                 # The provider rejected/expired managed state.  Keep subsequent
                 # turns stateless until the client/session is explicitly reset.
                 self._provider_state_mode = "stateless"
-            self._provider_state = {
-                "previous_response_id": state.previous_response_id,
-                "fingerprint": state.fingerprint,
-            }
-            provider_state_mode_after = self._provider_state_mode
-            provider_state_to_persist = dict(self._provider_state)
-            state_was_invalidated = (
-                state_mode_before == "provider-managed"
-                and runner_state_mode == "stateless"
-                and state.previous_response_id is None
-            )
-        if state_was_invalidated and self.current_session_id and self.memory_manager:
+            if suppress_automatic_context:
+                # Do not publish controller-turn state to the shared client or
+                # session.  The terminal snapshot also restores these runner
+                # attributes for compatibility callers that enter through the
+                # response handler.
+                provider_state_mode_after = state_mode_before
+                provider_state_to_persist = {}
+                state_was_invalidated = False
+            else:
+                self._provider_state = {
+                    "previous_response_id": state.previous_response_id,
+                    "fingerprint": state.fingerprint,
+                }
+                provider_state_mode_after = self._provider_state_mode
+                provider_state_to_persist = dict(self._provider_state)
+                state_was_invalidated = (
+                    state_mode_before == "provider-managed"
+                    and runner_state_mode == "stateless"
+                    and state.previous_response_id is None
+                )
+        if (
+            not suppress_automatic_context
+            and state_was_invalidated
+            and self.current_session_id
+            and self.memory_manager
+        ):
             try:
                 await self.memory_manager.repository.update_session_context(
                     self.current_session_id,
@@ -748,7 +1131,8 @@ class TurnExecutionMixin:
             except Exception:
                 logger.warning("無効化したprovider-managed stateの消去に失敗しました", exc_info=True)
         if (
-            self.current_session_id
+            not suppress_automatic_context
+            and self.current_session_id
             and self.memory_manager
             and provider_state_mode_after == "provider-managed"
         ):
@@ -762,11 +1146,13 @@ class TurnExecutionMixin:
         result_context_snapshots = list(
             getattr(result, "context_snapshots", None) or []
         )
-        self._last_generation_failure = getattr(
+        result_generation_failure = getattr(
             result,
             "generation_failure",
             None,
         )
+        if not suppress_automatic_context:
+            self._last_generation_failure = result_generation_failure
         result_tool_records = list(getattr(result, "tool_calls", None) or [])
         result_tool_rounds_exhausted = bool(
             getattr(result, "tool_rounds_exhausted", False)
@@ -778,7 +1164,7 @@ class TurnExecutionMixin:
                 "final"
                 if (
                     not result_tool_rounds_exhausted
-                    and self._last_generation_failure is None
+                    and result_generation_failure is None
                 )
                 else None
             ),
@@ -802,6 +1188,11 @@ class TurnExecutionMixin:
                     "tool_loop_completion_confirmed": (
                         result_tool_loop_completion_confirmed
                     ),
+                    # Keep provider failure provenance with this attempt.  A
+                    # later completion ledger may ignore an optional tool
+                    # failure, but must never treat a failed provider sample
+                    # as authoritative completion.
+                    "generation_failure": result_generation_failure,
                     "usage_records": [
                         dict(item)
                         for item in (getattr(result, "usage_records", None) or [])
@@ -815,6 +1206,17 @@ class TurnExecutionMixin:
                     ],
                     "active_before": [dict(message) for message in active_before],
                 }
+            )
+        if not suppress_automatic_context:
+            self._publish_native_agent_run_state(
+                get_current_agent_run_id(),
+                tool_records=result_tool_records,
+                usage_records=[
+                    dict(item)
+                    for item in (getattr(result, "usage_records", None) or [])
+                    if isinstance(item, dict)
+                ],
+                failure=result_generation_failure,
             )
         await self._record_native_usage(result, agent)
         if (
@@ -853,32 +1255,33 @@ class TurnExecutionMixin:
         # Keep the shared compatibility fields and HistoryManager update
         # coherent, but do not hold this client-wide lock over usage/database
         # awaits above.
-        async with self._native_runner_lock_scope():
-            self._last_context_snapshots = list(result_context_snapshots)
-            self._last_turn_tool_records = list(result_tool_records)
-            self._last_turn_tool_rounds_exhausted = result_tool_rounds_exhausted
-            self._last_tool_loop_completion_confirmed = (
-                result_tool_loop_completion_confirmed
-            )
-            self._last_model_transcript = [
-                dict(message) for message in last_model_transcript
-            ]
-            self._history_authoritative_model_transcript = [
-                dict(message) for message in self._last_model_transcript
-            ]
-            self._history_active_model_transcript = [
-                dict(message)
-                for message in active_model_transcript
-                if isinstance(message, dict)
-                and message.get("role") in {"user", "assistant", "tool"}
-            ]
-            self._last_usage_records = [
-                dict(item)
-                for item in (getattr(result, "usage_records", None) or [])
-                if isinstance(item, dict)
-            ]
-            if hasattr(self.history_manager, "set_model_messages"):
-                self.history_manager.set_model_messages(active_model_transcript)
+        if not suppress_automatic_context:
+            async with self._native_runner_lock_scope():
+                self._last_context_snapshots = list(result_context_snapshots)
+                self._last_turn_tool_records = list(result_tool_records)
+                self._last_turn_tool_rounds_exhausted = result_tool_rounds_exhausted
+                self._last_tool_loop_completion_confirmed = (
+                    result_tool_loop_completion_confirmed
+                )
+                self._last_model_transcript = [
+                    dict(message) for message in last_model_transcript
+                ]
+                self._history_authoritative_model_transcript = [
+                    dict(message) for message in self._last_model_transcript
+                ]
+                self._history_active_model_transcript = [
+                    dict(message)
+                    for message in active_model_transcript
+                    if isinstance(message, dict)
+                    and message.get("role") in {"user", "assistant", "tool"}
+                ]
+                self._last_usage_records = [
+                    dict(item)
+                    for item in (getattr(result, "usage_records", None) or [])
+                    if isinstance(item, dict)
+                ]
+                if hasattr(self.history_manager, "set_model_messages"):
+                    self.history_manager.set_model_messages(active_model_transcript)
         if result_tool_records:
             print(f"[AgentLLMClient] Tool messages found: {len(result_tool_records)}")
         if required_tool_name and not any(
@@ -897,6 +1300,10 @@ class TurnExecutionMixin:
 
     async def _record_native_usage(self, result: Any, agent: Agent) -> None:
         """Native runtimeの各provider request usageを永続化する。"""
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Help is a read-only controller projection; its provider usage is
+            # deliberately not attributed to the user's ordinary chat ledger.
+            return
         records = list(getattr(result, "usage_records", None) or [])
         if not records:
             return
@@ -1011,7 +1418,10 @@ class TurnExecutionMixin:
         )
 
     async def _build_tool_hint_context(self, user_input: str) -> str:
-        if not getattr(self, "_native_tools_enabled", True):
+        if (
+            not getattr(self, "_native_tools_enabled", True)
+            or bool(getattr(get_turn_context(), "suppress_automatic_context", False))
+        ):
             return ""
         return await build_tool_hint_context_async(
             user_input=user_input,
@@ -1047,6 +1457,111 @@ class TurnExecutionMixin:
         if turn_snapshot is not None and "tool_records" in turn_snapshot:
             return list(turn_snapshot.get("tool_records") or [])
         return list(getattr(self, "_last_turn_tool_records", None) or [])
+
+    def _publish_native_agent_run_state(
+        self,
+        run_id: str | None,
+        *,
+        tool_records: list[Any] | None,
+        usage_records: list[dict[str, Any]] | None = None,
+        failure: Any = None,
+    ) -> None:
+        """Publish attempt evidence under the owning AgentRun id.
+
+        The SGLang compatibility client already exposes a run-keyed completed
+        ledger.  Native OpenAI turns need the same seam because a final text
+        request can fail after a durable task mutation and before the shared
+        ``_last_*`` fields are updated.  Keep this projection in memory only;
+        AgentRun persistence acknowledges it after terminalization.
+        """
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return
+        states = getattr(self, "_native_completed_agent_run_states", None)
+        if not isinstance(states, dict):
+            states = {}
+            setattr(self, "_native_completed_agent_run_states", states)
+        lock = getattr(self, "_native_completed_agent_run_states_lock", None)
+        # ``threading.Lock`` is a factory on CPython, so use the minimal
+        # protocol check instead of ``isinstance`` (which is not portable
+        # across Python implementations).
+        if not hasattr(lock, "__enter__") or not hasattr(lock, "__exit__"):
+            lock = threading.Lock()
+            setattr(self, "_native_completed_agent_run_states_lock", lock)
+
+        usage: dict[str, int] = {}
+        for item in usage_records or ():
+            if not isinstance(item, dict):
+                continue
+            for key in ("input_tokens", "output_tokens", "cached_tokens", "total_tokens"):
+                value = item.get(key)
+                if value is None:
+                    continue
+                try:
+                    usage[key] = usage.get(key, 0) + max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+        if usage:
+            usage.setdefault(
+                "total_tokens",
+                usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+            )
+        failure_text = ""
+        if failure is not None:
+            failure_text = str(
+                getattr(failure, "technical_detail", None) or failure
+            ).strip()
+        payload: dict[str, Any] = {
+            "tool_calls": list(tool_records or ()),
+            "usage": usage,
+        }
+        if failure_text:
+            payload["failure"] = failure_text
+        with lock:
+            states[normalized_run_id] = payload
+            # Bound in-memory evidence for abandoned requests.  Terminalized
+            # runs are removed by ack_completed_agent_run_state below.
+            while len(states) > 128:
+                states.pop(next(iter(states)))
+
+    def peek_completed_agent_run_state(
+        self,
+        run_id: str | None,
+    ) -> dict[str, Any]:
+        """Read native OpenAI evidence without consuming it."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return {"tool_calls": [], "usage": {}}
+        states = getattr(self, "_native_completed_agent_run_states", None)
+        lock = getattr(self, "_native_completed_agent_run_states_lock", None)
+        if not isinstance(states, dict) or not hasattr(lock, "__enter__"):
+            return {"tool_calls": [], "usage": {}}
+        with lock:
+            state = states.get(normalized_run_id)
+            if not isinstance(state, dict):
+                return {"tool_calls": [], "usage": {}}
+            payload = {
+                "tool_calls": list(state.get("tool_calls") or ()),
+                "usage": dict(state.get("usage") or {}),
+            }
+            if state.get("failure"):
+                payload["failure"] = str(state["failure"])
+            return payload
+
+    def ack_completed_agent_run_state(self, run_id: str | None) -> bool:
+        """Remove native evidence after durable AgentRun terminalization."""
+
+        normalized_run_id = str(run_id or "").strip()
+        if not normalized_run_id:
+            return False
+        states = getattr(self, "_native_completed_agent_run_states", None)
+        lock = getattr(self, "_native_completed_agent_run_states_lock", None)
+        if not isinstance(states, dict) or not hasattr(lock, "__enter__"):
+            return False
+        with lock:
+            return states.pop(normalized_run_id, None) is not None
 
     async def _run_agentic_completion_loop_impl(
         self,
@@ -1092,14 +1607,88 @@ class TurnExecutionMixin:
             else str(context)
         )
         initial_context_pending = not isinstance(context, str)
+        # ``latest_work_tool_records`` is the complete audit ledger for this
+        # outer turn.  It intentionally survives review/continuation calls so
+        # diagnostics and AgentRun persistence retain every attempted tool.
+        # Semantic completion uses a separate attempt-local ledger below; an
+        # optional failure in this audit list must not invalidate a successful
+        # deterministic mutation forever.
         latest_work_tool_records: list[Any] = []
+        latest_attempt_tool_records: list[Any] = []
+        logical_attempt_tool_records: list[Any] = []
         latest_work_completion_confirmed = False
+        latest_attempt_generation_failure: Any = None
+        latest_attempt_tool_rounds_exhausted = False
+        logical_attempt_index = 0
+        duplicate_search_pending = False
+        duplicate_search_succeeded = False
+
+        def _requested_task_mutation_tools() -> set[str]:
+            request_text = str(user_input or "")
+            if request_text.strip() and not _simple_task_request_is_explicit(
+                request_text
+            ):
+                return set()
+            try:
+                requested = requested_deterministic_task_mutation_tools(request_text)
+            except Exception:  # noqa: BLE001 - compatibility clients may omit policy
+                requested = set()
+            required = {
+                str(name).strip().casefold()
+                for name in requested
+                if str(name).strip().casefold()
+                in DETERMINISTIC_TASK_MUTATION_TOOLS
+            }
+            # A primary create/update mutation carries its schedule fields;
+            # requiring a second schedule_task call would amplify a simple
+            # task request and is already excluded by the missing-mutation
+            # guard in agentic_completion.py.
+            if {"create_task", "update_task"}.intersection(required):
+                required.discard("schedule_task")
+            return required
+
+        def _successful_empty_search_record(record: Any) -> bool:
+            if _turn_tool_record_name(record).casefold() not in {
+                "search_task_candidates",
+                "list_tasks",
+            }:
+                return False
+            if not _turn_tool_record_successful(record):
+                return False
+            return successful_empty_task_search([record]) is True
 
         def capture_latest_work_tool_records() -> None:
-            nonlocal latest_work_tool_records, latest_work_completion_confirmed
-            latest_work_tool_records.extend(
-                self._last_turn_tool_records_for_review()
-            )
+            nonlocal latest_attempt_tool_records, logical_attempt_tool_records
+            nonlocal latest_work_completion_confirmed
+            nonlocal latest_attempt_generation_failure
+            nonlocal latest_attempt_tool_rounds_exhausted
+            nonlocal logical_attempt_index
+            nonlocal duplicate_search_pending, duplicate_search_succeeded
+            run_records = list(self._last_turn_tool_records_for_review())
+            latest_work_tool_records.extend(run_records)
+            latest_attempt_tool_records = list(run_records)
+            logical_attempt_index += 1
+
+            # Retain only successful prerequisite/mutation evidence from older
+            # attempts, then append this attempt verbatim for diagnostics.  A
+            # previous failed create/update therefore cannot poison the next
+            # successful attempt, while the current optional failure remains
+            # visible in ``latest_work_tool_records``.
+            prior_successful = [
+                record
+                for record in logical_attempt_tool_records
+                if _turn_tool_record_successful(record)
+                and (
+                    _turn_tool_record_name(record).casefold()
+                    in {
+                        "search_task_candidates",
+                        "list_tasks",
+                        *DETERMINISTIC_TASK_MUTATION_TOOLS,
+                    }
+                )
+            ]
+            logical_attempt_tool_records = [*prior_successful, *run_records]
+
             # Completion provenance must come from this logical turn's
             # ContextVar snapshot, never from the shared client's mutable
             # compatibility fields.
@@ -1111,6 +1700,121 @@ class TurnExecutionMixin:
                     False,
                 )
             )
+            latest_attempt_generation_failure = (
+                turn_snapshot.get("generation_failure")
+                if turn_snapshot is not None
+                else None
+            )
+            latest_attempt_tool_rounds_exhausted = bool(
+                turn_snapshot is not None
+                and turn_snapshot.get("tool_rounds_exhausted", False)
+            )
+
+            # Track the required duplicate-search precondition in execution
+            # order.  Once a successful create follows an empty search, keep
+            # that fact stable even if a later optional search fails.
+            for record in run_records:
+                record_name = _turn_tool_record_name(record).casefold()
+                if record_name in {"search_task_candidates", "list_tasks"}:
+                    duplicate_search_pending = _successful_empty_search_record(
+                        record
+                    )
+                elif (
+                    record_name == "create_task"
+                    and _turn_task_record_postcondition_verified(record)
+                    and duplicate_search_pending
+                ):
+                    duplicate_search_succeeded = True
+
+        def _completion_evidence(response: str | None = None) -> dict[str, Any]:
+            required_tools = _requested_task_mutation_tools()
+            semantic_records = list(logical_attempt_tool_records)
+            if not semantic_records:
+                semantic_records = list(latest_attempt_tool_records)
+            unexpected_successful_mutation = (
+                _simple_task_has_unexpected_successful_mutation(semantic_records)
+            )
+
+            # Only records from the current logical mutation chain that carry
+            # a structured success/postcondition are eligible as proof.  The
+            # full audit list is intentionally excluded from this selection.
+            required_tool_records: list[Any] = []
+            satisfied_tools: set[str] = set()
+            successful_create_records = [
+                record
+                for record in semantic_records
+                if _turn_tool_record_name(record).casefold() == "create_task"
+                and _turn_task_record_postcondition_verified(record)
+            ]
+            ambiguous_create = len(successful_create_records) > 1
+            for required_name in sorted(required_tools):
+                candidates = [
+                    record
+                    for record in reversed(semantic_records)
+                    if _turn_tool_record_name(record).casefold() == required_name
+                    and _turn_task_record_postcondition_verified(record)
+                ]
+                if candidates:
+                    required_tool_records.append(candidates[0])
+                    if (
+                        required_name != "create_task" or duplicate_search_succeeded
+                    ) and not (
+                        required_name == "create_task" and ambiguous_create
+                    ):
+                        satisfied_tools.add(required_name)
+
+            required_mutations_satisfied = bool(required_tools) and (
+                satisfied_tools == required_tools
+            ) and not ambiguous_create and not unexpected_successful_mutation
+            authoritative = bool(
+                required_mutations_satisfied
+                and required_tool_records
+                and set(required_tools).issubset(
+                    AUTHORITATIVE_TASK_MUTATION_TOOLS
+                )
+                and not unexpected_successful_mutation
+                and not _simple_task_post_create_has_blocked_work(semantic_records)
+            )
+            search_records = [
+                record
+                for record in semantic_records
+                if _successful_empty_search_record(record)
+            ]
+            missing_tool_set = set(required_tools - satisfied_tools)
+            if ambiguous_create and "create_task" in required_tools:
+                missing_tool_set.add("create_task")
+            missing_tools = tuple(sorted(missing_tool_set))
+            return {
+                "authoritative": authoritative,
+                "attempt_id": logical_attempt_index,
+                "required_tools": tuple(sorted(required_tools)),
+                "satisfied_tools": tuple(sorted(satisfied_tools)),
+                "required_mutations_satisfied": required_mutations_satisfied,
+                "postcondition_verified": required_mutations_satisfied,
+                "postconditions_verified": required_mutations_satisfied,
+                "required_failure": missing_tools,
+                "required_tool_records": list(required_tool_records),
+                "tool_records": list(semantic_records),
+                "latest_attempt_tool_records": list(latest_attempt_tool_records),
+                "search_records": search_records,
+                "duplicate_search_succeeded": bool(duplicate_search_succeeded),
+                "ambiguous_successful_create": ambiguous_create,
+                "unexpected_successful_task_mutation": bool(
+                    unexpected_successful_mutation
+                ),
+                "completion_confirmed": bool(latest_work_completion_confirmed),
+                "latest_attempt_generation_failed": (
+                    latest_attempt_generation_failure is not None
+                ),
+                "latest_attempt_tool_rounds_exhausted": bool(
+                    latest_attempt_tool_rounds_exhausted
+                ),
+                "summary": (
+                    "deterministic task mutation postconditions verified"
+                    if authoritative
+                    else "deterministic task mutation evidence incomplete"
+                ),
+            }
 
         review_state_attributes = (
             "_last_turn_tool_records",
@@ -1123,7 +1827,9 @@ class TurnExecutionMixin:
             "_last_model_transcript",
             "_last_tool_loop_messages",
             "_last_tool_loop_completion_confirmed",
+            "_last_agentic_completion_evidence",
         )
+        response_state: dict[str, str] = {"value": ""}
 
         async def _run_once(prompt: str) -> str:
             nonlocal initial_context_pending
@@ -1139,6 +1845,7 @@ class TurnExecutionMixin:
                 None,
                 generation_policy=run_generation_policy,
             )
+            response_state["value"] = str(response or "")
             capture_latest_work_tool_records()
             return response
 
@@ -1219,6 +1926,7 @@ class TurnExecutionMixin:
                     required_tool_name=required_tool_name,
                     generation_policy=run_generation_policy,
                 )
+            response_state["value"] = str(response or "")
             capture_latest_work_tool_records()
             return response
 
@@ -1242,13 +1950,44 @@ class TurnExecutionMixin:
             completion_confirmed_provider=lambda: (
                 latest_work_completion_confirmed
             ),
+            # Keep semantic completion separate from the complete audit
+            # ledger.  The provider reads this mapping before each review
+            # round; failures in ``latest_work_tool_records`` that are not
+            # required for the mutation therefore cannot reopen a satisfied
+            # request.
+            completion_evidence_provider=lambda: _completion_evidence(
+                response_state.get("value")
+            ),
         )
+        final_completion_evidence = _completion_evidence(response)
         self._last_turn_tool_records = list(latest_work_tool_records)
+        self._last_agentic_completion_evidence = dict(final_completion_evidence)
         turn_snapshot = _native_turn_result_snapshot.get()
         if turn_snapshot is not None:
             turn_snapshot["tool_records"] = list(latest_work_tool_records)
+            turn_snapshot["audit_tool_records"] = list(latest_work_tool_records)
             turn_snapshot["tool_loop_completion_confirmed"] = (
                 latest_work_completion_confirmed
+            )
+            turn_snapshot["completion_evidence"] = dict(final_completion_evidence)
+        if not bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        ):
+            self._publish_native_agent_run_state(
+                get_current_agent_run_id(),
+                tool_records=list(latest_work_tool_records),
+                usage_records=(
+                    list(
+                        (turn_snapshot or {}).get("usage_records") or []
+                    )
+                    if turn_snapshot is not None
+                    else []
+                ),
+                failure=(
+                    (turn_snapshot or {}).get("generation_failure")
+                    if turn_snapshot is not None
+                    else None
+                ),
             )
         return response
 
@@ -1331,13 +2070,44 @@ class TurnExecutionMixin:
                 # Do not let a new turn clear another task's compatibility
                 # metadata while that task is still in its runner/review loop.
                 self._last_context_snapshots = []
-            project_context = await self._resolve_project_context()
+                # A provider exception can occur before _run_once_with_agent
+                # publishes a new snapshot.  Clear all legacy evidence at the
+                # turn boundary so TerminalMode cannot mistake the previous
+                # turn's successful create for this turn's mutation.
+                for attribute, empty_value in (
+                    ("_last_turn_tool_records", []),
+                    ("_last_tool_calls", []),
+                    ("_last_audit_tool_calls", []),
+                    ("_last_agentic_completion_evidence", {}),
+                    ("_last_generation_failure", None),
+                    ("_last_turn_tool_rounds_exhausted", False),
+                    ("_last_turn_tool_loop_failed", False),
+                ):
+                    if hasattr(self, attribute):
+                        try:
+                            setattr(self, attribute, empty_value)
+                        except Exception:
+                            continue
+            suppress_automatic_context = bool(
+                getattr(get_turn_context(), "suppress_automatic_context", False)
+            )
+            project_context = (
+                None
+                if suppress_automatic_context
+                else await self._resolve_project_context()
+            )
             project_token = set_runtime_project_context(project_context)
             # Project-scoped skills/tools are intentionally discovered per turn so
             # edits made during the previous turn are visible without a restart.
             previous_registry_project = getattr(self, "_runtime_registry_project_id", None)
-            registry_project = str((project_context or {}).get("id") or "") or None
-            if project_context or previous_registry_project is not None:
+            registry_project = (
+                previous_registry_project
+                if suppress_automatic_context
+                else str((project_context or {}).get("id") or "") or None
+            )
+            if not suppress_automatic_context and (
+                project_context or previous_registry_project is not None
+            ):
                 # ロード済み pack はレジストリ再構築後も同じ session オブジェクトを
                 # 渡すことで維持される。
                 trusted_parent_context = None
@@ -1367,23 +2137,36 @@ class TurnExecutionMixin:
                 ensure_load_tool_pack_tool(self._tool_registry, self)
                 self.agent = self._create_character_agent()
             self._runtime_registry_project_id = registry_project
-            self._current_context_bundle = await self._build_context_bundle_for_prompt(
-                user_input, project_context
+            self._current_context_bundle = (
+                None
+                if suppress_automatic_context
+                else await self._build_context_bundle_for_prompt(
+                    user_input, project_context
+                )
             )
 
-            if self.memory_manager and not self.memory_manager.is_initialized():
+            if (
+                not suppress_automatic_context
+                and self.memory_manager
+                and not self.memory_manager.is_initialized()
+            ):
                 await self.memory_manager.initialize()
 
-            await self._sync_history_with_current_session()
+            if not suppress_automatic_context:
+                await self._sync_history_with_current_session()
 
             # Bind the effective policy before any reasoning/specialist/tool
             # child is spawned.  Contextvars make this inherited by nested
             # Agent Team calls while keeping concurrent sessions isolated.
             self._privacy_project_metadata = (
-                dict((project_context or {}).get("metadata") or {})
-                if isinstance(project_context, dict)
-                and isinstance((project_context or {}).get("metadata"), dict)
-                else {}
+                {}
+                if suppress_automatic_context
+                else (
+                    dict((project_context or {}).get("metadata") or {})
+                    if isinstance(project_context, dict)
+                    and isinstance((project_context or {}).get("metadata"), dict)
+                    else {}
+                )
             )
             # Lightweight compatibility callers (and a few integrations that
             # invoke ``_generate_async`` with a stub client) may not construct
@@ -1392,13 +2175,18 @@ class TurnExecutionMixin:
             # skip runner-specific updates when it is absent.
             turn_runner = getattr(self, "_turn_runner", None)
             privacy_gateway = getattr(turn_runner, "privacy_gateway", None)
+            privacy_session_context = (
+                {}
+                if suppress_automatic_context
+                else getattr(self, "_privacy_session_context", None)
+            )
             if isinstance(privacy_gateway, OutboundPrivacyGateway):
                 privacy_gateway.update_policy_context(
-                    session_context=getattr(self, "_privacy_session_context", None),
+                    session_context=privacy_session_context,
                     project_metadata=self._privacy_project_metadata,
                 )
             privacy_policy_token = set_privacy_policy_context(
-                session_context=getattr(self, "_privacy_session_context", None),
+                session_context=privacy_session_context,
                 project_metadata=self._privacy_project_metadata,
             )
 
@@ -1406,7 +2194,11 @@ class TurnExecutionMixin:
                 getattr(self, "external_persistence_enabled", False)
             )
 
-            if self.memory_manager and not external_persistence:
+            if (
+                not suppress_automatic_context
+                and self.memory_manager
+                and not external_persistence
+            ):
                 try:
                     if self.current_session_id:
                         await self.memory_manager.add_message_to_session(
@@ -1423,20 +2215,27 @@ class TurnExecutionMixin:
                         f"[AgentLLMClient] Failed to save user message to memory: {e}"
                     )
 
-            async with self._native_runner_lock_scope():
-                self.history_manager.add_message("user", user_input)
+            if not suppress_automatic_context:
+                async with self._native_runner_lock_scope():
+                    self.history_manager.add_message("user", user_input)
 
             # Keep role boundaries intact.  The legacy text rendering remains
             # available for diagnostics and compatibility callers, but is no
             # longer used as the model transcript.
             memory_recall_started = time.perf_counter()
-            memory_recall = await self._build_past_conversation_recall(user_input)
+            memory_recall = (
+                ""
+                if suppress_automatic_context
+                else await self._build_past_conversation_recall(user_input)
+            )
             self._current_memory_recall_duration_ms = (
                 time.perf_counter() - memory_recall_started
             ) * 1000
             tool_hint_started = time.perf_counter()
-            tool_hint_context = await self._build_tool_hint_context(
-                user_input
+            tool_hint_context = (
+                ""
+                if suppress_automatic_context
+                else await self._build_tool_hint_context(user_input)
             )
             self._current_tool_hint_duration_ms = (
                 time.perf_counter() - tool_hint_started
@@ -1448,14 +2247,19 @@ class TurnExecutionMixin:
                 project_context=project_context,
             )
             response: Optional[str] = None
-            required_tool_name = self._required_command_tool_name(user_input)
+            required_tool_name = (
+                None
+                if suppress_automatic_context
+                else self._required_command_tool_name(user_input)
+            )
             try:
                 available_tools = self._get_available_tools()
             except (AttributeError, TypeError):
                 available_tools = []
 
             if (
-                not required_tool_name
+                not suppress_automatic_context
+                and not required_tool_name
                 and self.reasoning_manager
                 and self._legacy_reasoning_manager_allowed_for_turn(
                     available_tools
@@ -1514,7 +2318,11 @@ class TurnExecutionMixin:
                 if stream_callback:
                     await stream_callback("stream_end", {"content": response})
 
-                if self.memory_manager and not external_persistence:
+                if (
+                    not suppress_automatic_context
+                    and self.memory_manager
+                    and not external_persistence
+                ):
                     try:
                         if self.current_session_id:
                             await self.memory_manager.add_message_to_session(
@@ -1529,20 +2337,25 @@ class TurnExecutionMixin:
                         )
 
             if response is not None:
-                async with self._native_runner_lock_scope():
-                    self.history_manager.add_message("assistant", response)
-                    self._last_model_transcript = [
-                        *self.history_manager.get_model_messages(),
-                        {"role": "assistant", "content": response},
-                    ]
-                    self.history_manager.set_model_messages(
-                        self._last_model_transcript
-                    )
+                if not suppress_automatic_context:
+                    async with self._native_runner_lock_scope():
+                        self.history_manager.add_message("assistant", response)
+                        self._last_model_transcript = [
+                            *self.history_manager.get_model_messages(),
+                            {"role": "assistant", "content": response},
+                        ]
+                        self.history_manager.set_model_messages(
+                            self._last_model_transcript
+                        )
                 return response
 
             try:
                 try:
-                    story_chat_context = self._get_story_chat_context_sync()
+                    story_chat_context = (
+                        None
+                        if suppress_automatic_context
+                        else self._get_story_chat_context_sync()
+                    )
                 except StoryChatContextBuildError as story_context_error:
                     error_message = (
                         "執筆文脈の構築に失敗しました。Story Studio の設定や章データを確認してから再試行してください。"
@@ -1557,8 +2370,9 @@ class TurnExecutionMixin:
                             "stream_end",
                             {"content": error_message},
                         )
-                    async with self._native_runner_lock_scope():
-                        self.history_manager.add_message("assistant", error_message)
+                    if not suppress_automatic_context:
+                        async with self._native_runner_lock_scope():
+                            self.history_manager.add_message("assistant", error_message)
                     return error_message
                 # An explicit specialist-role request is a routing contract,
                 # not merely a hint for the model.  In particular an
@@ -1571,7 +2385,8 @@ class TurnExecutionMixin:
                 # directly while still preserving the normal dynamic
                 # load/registry/dispatch path for ordinary turns.
                 force_docs_specialist = bool(
-                    looks_like_docs_agent_delegation_request(user_input)
+                    not suppress_automatic_context
+                    and looks_like_docs_agent_delegation_request(user_input)
                     and _docs_agent_delegation_available(self.config)
                 )
                 if force_docs_specialist:
@@ -1648,9 +2463,10 @@ class TurnExecutionMixin:
                         effective_agent,
                         required_tool_name,
                     )
-                context = await self._append_pending_steering_to_context(
-                    context, steering_callback, stream_callback
-                )
+                if not suppress_automatic_context:
+                    context = await self._append_pending_steering_to_context(
+                        context, steering_callback, stream_callback
+                    )
                 if required_tool_name:
                     response = await self._run_once_with_agent(
                         effective_agent,
@@ -1672,11 +2488,10 @@ class TurnExecutionMixin:
                         stream_callback,
                         user_input=user_input,
                     )
-            except Exception as e:
-                print(f"[AgentLLMClient] native runtime実行エラー: {e}")
-                import traceback
-
-                traceback.print_exc()
+            except Exception:
+                # The caller owns the terminal/user-visible error boundary.
+                # Logging here and re-raising duplicates the same traceback at
+                # outer boundaries such as HeartbeatRunner.
                 raise
 
             image_event = None
@@ -1685,7 +2500,7 @@ class TurnExecutionMixin:
             if not existing:
                 self.current_assistant_message_id = str(uuid.uuid4())
             assistant_message_id = self.current_assistant_message_id
-            if scene_description:
+            if scene_description and not suppress_automatic_context:
                 visible_response = self._strip_scene_description_markers(response or "")
                 image_event = await self._generate_scene_image_async(
                     scene_description,
@@ -1703,7 +2518,11 @@ class TurnExecutionMixin:
                         }
                         await stream_callback("generated_image", payload)
 
-            if self.memory_manager and not external_persistence:
+            if (
+                not suppress_automatic_context
+                and self.memory_manager
+                and not external_persistence
+            ):
                 try:
                     if self.current_session_id:
                         await self.memory_manager.add_message_to_session(
@@ -1719,39 +2538,41 @@ class TurnExecutionMixin:
                     )
 
             turn_snapshot = _native_turn_result_snapshot.get()
-            async with self._native_runner_lock_scope():
-                self.history_manager.add_message("assistant", response)
-                # A native result already carries its model transcript.  Use
-                # the task-local copy when available rather than whatever a
-                # concurrent turn most recently stored in ``_last_*``.
-                turn_model_transcript = (
-                    turn_snapshot.get("model_transcript")
-                    if turn_snapshot is not None
-                    else None
-                )
-                if turn_model_transcript:
-                    self._last_model_transcript = [
-                        dict(message) for message in turn_model_transcript
-                    ]
-                    active_model_transcript = turn_snapshot.get(
-                        "active_model_transcript"
-                    ) or compact_model_transcript_for_history(
-                        self._last_model_transcript,
-                        getattr(self, "config", None),
+            if not suppress_automatic_context:
+                async with self._native_runner_lock_scope():
+                    self.history_manager.add_message("assistant", response)
+                    # A native result already carries its model transcript.  Use
+                    # the task-local copy when available rather than whatever a
+                    # concurrent turn most recently stored in the shared
+                    # ``_last_*`` compatibility fields.
+                    turn_model_transcript = (
+                        turn_snapshot.get("model_transcript")
+                        if turn_snapshot is not None
+                        else None
                     )
-                    self.history_manager.set_model_messages(
-                        active_model_transcript
-                    )
-                elif not self._last_model_transcript:
-                    self._last_model_transcript = [
-                        *self.history_manager.get_model_messages(),
-                        {"role": "assistant", "content": response},
-                    ]
-                    self.history_manager.set_model_messages(
-                        self._last_model_transcript
-                    )
+                    if turn_model_transcript:
+                        self._last_model_transcript = [
+                            dict(message) for message in turn_model_transcript
+                        ]
+                        active_model_transcript = turn_snapshot.get(
+                            "active_model_transcript"
+                        ) or compact_model_transcript_for_history(
+                            self._last_model_transcript,
+                            getattr(self, "config", None),
+                        )
+                        self.history_manager.set_model_messages(
+                            active_model_transcript
+                        )
+                    elif not self._last_model_transcript:
+                        self._last_model_transcript = [
+                            *self.history_manager.get_model_messages(),
+                            {"role": "assistant", "content": response},
+                        ]
+                        self.history_manager.set_model_messages(
+                            self._last_model_transcript
+                        )
 
-                self.check_and_summarize_history(self.history_manager)
+                    self.check_and_summarize_history(self.history_manager)
 
             return response
         except GenerationInterrupted:
@@ -1772,12 +2593,64 @@ class TurnExecutionMixin:
                 reset_runtime_project_context(project_token)
             if privacy_policy_token is not None:
                 reset_privacy_policy_context(privacy_policy_token)
+            capture_context_manifest_before_context_clear(self)
             self._current_context_bundle = None
 
     async def _run_streamed_with_callback(
         self, agent: Agent, context: str, callback: StreamCallback
     ) -> str:
         """Native runtime streaming callback bridge."""
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        isolated_runner_state: dict[str, Any] = {}
+        isolated_runner_gateway_previous: OutboundPrivacyGateway | None = None
+        isolated_runner_gateway_active = False
+        if suppress_automatic_context:
+            # Direct callers can enter this bridge without TerminalMode's
+            # provider snapshot.  Preserve the runner's ordinary state and
+            # install an empty gateway before any policy update or native run.
+            for name in (
+                "conversation_state_mode",
+                "provider_state",
+                "prompt_cache_key",
+                "prompt_cache_retention",
+                "reasoning_summary_enabled",
+            ):
+                if hasattr(self._turn_runner, name):
+                    value = getattr(self._turn_runner, name)
+                    isolated_runner_state[name] = value
+            candidate_gateway = getattr(self._turn_runner, "privacy_gateway", None)
+            if not isinstance(candidate_gateway, OutboundPrivacyGateway):
+                raise RuntimeError(
+                    "AoiTalk Help isolated privacy gateway is unavailable"
+                )
+            isolated_runner_gateway_previous = candidate_gateway
+            try:
+                turn = get_turn_context()
+                isolated_gateway = OutboundPrivacyGateway(
+                    getattr(self._turn_runner, "config", None)
+                    or getattr(self, "config", None),
+                    user_id=str(
+                        getattr(turn, "user_id", None)
+                        or self._get_session_user_id()
+                        or ""
+                    ),
+                    session_id=str(
+                        getattr(turn, "session_id", None)
+                        or getattr(self, "current_session_id", None)
+                        or ""
+                    ),
+                    session_context={},
+                    project_metadata={},
+                )
+                setattr(isolated_gateway, "_aoitalk_help_isolated", True)
+                self._turn_runner.privacy_gateway = isolated_gateway
+                isolated_runner_gateway_active = True
+            except Exception as exc:
+                raise RuntimeError(
+                    "AoiTalk Help isolated privacy gateway is unavailable"
+                ) from exc
         # This bridge is a separate native-runner entry used by capability
         # based callers.  Keep its budget semantics identical to
         # ``_run_once_with_agent`` and always restore the runner default after
@@ -1787,14 +2660,32 @@ class TurnExecutionMixin:
             generation_policy=run_generation_policy,
         )
         privacy_policy_token = set_privacy_policy_context(
-            session_context=getattr(self, "_privacy_session_context", None),
-            project_metadata=getattr(self, "_privacy_project_metadata", None),
+            session_context=(
+                {}
+                if suppress_automatic_context
+                else getattr(self, "_privacy_session_context", None)
+            ),
+            project_metadata=(
+                {}
+                if suppress_automatic_context
+                else getattr(self, "_privacy_project_metadata", None)
+            ),
         )
         privacy_gateway = getattr(self._turn_runner, "privacy_gateway", None)
-        if isinstance(privacy_gateway, OutboundPrivacyGateway):
+        if isinstance(privacy_gateway, OutboundPrivacyGateway) and (
+            not suppress_automatic_context or isolated_runner_gateway_active
+        ):
             privacy_gateway.update_policy_context(
-                session_context=getattr(self, "_privacy_session_context", None),
-                project_metadata=getattr(self, "_privacy_project_metadata", None),
+                session_context=(
+                    {}
+                    if suppress_automatic_context
+                    else getattr(self, "_privacy_session_context", None)
+                ),
+                project_metadata=(
+                    {}
+                    if suppress_automatic_context
+                    else getattr(self, "_privacy_project_metadata", None)
+                ),
             )
         snapshot_token = None
         if _native_turn_result_snapshot.get() is None:
@@ -1824,7 +2715,8 @@ class TurnExecutionMixin:
                         previous_max_tool_rounds,
                         native_tool_round_budget,
                     )
-                self._last_generation_failure = None
+                if not suppress_automatic_context:
+                    self._last_generation_failure = None
                 try:
                     result = await self._turn_runner.run(
                         agent,
@@ -1837,11 +2729,12 @@ class TurnExecutionMixin:
             result_context_snapshots = list(
                 getattr(result, "context_snapshots", None) or []
             )
-            self._last_generation_failure = getattr(
-                result,
-                "generation_failure",
-                None,
-            )
+            if not suppress_automatic_context:
+                self._last_generation_failure = getattr(
+                    result,
+                    "generation_failure",
+                    None,
+                )
             result_tool_records = list(getattr(result, "tool_calls", None) or [])
             turn_snapshot = _native_turn_result_snapshot.get()
             if turn_snapshot is not None:
@@ -1852,6 +2745,11 @@ class TurnExecutionMixin:
                         "tool_rounds_exhausted": bool(
                             getattr(result, "tool_rounds_exhausted", False)
                         ),
+                        "generation_failure": getattr(
+                            result,
+                            "generation_failure",
+                            None,
+                        ),
                         "usage_records": [
                             dict(item)
                             for item in (getattr(result, "usage_records", None) or [])
@@ -1859,18 +2757,38 @@ class TurnExecutionMixin:
                         ],
                     }
                 )
-            await self._record_native_usage(result, agent)
-            async with self._native_runner_lock_scope():
-                self._last_context_snapshots = list(result_context_snapshots)
-                self._last_turn_tool_records = list(result_tool_records)
-                self._last_turn_tool_rounds_exhausted = bool(
-                    getattr(result, "tool_rounds_exhausted", False)
+            if not suppress_automatic_context:
+                self._publish_native_agent_run_state(
+                    get_current_agent_run_id(),
+                    tool_records=result_tool_records,
+                    usage_records=[
+                        dict(item)
+                        for item in (getattr(result, "usage_records", None) or [])
+                        if isinstance(item, dict)
+                    ],
+                    failure=getattr(result, "generation_failure", None),
                 )
+            await self._record_native_usage(result, agent)
+            if not suppress_automatic_context:
+                async with self._native_runner_lock_scope():
+                    self._last_context_snapshots = list(result_context_snapshots)
+                    self._last_turn_tool_records = list(result_tool_records)
+                    self._last_turn_tool_rounds_exhausted = bool(
+                        getattr(result, "tool_rounds_exhausted", False)
+                    )
             return result.final_output
         finally:
             if snapshot_token is not None:
                 _native_turn_result_snapshot.reset(snapshot_token)
             reset_privacy_policy_context(privacy_policy_token)
+            if isolated_runner_gateway_active:
+                self._turn_runner.privacy_gateway = isolated_runner_gateway_previous
+            if isolated_runner_state:
+                for name, value in isolated_runner_state.items():
+                    try:
+                        setattr(self._turn_runner, name, value)
+                    except Exception:
+                        continue
 
     def get_generation_metadata(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
@@ -1890,6 +2808,9 @@ class TurnExecutionMixin:
             )
             if bounded_snapshot:
                 metadata["context_snapshot"] = bounded_snapshot
+        manifest = context_manifest_metadata(self)
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
         if self._last_model_transcript:
             metadata["model_transcript"] = redact_sensitive_model_transcript(
                 [

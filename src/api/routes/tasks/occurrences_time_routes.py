@@ -13,6 +13,8 @@ from ._shared import (
     TimerStopPayload,
     UpdateTimeEntryPayload,
     _parse_datetime,
+    _parse_timer_datetime,
+    _parse_browse_scope,
     _parse_wall_clock_datetime,
 )
 from ...uuid_http import parse_uuid_or_400
@@ -33,6 +35,15 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             return await service.list_occurrences(
                 session,
                 user_id=user_id,
@@ -46,6 +57,7 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                     request.query_params.get("start_from"), "start_from"
                 ),
                 end_to=_parse_datetime(request.query_params.get("end_to"), "end_to"),
+                **browse_kwargs,
             )
         except TaskManagementError as exc:
             raise _translate_service_error(exc)
@@ -79,6 +91,31 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                         else None
                     ),
                     "reminder_offsets": payload.reminder_offsets,
+                    # Omitted mode is the backwards-compatible single
+                    # occurrence mutation.  Keep it in the service update
+                    # envelope so the active FastAPI endpoint and the Web
+                    # occurrence API share the same explicit semantics.
+                    "mode": payload.mode or "single",
+                    "original_start_at": (
+                        _parse_wall_clock_datetime(
+                            payload.original_start_at, "original_start_at"
+                        )
+                        if payload.original_start_at is not None
+                        else None
+                    ),
+                    "next_start_at": (
+                        _parse_wall_clock_datetime(
+                            payload.next_start_at, "next_start_at"
+                        )
+                        if payload.next_start_at is not None
+                        else None
+                    ),
+                    "next_end_at": (
+                        _parse_wall_clock_datetime(payload.next_end_at, "next_end_at")
+                        if payload.next_end_at is not None
+                        else None
+                    ),
+                    "all_day": payload.all_day,
                 },
             )
         except TaskManagementError as exc:
@@ -94,6 +131,15 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             return await service.list_time_entries(
                 session,
                 user_id=user_id,
@@ -106,13 +152,16 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                 task_id=parse_uuid_or_400(request.query_params.get("task_id"), "task_id"),
                 active_only=request.query_params.get("active_only", "false").lower()
                 in {"1", "true", "yes"},
-                # DB はローカル壁時計時刻保存のため、Web BFF と同じ壁時計解釈で受ける
-                date_from=_parse_wall_clock_datetime(
+                # Timer rows are naive deployment-zone wall-clock values.  An
+                # explicit offset is converted to that zone; a naive value
+                # retains its legacy/manual wall-clock meaning.
+                date_from=_parse_timer_datetime(
                     request.query_params.get("date_from"), "date_from"
                 ),
-                date_to=_parse_wall_clock_datetime(
+                date_to=_parse_timer_datetime(
                     request.query_params.get("date_to"), "date_to"
                 ),
+                **browse_kwargs,
             )
         except TaskManagementError as exc:
             raise _translate_service_error(exc)
@@ -189,12 +238,12 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                 user_id=user_id,
                 entry_id=parse_uuid_or_400(entry_id, "entry_id"),
                 started_at=(
-                    _parse_wall_clock_datetime(payload.started_at, "started_at")
+                    _parse_timer_datetime(payload.started_at, "started_at")
                     if payload.started_at is not None
                     else None
                 ),
                 ended_at=(
-                    _parse_wall_clock_datetime(payload.ended_at, "ended_at")
+                    _parse_timer_datetime(payload.ended_at, "ended_at")
                     if payload.ended_at is not None
                     else None
                 ),
@@ -238,8 +287,8 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                 user_id=user_id,
                 task_id=parse_uuid_or_400(payload.task_id, "task_id"),
                 occurrence_id=parse_uuid_or_400(payload.occurrence_id, "occurrence_id"),
-                started_at=_parse_wall_clock_datetime(payload.started_at, "started_at"),
-                ended_at=_parse_wall_clock_datetime(payload.ended_at, "ended_at"),
+                started_at=_parse_timer_datetime(payload.started_at, "started_at"),
+                ended_at=_parse_timer_datetime(payload.ended_at, "ended_at"),
                 note=payload.note,
                 source=payload.source,
             )
@@ -256,6 +305,15 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             return await service.get_time_report(
                 session,
                 user_id=user_id,
@@ -265,12 +323,13 @@ def register_occurrence_time_routes(router: APIRouter, ctx: TaskRouterContext) -
                 space_id=parse_uuid_or_400(
                     request.query_params.get("space_id"), "space_id"
                 ),
-                date_from=_parse_wall_clock_datetime(
+                date_from=_parse_timer_datetime(
                     request.query_params.get("date_from"), "date_from"
                 ),
-                date_to=_parse_wall_clock_datetime(
+                date_to=_parse_timer_datetime(
                     request.query_params.get("date_to"), "date_to"
                 ),
+                **browse_kwargs,
             )
         except TaskManagementError as exc:
             raise _translate_service_error(exc)

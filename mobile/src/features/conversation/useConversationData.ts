@@ -1,5 +1,6 @@
 import { chatApi } from "../../lib/chat-api";
 import { conversationsRepo } from "../../repositories";
+import { applyForegroundConversationSessions } from "../../repositories/conversations";
 import type { ConversationMessage, ConversationSession } from "../../types/api";
 
 export type ConversationRemoteData = {
@@ -20,6 +21,9 @@ export async function loadConversationRemoteData(
   const remote = await chatApi.resumeSession(sessionId, {
     includeMessages: false,
   });
+  // Subsequent refreshes read session metadata from SQLite as well. Persist
+  // the resumed title/group context so they cannot revert to an old cache.
+  await applyForegroundConversationSessions([remote.session]);
   const refresh = await conversationsRepo.refreshMessagesDetailed(sessionId);
   return {
     session: remote.session,

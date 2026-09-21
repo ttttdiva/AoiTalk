@@ -17,8 +17,11 @@ default_character: 案件管理アシスタント
 app_config_schema_version: 2
 llm_model: gpt-5.6-luna
 llm_provider: openai
+llm_provider_visibility:
+  hidden_provider_ids: []
 gemini:
   model: gemini-3-flash-preview
+  request_timeout_seconds: 60
 openai:
   model: gpt-5.6-luna
   reasoning_effort: max
@@ -61,6 +64,10 @@ openai_compatible_local:
   enable_extra_body: false
   extra_body: {}
   server_profile: auto
+  # Optional override for ManagedLocalRuntimeManager.  When empty, the
+  # resolver uses the repository-local ignored .aoitalk-local-llm/runtime root
+  # (independent of the process current working directory).
+  runtime_root: ''
   cache:
     mode: auto
     extra_body: {}
@@ -72,15 +79,31 @@ openai_compatible_local:
   mlx_lm:
     auto_start: true
     command: ''
+  freetoken:
+    executable: ft
+    version: ''
+    minimum_version: '0.1.2'
+    runtime_root: ''
+    model_path: ''
+    model_alias: ''
+    model_source: ''
+    host: 127.0.0.1
+    port: 1919
+    extra_args: []
+    auto_start: true
+    readiness_timeout: 180
+    readiness_timeout_seconds: 180
   # Generic llama.cpp/llama-server runtime.  The model is selected through
-  # the existing openai_compatible_local provider; no model is downloaded by
-  # AoiTalk.  Set model_path (or MUSE_GLIMMER_MODEL_PATH) to enable startup.
+  # the existing openai_compatible_local provider. Trusted profiles may be
+  # prepared by the managed local-runtime API; custom paths remain manual.
+  # Set model_path (or MUSE_GLIMMER_MODEL_PATH) to enable startup.
   llama_cpp:
     executable: ''
     model_path: ''
-    # Optional directory roots for exact profile GGUF auto-discovery.
-    # Existing profile_runtime paths and the checkout-drive default remain
-    # fallback candidates.  AoiTalk never downloads model files itself.
+    # Optional external directory root for exact profile GGUF discovery and
+    # trusted managed-download destinations.  When empty, the resolver uses
+    # the repository-local ignored .aoitalk-local-llm/models/llama_cpp root.
+    # This is intentionally separate from runtime_root (which owns binaries).
     model_root: ''
     model_alias: ''
     host: 127.0.0.1
@@ -112,9 +135,26 @@ context_compression:
     recent_tool_results: 2
     error_outputs_under_chars: 8000
     latest_project_progress: true
+work_intelligence:
+  # Typed Work Intelligence is additive to the existing ContextBuilder path.
+  # Keep the literal boolean gate explicit so an operator can roll it back
+  # without touching provider code; malformed values are treated as disabled.
+  enabled: true
+  rollback: false
+  compiler:
+    max_items: 8
+    max_people: 8
+    max_evidence: 24
+    max_chars: 3600
+  context_manifest:
+    # WS1 is observation-only. Explicit enablement is required even though
+    # shadow_mode itself defaults safe.
+    enabled: true
+    shadow_mode: true
+    persist_metadata: true
 openrouter:
   base_url: https://openrouter.ai/api/v1
-  model: openai/gpt-4o-mini
+  model: openai/gpt-5.5
   model_provider_options: {}
   enable_tools: false
   app_name: AoiTalk
@@ -151,6 +191,17 @@ llm_cli:
   # Aggregate tool-result context sent to each CLI follow-up (characters).
   # The runtime clamps user values to a safe upper bound.
   tool_result_context_max_chars: 32000
+# Optional bridge for ordinary employee Agents running on a Windows endpoint.
+# This is intentionally disabled by default.  A deployment enables it only
+# after installing a companion/broker that verifies the authenticated AoiTalk
+# user against the endpoint's Windows token/SID.  No token, password, or
+# other secret belongs in this configuration; ``windows_bindings`` contains
+# identifiers and policy metadata only.
+native_employee_execution:
+  enabled: false
+  endpoint_id: ''
+  capability_ttl_seconds: 300
+  windows_bindings: {}
 runtime_feature_permissions:
   allowed_discord_user_ids: []
 runtime_features:
@@ -203,6 +254,14 @@ model_routing:
       base_url: ''
       api_key: ''
       reasoning_effort: ''
+    project_automation:
+      inherit: true
+      provider: ''
+      model: ''
+      base_url: ''
+      api_key: ''
+      reasoning_effort: ''
+      mode: ''
     video:
       inherit: false
       provider: mage_vl
@@ -454,10 +513,33 @@ external_model_privacy:
   semantic_redaction_enabled: true
   local_provider: openai_compatible_local
   local_model: ''
+  # Semantic privacy detection is opt-in to a dedicated local model.  It must
+  # never inherit the primary chat model (which may emit hidden reasoning).
+  local_model_profile: {}
+  local_model_timeout_seconds: 8
+  local_model_max_tokens: 512
   redaction_terms: []
   trusted_local_hosts: []
   raw_media_policy: block
   cache_enabled: true
+
+browser_agent:
+  enabled: true
+  jev_enabled: true
+  max_steps: 24
+  timeout_seconds: 300
+
+cloud_advisor:
+  # New capability is opt-in. Existing Personal/Enterprise behavior is
+  # unchanged until an administrator enables manual or automatic mode.
+  mode: disabled
+  provider: openai
+  # Empty means use the existing canonical provider model resolver.
+  model: ''
+  reasoning_effort: high
+  # Backend safety budget; intentionally not user-editable in v1 settings UI.
+  max_consultations_per_turn: 1
+
 chatgpt_web:
   profile_dir: '%LOCALAPPDATA%\AoiTalk\chatgpt-web-profile'
   response_timeout_seconds: 900
@@ -471,6 +553,9 @@ routing_profiles:
     max_fallbacks: 6
 search:
   provider: openai
+  # Hosted Search in Enterprise requires an operator-approved egress route and
+  # credential.  Personal callers retain the historical provider default.
+  hosted_egress_enabled: false
   openai_model: gpt-5.6-luna
   x_enabled: false
   grok_x_enabled: false
@@ -480,12 +565,18 @@ search:
   - wikipedia
   local_max_results: 5
   include_local_knowledge: false
+deep_research:
+  queue_capacity: 8
+  worker_count: 1
+  planning_timeout_seconds: 30
+  engine_timeout_seconds: 45
+  synthesis_timeout_seconds: 90
+  overall_timeout_seconds: 180
 memory:
   enabled: true
   enable_history_logging: true
   enable_search: true
   auto_cleanup_enabled: true
-  embedding_model: all-MiniLM-L6-v2
   exclude_patterns: []
   history_batch_size: 100
   history_retention_days: 180
@@ -494,7 +585,6 @@ memory:
   max_context_tokens: 8000
   max_search_results: 5
   max_summary_retries: 3
-  preload_embedding_model: false
   save_assistant_messages: true
   save_function_calls: true
   save_successful_only: false
@@ -568,6 +658,23 @@ voice_sessions:
     queue_depth: 2
 apps:
   enabled: true
+  managed_tool_promotion:
+    # Agent-generated managed scripts are server-owned and may be promoted to
+    # Apps only after independent successful observations.  The runtime
+    # registry keeps this branch disabled when absent/invalid in migrated
+    # configurations (fresh installs receive these defaults).
+    enabled: true
+    auto_promote: true
+    min_successful_runs: 2
+    min_distinct_root_runs: 2
+    allowed_runtimes:
+    - python
+    - powershell
+    - shell
+    - node
+    max_script_bytes: 1000000
+    execution_timeout_seconds: 30
+    max_output_bytes: 32768
   jobs:
     server_execution_enabled: false
     require_system_admin: true
@@ -580,6 +687,23 @@ heartbeat:
   default_interval_minutes: 30
 agent_harness:
   enabled: false
+  execution:
+    # The upper capability scope is enabled by default even when the polling
+    # harness itself is disabled.  Enterprise command tools require this
+    # server-owned WSL+bubblewrap backend and never fall back to host shell.
+    enabled: true
+    backend: wsl_bwrap
+    network: none
+    network_capability: none
+    external_read_grants: []
+    resource_limits:
+      timeout_seconds: 120
+      max_processes: 64
+      max_output_bytes: 32768
+      max_disk_bytes: 268435456
+      max_cpu_seconds: null
+      max_memory_bytes: null
+      max_background_seconds: 600
   auto_start: false
   polling_interval_ms: 30000
   workflow_file: config/agent_harness/WORKFLOW.md
@@ -988,6 +1112,12 @@ def load_default_config() -> Dict[str, Any]:
             privacy = config.setdefault("external_model_privacy", {})
             if isinstance(privacy, dict):
                 privacy["mode"] = "protected"
+            search = config.setdefault("search", {})
+            if isinstance(search, dict) and not search.get("hosted_egress_enabled"):
+                # Enterprise/local deployments must opt into hosted egress
+                # explicitly; the default search route is the configured local
+                # engine rather than an unusable cloud provider.
+                search["provider"] = "local"
     except Exception:
         pass
     return config

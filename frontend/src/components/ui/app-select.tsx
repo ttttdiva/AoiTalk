@@ -50,6 +50,7 @@ export type AppSelectProps = TriggerProps & {
     open: boolean,
     details?: AppSelectOpenChangeDetails,
   ) => void;
+  onOpenChangeComplete?: (open: boolean) => void;
   onValueChange?: (value: string) => void;
   open?: boolean;
   placeholder?: React.ReactNode;
@@ -103,6 +104,86 @@ function externalValue(value: string | null) {
   return value === EMPTY_VALUE || value === null ? "" : value;
 }
 
+function getKeyboardOptions(content: HTMLDivElement): HTMLElement[] {
+  return Array.from(content.querySelectorAll<HTMLElement>('[role="option"]')).filter(
+    (option) =>
+      !option.matches('[disabled], [data-disabled], [aria-disabled="true"]') &&
+      !option.closest('[hidden], [inert], [aria-hidden="true"]'),
+  );
+}
+
+function getKeyboardCurrentOption(
+  content: HTMLDivElement,
+  options: HTMLElement[],
+): HTMLElement | undefined {
+  const active = content.ownerDocument.activeElement;
+  return (
+    options.find((option) => option === active || option.contains(active)) ??
+    options.find((option) => option.getAttribute("aria-selected") === "true") ??
+    options[0]
+  );
+}
+
+function focusKeyboardOption(option: HTMLElement) {
+  option.focus({ preventScroll: true });
+  option.scrollIntoView({ block: "nearest" });
+}
+
+function focusCurrentSelectOption(content: HTMLDivElement | null) {
+  if (!content?.isConnected) return;
+  const options = getKeyboardOptions(content);
+  const current = getKeyboardCurrentOption(content, options);
+  if (!current) return;
+  const active = content.ownerDocument.activeElement;
+  if (current !== active && !current.contains(active)) {
+    focusKeyboardOption(current);
+  }
+}
+
+function handleSelectKeyboardNavigation(
+  content: HTMLDivElement | null,
+  event: React.KeyboardEvent<HTMLDivElement>,
+) {
+  if (
+    !content ||
+    event.defaultPrevented ||
+    event.ctrlKey ||
+    event.altKey ||
+    event.metaKey ||
+    event.shiftKey ||
+    event.nativeEvent.isComposing
+  ) {
+    return;
+  }
+
+  if (!["ArrowUp", "ArrowDown", "Home", "End", "Enter"].includes(event.key)) {
+    return;
+  }
+
+  const options = getKeyboardOptions(content);
+  if (options.length === 0) return;
+  const current = getKeyboardCurrentOption(content, options);
+  if (!current) return;
+
+  event.preventDefault();
+  event.stopPropagation();
+
+  if (event.key === "Enter") {
+    current.click();
+    return;
+  }
+
+  const currentIndex = Math.max(0, options.indexOf(current));
+  let nextIndex = currentIndex;
+  if (event.key === "ArrowUp") nextIndex = Math.max(0, currentIndex - 1);
+  if (event.key === "ArrowDown") {
+    nextIndex = Math.min(options.length - 1, currentIndex + 1);
+  }
+  if (event.key === "Home") nextIndex = 0;
+  if (event.key === "End") nextIndex = options.length - 1;
+  focusKeyboardOption(options[nextIndex]);
+}
+
 /**
  * アプリ全体で使う、HTML selectに近い移行用APIのカスタムSelect。
  *
@@ -123,6 +204,7 @@ export function AppSelect({
   name,
   onChange,
   onOpenChange,
+  onOpenChangeComplete,
   onValueChange,
   open,
   placeholder,
@@ -135,6 +217,7 @@ export function AppSelect({
   container,
   ...triggerProps
 }: AppSelectProps) {
+  const contentRef = React.useRef<HTMLDivElement>(null);
   const options = React.useMemo(() => collectOptions(children), [children]);
   const items = React.useMemo(
     () =>
@@ -169,6 +252,12 @@ export function AppSelect({
       itemToStringValue={(itemValue) => externalValue(itemValue)}
       name={name}
       onOpenChange={(nextOpen, details) => onOpenChange?.(nextOpen, details)}
+      onOpenChangeComplete={(nextOpen) => {
+        if (nextOpen) {
+          queueMicrotask(() => focusCurrentSelectOption(contentRef.current));
+        }
+        onOpenChangeComplete?.(nextOpen);
+      }}
       onValueChange={handleValueChange}
       open={open}
       readOnly={readOnly}
@@ -183,9 +272,13 @@ export function AppSelect({
         )}
       </SelectTrigger>
       <SelectContent
+        ref={contentRef}
         alignItemWithTrigger={alignItemWithTrigger}
         className={contentClassName}
-        onKeyDownCapture={onContentKeyDownCapture}
+        onKeyDownCapture={(event) => {
+          onContentKeyDownCapture?.(event);
+          handleSelectKeyboardNavigation(contentRef.current, event);
+        }}
         positionerClassName={positionerClassName}
         container={container}
       >

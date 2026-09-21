@@ -14,6 +14,7 @@ from .config_validator import ConfigValidator
 from .config_defaults import load_default_config
 from .features import Features
 from .app_config_store import (
+    OBSOLETE_MEMORY_CONFIG_KEYS,
     load_app_config_sync,
     save_app_config_sync,
     update_app_config_key_sync,
@@ -229,12 +230,28 @@ class Config:
             for key in _HF_STANDARD_CACHE_ENV_KEYS
             if key in os.environ
         }
+        # A packaged Enterprise launcher exports the profile selectors before
+        # Config is constructed.  Treat that process-level decision as a
+        # security boundary: a stale repository ``.env`` must not downgrade
+        # it to personal via ``override=True``.
+        preexisting_profile = str(os.getenv("AOITALK_PROFILE") or "").strip().lower()
+        preexisting_environment = str(os.getenv("AIVTUBER_ENV") or "").strip().lower()
+        launch_enterprise = "enterprise" in {preexisting_profile, preexisting_environment}
         load_dotenv(self.root_dir / ".env", override=True)
         for key, value in preexisting_hf_cache_env.items():
             os.environ[key] = value
         # dotenv must not override a deployment secret file.  Re-read after
         # dotenv because a native launcher may load .env before Config.
         load_secret_environment()
+        if launch_enterprise:
+            os.environ["AOITALK_PROFILE"] = "enterprise"
+            os.environ["AIVTUBER_ENV"] = "enterprise"
+        # Feature profile caches may have been populated by an import before
+        # dotenv loading; recompute after the effective selectors are fixed.
+        try:
+            Features.reset_cache()
+        except Exception:
+            pass
         
         # Load configuration
         self.config = self._load_config()
@@ -583,6 +600,20 @@ class Config:
                 persisted = load_app_config_sync()
                 self.config["agent_team"] = copy.deepcopy(
                     persisted.get("agent_team", {})
+                    if isinstance(persisted, dict)
+                    else {}
+                )
+            elif key == "memory" or (
+                len(key.split(".")) > 1
+                and key.split(".")[0] == "memory"
+                and key.split(".")[1] in OBSOLETE_MEMORY_CONFIG_KEYS
+            ):
+                # Retired embedding settings are accepted only as migration
+                # input by the DB store.  Refresh the canonical memory branch
+                # instead of reintroducing the discarded key in this process.
+                persisted = load_app_config_sync()
+                self.config["memory"] = copy.deepcopy(
+                    persisted.get("memory", {})
                     if isinstance(persisted, dict)
                     else {}
                 )

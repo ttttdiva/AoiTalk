@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import inspect
 import json
 import time
@@ -17,6 +18,11 @@ from ..services.free_team_service import (
     free_team_profile,
     main_route_intent,
 )
+from ..services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    get_turn_context,
+)
+from .context_snapshot import validate_context_manifest_metadata
 from .provider_capabilities import ProviderCapabilities
 
 
@@ -46,7 +52,12 @@ def disable_target_tools(target: Any) -> None:
     if hasattr(target, "_tool_registry"):
         target._tool_registry = empty_registry
     recreate_agent = getattr(target, "_create_character_agent", None)
-    if callable(recreate_agent) and hasattr(target, "agent"):
+    if bool(getattr(target, "_lightweight_ephemeral_client", False)):
+        # Project Overview deliberately constructed this target without any
+        # Character state. Tool disabling must never resurrect that state.
+        if hasattr(target, "agent"):
+            target.agent = None
+    elif callable(recreate_agent) and hasattr(target, "agent"):
         target.agent = recreate_agent()
 
 
@@ -90,6 +101,38 @@ def _usage_from_client(client: Any) -> dict[str, Any]:
         }
         and value is not None
     }
+
+
+def _target_generation_metadata(target: Any) -> dict[str, Any]:
+    getter = getattr(target, "get_generation_metadata", None)
+    try:
+        raw = getter() if callable(getter) else {}
+    except Exception:
+        raw = {}
+    metadata = dict(raw) if isinstance(raw, dict) else {}
+    manifest = validate_context_manifest_metadata(
+        metadata.get("context_manifest")
+    )
+    if manifest is not None:
+        metadata["context_manifest"] = manifest
+        return metadata
+    metadata.pop("context_manifest", None)
+
+    memory_getter = getattr(target, "_get_memory_metadata", None)
+    if not callable(memory_getter):
+        return metadata
+    try:
+        memory_metadata = memory_getter() or {}
+    except Exception:
+        return metadata
+    if not isinstance(memory_metadata, dict):
+        return metadata
+    manifest = validate_context_manifest_metadata(
+        memory_metadata.get("context_manifest")
+    )
+    if manifest is not None:
+        metadata["context_manifest"] = manifest
+    return metadata
 
 
 async def _call_target_method(
@@ -152,6 +195,46 @@ async def _cleanup_client(client: Any) -> None:
         await result
 
 
+def _set_isolated_prompt_on_target(target: Any, prompt: str) -> None:
+    """Apply the dedicated prompt channel without falling back to ambient state."""
+
+    setter = getattr(target, "set_isolated_system_prompt", None)
+    if callable(setter):
+        result = setter(prompt)
+        if inspect.isawaitable(result):
+            # ``_sync_to_target`` is deliberately synchronous.  Close a
+            # coroutine returned by a malformed/async target setter before
+            # failing closed so Python does not emit an unawaited-coroutine
+            # warning while the caller reports the routing error.
+            close = getattr(result, "close", None)
+            if callable(close):
+                close()
+            raise RuntimeError(
+                "Free Team isolated system prompt setter must be synchronous"
+            )
+        return
+    # A target with an effective builder but no dedicated setter cannot be
+    # proven safe here: assigning a raw field could still leave the builder's
+    # ambient path active.  Project Steward will fail closed rather than
+    # silently downgrade the isolation guarantee.
+    if any(
+        callable(getattr(target, name, None))
+        for name in ("_build_effective_instructions", "_build_effective_system_prompt")
+    ):
+        raise RuntimeError(
+            "Free Team target cannot install an isolated system prompt"
+        )
+    # SGLang-like legacy targets expose the final system field directly but
+    # no dedicated setter.  Assign it after character synchronization so the
+    # strict prompt wins without invoking the ambient regular setter.
+    if hasattr(target, "system_prompt"):
+        if hasattr(target, "_isolated_system_prompt_override"):
+            target._isolated_system_prompt_override = prompt
+        target.system_prompt = prompt
+        return
+    raise RuntimeError("Free Team target cannot install an isolated system prompt")
+
+
 def _reservation_prompt(
     prompt: str,
     *,
@@ -198,15 +281,23 @@ class FreeTeamRoutingClient:
 
     def __init__(self, config: Any):
         self.config = config
+        self._lightweight_ephemeral_client = bool(
+            config
+            and config.get("runtime.lightweight_ephemeral_client", False)
+        )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
-            supports_tools=True,
+            supports_tools=not self._lightweight_ephemeral_client,
             supports_response_format=True,
             supports_model_pull=False,
             supports_model_delete=False,
             supports_extra_body=False,
         )
-        self.character_name = getattr(config, "default_character", "Assistant")
+        self.character_name = (
+            "Assistant"
+            if self._lightweight_ephemeral_client
+            else getattr(config, "default_character", "Assistant")
+        )
         self.history_manager = HistoryManager()
         self.memory_manager = None
         self.current_session_id: str | None = None
@@ -229,17 +320,39 @@ class FreeTeamRoutingClient:
         self._last_model_transcript: list[dict[str, Any]] = []
         self._provider_state = {"previous_response_id": None, "fingerprint": None}
         self._provider_state_mode = "stateless"
+        # Project Automation uses a dedicated prompt channel.  Keep it
+        # separate from the regular character/system prompt so a routed child
+        # provider cannot accidentally replace the strict prompt with its
+        # ambient character instructions during target synchronization.
+        self._isolated_system_prompt_override = ""
 
     def set_session_context(self, user_id: str = "default_user", metadata: Any = None) -> None:
+        self._isolated_system_prompt_override = ""
         self.session_user_id = user_id
         self.session_metadata = dict(metadata or {})
 
     def set_system_prompt(self, prompt: str) -> None:
+        self._isolated_system_prompt_override = ""
         self.system_prompt = str(prompt or "")
         if self._active_client and hasattr(self._active_client, "set_system_prompt"):
             self._active_client.set_system_prompt(self.system_prompt)
 
+    def set_isolated_system_prompt(self, prompt: str) -> None:
+        """Install a prompt that must survive Free Team target selection."""
+
+        isolated_prompt = str(prompt or "").strip()
+        self._isolated_system_prompt_override = isolated_prompt
+        # ``system_prompt`` is retained as the proxy's observable outgoing
+        # field for legacy callers and for the fail-closed Project Steward
+        # assertion.  The dedicated field remains the source of precedence.
+        self.system_prompt = isolated_prompt
+        target = self._active_client
+        if target is None:
+            return
+        _set_isolated_prompt_on_target(target, isolated_prompt)
+
     def set_character(self, character_name: str) -> None:
+        self._isolated_system_prompt_override = ""
         self.character_name = character_name
         # キャラクター切替後は起動時キャラの system prompt を再利用せず、
         # 次のルーティング先へ選択キャラの統合プロンプトを渡す。
@@ -265,6 +378,9 @@ class FreeTeamRoutingClient:
         return {"ok": True, "provider": self.provider_label, "model": self.model_name}
 
     def _sync_to_target(self, target: Any) -> None:
+        isolated_controller_turn = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         for field in (
             "current_session_id",
             "current_project_id",
@@ -280,19 +396,78 @@ class FreeTeamRoutingClient:
             "system_prompt",
         ):
             if hasattr(target, field):
-                setattr(target, field, getattr(self, field))
-        if hasattr(target, "set_character"):
-            target.set_character(self.character_name)
+                value = getattr(self, field)
+                if isolated_controller_turn and field == "system_prompt":
+                    value = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+                elif isolated_controller_turn and field == "session_metadata":
+                    value = {}
+                setattr(target, field, value)
+        if not self._lightweight_ephemeral_client:
+            if hasattr(target, "set_character"):
+                target.set_character(self.character_name)
+            elif hasattr(target, "character_name"):
+                target.character_name = self.character_name
         elif hasattr(target, "character_name"):
-            target.character_name = self.character_name
+            # Do not call a setter that may rebuild Character/system state.
+            target.character_name = "Assistant"
         if hasattr(target, "history_manager"):
-            target.history_manager = self.history_manager
+            if isolated_controller_turn:
+                # Free Team creates a fresh provider target, but its proxy
+                # history can still contain the preceding ordinary turn.  A
+                # target-local blank manager makes the Guide-only boundary
+                # hold even for providers whose direct prompt helper does not
+                # consult the turn ContextVar.
+                try:
+                    target.history_manager = HistoryManager(
+                        max_history_length=int(
+                            getattr(self.history_manager, "max_history_length", 20)
+                        ),
+                        context_window_size=int(
+                            getattr(self.history_manager, "context_window_size", 10)
+                        ),
+                    )
+                except Exception:
+                    target.history_manager = HistoryManager()
+            else:
+                target.history_manager = self.history_manager
+        if isolated_controller_turn:
+            # These caches are provider-local equivalents of history/context
+            # and are not necessarily covered by every provider's message
+            # builder.  Clear them on the ephemeral target as a final seam.
+            for field, empty in (
+                ("conversation_history", []),
+                ("_current_context_bundle", None),
+                ("_current_dynamic_context", []),
+                ("_current_dynamic_context_metadata", {}),
+                ("_last_tool_loop_messages", []),
+            ):
+                if hasattr(target, field):
+                    try:
+                        setattr(target, field, empty)
+                    except Exception:
+                        pass
         if hasattr(target, "_model_transcript"):
-            target._model_transcript = [dict(item) for item in self._model_transcript]
-        if self.system_prompt and hasattr(target, "set_system_prompt"):
+            target._model_transcript = (
+                []
+                if isolated_controller_turn
+                else [dict(item) for item in self._model_transcript]
+            )
+        isolated_prompt = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if isolated_controller_turn and not isolated_prompt:
+            isolated_prompt = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+        if isolated_prompt:
+            _set_isolated_prompt_on_target(target, isolated_prompt)
+        elif self.system_prompt and hasattr(target, "set_system_prompt"):
             target.set_system_prompt(self.system_prompt)
 
     def _sync_from_target(self, target: Any) -> None:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # The target is an ephemeral Help provider.  Never replace the
+            # proxy's ordinary history/transcript objects with its blank
+            # target-local state on a direct routed call.
+            return
         if hasattr(target, "history_manager"):
             self.history_manager = target.history_manager
         self._model_transcript = [
@@ -314,6 +489,23 @@ class FreeTeamRoutingClient:
     ) -> str:
         from .manager import create_llm_client_for_target
 
+        isolated_controller_turn = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        isolated_proxy_state: dict[str, Any] | None = None
+        if isolated_controller_turn:
+            isolated_proxy_state = {
+                "active_client": self._active_client,
+                "last_client": self._last_client,
+                "last_route_metadata": dict(self._last_route_metadata),
+                "last_generation_metadata": dict(self._last_generation_metadata),
+                "model_transcript": [dict(item) for item in self._model_transcript],
+                "last_model_transcript": [
+                    dict(item) for item in self._last_model_transcript
+                ],
+            }
+        else:
+            self._last_generation_metadata = {}
         intent = main_route_intent(self.config)
         if intent.kind != "pool":
             raise FreeTeamUnavailableError("無料Teamのルーティング設定が無効です")
@@ -321,8 +513,10 @@ class FreeTeamRoutingClient:
         if image_data:
             required.add("vision")
         tool_registry = None
-        tools_enabled = method_name == "generate_response_async" and bool(
-            self.config.get("use_tools", True)
+        tools_enabled = (
+            method_name == "generate_response_async"
+            and bool(self.config.get("use_tools", True))
+            and not isolated_controller_turn
         )
         if tools_enabled:
             try:
@@ -337,7 +531,9 @@ class FreeTeamRoutingClient:
         tools_required = False
         if method_name == "generate_response_async":
             tools_required = (
-                bool(explicit_tool_required)
+                False
+                if isolated_controller_turn
+                else bool(explicit_tool_required)
                 if isinstance(explicit_tool_required, bool)
                 else tools_enabled and tool_mode != "disabled"
             )
@@ -347,17 +543,35 @@ class FreeTeamRoutingClient:
         max_fallbacks = max(0, min(10, int(profile.get("max_fallbacks") or 0)))
         excluded: set[str] = set()
         last_error: BaseException | None = None
-
-        model_messages = self.history_manager.get_model_messages()
+        isolated_controller_turn = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        model_messages = (
+            []
+            if isolated_controller_turn
+            else self.history_manager.get_model_messages()
+        )
         if self._model_transcript:
-            model_messages = [dict(item) for item in self._model_transcript]
+            model_messages = (
+                []
+                if isolated_controller_turn
+                else [dict(item) for item in self._model_transcript]
+            )
         reservation_prompt = _reservation_prompt(
             prompt,
-            system_prompt=system_prompt or self.system_prompt,
+            system_prompt=(
+                AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+                if isolated_controller_turn
+                else system_prompt or self.system_prompt
+            ),
             messages=model_messages,
-            summary=self.history_manager.summary,
-            session_metadata=self.session_metadata,
-            tool_registry=tool_registry if tools_required else None,
+            summary="" if isolated_controller_turn else self.history_manager.summary,
+            session_metadata=(
+                {} if isolated_controller_turn else self.session_metadata
+            ),
+            tool_registry=(
+                None if isolated_controller_turn else tool_registry if tools_required else None
+            ),
         )
 
         for fallback_count in range(max_fallbacks + 1):
@@ -411,6 +625,36 @@ class FreeTeamRoutingClient:
                     raise FreeTeamUnavailableError(
                         "CLIクリップ取り込みは、ツール無効化を検証済みのCodex CLIでのみ利用できます"
                     )
+
+                target_provider_options = {
+                    **lease.provider_options,
+                    "max_output_tokens": lease.max_output_tokens,
+                }
+                if isolated_controller_turn:
+                    # Help is a server-grounded, tool-free controller turn.
+                    # Disable tools before constructing the routed target so
+                    # provider constructors do not build a full runtime
+                    # registry (or briefly expose mutation-capable tools)
+                    # before the post-construction safety shim runs.
+                    target_provider_options["enable_tools"] = False
+                    target_provider_options["lightweight_client"] = True
+                if method_name in {
+                    "generate_plain_text_async",
+                    "generate_memory_extraction_async",
+                }:
+                    target_provider_options["enable_tools"] = False
+                else:
+                    target_enable_tools = self.config.get(
+                        "runtime.target_enable_tools",
+                        None,
+                    )
+                    if isinstance(target_enable_tools, bool):
+                        target_provider_options["enable_tools"] = target_enable_tools
+                if self.config.get("runtime.ephemeral_session_client", False):
+                    target_provider_options["ephemeral_session_client"] = True
+                if self._lightweight_ephemeral_client:
+                    target_provider_options["lightweight_client"] = True
+
                 target = create_llm_client_for_target(
                     self.config,
                     provider=lease.provider,
@@ -418,10 +662,7 @@ class FreeTeamRoutingClient:
                     effort=lease.effort,
                     base_url=lease.base_url,
                     api_key=lease.api_key,
-                    provider_options={
-                        **lease.provider_options,
-                        "max_output_tokens": lease.max_output_tokens,
-                    },
+                    provider_options=target_provider_options,
                 )
                 self._sync_to_target(target)
                 if not tools_required:
@@ -456,20 +697,29 @@ class FreeTeamRoutingClient:
                     success=True,
                     latency_ms=latency_ms,
                 )
-                self._sync_from_target(target)
-                target_metadata = (
-                    target.get_generation_metadata()
-                    if hasattr(target, "get_generation_metadata")
-                    else {}
-                )
-                self._last_route_metadata = lease.safe_metadata()
-                self._last_generation_metadata = {
-                    **dict(target_metadata or {}),
-                    "free_team_route": self._last_route_metadata,
-                }
+                if not isolated_controller_turn:
+                    self._sync_from_target(target)
+                target_metadata = _target_generation_metadata(target)
+                if not isolated_controller_turn:
+                    self._last_route_metadata = lease.safe_metadata()
+                    self._last_generation_metadata = {
+                        **dict(target_metadata or {}),
+                        "free_team_route": self._last_route_metadata,
+                    }
                 previous_client = self._last_client
-                self._last_client = target
-                if previous_client is not None and previous_client is not target:
+                # A trusted controller turn (notably Help) uses an ephemeral
+                # provider target.  Keep the ordinary target alive and
+                # authoritative so a legacy no-session transcript is not
+                # replaced or cleaned up by this one-turn request.  The
+                # caller's provider-state snapshot restores the proxy's
+                # history after the target finishes.
+                if not isolated_controller_turn:
+                    self._last_client = target
+                if (
+                    previous_client is not None
+                    and previous_client is not target
+                    and not isolated_controller_turn
+                ):
                     await _cleanup_client(previous_client)
                 return str(response)
             except asyncio.CancelledError:
@@ -528,6 +778,19 @@ class FreeTeamRoutingClient:
                 self._active_client = None
                 if target is not None and target is not self._last_client:
                     await _cleanup_client(target)
+                if isolated_proxy_state is not None:
+                    self._active_client = isolated_proxy_state["active_client"]
+                    self._last_client = isolated_proxy_state["last_client"]
+                    self._last_route_metadata = isolated_proxy_state[
+                        "last_route_metadata"
+                    ]
+                    self._last_generation_metadata = isolated_proxy_state[
+                        "last_generation_metadata"
+                    ]
+                    self._model_transcript = isolated_proxy_state["model_transcript"]
+                    self._last_model_transcript = isolated_proxy_state[
+                        "last_model_transcript"
+                    ]
 
         if last_error:
             raise last_error
@@ -627,6 +890,12 @@ class FreeTeamRoutingClient:
         image_data: dict | None = None,
         stream_callback: Optional[StreamCallback] = None,
     ) -> str | Generator[str, None, None]:
+        # The worker thread does not inherit ContextVars.  Preserve the
+        # trusted Help turn (or the ordinary request scope) explicitly so a
+        # synchronous compatibility call cannot silently fall back to the
+        # shared history/tools gateway.
+        execution_context = contextvars.copy_context()
+
         def run() -> str:
             return asyncio.run(
                 self.generate_response_async(
@@ -639,7 +908,7 @@ class FreeTeamRoutingClient:
             )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            result = pool.submit(run).result()
+            result = pool.submit(execution_context.run, run).result()
         if stream:
             return iter((result,))
         return result
@@ -660,7 +929,14 @@ class FreeTeamRoutingClient:
         return self.generate(prompt)
 
     def stream_chat(self, messages: list[dict[str, Any]], **kwargs: Any):
-        yield self.chat(messages, **kwargs)
+        # Capture the caller's context at stream creation; the generator may
+        # be consumed after the outer request has reset its Help token.
+        stream_context = contextvars.copy_context()
+
+        def _deferred():
+            yield stream_context.run(self.chat, messages, **kwargs)
+
+        return _deferred()
 
     def get_generation_metadata(self) -> dict[str, Any]:
         return dict(self._last_generation_metadata)

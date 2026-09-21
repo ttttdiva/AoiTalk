@@ -28,6 +28,11 @@ ENV_EXAMPLE="$SCRIPT_DIR/.env.example"
 COMPOSE_PROJECT_NAME="aoitalk-enterprise"
 DOCKER=(docker)
 OPERATION_LOCK_FD=""
+OFFLINE_INPUTS_LOADED=0
+declare -A OFFLINE_IMAGE_CONFIG_DIGESTS=()
+OFFLINE_REGISTRY_PID=""
+OFFLINE_REGISTRY_PORT="51181"
+OFFLINE_REGISTRY_TOKEN=""
 
 info() {
     echo "[AoiTalk Enterprise] $*"
@@ -65,6 +70,7 @@ acquire_operation_lock() {
     chmod 0600 "$lock_file"
     flock -n "$OPERATION_LOCK_FD" || die "another Enterprise operation is already running for $AOITALK_INSTALL_ROOT"
     export AOIT_INTERNAL_OPERATION_LOCK_HELD="$lock_file"
+    export AOIT_INTERNAL_OPERATION_LOCK_FD="$OPERATION_LOCK_FD"
 }
 
 release_operation_lock() {
@@ -146,6 +152,12 @@ set_defaults() {
     export AOITALK_RELEASE_ROOT="$RELEASE_ROOT"
     export AOITALK_CURRENT_LINK="${AOITALK_CURRENT_LINK:-$AOITALK_INSTALL_ROOT/current}"
     export AOITALK_DATA_ROOT="${AOITALK_DATA_ROOT:-/var/lib/aoitalk}"
+    # Python, Node.js, and PostgreSQL consume one validated IANA timezone.  Do
+    # not inherit the host's ambient timezone: target behavior must be stable
+    # across fresh and existing Enterprise installations.
+    # Preserve an explicitly empty operator value so validation rejects it;
+    # only an unset variable receives the Asia/Tokyo default.
+    export AOITALK_TIMEZONE="${AOITALK_TIMEZONE-Asia/Tokyo}"
     export AOITALK_SECRETS_DIR="${AOITALK_SECRETS_DIR:-/etc/aoitalk/secrets}"
     export AOITALK_RUNTIME_CONFIG_FILE="${AOITALK_RUNTIME_CONFIG_FILE:-/etc/aoitalk/runtime-config/enterprise.yaml}"
     export AOITALK_INIT_DB_SQL="${AOITALK_INIT_DB_SQL:-$AOITALK_BUNDLE_ROOT/scripts/init-db.sql}"
@@ -153,10 +165,22 @@ set_defaults() {
     export AOITALK_HTTPS_PORT="${AOITALK_HTTPS_PORT:-6002}"
     export AOITALK_HTTP_PORT="${AOITALK_HTTP_PORT:-6001}"
     export AOITALK_BOOTSTRAP_HTTPS_PORT="${AOITALK_BOOTSTRAP_HTTPS_PORT:-8443}"
+    # An omitted bind is safe/local-only.  The checked-in Enterprise example
+    # deliberately selects 0.0.0.0 and therefore requires an explicit
+    # client-visible AOITALK_PUBLIC_HOST before init/up/preflight/verify.
+    export AOITALK_PUBLIC_BIND_ADDRESS="${AOITALK_PUBLIC_BIND_ADDRESS:-127.0.0.1}"
+    export AOITALK_PUBLIC_HOST="${AOITALK_PUBLIC_HOST:-}"
     # Backend and transport are first-class values.  Keep AOITALK_LLM_MODE as
     # a backwards-compatible alias for older operator .env files.
     export AOITALK_BACKEND="${AOITALK_BACKEND:-${AOITALK_LLM_MODE:-external}}"
     export AOITALK_IMAGE="${AOITALK_IMAGE:-}"
+    # Optional target-only npm cache.  The directory is never part of the
+    # handoff source/archive and is mounted read-only only for offline builds.
+    export AOITALK_NPM_CACHE_DIR="${AOITALK_NPM_CACHE_DIR:-}"
+    # Complete restricted-network inputs are supplied by a source-bound
+    # companion and kept outside the managed release/data/config roots.
+    export AOITALK_OFFLINE_INPUTS_DIR="${AOITALK_OFFLINE_INPUTS_DIR:-}"
+    export AOITALK_OFFLINE_INPUTS_ARCHIVE="${AOITALK_OFFLINE_INPUTS_ARCHIVE:-}"
     export AOITALK_TRANSPORT="${AOITALK_TRANSPORT:-https}"
     export AOITALK_LLM_MODE="${AOITALK_LLM_MODE:-$AOITALK_BACKEND}"
     # An unset allowlist preserves compatibility with older operator files;
@@ -167,7 +191,12 @@ set_defaults() {
     if [[ -z "${AOITALK_EXTERNAL_MODEL:-}" ]]; then
         case "$AOITALK_EXTERNAL_PROVIDER" in
             openai_compatible_local) AOITALK_EXTERNAL_MODEL=qwen3.8-27b ;;
-            *) AOITALK_EXTERNAL_MODEL=openai/gpt-4o-mini ;;
+            openai) AOITALK_EXTERNAL_MODEL=gpt-5.6-luna ;;
+            openrouter) AOITALK_EXTERNAL_MODEL=openai/gpt-5.5 ;;
+            # Cloud/external providers must receive an operator-selected model.
+            # Do not synthesize a provider-agnostic model here: the application
+            # config/catalog remains the authority for provider-specific defaults.
+            *) die "AOITALK_EXTERNAL_MODEL must be set explicitly for provider: $AOITALK_EXTERNAL_PROVIDER" ;;
         esac
     fi
     export AOITALK_EXTERNAL_MODEL
@@ -179,7 +208,7 @@ set_defaults() {
         esac
     fi
     export AOITALK_EXTERNAL_BASE_URL
-    export AOITALK_EXTERNAL_REQUIRED_MODELS="${AOITALK_EXTERNAL_REQUIRED_MODELS:-qwen3.8-27b,gemma-4-26b-a4b-it-qat-q4-0}"
+    export AOITALK_EXTERNAL_REQUIRED_MODELS="${AOITALK_EXTERNAL_REQUIRED_MODELS:-qwen3.8-27b,qwen3.8-flash-next}"
     export AOITALK_GEMMA_VLLM_IMAGE="${AOITALK_GEMMA_VLLM_IMAGE:-}"
     export AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE="${AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE:-}"
     export AOITALK_GEMMA_MODEL="${AOITALK_GEMMA_MODEL:-google/gemma-4-E4B-it}"
@@ -269,6 +298,270 @@ paths_overlap() {
     [[ "$left" == "$right" || "$left" == "$right"/* || "$right" == "$left"/* ]]
 }
 
+validate_npm_cache_dir() {
+    local path="${AOITALK_NPM_CACHE_DIR:-}" current canonical
+    [[ -z "$path" ]] && return 0
+    validate_value AOITALK_NPM_CACHE_DIR "$path"
+    validate_safe_path AOITALK_NPM_CACHE_DIR "$path"
+    [[ -d "$path" && ! -L "$path" ]] || die "AOITALK_NPM_CACHE_DIR must be an existing directory and must not be a symlink: $path"
+
+    # Reject symlinked ancestors as well as a symlink at the cache path.  A
+    # later Docker bind mount must resolve to the exact operator-selected
+    # directory, never to a path that can be swapped through a link.
+    current="$path"
+    while [[ "$current" != "/" ]]; do
+        [[ ! -L "$current" ]] || die "AOITALK_NPM_CACHE_DIR contains a symlink path component: $current"
+        current="$(dirname -- "$current")"
+    done
+    canonical="$(readlink -f -- "$path" 2>/dev/null || true)"
+    [[ -n "$canonical" && "$canonical" == "$path" ]] || die "AOITALK_NPM_CACHE_DIR must resolve without symlinks: $path"
+
+    # Never allow the named context to read from the immutable release or the
+    # sanitized source tree.  The cache is deliberately external and is only
+    # mounted read-only for the offline npm install.
+    paths_overlap "$canonical" "$AOITALK_INSTALL_ROOT/releases" && die "AOITALK_NPM_CACHE_DIR must be outside the Enterprise release tree"
+    paths_overlap "$canonical" "$BUNDLE_ROOT" && die "AOITALK_NPM_CACHE_DIR must be outside the sanitized source tree"
+    return 0
+}
+
+# A complete restricted-network input root is enabled by the active handoff
+# manifest, not by a stale host marker. This keeps an online handoff immune to
+# an interrupted or previously-offline apply while still failing closed when
+# the active source explicitly requires a companion.
+offline_build_enabled() {
+    local manifest="$HANDOFF_ROOT/bundle-manifest.json"
+    [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+    local state
+    state="$(python3 - "$manifest" <<'PY'
+import json, pathlib, sys
+try:
+    value = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+except Exception:
+    raise SystemExit("invalid active Enterprise handoff manifest")
+offline = value.get("offline_build")
+if not isinstance(offline, dict):
+    print("disabled")
+elif offline.get("enabled") is True:
+    print("enabled")
+else:
+    print("disabled")
+PY
+    )" || die "active Enterprise handoff manifest cannot be parsed"
+    [[ "$state" == enabled ]]
+}
+
+offline_inputs_root() {
+    if [[ -n "${AOITALK_OFFLINE_INPUTS_DIR:-}" ]]; then
+        # An operator may leave the optional variable in .env after moving back
+        # to an online handoff; the active manifest, not stale configuration,
+        # decides whether the companion is used.
+        offline_build_enabled || return 0
+        printf '%s\n' "$AOITALK_OFFLINE_INPUTS_DIR"
+    else
+        offline_build_enabled || return 0
+        local commit="${AOITALK_OFFLINE_INPUTS_COMMIT:-}"
+        if [[ -z "$commit" ]] && declare -F manifest_source_commit >/dev/null 2>&1; then
+            commit="$(manifest_source_commit 2>/dev/null || true)"
+        fi
+        if [[ -n "$commit" && -d "$AOITALK_INSTALL_ROOT/offline-inputs/$commit" && ! -L "$AOITALK_INSTALL_ROOT/offline-inputs/$commit" ]]; then
+            printf '%s\n' "$AOITALK_INSTALL_ROOT/offline-inputs/$commit"
+            return 0
+        fi
+    fi
+}
+
+offline_inputs_required() {
+    # The active handoff is authoritative.  A missing/corrupt companion must
+    # fail closed even if a marker was never written because activation was
+    # interrupted; a stale marker on an online handoff is ignored.
+    offline_build_enabled
+}
+
+offline_manifest_path() {
+    local root="${1:-$(offline_inputs_root)}"
+    [[ -n "$root" ]] || return 1
+    if [[ -f "$root/offline-build-manifest.json" && ! -L "$root/offline-build-manifest.json" ]]; then
+        printf '%s\n' "$root/offline-build-manifest.json"
+    elif [[ -f "$root/offline-input-manifest.json" && ! -L "$root/offline-input-manifest.json" ]]; then
+        # Ingestion compatibility for an older companion.  The builder emits
+        # the canonical name; all target consumers use the selected path so a
+        # valid descriptive-name companion cannot pass validation and then
+        # fail during registry/build setup.
+        printf '%s\n' "$root/offline-input-manifest.json"
+    else
+        return 1
+    fi
+}
+
+validate_offline_inputs_dir() {
+    local path="${1:-$(offline_inputs_root)}" current canonical mode_num
+    if [[ -z "$path" ]]; then
+        offline_build_enabled && die "the active handoff requires a verified offline companion"
+        offline_inputs_required && die "this installation requires a verified offline companion for the current source commit"
+        return 0
+    fi
+    validate_value AOITALK_OFFLINE_INPUTS_DIR "$path"
+    validate_safe_path AOITALK_OFFLINE_INPUTS_DIR "$path"
+    [[ -d "$path" && ! -L "$path" ]] || die "AOITALK_OFFLINE_INPUTS_DIR must be an existing directory and must not be a symlink: $path"
+    assert_secure_ancestors "$path"
+    current="$path"
+    while [[ "$current" != "/" ]]; do
+        [[ ! -L "$current" ]] || die "AOITALK_OFFLINE_INPUTS_DIR contains a symlink path component: $current"
+        current="$(dirname -- "$current")"
+    done
+    canonical="$(readlink -f -- "$path" 2>/dev/null || true)"
+    [[ -n "$canonical" && "$canonical" == "$path" ]] || die "AOITALK_OFFLINE_INPUTS_DIR must resolve without symlinks: $path"
+    [[ "$(stat -c '%u' -- "$path" 2>/dev/null || true)" == 0 ]] || die "AOITALK_OFFLINE_INPUTS_DIR must be root-owned: $path"
+    mode_num=$((8#$(stat -c '%a' -- "$path" 2>/dev/null || printf 0)))
+    (( (mode_num & 0022) == 0 )) || die "AOITALK_OFFLINE_INPUTS_DIR must not be group/world writable: $path"
+    paths_overlap "$canonical" "$AOITALK_INSTALL_ROOT/releases" && die "AOITALK_OFFLINE_INPUTS_DIR must be outside the Enterprise release tree"
+    paths_overlap "$canonical" "$BUNDLE_ROOT" && die "AOITALK_OFFLINE_INPUTS_DIR must be outside the sanitized source tree"
+    paths_overlap "$canonical" "$AOITALK_DATA_ROOT" && die "AOITALK_OFFLINE_INPUTS_DIR must be outside persistent application data"
+    paths_overlap "$canonical" "$AOITALK_CONFIG_ROOT" && die "AOITALK_OFFLINE_INPUTS_DIR must be outside Enterprise configuration"
+}
+
+verify_offline_inputs() {
+    local root="${1:-$(offline_inputs_root)}" archive="${AOITALK_OFFLINE_INPUTS_ARCHIVE:-}" validator="$SCRIPT_DIR/offline_inputs.py" handoff="$HANDOFF_ROOT/bundle-manifest.json"
+    [[ -z "$root" ]] && return 0
+    [[ -f "$validator" && ! -L "$validator" ]] || die "offline input validator is missing or symlinked: $validator"
+    validate_offline_inputs_dir "$root"
+    [[ ( -f "$root/offline-build-manifest.json" && ! -L "$root/offline-build-manifest.json" ) || ( -f "$root/offline-input-manifest.json" && ! -L "$root/offline-input-manifest.json" ) ]] || die "offline input manifest is missing or symlinked"
+    [[ -f "$handoff" && ! -L "$handoff" ]] || die "handoff manifest is missing or symlinked"
+    if [[ "$root" != "$HANDOFF_ROOT/offline-inputs" && "$root" != "$AOITALK_INSTALL_ROOT/offline-inputs/"* ]]; then
+        [[ -n "$archive" ]] || die "external offline input roots require AOITALK_OFFLINE_INPUTS_ARCHIVE"
+    fi
+    if [[ -n "$archive" ]]; then
+        validate_value AOITALK_OFFLINE_INPUTS_ARCHIVE "$archive"
+        validate_safe_path AOITALK_OFFLINE_INPUTS_ARCHIVE "$archive"
+        [[ -f "$archive" && ! -L "$archive" ]] || die "AOITALK_OFFLINE_INPUTS_ARCHIVE must be a regular non-symlink file: $archive"
+        assert_secure_ancestors "$archive"
+    fi
+    command -v python3 >/dev/null 2>&1 || die "python3 is required to verify offline Enterprise inputs"
+    local -a args=("$validator" verify --root "$root" --handoff "$handoff")
+    [[ -n "$archive" ]] && args+=(--archive "$archive")
+    python3 "${args[@]}" || die "offline Enterprise input verification failed"
+}
+
+start_offline_registry() {
+    local root="${1:-$(offline_inputs_root)}" validator="$SCRIPT_DIR/offline_inputs.py" log_path
+    [[ -n "$root" ]] || return 0
+    [[ -n "$OFFLINE_REGISTRY_PID" ]] && return 0
+    # A registry is needed for Compose dependency OCI layouts.  It is strictly
+    # loopback-only and serves only digest-verified blobs from the companion.
+    local manifest_path
+    manifest_path="$(offline_manifest_path "$root")" || die "offline input manifest is missing or symlinked"
+    if ! python3 - "$manifest_path" <<'PY' >/dev/null 2>&1
+import json, pathlib, sys
+document=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+raise SystemExit(0 if any(isinstance(row,dict) and not str(row.get("name","")).startswith("dockerfile-") and row.get("oci_layout") for row in document.get("image_pins",[])) else 1)
+PY
+    then
+        return 0
+    fi
+    ensure_root_directory "$AOITALK_INSTALL_ROOT/.handoff-tmp" 0700
+    log_path="$AOITALK_INSTALL_ROOT/.handoff-tmp/offline-registry.log"
+    OFFLINE_REGISTRY_TOKEN="$$-${RANDOM}-$(date +%s%N)"
+    python3 "$validator" serve --root "$root" --host 127.0.0.1 --port "$OFFLINE_REGISTRY_PORT" --token "$OFFLINE_REGISTRY_TOKEN" >"$log_path" 2>&1 &
+    OFFLINE_REGISTRY_PID=$!
+    for _ in {1..50}; do
+        if ! kill -0 "$OFFLINE_REGISTRY_PID" >/dev/null 2>&1; then break; fi
+        if curl --noproxy '*' -fsS -D - "http://127.0.0.1:${OFFLINE_REGISTRY_PORT}/v2/" -o /dev/null 2>/dev/null | grep -Fq "X-Offline-Registry-Nonce: $OFFLINE_REGISTRY_TOKEN"; then return 0; fi
+        sleep 0.1
+    done
+    kill "$OFFLINE_REGISTRY_PID" >/dev/null 2>&1 || true
+    wait "$OFFLINE_REGISTRY_PID" >/dev/null 2>&1 || true
+    OFFLINE_REGISTRY_PID=""
+    die "verified offline OCI registry did not start; see $log_path"
+}
+
+stop_offline_registry() {
+    if [[ -n "$OFFLINE_REGISTRY_PID" ]]; then
+        kill "$OFFLINE_REGISTRY_PID" >/dev/null 2>&1 || true
+        wait "$OFFLINE_REGISTRY_PID" >/dev/null 2>&1 || true
+        OFFLINE_REGISTRY_PID=""
+        OFFLINE_REGISTRY_TOKEN=""
+    fi
+}
+
+apply_offline_image_defaults() {
+    local root="${1:-$(offline_inputs_root)}" name ref repository digest key local_ref current
+    [[ -n "$root" && -n "$OFFLINE_REGISTRY_PID" ]] || return 0
+    while IFS=$'\t' read -r name ref; do
+        [[ -n "$name" && -n "$ref" ]] || continue
+        repository="${ref%@*}"; digest="${ref##*@}"
+        case "$name" in
+            postgres) key=AOITALK_POSTGRES_IMAGE ;;
+            qdrant) key=AOITALK_QDRANT_IMAGE ;;
+            caddy) key=AOITALK_CADDY_IMAGE ;;
+            busybox) key=AOITALK_BUSYBOX_IMAGE ;;
+            curl) key=AOITALK_CURL_IMAGE ;;
+            gemma-vllm) key=AOITALK_GEMMA_VLLM_IMAGE ;;
+            sglang) key=AOITALK_SGLANG_IMAGE ;;
+            deepseek-llamacpp) key=AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE ;;
+            *) continue ;;
+        esac
+        if [[ -z "$(python3 - "$(offline_manifest_path "$root")" "$name" <<'PY'
+import json, pathlib, sys
+d=json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")); name=sys.argv[2]
+for row in d.get("image_pins",[]):
+    if isinstance(row,dict) and row.get("name")==name:
+        print(row.get("oci_layout", "")); break
+PY
+        )" ]]; then
+            continue
+        fi
+        local_ref="127.0.0.1:${OFFLINE_REGISTRY_PORT}/${repository}@${digest}"
+        printf -v "$key" '%s' "$local_ref"
+        export "$key"
+    done < <(python3 - "$HANDOFF_ROOT/bundle-manifest.json" <<'PY'
+import json, pathlib
+d=json.loads(pathlib.Path(__import__('sys').argv[1]).read_text(encoding="utf-8"))
+for row in d.get("image_pins",[]):
+    if isinstance(row,dict) and row.get("kind") == "dependency": print(f"{row.get('name','')}\t{row.get('ref','')}")
+PY
+    )
+}
+
+load_offline_images() {
+    local root="${1:-$(offline_inputs_root)}" name ref archive config_digest archive_manifest_digest layout inspect_ref image_id repo_digests platform local_ref repository digest
+    [[ -z "$root" ]] && return 0
+    (( OFFLINE_INPUTS_LOADED )) && return 0
+    verify_offline_inputs "$root"
+    start_offline_registry "$root"
+    apply_offline_image_defaults "$root"
+    select_docker
+    while IFS=$'\t' read -r name ref archive config_digest archive_manifest_digest layout; do
+        [[ -n "$ref" ]] || continue
+        [[ "$archive_manifest_digest" == "${ref##*@}" ]] || die "offline OCI archive manifest digest metadata does not match the canonical pin: $ref"
+        [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "offline OCI archive config digest metadata is invalid: $ref"
+        OFFLINE_IMAGE_CONFIG_DIGESTS["$ref"]="$config_digest"
+        [[ -n "$layout" ]] || die "offline dependency image is missing its verified OCI layout: $ref"
+        repository="${ref%@*}"; digest="${ref##*@}"
+        local_ref="127.0.0.1:${OFFLINE_REGISTRY_PORT}/${repository}@${digest}"
+        OFFLINE_IMAGE_CONFIG_DIGESTS["$local_ref"]="$config_digest"
+        docker_cmd pull --platform linux/amd64 "$local_ref" >/dev/null || die "could not hydrate offline OCI input from the loopback registry: $ref"
+        inspect_ref="$local_ref"
+        docker_cmd image inspect "$inspect_ref" >/dev/null 2>&1 || die "hydrated offline OCI input is not addressable by its immutable loopback ref: $ref"
+        image_id="$(docker_cmd image inspect "$inspect_ref" --format '{{.Id}}' 2>/dev/null || true)"
+        [[ "$image_id" == "$config_digest" ]] || die "loaded offline OCI input config digest does not match the verified archive metadata: $ref"
+        repo_digests="$(docker_cmd image inspect "$inspect_ref" --format '{{json .RepoDigests}}' 2>/dev/null || true)"
+        if [[ "$inspect_ref" == "$ref" ]]; then
+            [[ "$repo_digests" == *"$ref"* ]] || die "loaded offline OCI input RepoDigests do not contain the verified pin: $ref"
+        fi
+        platform="$(docker_cmd image inspect "$inspect_ref" --format '{{.Os}}/{{.Architecture}}' 2>/dev/null || true)"
+        [[ "$platform" == "linux/amd64" ]] || die "loaded offline OCI input has platform $platform; expected linux/amd64: $ref"
+    done < <(python3 - "$(offline_manifest_path "$root")" <<'PY'
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for row in document.get("image_pins", []):
+    if str(row.get("name", "")).startswith("dockerfile-"):
+        continue
+    print(f"{row['name']}\t{row['ref']}\t{row.get('archive','')}\t{row['config_digest']}\t{row['archive_manifest_digest']}\t{row.get('oci_layout','')}")
+PY
+    )
+    OFFLINE_INPUTS_LOADED=1
+}
+
 assert_secure_ancestors() {
     local path="$1" current parent owner mode mode_num
     current="$(dirname "$path")"
@@ -326,6 +619,125 @@ validate_value() {
     esac
 }
 
+validate_timezone() {
+    local value
+    if [[ $# -eq 0 ]]; then
+        value="${AOITALK_TIMEZONE:-Asia/Tokyo}"
+    else
+        # An explicitly empty argument is invalid; do not let `${1:-...}`
+        # silently turn a malformed operator value back into the default.
+        value="$1"
+    fi
+    validate_value AOITALK_TIMEZONE "$value"
+    # Keep this a canonical zoneinfo key, not a POSIX TZ expression, path, or
+    # shell fragment.  The zoneinfo probe below is the authority for aliases
+    # and the actual target image's tzdata database.
+    [[ "$value" =~ ^[A-Za-z0-9._+-]+(/[A-Za-z0-9._+-]+)*$ ]] || \
+        die "AOITALK_TIMEZONE must be an IANA timezone name such as Asia/Tokyo"
+    [[ "$value" != *..* && "$value" != .* && "$value" != */.* && "$value" != */*..* ]] || \
+        die "AOITALK_TIMEZONE contains an unsafe path component"
+    local python_command
+    for python_command in python3 python; do
+        command -v "$python_command" >/dev/null 2>&1 || continue
+        if "$python_command" - "$value" <<'PY'
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import sys
+
+value = sys.argv[1]
+try:
+    zone = ZoneInfo(value)
+except (ZoneInfoNotFoundError, ValueError):
+    raise SystemExit(f"AOITALK_TIMEZONE is not present in the target zoneinfo database: {value}")
+if zone.key != value:
+    raise SystemExit(f"AOITALK_TIMEZONE must use the canonical zoneinfo key: {value}")
+PY
+        then
+            export AOITALK_TIMEZONE="$value"
+            return 0
+        fi
+    done
+    die "AOITALK_TIMEZONE is not present in the target zoneinfo database: $value"
+}
+
+is_loopback_public_address() {
+    local value="${1,,}"
+    if [[ "$value" == \[*\] ]]; then
+        value="${value:1:${#value}-2}"
+    fi
+    if [[ "$value" == *:* || "$value" =~ ^[0-9.]+$ ]]; then
+        local python_command
+        for python_command in python3 python; do
+            if ! command -v "$python_command" >/dev/null 2>&1; then
+                continue
+            fi
+            if ! "$python_command" -c 'import ipaddress' >/dev/null 2>&1; then
+                continue
+            fi
+            "$python_command" - "$value" <<'PY'
+import ipaddress
+import sys
+
+try:
+    raise SystemExit(0 if ipaddress.ip_address(sys.argv[1]).is_loopback else 1)
+except ValueError:
+    raise SystemExit(1)
+PY
+            return $?
+        done
+        return 1
+    fi
+    case "$value" in
+        localhost|localhost.)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+validate_public_host_contract() {
+    local bind="${AOITALK_PUBLIC_BIND_ADDRESS:-127.0.0.1}"
+    local host="${AOITALK_PUBLIC_HOST:-}"
+
+    validate_value AOITALK_PUBLIC_BIND_ADDRESS "$bind"
+    validate_value AOITALK_PUBLIC_HOST "$host"
+
+    [[ -n "$bind" ]] || die "AOITALK_PUBLIC_BIND_ADDRESS must not be empty"
+    case "$bind" in
+        *://*|*/*|*\\*|*$' '*|*$'\t'*)
+            die "AOITALK_PUBLIC_BIND_ADDRESS must be a bind address, not a URL or path"
+            ;;
+    esac
+
+    # Local-only deployments may use localhost/empty because Compose/Caddy's
+    # localhost default is appropriate there.  A non-loopback listener,
+    # including 0.0.0.0/::/a LAN interface, must name the site that clients
+    # actually send in SNI/Host.
+    if is_loopback_public_address "$bind"; then
+        return 0
+    fi
+
+    if [[ -z "$host" ]] || is_loopback_public_address "$host"; then
+        die "AOITALK_PUBLIC_HOST must be set to the LAN IP or DNS name used by clients when AOITALK_PUBLIC_BIND_ADDRESS is non-loopback"
+    fi
+
+    case "$host" in
+        *://*|*/*|*\\*|*$' '*|*$'\t'*)
+            die "AOITALK_PUBLIC_HOST must contain only the client-visible IP or DNS name, without scheme, path, port, or whitespace"
+            ;;
+    esac
+
+    # Bracketed IPv6 is accepted because URL/SNI callers need the brackets.
+    # Other values are ordinary IPv4/DNS/hostname forms.  Caddy remains the
+    # final authority for the concrete site address.
+    if [[ "$host" == \[*\] ]]; then
+        [[ "$host" =~ ^\[[0-9A-Fa-f:]+\]$ ]] || \
+            die "AOITALK_PUBLIC_HOST has an invalid bracketed IPv6 form"
+    else
+        [[ "$host" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] || \
+            die "AOITALK_PUBLIC_HOST must be a LAN IP or DNS name used by clients"
+    fi
+}
+
 provider_allowed_by_operator() {
     local provider="$1" raw token
     raw="${AOITALK_ALLOWED_PROVIDER_IDS:-}"
@@ -343,19 +755,22 @@ provider_allowed_by_operator() {
 }
 
 validate_external_required_models() {
-    local provider="$1" raw token has_qwen=false has_gemma=false
+    local provider="$1" raw token has_qwen=false has_flash=false count=0
     raw="${AOITALK_EXTERNAL_REQUIRED_MODELS:-}"
     validate_value AOITALK_EXTERNAL_REQUIRED_MODELS "$raw"
     [[ -n "$raw" ]] || { [[ "$provider" != openai_compatible_local ]] && return 0; die "AOITALK_EXTERNAL_REQUIRED_MODELS is required for the local router"; }
     IFS=',' read -ra _required_models <<< "$raw"
     for token in "${_required_models[@]}"; do
+        token="${token#${token%%[![:space:]]*}}"
+        token="${token%${token##*[![:space:]]}}"
         [[ "$token" =~ ^[A-Za-z0-9][A-Za-z0-9._:-]*$ ]] || die "AOITALK_EXTERNAL_REQUIRED_MODELS contains an unsafe model ID"
+        ((count+=1))
         [[ "$token" == qwen3.8-27b ]] && has_qwen=true
-        [[ "$token" == gemma-4-26b-a4b-it-qat-q4-0 ]] && has_gemma=true
+        [[ "$token" == qwen3.8-flash-next ]] && has_flash=true
     done
     if [[ "$provider" == openai_compatible_local ]]; then
-        [[ "$has_qwen" == true && "$has_gemma" == true ]] || \
-            die "AOITALK_EXTERNAL_REQUIRED_MODELS must include qwen3.8-27b and gemma-4-26b-a4b-it-qat-q4-0"
+        [[ "$has_qwen" == true && "$has_flash" == true && "$count" == 2 ]] || \
+            die "AOITALK_EXTERNAL_REQUIRED_MODELS must be exactly qwen3.8-27b,qwen3.8-flash-next"
     fi
 }
 
@@ -392,6 +807,8 @@ validate_settings() {
     backend="$(normalize_backend "${AOITALK_BACKEND:-$AOITALK_LLM_MODE}")"
     transport="$(normalize_transport "${AOITALK_TRANSPORT:-https}")"
     export AOITALK_BACKEND="$backend" AOITALK_TRANSPORT="$transport"
+    validate_timezone "$AOITALK_TIMEZONE"
+    validate_public_host_contract
     case "$AOITALK_LLM_MODE" in
         external|core|gemma-vllm|deepseek-llamacpp|sglang|sglang-cuda|openai_compatible_local) ;;
         *) die "AOITALK_LLM_MODE is not a supported compatibility value: $AOITALK_LLM_MODE" ;;
@@ -435,6 +852,8 @@ validate_settings() {
     validate_safe_path AOITALK_RUNTIME_CONFIG_FILE "$AOITALK_RUNTIME_CONFIG_FILE"
     validate_safe_path AOITALK_GEMMA_MODEL_DIR "$AOITALK_GEMMA_MODEL_DIR"
     validate_safe_path AOITALK_DEEPSEEK_MODEL_DIR "$AOITALK_DEEPSEEK_MODEL_DIR"
+    validate_npm_cache_dir
+    validate_offline_inputs_dir
     [[ "$ENV_FILE" == "/etc/aoitalk/.env" ]] || \
         die "ENV_FILE must be /etc/aoitalk/.env for the immutable release layout"
     [[ "$AOITALK_DATA_ROOT" == "/var/lib/aoitalk" ]] || \
@@ -536,6 +955,133 @@ compose_cmd() {
     esac
     [[ "$transport" == http-redirect ]] && files+=(-f "$SCRIPT_DIR/compose.http.yml")
     (cd "$SCRIPT_DIR" && docker_cmd compose --env-file "$ENV_FILE" "${files[@]}" "$@")
+}
+
+enterprise_field_crypto_preflight() {
+    local profile="${1:-${AOITALK_BACKEND:-external}}"
+    # Keep this check on the production entrypoint/provider resolver path.  A
+    # direct host-side Python probe would bypass Docker secret hygiene and the
+    # same runtime configuration used by the long-running service.
+    compose_cmd "$profile" run --rm --no-deps --pull never aoitalk --enterprise-field-crypto-preflight-only
+}
+
+timezone_container_env_check() {
+    local profile="$1" container_id="$2" service="$3" env_dump process_env
+    [[ -n "$container_id" ]] || die "timezone check cannot inspect an empty $service container ID"
+    env_dump="$(docker_cmd inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$container_id" 2>/dev/null || true)"
+    printf '%s\n' "$env_dump" | grep -Fqx "TZ=$AOITALK_TIMEZONE" || \
+        die "$service live process environment does not set TZ=$AOITALK_TIMEZONE"
+    # Config.Env is the declared contract; /proc/1/environ proves the running
+    # process did not lose or rewrite it during entrypoint initialization.
+    process_env="$(compose_cmd "$profile" exec -T "$service" sh -c 'tr "\0" "\n" < /proc/1/environ' 2>/dev/null || true)"
+    printf '%s\n' "$process_env" | grep -Fqx "TZ=$AOITALK_TIMEZONE" || \
+        die "$service live process /proc/1/environ does not set TZ=$AOITALK_TIMEZONE"
+}
+
+probe_python_timezone() {
+    local profile="$1" container_id="$2" probe
+    probe='import os,sys,time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+expected=sys.argv[1]
+if os.environ.get("TZ") != expected:
+    raise SystemExit("Python TZ environment mismatch")
+time.tzset()
+zone=ZoneInfo(expected)
+local=datetime.now().astimezone()
+reference=datetime.now(zone)
+if local.utcoffset() != reference.utcoffset() or local.tzname() != reference.tzname():
+    raise SystemExit("Python effective timezone mismatch")
+print("python timezone=" + expected)'
+    if [[ -n "$container_id" ]]; then
+        compose_cmd "$profile" exec -T aoitalk python -c "$probe" "$AOITALK_TIMEZONE" || \
+            die "Python runtime timezone probe failed"
+    else
+        compose_cmd "$profile" run --rm --no-deps --pull never --entrypoint python aoitalk -c "$probe" "$AOITALK_TIMEZONE" || \
+            die "Python runtime timezone probe failed"
+    fi
+}
+
+probe_node_timezone() {
+    local profile="$1" container_id="$2" probe
+    probe='const expected=process.argv[1];
+if (process.env.TZ !== expected) throw new Error("Node TZ environment mismatch");
+const canonical=new Intl.DateTimeFormat("en-US", {timeZone: expected}).resolvedOptions().timeZone;
+const actual=new Intl.DateTimeFormat("en-US").resolvedOptions().timeZone;
+if (actual !== canonical) throw new Error("Node effective timezone mismatch: " + actual + " (expected " + canonical + ")");
+const instant=new Date();
+const parts=(zone)=>new Intl.DateTimeFormat("en-US", {timeZone: zone, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"}).formatToParts(instant).filter((part)=>part.type !== "literal").map((part)=>part.type + "=" + part.value).join(";");
+if (parts(actual) !== parts(canonical)) throw new Error("Node timezone alias semantics mismatch");
+console.log("node timezone=" + actual);'
+    if [[ -n "$container_id" ]]; then
+        compose_cmd "$profile" exec -T aoitalk node -e "$probe" "$AOITALK_TIMEZONE" || \
+            die "Node.js runtime timezone probe failed"
+    else
+        compose_cmd "$profile" run --rm --no-deps --pull never --entrypoint node aoitalk -e "$probe" "$AOITALK_TIMEZONE" || \
+            die "Node.js runtime timezone probe failed"
+    fi
+}
+
+ensure_postgres_timezone() {
+    local profile="${1:-${AOITALK_BACKEND:-external}}" postgres_id observed
+    postgres_id="$(compose_cmd "$profile" ps --status running -q postgres 2>/dev/null || true)"
+    [[ -n "$postgres_id" ]] || die "PostgreSQL service is not running for timezone initialization"
+    # The timezone value has already passed validate_timezone.  psql's :name
+    # interpolation still quotes it as a SQL literal, so a future validation
+    # regression cannot turn operator input into SQL syntax.
+    compose_cmd "$profile" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+        -v "aoitalk_timezone=$AOITALK_TIMEZONE" -U aoitalk -d postgres -Atqc \
+        "ALTER DATABASE aoitalk_memory SET timezone TO :'aoitalk_timezone';" >/dev/null || \
+        die "could not persist PostgreSQL database timezone default"
+    # A separate psql invocation proves a fresh connection observes the
+    # persisted database setting.  No timestamp columns or rows are changed.
+    observed="$(compose_cmd "$profile" exec -T postgres psql -X -v ON_ERROR_STOP=1 \
+        -U aoitalk -d aoitalk_memory -Atqc 'SHOW timezone' 2>/dev/null | tr -d '\r\n' || true)"
+    [[ "$observed" == "$AOITALK_TIMEZONE" ]] || \
+        die "PostgreSQL fresh connection timezone mismatch: expected=$AOITALK_TIMEZONE actual=$observed"
+    printf 'postgres timezone=%s\n' "$observed"
+}
+
+probe_timezone_runtime() {
+    local profile="${1:-${AOITALK_BACKEND:-external}}" mode="${2:-live}" app_id postgres_id
+    validate_timezone "$AOITALK_TIMEZONE"
+    app_id="$(compose_cmd "$profile" ps --status running -q aoitalk 2>/dev/null || true)"
+    postgres_id="$(compose_cmd "$profile" ps --status running -q postgres 2>/dev/null || true)"
+    if [[ "$mode" == live ]]; then
+        [[ -n "$app_id" ]] || die "AoiTalk service is not running for live timezone verification"
+    elif [[ "$mode" != preflight ]]; then
+        die "invalid timezone probe mode: $mode"
+    fi
+    # Preflight starts only PostgreSQL (below) and probes Python/Node in a
+    # short-lived container with the exact Compose environment. Verify uses the
+    # long-running application container, so both paths test actual processes.
+    probe_python_timezone "$profile" "$app_id"
+    probe_node_timezone "$profile" "$app_id"
+    if [[ -z "$postgres_id" ]]; then
+        [[ "$mode" == preflight ]] || die "PostgreSQL service is not running for live timezone verification"
+        compose_cmd "$profile" up -d --no-build --pull never --wait postgres >/dev/null || \
+            die "could not start PostgreSQL for timezone preflight"
+        postgres_id="$(compose_cmd "$profile" ps --status running -q postgres 2>/dev/null || true)"
+    fi
+    [[ -n "$postgres_id" ]] || die "PostgreSQL service is not running for timezone verification"
+    ensure_postgres_timezone "$profile"
+    if [[ "$mode" == live ]]; then
+        timezone_container_env_check "$profile" "$app_id" aoitalk
+        timezone_container_env_check "$profile" "$postgres_id" postgres
+    fi
+}
+
+prepare_storage_for_preflight() {
+    local profile="${1:-${AOITALK_BACKEND:-external}}"
+    # The local field-crypto fallback is intentionally created by uid 1000
+    # below /app/cache.  That path is a bind mount of the persistent cache,
+    # whose ownership is established by this one-shot root-owned service.  Run
+    # it before the provider sentinel so a fresh host can bootstrap a durable
+    # local key instead of failing merely because init has not started Compose
+    # yet.  The service is idempotent and does not touch secrets or databases.
+    compose_cmd "$profile" rm -f aoitalk-storage-init >/dev/null 2>&1 || true
+    compose_cmd "$profile" run --rm --no-deps --pull never aoitalk-storage-init >/dev/null || \
+        die "persistent storage initialization failed before field crypto preflight"
 }
 
 secret_file() {
@@ -779,6 +1325,14 @@ openai_compatible_local:
   model: $(yaml_quote "$model")
   base_url: $(yaml_quote "$base")
   tools: true
+external_model_privacy:
+  mode: protected
+  trusted_local_hosts:
+    - gemma-vllm
+    - searxng
+search:
+  provider: local
+  hosted_egress_enabled: false
 enterprise_deployment:
   backend: gemma-vllm
   active_backend: gemma-vllm
@@ -806,6 +1360,14 @@ openai_compatible_local:
   model: $(yaml_quote "$model")
   base_url: $(yaml_quote "$base")
   tools: true
+external_model_privacy:
+  mode: protected
+  trusted_local_hosts:
+    - deepseek-llamacpp
+    - searxng
+search:
+  provider: local
+  hosted_egress_enabled: false
 enterprise_deployment:
   backend: deepseek-llamacpp
   active_backend: deepseek-llamacpp
@@ -830,6 +1392,14 @@ openai_compatible_local:
   model: $(yaml_quote "${SGLANG_MODEL:-google/gemma-4-E4B-it}")
   base_url: "http://sglang:30000/v1"
   tools: true
+external_model_privacy:
+  mode: protected
+  trusted_local_hosts:
+    - sglang
+    - searxng
+search:
+  provider: local
+  hosted_egress_enabled: false
 enterprise_deployment:
   backend: sglang-cuda
   active_backend: sglang-cuda
@@ -864,6 +1434,14 @@ openai_compatible_local:
   enable_extra_body: true
   llama_cpp:
     auto_start: false
+external_model_privacy:
+  mode: protected
+  trusted_local_hosts:
+    - host.docker.internal
+    - searxng
+search:
+  provider: local
+  hosted_egress_enabled: false
 enterprise_deployment:
   backend: external
   active_backend: external
@@ -963,7 +1541,9 @@ try:
     m=json.loads(open(manifest_path, encoding='utf-8').read())
 except Exception as exc:
     raise SystemExit(f'invalid handoff manifest: {exc}')
-if m.get('format') != 'aoitalk-enterprise-handoff' or int(m.get('version', 0)) != 1:
+format_name=str(m.get('format',''))
+brand=(format_name[:-len('-enterprise-handoff')] if format_name.endswith('-enterprise-handoff') else '')
+if not re.fullmatch(r'[a-z][a-z0-9]*', brand) or int(m.get('version', 0)) != 1:
     raise SystemExit('handoff manifest format/version is unsupported')
 pins=m.get('image_pins')
 if not isinstance(pins, list) or not pins:
@@ -979,6 +1559,7 @@ if not app_ref: app_ref=values.get('AOITALK_IMAGE','')
 if not app_id: app_id=values.get('AOITALK_IMAGE_ID','')
 expected_keys={'postgres':'AOITALK_POSTGRES_IMAGE','qdrant':'AOITALK_QDRANT_IMAGE','caddy':'AOITALK_CADDY_IMAGE','busybox':'AOITALK_BUSYBOX_IMAGE','curl':'AOITALK_CURL_IMAGE','gemma-vllm':'AOITALK_GEMMA_VLLM_IMAGE','sglang':'AOITALK_SGLANG_IMAGE','deepseek-llamacpp':'AOITALK_DEEPSEEK_LLAMA_CPP_IMAGE'}
 expected_bases={'dockerfile-node':'node@sha256:d649c27dae7ba0137b3cef5dd75baa422c08dc3d9e3fc0c23dfb172dc3cc6436','dockerfile-python':'python@sha256:4766d8b510c428e595d74b9cc5bbb2fae8e26316fffb4adc89908d79aacd58a2'}
+offline_enabled=isinstance(m.get('offline_build'), dict) and m['offline_build'].get('enabled') is True
 dependency_count=0
 base_count=0
 for row in pins:
@@ -986,9 +1567,9 @@ for row in pins:
         raise SystemExit('malformed image pin')
     name=row['name']; ref=row['ref']; kind=row.get('kind','dependency')
     if kind == 'local-build':
-        if name != 'aoitalk' or not row.get('build_from_source') or not row.get('local_image_id_required') or row.get('image_id_env') != 'AOITALK_IMAGE_ID':
+        if name != brand or not row.get('build_from_source') or not row.get('local_image_id_required') or row.get('image_id_env') != f'{brand.upper()}_IMAGE_ID':
             raise SystemExit('application image pin must use the local-image-id contract')
-        if not re.fullmatch(r'aoitalk/enterprise:handoff-[0-9a-f]{12}', ref):
+        if not re.fullmatch(rf'{re.escape(brand)}/enterprise:handoff-(?:[0-9a-f]{{12}}|[0-9a-f]{{40}})', ref):
             raise SystemExit('application image local tag is not commit-bound')
         if app_ref and app_ref != ref: raise SystemExit(f'AOITALK_IMAGE must equal the commit-bound local ref {ref}')
         if app_id and not re.fullmatch(r'sha256:[0-9a-f]{64}', app_id): raise SystemExit('AOITALK_IMAGE_ID must be a Docker image ID')
@@ -1006,7 +1587,9 @@ for row in pins:
     key=expected_keys.get(name)
     if not key: raise SystemExit(f'unknown dependency image pin: {name}')
     value=os.environ.get(key) or values.get(key,'')
-    if value != ref: raise SystemExit(f'{key} does not exactly match bundle-manifest.json')
+    if value != ref:
+        if not (offline_enabled and re.fullmatch(rf'127\.0\.0\.1:51181/{re.escape(repository)}@sha256:[0-9a-f]{{64}}', value or '') and value.rsplit('@', 1)[1] == ref.rsplit('@', 1)[1]):
+            raise SystemExit(f'{key} does not exactly match bundle-manifest.json')
     dependency_count += 1
 if dependency_count != len(expected_keys): raise SystemExit('manifest is missing a required dependency image pin')
 if base_count != len(expected_bases): raise SystemExit('manifest is missing a required Dockerfile base pin')
@@ -1020,7 +1603,7 @@ for image in expected_bases.values():
         raise SystemExit(f'Dockerfile FROM is not pinned to manifest: {image}')
 if re.search(r'^FROM\s+(?:node|python)(?::|\s)', dockerfile, re.MULTILINE | re.IGNORECASE):
     raise SystemExit('Dockerfile contains a mutable node/python FROM tag')
-if app_ref and not app_id: raise SystemExit('AOITALK_IMAGE_ID is required for the locally built application image')
+if app_ref and not app_id: raise SystemExit(f'{brand.upper()}_IMAGE_ID is required for the locally built application image')
 print('image pins: dependency RepoDigest/env equality, Dockerfile base digests, and local app image-ID boundary OK')
 PY
 }
@@ -1055,21 +1638,151 @@ set_env_value() {
     export "$key=$value"
 }
 
+build_audit_log_path() {
+    local commit="$1" audit_dir stamp path
+    # Keep build evidence out of the sanitized release/source tree and out of
+    # the application log bind mount.  The install root is root-owned and the
+    # audit directory is mode 0700 so only the target operator can inspect it.
+    audit_dir="$AOITALK_INSTALL_ROOT/build-audit"
+    ensure_root_directory "$audit_dir" 0700
+    stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
+    path="$audit_dir/${stamp}-${commit:0:12}.log"
+    [[ ! -e "$path" && ! -L "$path" ]] || die "build audit log path already exists"
+    (umask 077; : > "$path")
+    chown root:root "$path"
+    chmod 0600 "$path"
+    printf '%s\n' "$path"
+}
+
+redact_build_output() {
+    # BuildKit's plain progress is useful evidence, but a future build script
+    # must not be able to persist a mounted secret accidentally.  Filter every
+    # materialized single-line secret before output reaches either the console
+    # or the durable audit log.  A read/parse failure is fatal to the pipeline,
+    # preserving fail-closed secret handling.
+    local secrets_dir="${1:-$AOITALK_SECRETS_DIR}"
+    # Keep fd 0 attached to the BuildKit/Docker pipeline.  The previous
+    # `python3 - ... <<'PY'` form consumed stdin as Python source, so the
+    # program's sys.stdin.buffer never received the piped build stream.
+    # Feed the program through fd 3 and reserve stdin exclusively for data.
+    python3 /dev/fd/3 "$secrets_dir" 3<<'PY'
+import pathlib
+import sys
+
+root = pathlib.Path(sys.argv[1])
+try:
+    values = []
+    for path in sorted(root.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            continue
+        raw = path.read_bytes().rstrip(b"\r\n")
+        # generate_secret_file uses the conventional trailing newline from
+        # openssl/base64; the shell/container contract strips that newline
+        # before exporting the value, so normalize it here as well.  Any
+        # remaining control/newline byte is malformed for the secret contract;
+        # abort rather than risk writing an unredacted multi-line value.
+        if not raw:
+            continue
+        if b"\x00" in raw or b"\n" in raw or b"\r" in raw:
+            raise ValueError("invalid multiline secret")
+        values.append(raw)
+    # Replace longest values first so a short secret cannot leave a suffix of
+    # a longer value visible in the progress stream.
+    values.sort(key=len, reverse=True)
+    stream = sys.stdin.buffer
+    output = sys.stdout.buffer
+    for line in stream:
+        for value in values:
+            line = line.replace(value, b"[REDACTED]")
+        output.write(line)
+        output.flush()
+except Exception:
+    raise SystemExit(1)
+PY
+}
+
+validate_build_pipeline_statuses() {
+    local audit_log="$1"
+    local docker_status="${2:-1}"
+    local redactor_status="${3:-1}"
+    local tee_status="${4:-1}"
+
+    # A downstream audit failure can close the pipe and induce a nonzero
+    # upstream/Docker status.  Preserve the audit failure as the primary
+    # diagnostic boundary and include every stage status for investigation.
+    if (( redactor_status != 0 || tee_status != 0 )); then
+        die "Docker build audit capture failed (docker=$docker_status redactor=$redactor_status tee=$tee_status); audit log may be incomplete: $audit_log"
+    fi
+    if (( docker_status != 0 )); then
+        die "Docker build failed (exit $docker_status); audit log retained at $audit_log"
+    fi
+}
+
 build_app_image() {
-    local backend="$(normalize_backend "${1:-$AOITALK_BACKEND}")" commit local_ref secret_path image_id platform
+    local backend="$(normalize_backend "${1:-$AOITALK_BACKEND}")" commit local_ref secret_path image_id platform audit_log offline_root
+    local -a npm_build_args=()
+    local -a offline_context_args=()
+    local -a pipeline_status=()
+    validate_npm_cache_dir
+    offline_root="$(offline_inputs_root)"
+    if [[ -n "$offline_root" ]]; then
+        verify_offline_inputs "$offline_root"
+        [[ -d "$offline_root/npm-cache" && ! -L "$offline_root/npm-cache" ]] || die "verified offline npm cache directory is missing or symlinked"
+        if [[ -n "${AOITALK_NPM_CACHE_DIR:-}" && "$AOITALK_NPM_CACHE_DIR" != "$offline_root/npm-cache" ]]; then
+            die "AOITALK_NPM_CACHE_DIR must be the verified offline input npm-cache when AOITALK_OFFLINE_INPUTS_DIR is set"
+        fi
+        while IFS=$'\t' read -r image_name layout platform_manifest_digest; do
+            [[ -n "$image_name" && -n "$layout" && -n "$platform_manifest_digest" ]] || continue
+            case "$image_name" in
+                dockerfile-node) offline_context_args+=(--build-arg BUILDKIT_SYNTAX=dockerfile.v0 --build-context "enterprise-node-base=oci-layout://$offline_root/$layout@$platform_manifest_digest") ;;
+                dockerfile-python) offline_context_args+=(--build-context "enterprise-python-base=oci-layout://$offline_root/$layout@$platform_manifest_digest") ;;
+                *) ;;
+            esac
+        done < <(python3 - "$(offline_manifest_path "$offline_root")" <<'PY'
+import json, pathlib, sys
+document = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+for row in document.get("image_pins", []):
+    if str(row.get("name", "")).startswith("dockerfile-"):
+        print(f"{row['name']}\t{row['oci_layout']}\t{row['platform_manifest_digest']}")
+PY
+        )
+        [[ ${#offline_context_args[@]} -eq 4 ]] || die "verified offline inputs did not provide both OCI Dockerfile base contexts"
+        npm_build_args+=(--build-context "npm-cache=$offline_root/npm-cache" --build-context "offline-inputs=$offline_root" "${offline_context_args[@]}" --build-arg NPM_INSTALL_MODE=offline --build-arg AOITALK_OFFLINE_BUILD=1 --network=none)
+    elif [[ -n "${AOITALK_NPM_CACHE_DIR:-}" ]]; then
+        npm_build_args+=(--build-context "npm-cache=$AOITALK_NPM_CACHE_DIR" --build-arg NPM_INSTALL_MODE=offline)
+    fi
     select_docker
     [[ -f "$AOITALK_BUNDLE_ROOT/Dockerfile" && ! -L "$AOITALK_BUNDLE_ROOT/Dockerfile" ]] || die "sanitized source Dockerfile is missing or symlinked"
     secret_path="$(secret_file nextauth_secret)"
     assert_root_owned_file "$secret_path"
     [[ -s "$secret_path" ]] || die "nextauth_secret must be materialized by init before the BuildKit build"
     commit="$(manifest_source_commit)"
-    local_ref="aoitalk/enterprise:handoff-${commit:0:12}"
+    # The application image tag is bound to the complete source identity.  A
+    # local tag is only a build handle; the recorded image ID remains the
+    # authoritative immutable application contract.
+    local_ref="aoitalk/enterprise:handoff-${commit}"
     # The token is passed only through BuildKit's secret mount. It is never an
     # ARG, shell-expanded command value, build log line, or ZIP input.
-    info "Building local Enterprise application image from sanitized source (BuildKit secret mount)"
-    docker_cmd build --platform linux/amd64 --pull=false --progress=plain \
+    audit_log="$(build_audit_log_path "$commit")"
+    info "Building local Enterprise application image from sanitized source (BuildKit secret mount; audit=$audit_log)"
+    # Keep --progress=plain on the target for actionable diagnostics.  Pipe it
+    # through the secret-value filter before teeing to both the operator's
+    # terminal and a root-only durable audit file.  PIPESTATUS captures the
+    # Docker exit code without masking failures behind tee/redaction.
+    set +e
+    docker_cmd build --platform linux/amd64 --pull=false --no-cache --progress=plain \
+        "${npm_build_args[@]}" \
         --secret "id=nextauth_secret,src=$secret_path" \
-        --tag "$local_ref" "$AOITALK_BUNDLE_ROOT" >/dev/null
+        --tag "$local_ref" "$AOITALK_BUNDLE_ROOT" 2>&1 |
+        redact_build_output "$AOITALK_SECRETS_DIR" |
+        tee "$audit_log"
+    pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+    validate_build_pipeline_statuses \
+        "$audit_log" \
+        "${pipeline_status[0]:-1}" \
+        "${pipeline_status[1]:-1}" \
+        "${pipeline_status[2]:-1}"
     image_id="$(docker_cmd image inspect "$local_ref" --format '{{.Id}}')"
     [[ "$image_id" =~ ^sha256:[0-9a-fA-F]{64}$ ]] || die "local application image did not return a Docker image ID"
     platform="$(docker_cmd image inspect "$local_ref" --format '{{.Os}}/{{.Architecture}}')"
@@ -1081,14 +1794,26 @@ build_app_image() {
 }
 
 verify_loaded_image_pins() {
-    local backend="$(normalize_backend "${1:-$AOITALK_BACKEND}")" ref repo_digests expected app_id actual_id
+    local backend="$(normalize_backend "${1:-$AOITALK_BACKEND}")" ref repo_digests expected app_id actual_id config_digest inspect_ref image_id
     [[ -n "${AOITALK_IMAGE:-}" && -n "${AOITALK_IMAGE_ID:-}" ]] || die "local application image must be built before dependency verification"
     actual_id="$(docker_cmd image inspect "$AOITALK_IMAGE" --format '{{.Id}}' 2>/dev/null || true)"
     [[ "$actual_id" == "$AOITALK_IMAGE_ID" ]] || die "local application image ID changed after build"
     while IFS= read -r ref; do
         [[ -n "$ref" ]] || continue
+        [[ "$ref" == "${AOITALK_IMAGE:-}" ]] && continue
         repo_digests="$(docker_cmd image inspect "$ref" --format '{{json .RepoDigests}}' 2>/dev/null || true)"
-        [[ "$repo_digests" == *"$ref"* ]] || die "pulled image RepoDigests do not contain the manifest pin: $ref"
+        if [[ -n "$(offline_inputs_root)" ]]; then
+            if [[ "$repo_digests" == *"$ref"* ]]; then
+                continue
+            fi
+            config_digest="${OFFLINE_IMAGE_CONFIG_DIGESTS[$ref]:-}"
+            [[ "$config_digest" =~ ^sha256:[0-9a-f]{64}$ ]] || die "offline image config digest metadata is missing: $ref"
+            inspect_ref="$config_digest"
+            image_id="$(docker_cmd image inspect "$inspect_ref" --format '{{.Id}}' 2>/dev/null || true)"
+            [[ "$image_id" == "$config_digest" ]] || die "offline image config digest changed after load: $ref"
+        else
+            [[ "$repo_digests" == *"$ref"* ]] || die "pulled image RepoDigests do not contain the manifest pin: $ref"
+        fi
     done < <(image_refs "$backend" | tail -n +2)
 }
 
@@ -1464,6 +2189,9 @@ build_images() {
     local backend="$(normalize_backend "${1:-$AOITALK_BACKEND}")" services
     select_docker
     apply_manifest_image_defaults
+    if [[ -n "$(offline_inputs_root)" ]]; then
+        load_offline_images "$(offline_inputs_root)"
+    fi
     build_app_image "$backend"
     verify_image_pins "$backend"
     services="aoitalk-storage-init postgres qdrant qdrant-ready caddy"
@@ -1472,10 +2200,15 @@ build_images() {
         deepseek-llamacpp) services+=" deepseek-llamacpp" ;;
         sglang-cuda) services+=" sglang-cuda" ;;
     esac
-    # Pull only immutable dependency services; the aoitalk image was built
-    # locally above and must never trigger a registry pull by tag.
-    # shellcheck disable=SC2086
-    compose_cmd "$backend" pull --quiet $services
+    # Online mode pulls the immutable dependency services. Offline mode has
+    # already pulled the same digests from the loopback read-only registry;
+    # Compose itself must never contact a public registry.
+    if [[ -z "$(offline_inputs_root)" ]]; then
+        # shellcheck disable=SC2086
+        compose_cmd "$backend" pull --quiet $services
+    else
+        info "Using verified offline OCI inputs from the loopback registry; public dependency pull is disabled"
+    fi
     verify_loaded_image_pins "$backend"
 }
 
@@ -1630,6 +2363,10 @@ preflight() {
     backend="$(normalize_backend "$profile")"
     transport="$(normalize_transport "${AOITALK_TRANSPORT:-https}")"
     select_docker
+    if [[ -n "$(offline_inputs_root)" ]]; then
+        verify_offline_inputs "$(offline_inputs_root)"
+        load_offline_images "$(offline_inputs_root)"
+    fi
     assert_single_inference_backend "$backend"
     docker_cmd compose version >/dev/null 2>&1 || die "Docker Compose v2 is required"
     docker_version_check
@@ -1659,8 +2396,9 @@ preflight() {
     fi
     # Re-check the path boundary on every preflight, including subsequent
     # starts where init is skipped; never let Compose follow a replaced link.
-    # Do not chown live application directories here: the running app owns
-    # those bind mounts as uid 1000 after the storage-init service completes.
+    # Ownership is changed only by the pinned storage-init service below (and
+    # never by this host shell), so the same uid-1000 bind-mount contract is
+    # exercised by both preflight and the later startup path.
     validate_persistent_directories
     free_kb="$(df -Pk "$AOITALK_DATA_ROOT" | awk 'NR==2 {print $4}')"
     min_kb="$(( ${AOITALK_MIN_FREE_GB:-10} * 1024 * 1024 ))"
@@ -1677,6 +2415,14 @@ preflight() {
         [[ "$AOITALK_EXTERNAL_BASE_URL" =~ ^https:// ]] || warn "external provider URL is not HTTPS: $AOITALK_EXTERNAL_BASE_URL"
     fi
     compose_cmd "$profile" config --quiet >/dev/null
+    # Ensure bind-mounted cache/workspace paths are writable by uid 1000 before
+    # asking the production entrypoint to resolve a freshly generated local
+    # field-crypto key.  This one-shot service is idempotent and runs before
+    # the sentinel, while the later `up` path repeats it immediately before
+    # starting the long-running services.
+    prepare_storage_for_preflight "$profile"
+    enterprise_field_crypto_preflight "$profile"
+    probe_timezone_runtime "$profile" preflight
     info "Preflight passed for profile=$profile, architecture=linux/amd64, data_root=$AOITALK_DATA_ROOT."
 }
 
@@ -1705,8 +2451,8 @@ up_project() {
         # The explicit external profile is a safe escape hatch from a stale
         # SGLang overlay; existing database settings remain authoritative.
         AOITALK_LLM_MODE=external
-        if [[ "${AOITALK_PRESERVE_RUNTIME_CONFIG:-false}" == "true" ]]; then
-            info "Preserving the existing runtime config for rollback/recovery"
+        if [[ "${AOITALK_PRESERVE_RUNTIME_CONFIG:-false}" == "true" || ( -s "$AOITALK_RUNTIME_CONFIG_FILE" && "${AOITALK_REGENERATE_RUNTIME_CONFIG:-false}" != "true" ) ]]; then
+            info "Preserving the existing runtime config for normal update/startup"
         else
             init_runtime regenerate
         fi
@@ -1724,7 +2470,12 @@ up_project() {
     compose_cmd "$backend" run --rm --no-deps --pull never aoitalk-storage-init >/dev/null
     info "Starting verified images (no implicit pull/build) with backend=$backend transport=$(normalize_transport "$AOITALK_TRANSPORT")"
     compose_cmd "$backend" up -d --remove-orphans --no-build --pull never --wait
+    # Persist the database default after every successful startup. PostgreSQL's
+    # command-line -c setting covers service restarts; this idempotent ALTER
+    # covers an existing volume created before the timezone contract existed.
+    ensure_postgres_timezone "$backend"
     verify_project "$backend"
+    durable_note_started
 }
 
 https_external_smoke() {
@@ -1887,6 +2638,7 @@ verify_project() {
     if [[ "$backend" == external && "$AOITALK_EXTERNAL_PROVIDER" == openai_compatible_local ]]; then
         verify_external_router "$profile"
     fi
+    probe_timezone_runtime "$profile" live
     bootstrap_code="$(curl -k -sS -o /dev/null -w '%{http_code}' \
         --resolve "localhost:${AOITALK_BOOTSTRAP_HTTPS_PORT}:127.0.0.1" \
         "https://localhost:${AOITALK_BOOTSTRAP_HTTPS_PORT}/login" || true)"
@@ -1942,33 +2694,7 @@ down_project() {
     info "Containers stopped; data under $AOITALK_DATA_ROOT was retained."
 }
 
-update_project() {
-    local staged_bundle="${1:-}" profile="${2:-external}"
-    [[ -n "$staged_bundle" ]] || die "update requires a handoff ZIP path"
-    [[ "$staged_bundle" == /* ]] || die "update bundle path must be absolute"
-    [[ "${staged_bundle,,}" == *.zip ]] || die "update accepts only the canonical handoff ZIP; directory input is disabled"
-    [[ -f "$staged_bundle" && ! -L "$staged_bundle" ]] || die "update ZIP is missing or symlinked"
-    validate_profile "$profile"
-    require_root update
-    [[ -x "$BUNDLE_ROOT/deploy/enterprise/update-on-server.sh" ]] || \
-        die "update-on-server.sh is missing from the current release"
-    info "Starting Enterprise handoff update: safe ZIP extraction/checksum/manifest -> atomic source activation -> target BuildKit image/dependency pins -> Compose up/preflight/HTTPS smoke"
-    "$BUNDLE_ROOT/deploy/enterprise/update-on-server.sh" apply "$staged_bundle" "$AOITALK_INSTALL_ROOT" "$profile"
-    local current_root="$(readlink -f "$AOITALK_CURRENT_LINK")" next_launcher="$current_root/source/deploy/enterprise/deploy-compose.sh"
-    [[ -x "$next_launcher" ]] || die "activated handoff launcher is missing or not executable"
-    # The newly activated release is the only script allowed to build/start it;
-    # this keeps source paths, manifest pins, and Compose files consistent.
-    AOITALK_ENV_FILE="$ENV_FILE" AOITALK_INSTALL_ROOT="$AOITALK_INSTALL_ROOT" \
-        "$next_launcher" up "$profile"
-}
-
-rollback_project() {
-    local release_id="${1:-}" profile="${2:-external}"
-    [[ -n "$release_id" ]] || die "rollback requires a release_id"
-    validate_profile "$profile"
-    require_root rollback
-    "$BUNDLE_ROOT/deploy/enterprise/update-on-server.sh" rollback "$AOITALK_INSTALL_ROOT" "$release_id" "$profile"
-}
+# Transactional update/rollback definitions are loaded from durable-lifecycle.sh.
 
 runtime_yaml_value() {
     local key="$1"
@@ -2208,10 +2934,10 @@ Commands:
   download-model              legacy target-side HF_TOKEN downloader (Gemma/vLLM only)
   prerequisites [runtime|build]
                                fail-closed check of curl/python3, safe filesystem, Docker BuildKit/Compose
-  update <handoff.zip> [profile]
+  update <handoff.zip> [profile] [offline-inputs.zip]
                                safe-extract/checksum/manifest, activate, build/pull, preflight, Compose up, HTTPS smoke
-  rollback <release-id> [profile]
-                              activate an immutable previous release; migrations are not reversed automatically
+  rollback <transaction-id>
+                              restore both durable stores, previous pointer and exact previous runtime
 EOF
 }
 
@@ -2219,6 +2945,10 @@ main() {
     ensure_env_file
     load_env_file
     set_defaults
+    # Validate before any command (including status/logs) can hand values to
+    # Compose interpolation. validate_settings repeats this check for the
+    # state-changing lifecycle commands.
+    validate_timezone "$AOITALK_TIMEZONE"
     apply_manifest_image_defaults
     local command="${1:-}" arg="${2:-}"
     case "$command" in
@@ -2228,7 +2958,10 @@ main() {
             fi
             ;;
     esac
-    trap 'release_operation_lock' EXIT
+    trap 'stop_offline_registry; release_operation_lock' EXIT
+    case "$command" in
+        load|preflight|up) durable_start_guard ;;
+    esac
     case "$command" in
         init)
             if [[ "$arg" == "--regenerate-config" ]]; then
@@ -2275,7 +3008,7 @@ main() {
             diagnose "${arg:-}"
             ;;
         update)
-            update_project "$arg" "${3:-external}"
+            update_project "$arg" "${3:-external}" "${4:-}"
             ;;
         rollback)
             rollback_project "$arg" "${3:-external}"
@@ -2289,5 +3022,7 @@ main() {
             ;;
     esac
 }
+
+source "$SCRIPT_DIR/durable-lifecycle.sh"
 
 main "$@"

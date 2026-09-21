@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar, Token
+from contextvars import ContextVar, Token, copy_context
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Iterator, Mapping
+
+
+# Provider-local system prompt used only while a trusted AoiTalk Help turn is
+# active.  The complete, authenticated Guide snapshot is carried in the
+# request prompt; this short static prefix prevents a long-lived provider's
+# ordinary character/custom/session prompt from leaking into that turn.
+AOITALK_HELP_ISOLATED_SYSTEM_PROMPT = (
+    "AoiTalk Helpの回答専用ターンです。"
+    "ユーザー入力に含まれるサーバー検証済みAoiTalkガイド本文と、"
+    "補助的な画像証拠だけを根拠に日本語で回答してください。"
+    "ツール、検索、Docs・Project・会話履歴の参照や製品データの操作は行わず、"
+    "ガイドに根拠がない仕様は確認できないと伝えてください。"
+)
 
 
 @dataclass(frozen=True)
@@ -53,11 +66,58 @@ class TurnContext:
     # stewardship by themselves.
     verified_project_attachment: bool = False
 
+    # Trusted background controllers may provide their complete bounded
+    # context explicitly and prohibit the normal chat ContextBuilder layers.
+    suppress_automatic_context: bool = False
+    # When set, read tools must remain on exactly ``project_id``. This is a
+    # server-issued execution constraint, never a prompt/model-controlled flag.
+    strict_project_scope: bool = False
+
+    # Cloud Advisor is a parent-owned capability.  These fields are optional
+    # request-boundary metadata and are deliberately kept separate from the
+    # user/model-visible prompt.  ``cloud_advisor_origin`` is normalized to
+    # the service enum when supplied by a trusted caller (including the
+    # system-owned workflow controller); malformed values are discarded (fail
+    # closed to the normal Main-agent origin).  The assessment is accepted
+    # only when it is the immutable semantic assessment object owned by
+    # ``cloud_advisor_service``; arbitrary mappings/booleans from a request or
+    # model tool argument never become escalation authority.
+    cloud_advisor_origin: Any | None = None
+    cloud_advisor_assessment: Any | None = None
+
 
 _current_turn_context: ContextVar[TurnContext] = ContextVar(
     "assistant_turn_context",
     default=TurnContext(),
 )
+
+
+def bind_context_to_iterator(iterator: Iterator[Any]) -> Iterator[Any]:
+    """Run every ``next``/``close`` of a lazy iterator in this context.
+
+    A synchronous generator does not execute its body until the first
+    consumer call.  Public provider ``stream_chat`` APIs are commonly created
+    inside a request and consumed after that request has reset its
+    ``ContextVar`` tokens (or on another thread).  Capturing only the context
+    at generator creation is therefore insufficient; each iterator operation
+    must execute under the captured context.
+    """
+
+    captured = copy_context()
+
+    def _bound() -> Iterator[Any]:
+        try:
+            while True:
+                try:
+                    yield captured.run(next, iterator)
+                except StopIteration:
+                    return
+        finally:
+            close = getattr(iterator, "close", None)
+            if callable(close):
+                captured.run(close)
+
+    return _bound()
 
 
 def set_turn_context(
@@ -73,6 +133,10 @@ def set_turn_context(
     docs_reference_ids: Iterable[str] | None = None,
     explicit_references: Iterable[ResourceReference | Mapping[str, Any] | tuple[str, str]] | None = None,
     verified_project_attachment: bool = False,
+    suppress_automatic_context: bool = False,
+    strict_project_scope: bool = False,
+    cloud_advisor_origin: Any | None = None,
+    cloud_advisor_assessment: Any | None = None,
 ) -> Token:
     normalized_reference_ids = tuple(
         dict.fromkeys(
@@ -126,6 +190,39 @@ def set_turn_context(
             ]
         )
     )
+
+    # Keep the turn-context module independent from the Cloud Advisor service
+    # at import time (the service itself imports ``get_turn_context``).  The
+    # trusted type check therefore happens lazily at the request boundary.
+    # Unknown origins/assessment shapes are ignored rather than promoted to
+    # automatic-escalation authority.
+    normalized_cloud_origin: Any | None = None
+    if cloud_advisor_origin is not None:
+        try:
+            from .cloud_advisor_service import CloudAdvisorTriggerOrigin
+
+            if isinstance(cloud_advisor_origin, CloudAdvisorTriggerOrigin):
+                normalized_cloud_origin = cloud_advisor_origin
+            else:
+                normalized_cloud_origin = CloudAdvisorTriggerOrigin(
+                    str(cloud_advisor_origin).strip().casefold()
+                )
+        except (ImportError, TypeError, ValueError):
+            normalized_cloud_origin = None
+
+    normalized_cloud_assessment: Any | None = None
+    if cloud_advisor_assessment is not None:
+        try:
+            from .cloud_advisor_service import CloudAdvisorEscalationAssessment
+
+            if isinstance(
+                cloud_advisor_assessment,
+                CloudAdvisorEscalationAssessment,
+            ):
+                normalized_cloud_assessment = cloud_advisor_assessment
+        except ImportError:
+            normalized_cloud_assessment = None
+
     return _current_turn_context.set(
         TurnContext(
             user_id=str(user_id).strip() if user_id else None,
@@ -145,6 +242,10 @@ def set_turn_context(
             docs_reference_ids=normalized_docs_reference_ids,
             explicit_references=tuple(normalized_references),
             verified_project_attachment=bool(verified_project_attachment),
+            suppress_automatic_context=bool(suppress_automatic_context),
+            strict_project_scope=bool(strict_project_scope),
+            cloud_advisor_origin=normalized_cloud_origin,
+            cloud_advisor_assessment=normalized_cloud_assessment,
         )
     )
 
@@ -228,3 +329,54 @@ def is_explicit_reference_in_turn(
 
 def reset_turn_context(token: Token) -> None:
     _current_turn_context.reset(token)
+
+
+def set_cloud_advisor_turn_context(
+    *,
+    origin: Any,
+    assessment: Any | None = None,
+) -> Token:
+    """Bind trusted Cloud Advisor metadata to the current turn.
+
+    Parent/request controllers should call this only after deciding the
+    trigger origin and (for automatic mode) constructing a
+    ``CloudAdvisorEscalationAssessment`` from trusted semantic signals.  The
+    helper rejects arbitrary mappings and model-provided booleans, preserving
+    the fail-closed default when the service is unavailable or the values are
+    malformed.  Reset the returned token with :func:`reset_turn_context`.
+    """
+
+    current = get_turn_context()
+    # Reuse the exact normalization performed by ``set_turn_context`` without
+    # rebuilding unrelated identity/scope fields.  This keeps the helper safe
+    # for nested parent scopes and avoids an import cycle at module load time.
+    normalized_origin: Any | None = None
+    normalized_assessment: Any | None = None
+    try:
+        from .cloud_advisor_service import (
+            CloudAdvisorEscalationAssessment,
+            CloudAdvisorTriggerOrigin,
+        )
+
+        if isinstance(origin, CloudAdvisorTriggerOrigin):
+            normalized_origin = origin
+        else:
+            normalized_origin = CloudAdvisorTriggerOrigin(
+                str(origin).strip().casefold()
+            )
+        if assessment is None:
+            normalized_assessment = CloudAdvisorEscalationAssessment()
+        elif isinstance(assessment, CloudAdvisorEscalationAssessment):
+            normalized_assessment = assessment
+    except (ImportError, TypeError, ValueError):
+        # A missing service or malformed caller input cannot grant authority.
+        normalized_origin = None
+        normalized_assessment = None
+
+    return _current_turn_context.set(
+        replace(
+            current,
+            cloud_advisor_origin=normalized_origin,
+            cloud_advisor_assessment=normalized_assessment,
+        )
+    )

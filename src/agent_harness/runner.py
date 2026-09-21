@@ -78,6 +78,10 @@ class CodexExecRunner(AgentRunner):
                 cmd,
                 scope=active_scope,
                 cwd=workspace,
+                timeout_seconds=max(
+                    float(self.settings.codex.stall_timeout_ms) / 1000.0,
+                    1.0,
+                ),
                 on_event=on_event,
             )
 
@@ -257,6 +261,10 @@ class ClaudeCodeRunner(AgentRunner):
                 cwd=workspace,
                 event_name="claude_output",
                 failure_event="claude_code_failed",
+                timeout_seconds=max(
+                    float(self.settings.codex.stall_timeout_ms) / 1000.0,
+                    1.0,
+                ),
                 on_event=on_event,
             )
         return await _run_plain_process(
@@ -332,6 +340,10 @@ class CustomCommandRunner(AgentRunner):
                 cwd=workspace,
                 event_name="custom_agent_output",
                 failure_event="custom_agent_failed",
+                timeout_seconds=max(
+                    float(self.settings.codex.stall_timeout_ms) / 1000.0,
+                    1.0,
+                ),
                 on_event=on_event,
             )
         return await _run_plain_process(
@@ -469,6 +481,7 @@ async def _spawn_scoped_process(
     *,
     scope: Any,
     cwd: Path,
+    timeout_seconds: float,
 ) -> tuple[Any | None, str | None]:
     """Spawn one child through the verified WSL+bwrap backend only."""
 
@@ -485,6 +498,7 @@ async def _spawn_scoped_process(
             cwd=safe_cwd,
             shell="bash",
             env=env,
+            timeout=max(float(timeout_seconds), 1.0),
             popen_kwargs={
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.PIPE,
@@ -499,8 +513,27 @@ async def _spawn_scoped_process(
     return process, None
 
 
-async def _read_process_line(process: Any) -> bytes | str:
-    """Read a backend stream without blocking the asyncio event loop."""
+def _scoped_output_limit() -> int:
+    try:
+        from ..security.harness_execution_scope import (
+            get_current_harness_execution_scope,
+        )
+
+        upper = get_current_harness_execution_scope()
+        limits = getattr(upper, "resource_limits", None) if upper is not None else None
+        if limits is not None:
+            return max(1, min(int(limits.max_output_bytes), 64 * 1024 * 1024))
+    except Exception:
+        pass
+    return 32_768
+
+
+async def _read_process_line(
+    process: Any,
+    *,
+    limit: int | None = None,
+) -> bytes | str:
+    """Read one bounded line without blocking the asyncio event loop."""
 
     stream = getattr(process, "stdout", None)
     if stream is None:
@@ -508,10 +541,45 @@ async def _read_process_line(process: Any) -> bytes | str:
     # WslBwrapBackend owns a synchronous ``subprocess.Popen``.  Test doubles
     # and legacy adapters may expose an async readline; support both without
     # changing the host subprocess path.
-    value = await asyncio.to_thread(stream.readline)
+    limit = _scoped_output_limit() if limit is None else max(int(limit), 1)
+    try:
+        value = await asyncio.to_thread(stream.readline, limit + 1)
+    except TypeError:  # pragma: no cover - minimal async/test stream adapter
+        value = await asyncio.to_thread(stream.readline)
     if inspect.isawaitable(value):
         value = await value
+    if isinstance(value, (bytes, str)) and len(value) > limit:
+        newline = b"\n" if isinstance(value, bytes) else "\n"
+        # Drain the remainder of an oversized logical line in bounded chunks;
+        # retaining it would let one no-newline runner message exhaust host
+        # memory before the output/event tail cap can run.
+        while value and not value.endswith(newline):
+            try:
+                remainder = await asyncio.to_thread(stream.readline, limit + 1)
+            except TypeError:  # pragma: no cover
+                remainder = await asyncio.to_thread(stream.readline)
+            if inspect.isawaitable(remainder):
+                remainder = await remainder
+            if not remainder or remainder.endswith(newline):
+                break
+        marker = (
+            b"...[scoped runner line truncated]"
+            if isinstance(value, bytes)
+            else "...[scoped runner line truncated]"
+        )
+        value = value[: max(limit - len(marker), 0)] + marker
     return value
+
+
+def _bounded_output_tail(current: str, value: str, *, limit: int = 32_768) -> str:
+    combined = f"{current}\n{value}" if current else value
+    payload = combined.encode("utf-8", errors="replace")
+    if len(payload) <= limit:
+        return combined
+    marker = b"...[scoped runner output truncated]...\n"
+    tail_size = max(limit - len(marker), 0)
+    tail = payload[-tail_size:] if tail_size else b""
+    return (marker[:limit] + tail).decode("utf-8", errors="replace")
 
 
 async def _wait_scoped_process(process: Any) -> int:
@@ -570,11 +638,17 @@ async def _run_plain_process_scoped(
     cwd: Path,
     event_name: str,
     failure_event: str,
+    timeout_seconds: float = 300.0,
     on_event: HarnessEventCallback | None = None,
 ) -> RunResult:
     """Run Claude/custom harness output through WSL2+bwrap."""
 
-    process, error = await _spawn_scoped_process(cmd, scope=scope, cwd=cwd)
+    process, error = await _spawn_scoped_process(
+        cmd,
+        scope=scope,
+        cwd=cwd,
+        timeout_seconds=timeout_seconds,
+    )
     if error:
         if on_event:
             await _emit(
@@ -586,10 +660,11 @@ async def _run_plain_process_scoped(
             )
         return RunResult(success=False, message=error)
 
-    output_lines: list[str] = []
+    output_tail = ""
+    output_limit = _scoped_output_limit()
     try:
         while True:
-            line = await _read_process_line(process)
+            line = await _read_process_line(process, limit=output_limit)
             if line in (b"", "", None):
                 break
             if isinstance(line, bytes):
@@ -598,8 +673,11 @@ async def _run_plain_process_scoped(
                 text = str(line).rstrip()
             if not text:
                 continue
-            output_lines.append(text)
-            output_lines = output_lines[-200:]
+            output_tail = _bounded_output_tail(
+                output_tail,
+                text,
+                limit=output_limit,
+            )
             if on_event:
                 await _emit(on_event, {"event": event_name, "message": text})
         return_code = await _wait_scoped_process(process)
@@ -619,7 +697,7 @@ async def _run_plain_process_scoped(
             )
         return RunResult(success=False, message=error)
 
-    message = "\n".join(output_lines).strip()
+    message = output_tail.strip()
     if return_code == 0:
         return RunResult(success=True, message=message)
     if on_event:
@@ -638,11 +716,17 @@ async def _run_codex_scoped_process(
     *,
     scope: Any,
     cwd: Path,
+    timeout_seconds: float = 300.0,
     on_event: HarnessEventCallback | None = None,
 ) -> RunResult:
     """Run Codex JSONL output through WSL2+bwrap without host subprocesses."""
 
-    process, error = await _spawn_scoped_process(cmd, scope=scope, cwd=cwd)
+    process, error = await _spawn_scoped_process(
+        cmd,
+        scope=scope,
+        cwd=cwd,
+        timeout_seconds=timeout_seconds,
+    )
     if error:
         if on_event:
             await _emit(
@@ -658,10 +742,11 @@ async def _run_codex_scoped_process(
     error_message = ""
     input_tokens = output_tokens = total_tokens = 0
     provider_session_id = None
-    raw_tail: list[str] = []
+    raw_tail = ""
+    output_limit = _scoped_output_limit()
     try:
         while True:
-            line = await _read_process_line(process)
+            line = await _read_process_line(process, limit=output_limit)
             if line in (b"", "", None):
                 break
             if isinstance(line, bytes):
@@ -669,8 +754,11 @@ async def _run_codex_scoped_process(
             else:
                 raw = str(line).strip()
             if raw:
-                raw_tail.append(raw)
-                raw_tail = raw_tail[-20:]
+                raw_tail = _bounded_output_tail(
+                    raw_tail,
+                    raw,
+                    limit=output_limit,
+                )
             try:
                 payload = json.loads(raw)
             except json.JSONDecodeError:
@@ -693,10 +781,18 @@ async def _run_codex_scoped_process(
                 total_tokens += usage.get("total_tokens", 0)
             message = _extract_agent_message(payload)
             if message:
-                final_message = message
+                final_message = _bounded_output_tail(
+                    "",
+                    message,
+                    limit=output_limit,
+                )
             parsed_error = _extract_error(payload)
             if parsed_error:
-                error_message = parsed_error
+                error_message = _bounded_output_tail(
+                    "",
+                    parsed_error,
+                    limit=output_limit,
+                )
 
         return_code = await _wait_scoped_process(process)
     except asyncio.CancelledError:
@@ -718,13 +814,13 @@ async def _run_codex_scoped_process(
     if return_code == 0:
         return RunResult(
             success=True,
-            message=final_message or "\n".join(raw_tail),
+            message=final_message or raw_tail,
             provider_session_id=provider_session_id,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
         )
-    message = error_message or "\n".join(raw_tail) or f"codex exec failed: {return_code}"
+    message = error_message or raw_tail or f"codex exec failed: {return_code}"
     if on_event:
         await _emit(
             on_event,

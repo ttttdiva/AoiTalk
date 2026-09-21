@@ -3,16 +3,15 @@ Service layer for conversation memory management
 """
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any
 from .config import MemoryConfig
 from .repository import ConversationRepository
 from .summary_validation import validate_generated_summary
-from .models import ConversationMessage, ConversationArchive
+from .models import ConversationMessage
 from .cross_session_memory import get_cross_session_memory
-import os
 
-# pgvector search removed - using Qdrant RAG for vector search instead
+# Conversation semantic search is exclusively owned by CrossSessionMemoryService
+# and the shared BGE-M3 + Qdrant RAG infrastructure.
 
 
 class SummarizationService:
@@ -20,7 +19,7 @@ class SummarizationService:
     
     def __init__(self, config: MemoryConfig):
         self.config = config
-        # Pass enable_search to repository to avoid loading embedding model when search is disabled
+        # Keep the repository aware of whether semantic search is enabled.
         self.repository = ConversationRepository(enable_search=config.enable_search)
     
     async def create_summary(
@@ -271,8 +270,8 @@ class MemorySearchService:
     
     def __init__(self, config: MemoryConfig):
         self.config = config
-        # Pass enable_search to repository to avoid loading embedding model when search is disabled
-        self.repository = ConversationRepository(enable_search=config.enable_search)
+        # Search is delegated to CrossSessionMemoryService; no repository or
+        # legacy embedding resources are needed here.
         
 
     async def search_conversation_memory(
@@ -338,57 +337,6 @@ class MemorySearchService:
         except Exception as e:
             print(f"[MemorySearchService] Search failed: {e}")
             return []
-    
-    def _filter_by_user_character(self, message, user_id: str, character_name: str) -> bool:
-        """Filter message by user and character"""
-        # This would need session lookup - for now return True
-        # TODO: Implement proper filtering based on session
-        return True
-    
-    async def _search_active_messages(self, user_id: str, character_name: str,
-                                    query: str, query_embedding: List[float]) -> List[Dict[str, Any]]:
-        """Search active conversation messages
-        
-        Args:
-            user_id: User identifier
-            character_name: Character name
-            query: Search query
-            query_embedding: Query embedding vector
-            
-        Returns:
-            List[Dict[str, Any]]: Active message search results
-        """
-        return []
-    
-    async def _search_archives(self, user_id: str, character_name: str,
-                             query_embedding: List[float]) -> List[Dict[str, Any]]:
-        """Search archived conversation summaries
-        
-        Args:
-            user_id: User identifier
-            character_name: Character name
-            query_embedding: Query embedding vector
-            
-        Returns:
-            List[Dict[str, Any]]: Archive search results
-        """
-        archive_results = await self.repository.search_archives(
-            user_id, character_name, query_embedding, 
-            self.config.similarity_threshold, self.config.max_search_results
-        )
-        
-        results = []
-        for archive, similarity in archive_results:
-            results.append({
-                'type': 'archived_summary',
-                'content': archive.summary,
-                'timestamp': archive.end_time.isoformat() if archive.end_time else None,
-                'relevance_score': similarity,
-                'message_count': archive.message_count,
-                'metadata': archive.message_metadata
-            })
-        
-        return results
 
 
 class ConversationHistoryService:
@@ -396,7 +344,7 @@ class ConversationHistoryService:
     
     def __init__(self, config: MemoryConfig):
         self.config = config
-        # Pass enable_search to repository to avoid loading embedding model when search is disabled
+        # Keep the repository aware of whether semantic search is enabled.
         self.repository = ConversationRepository(enable_search=config.enable_search)
     
     async def log_message(self, user_id: str, session_id: str, character_name: str,

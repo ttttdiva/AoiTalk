@@ -29,7 +29,7 @@ import {
   type TaskAppLink,
 } from "../lib/apps-api";
 import { getToken, getTokenAuthScope } from "../lib/auth";
-import { useNetworkStore } from "../stores/network";
+import { canAttemptAoiTalkServer } from "../stores/network";
 import { getDb, schema } from "../db/client";
 import { ensureSchema } from "../db/migrate";
 
@@ -722,8 +722,7 @@ function upsertApp(apps: AppSummary[], app: AppSummary): AppSummary[] {
 
 async function canUseServer(): Promise<boolean> {
   const token = await getToken();
-  const network = useNetworkStore.getState();
-  return Boolean(token) && network.online;
+  return Boolean(token) && canAttemptAoiTalkServer();
 }
 
 function requireOnlineMutation(online: boolean): void {

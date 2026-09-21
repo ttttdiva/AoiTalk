@@ -1,7 +1,7 @@
 """ナレッジソース・ドキュメント・チャンク・注釈系モデル。"""
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time, timezone
 from typing import Any, Dict
 
 from sqlalchemy import (
@@ -24,6 +24,20 @@ from sqlalchemy.dialects.postgresql import CIDR, UUID
 from sqlalchemy.orm import relationship, synonym
 
 from .base import Base, _encrypted_json_property, _encrypted_text_property
+
+
+def _document_date_iso(value: datetime | date | None) -> str | None:
+    """Serialize Knowledge document dates with an explicit UTC offset."""
+
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        value = datetime.combine(value, time.min)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    else:
+        value = value.astimezone(timezone.utc)
+    return value.isoformat()
 
 
 class KnowledgeSource(Base):
@@ -162,6 +176,15 @@ class KnowledgeDocument(Base):
     mime_type = Column(String(120))
     content_hash = Column(String(64), index=True)
     modified_at = Column(DateTime)
+    # Effective semantic date used by structured Knowledge queries.  Values
+    # are normalized to UTC and the source records whether the date came from
+    # explicit document metadata or the modified-at fallback.
+    document_date = Column(DateTime(timezone=True), nullable=True, index=True)
+    document_date_source = Column(String(32), nullable=True, index=True)
+    # Semantic aliases keep callers that use the domain term explicit while
+    # retaining one canonical persisted column pair.
+    semantic_date = synonym("document_date")
+    semantic_date_source = synonym("document_date_source")
     size_bytes = Column(Integer, default=0)
     frontmatter_json = Column(JSON, default=dict)
     tags = Column(JSON, default=list)
@@ -206,6 +229,10 @@ class KnowledgeDocument(Base):
             "mime_type": self.mime_type,
             "content_hash": self.content_hash,
             "modified_at": self.modified_at.isoformat() if self.modified_at else None,
+            "document_date": _document_date_iso(
+                getattr(self, "document_date", None)
+            ),
+            "document_date_source": getattr(self, "document_date_source", None),
             "size_bytes": self.size_bytes or 0,
             "frontmatter": self.frontmatter_json or {},
             "tags": self.tags or [],
@@ -520,6 +547,9 @@ class KnowledgeNode(Base):
         index=True,
     )
     system_key = Column(Text)
+    # body_json is encrypted at rest, so SQL visibility predicates use this
+    # explicit discriminator rather than attempting to inspect ciphertext.
+    is_explicit_blank = Column(Boolean, nullable=False, default=False, server_default=text("false"))
     title = Column(Text, nullable=False)
     # Web drizzle スキーマと serializeNode が持つ別名配列。DB 列は既存（alembic 済み）で、
     # ここは pull シリアライズ用の ORM ミラー。モバイルは read-only 表示に使う。
@@ -1213,6 +1243,7 @@ class DocsClipIngestJob(Base):
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    dismissed_at = Column(DateTime, nullable=True)
 
     actor = relationship("User", foreign_keys=[actor_user_id])
     library = relationship("DocsLibrary", foreign_keys=[docs_library_id])
@@ -1272,6 +1303,7 @@ class DocsClipIngestJob(Base):
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "finished_at": self.finished_at.isoformat() if self.finished_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "dismissed_at": self.dismissed_at.isoformat() if self.dismissed_at else None,
         }
 
 

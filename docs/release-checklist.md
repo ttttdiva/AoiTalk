@@ -1,81 +1,37 @@
 # Release / Push Checklist
 
-この文書は通常の `main` push、Mobile release、public publish、Enterprise handoff の入口をまとめます。細かな契約をここへ複製せず、それぞれの script / canonical runbook を正本にします。
+共通の作業規約と完了状態は [AGENTS.md](../AGENTS.md) を参照する。通常のソースpush、Mobile APK公開、Public公開、Enterprise handoffは別の成果として確認する。
 
-## 0. 最初に確認するもの
+## 通常の変更
 
-- `AGENTS.md`
-- `CLAUDE.md`
-- `git status --short --branch`
-- 今回の対象差分
+変更範囲の検証、対象なら [独立AI WebUI QA](ai_webui_qa.md)、最終差分レビューを行い、対象ブランチへcommit・pushする。push後にリモートのSHAと、そのコミットのGitHub Actionsを確認する。CIが利用不能の場合もPASSとは扱わない。
 
-通常のリポジトリ作業は現在の checkout（通常 `main`）へ直接 commit / push します。ユーザーが branch / PR を明示した場合だけその運用へ切り替えます。
+## Mobile APK
 
-## 1. 通常のコード / docs 変更
-
-1. 対象差分だけを変更する。
-2. 変更範囲に必要な targeted verification を行う。
-3. WebUI のユーザー挙動を変更した場合は [ai_webui_qa.md](ai_webui_qa.md) の独立 AI browser QA を通す。
-4. 最終差分を確認する。
-5. commit → current branch（通常 `main`）へ push。
-6. `scripts/wait_ci.ps1` で push commit の GitHub Actions を確認する。
-
-CI status の定義は `AGENTS.md` / `CLAUDE.md` を正本とします。billing / quota 等で CI 自体が起動不能な場合を PASS と書き換えません。
-
-## 2. Mobile 変更 / release gate
-
-merge/release の前に、存在する `scripts/check_mobile_release_gate.ps1` を先に実行します。
-
-`RELEASE_REQUIRED=True` なら、ユーザーが今回明示的に release / APK / upload 不要と指定していない限り、次を完了条件に含めます。
-
-1. `mobile/app.json` の release version を確認 / 必要なら更新
-2. mobile target verification
-3. APK build（`scripts/build_apk.bat` または platform 対応 script）
-4. public `ttttdiva/AoiTalk` GitHub Release へ `aoitalk-mobile.apk` を upload
-5. public repo の `latest.json` を同じ version / URL / notes / date へ更新
-6. Release と `latest.json` の remote 実体を確認
-
-詳細は [mobile-auto-update-standard.md](mobile-auto-update-standard.md) を正本とします。
-
-Mobile に差分がない通常 docs/backend/frontend 作業では APK release を発生させません。
-
-## 3. Public publish
-
-開発 repo から public `ttttdiva/AoiTalk` を更新するときだけ [public_publish.md](public_publish.md) と `scripts/publish_public.ps1` を使います。
-
-まず validation:
+比較元は作業開始時または前回リリースのコミットSHAを記録し、比較先の変更をcommitしてからgateを実行する。push後の `origin/main` を比較元にすると差分が消えるため使用しない。
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\publish_public.ps1 -ValidateOnly
+.\scripts\check_mobile_release_gate.ps1 -Base $BaseCommit -Target HEAD
 ```
 
-実 publish は source checkout が clean で、公開対象 commit が確定してから行います。public tree の exclusion / secret scan / navigation defaults / `latest.json` preservation は script が正本です。
+`RELEASE_REQUIRED=True` の場合、ユーザーが今回release / APK / upload不要を明示していない限り、以下を実施する。
 
-## 4. Enterprise handoff
+1. `mobile/app.json` の `expo.version` と `expo.android.versionCode` を更新し、Mobileのターゲット検証を行う。
+2. `scripts/build_apk.bat` または `scripts/build_apk.sh` でAPKを生成し、公開先 `ttttdiva/AoiTalk` のGitHub Releaseへアップロードする。
+3. 公開リポジトリの `latest.json` を同じversion・URL・notes・dateへ更新し、Releaseとmetadataのリモート実体を確認する。
 
-Enterprise 配布の人間向け正本は **`README.enterprise.md` だけ**です。生成入口は `scripts/build_enterprise_handoff.ps1` です。
+詳細は [Mobile自動更新手順](mobile-auto-update-standard.md) を参照する。Mobileに関係しない作業ではAPK releaseを発生させない。
 
-この checklist に model revision、file count、SHA256、Docker image digest を複製しません。それらは handoff builder が生成・検証する manifest と `README.enterprise.md` / deployment scripts の現行値を使います。値を二重管理すると release 時に古い checklist が勝ってしまうためです。
+## Public OSS
 
-基本入口:
+入口は `Publish.bat`、詳細は [公開手順](public_publish.md)。`-ValidateOnly` で公開対象を検証できる。配布元は取得したremote `main` の固定snapshotで、起動元の未commit差分ではない。公開実装は `scripts/publish_public.ps1` に集約されている。
 
-```powershell
-pwsh -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_enterprise_handoff.ps1
-```
+## Enterprise handoff
 
-対象 PC での checksum / manifest / model download / atomic activation / container startup / diagnose / HTTPS smoke は `README.enterprise.md` の順序に従います。
+入口は `Enterprise.bat`、手順の正本はリポジトリ直下の `README.enterprise.md`。取得したremote `main` から `scripts/build_enterprise_handoff.ps1` がsanitized-source handoffを生成する。
 
-## 5. 完了報告
+WindowsでのZIP生成・source検証を、production imageや稼働環境の検証成功と扱わない。対象サーバーでのbuild、適用、起動、HTTPS・永続化確認は `README.enterprise.md` と `deploy/enterprise/` に従う。
 
-少なくとも次を明記します。
+## 完了報告
 
-- commit SHA / push 先
-- targeted verification 結果
-- CI 結果
-- WebUI QA required / result
-- mobile changed: yes/no
-- release required: yes/no
-- APK build/upload/latest.json: required の場合のみ結果
-- Enterprise/public publish を実施した場合は生成物 / remote verification
-
-実行していない検証を PASS と報告しません。
+commit SHA・push先、ターゲット検証、CI、対象QAの結果を明記する。Mobile releaseやPublic / Enterprise配布を行った場合は、その生成物・公開・リモート検証の結果も報告する。実行していない検証をPASSにしない。

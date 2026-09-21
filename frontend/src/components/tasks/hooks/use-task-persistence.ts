@@ -5,16 +5,20 @@ import { useCallback, useMemo } from "react";
 import {
   taskApi,
   type RecurringOccurrenceContext,
+  type RecurringOccurrenceMutationMode,
   type Tag,
   type Task,
 } from "@/lib/task-api";
 import { type LinkDisplayMode } from "@/components/editor/task-description-editor";
 import {
   buildAutoEstimateTaskPatch,
-  hasNonMidnightTime,
   normalizeTaskTitle,
 } from "@/components/tasks/task-form-utils";
-import { toTaskDatePayloadValue } from "@/lib/date-time";
+import {
+  hasExplicitTimeComponent,
+  toLocalDateTimeInputValue,
+  toTaskDatePayloadValue,
+} from "@/lib/date-time";
 import {
   createTaskCompletionUndoEntry,
   dispatchTaskCompletionUndoBatch,
@@ -476,15 +480,21 @@ export function useTaskPersistence({
       const nextStartAt =
         partial.start_at !== undefined
           ? partial.start_at
-          : (task?.start_at ?? null);
+          : (toLocalDateTimeInputValue(task?.start_at, {
+              allDay: task?.all_day,
+            }) ?? null);
       const nextEndAt =
-        partial.end_at !== undefined ? partial.end_at : (task?.end_at ?? null);
+        partial.end_at !== undefined
+          ? partial.end_at
+          : (toLocalDateTimeInputValue(task?.end_at, {
+              allDay: task?.all_day,
+            }) ?? null);
       const nextAllDay =
         partial.all_day !== undefined
           ? partial.all_day
           : (!!nextStartAt || !!nextEndAt) &&
-            !hasNonMidnightTime(nextStartAt) &&
-            !hasNonMidnightTime(nextEndAt);
+            !hasExplicitTimeComponent(nextStartAt) &&
+            !hasExplicitTimeComponent(nextEndAt);
       const dateUpdate: Record<string, string | null | boolean> = {};
       const hasDateChange =
         partial.start_at !== undefined || partial.end_at !== undefined;
@@ -514,15 +524,20 @@ export function useTaskPersistence({
   );
 
   const moveOccurrenceDateRange = useCallback(
-    async (values: { startAt: string | null; endAt: string | null }) => {
+    async (
+      values: { startAt: string | null; endAt: string | null },
+      mode: RecurringOccurrenceMutationMode = "single",
+    ) => {
       if (!effectiveTaskId || !activeOccurrenceContext?.start_at) return;
       const updateTaskId = effectiveTaskId;
       const lifecycleGeneration = lifecycleGenerationRef.current;
+      const occurrenceAllDay =
+        activeOccurrenceContext.all_day ?? task?.all_day ?? false;
       const nextStartAt =
-        toTaskDatePayloadValue(values.startAt, { allDay: task?.all_day }) ??
+        toTaskDatePayloadValue(values.startAt, { allDay: occurrenceAllDay }) ??
         activeOccurrenceContext.start_at;
       const nextEndAt = toTaskDatePayloadValue(values.endAt, {
-        allDay: task?.all_day,
+        allDay: occurrenceAllDay,
       });
       try {
         const result = await taskApi.moveOccurrence(updateTaskId, {
@@ -533,7 +548,8 @@ export function useTaskPersistence({
           next_start_at: nextStartAt,
           next_end_at: nextEndAt,
           status: activeOccurrenceContext.status ?? task?.status ?? null,
-          all_day: task?.all_day,
+          all_day: occurrenceAllDay,
+          mode,
         });
         if (!isCurrentLifecycle(lifecycleGeneration)) return;
         setOccurrenceDateOverride({

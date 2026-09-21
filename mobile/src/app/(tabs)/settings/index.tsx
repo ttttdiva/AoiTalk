@@ -499,13 +499,14 @@ export default function SettingsScreen() {
         provider: draftProvider,
         apiKey: draftApiKey,
         model: draftEffectiveModel,
+        reasoningEffort: draftEffort || undefined,
         baseUrl: draftBaseUrl.trim() || definition.defaultBaseUrl,
       });
       setConnResult(result);
     } finally {
       setConnTesting(false);
     }
-  }, [draftApiKey, draftBaseUrl, draftEffectiveModel, draftProvider]);
+  }, [draftApiKey, draftBaseUrl, draftEffectiveModel, draftEffort, draftProvider]);
 
   const handleSaveSlot = useCallback(async () => {
     const slot = slotDialog;

@@ -29,6 +29,7 @@ from ...services.free_team_service import (
     seed_free_team_defaults,
 )
 from ...services.llm_model_catalog import default_fetch_json
+from ...llm.deployment_resolver import is_retired_model
 from ..router_helpers import cookie_auth_dependency
 
 if TYPE_CHECKING:
@@ -65,9 +66,12 @@ def _free_openrouter_model(item: dict[str, Any]) -> bool:
             return False
 
     return (
-        model_id == "openrouter/free"
-        or model_id.endswith(":free")
-        or (is_zero_price("prompt") and is_zero_price("completion"))
+        not is_retired_model(model_id)
+        and (
+            model_id == "openrouter/free"
+            or model_id.endswith(":free")
+            or (is_zero_price("prompt") and is_zero_price("completion"))
+        )
     )
 
 
@@ -566,6 +570,8 @@ def register_free_team_routes(app: FastAPI, server: "WebChatServer") -> None:
                 active_ids: set[str] = set()
                 for item in items:
                     model_id = str(item["id"])
+                    if is_retired_model(model_id):
+                        continue
                     candidate_id = _dynamic_candidate_id(model_id)
                     active_ids.add(candidate_id)
                     candidate = existing.get(candidate_id)

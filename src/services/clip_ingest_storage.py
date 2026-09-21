@@ -284,8 +284,18 @@ class ClipIngestStorage:
             minimum=0.0,
         )
 
+    def staging_namespace(self) -> str:
+        """Return the fixed staging namespace owned by this storage class."""
+
+        return "clip-ingest"
+
+    def _gc_scope_key(self) -> str:
+        """Separate GC locks/cadence for independent staging namespaces."""
+
+        return f"{self.workspace_root}\0{self.staging_namespace()}"
+
     def _gc_lock(self) -> threading.Lock:
-        key = str(self.workspace_root)
+        key = self._gc_scope_key()
         with self._gc_locks_guard:
             lock = self._gc_locks.get(key)
             if lock is None:
@@ -323,7 +333,7 @@ class ClipIngestStorage:
         return _assert_under(root, self.workspace_root / "_users")
 
     def staging_root(self, user_id: Any) -> Path:
-        return self._user_root(user_id) / "clip-ingest"
+        return self._user_root(user_id) / self.staging_namespace()
 
     def _upload_dir(self, user_id: Any, upload_id: Any) -> Path:
         parsed = _parse_uuid(upload_id)
@@ -956,7 +966,7 @@ class ClipIngestStorage:
                 except (OSError, ClipUploadError):
                     return 0
                 scan_roots = [
-                    item / "clip-ingest"
+                    item / self.staging_namespace()
                     for item in user_roots
                     if item.is_dir() and not _is_storage_link_or_reparse(item)
                 ]
@@ -1070,7 +1080,7 @@ class ClipIngestStorage:
             time_budget_seconds=budget / 2 if user_id is not None else budget,
             protected_upload_ids=protected_ids,
         )
-        key = str(self.workspace_root)
+        key = self._gc_scope_key()
         now = time.monotonic()
         interval = self._env_float(
             "AOITALK_DOCS_CLIP_STAGING_GLOBAL_GC_INTERVAL_SECONDS",

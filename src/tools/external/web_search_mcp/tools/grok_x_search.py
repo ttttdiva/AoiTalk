@@ -6,6 +6,7 @@ import json
 import os
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from typing import List, Optional, TYPE_CHECKING
 
 import requests
@@ -13,6 +14,7 @@ import requests
 from ...x_search_mcp.api_client import (
     normalize_usage,
     normalize_xai_response_usage,
+    require_protected_x_payload,
     persist_xai_usage_sync as _persist_xai_usage_sync,
 )
 from .....services.outbound_privacy_service import (
@@ -20,6 +22,10 @@ from .....services.outbound_privacy_service import (
     get_privacy_policy_context,
 )
 from .....services.turn_context import get_turn_context
+from .....services.search_egress_policy import (
+    SearchEgressPreconditionError,
+    assert_search_egress_approved,
+)
 
 if TYPE_CHECKING:
     from mcp.server.fastmcp import FastMCP
@@ -50,6 +56,29 @@ XAI_SYSTEM_PROMPT = (
 )
 
 _RECORDED_USAGE_RESPONSES: list[object] = []
+
+
+def _grok_egress_descriptor(model: str, destination: str):
+    try:
+        from .....services.outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="grok_x_search",
+            transport="requests.post",
+            destination=destination,
+            provider="grok",
+            tool="grok_x_search",
+            model=model,
+        )
+    except ImportError:  # pragma: no cover - old stripped embeds
+        return SimpleNamespace(
+            action="grok_x_search",
+            transport="requests.post",
+            destination=destination,
+            provider="grok",
+            tool="grok_x_search",
+            model=model,
+        )
 
 
 def _grok_privacy_gateway() -> OutboundPrivacyGateway:
@@ -259,20 +288,17 @@ def register(mcp: FastMCP):
         # external X query here.
         try:
             gateway = _grok_privacy_gateway()
-        except Exception as exc:
-            return f"Grok検索はプライバシー設定を解決できないため停止しました: {exc}"
+        except Exception:
+            return "Grok検索はプライバシー保護の設定を解決できないため停止しました。"
         try:
-            protected = await gateway.protect(
-                payload,
-                provider="grok",
-                base_url=xai_api_base,
-                source_kind="grok_x_search_mcp",
-                model=xai_model,
+            assert_search_egress_approved(
+                getattr(gateway, "config", None),
+                "grok",
+                credential=api_key,
+                endpoint=xai_api_base,
             )
-        except Exception as exc:  # noqa: BLE001
-            return f"Grok検索はプライバシーポリシーにより停止しました: {exc}"
-        payload = protected.payload
-
+        except SearchEgressPreconditionError:
+            return "Grok検索に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
         url = f"{xai_api_base.rstrip('/')}/responses"
         headers = {
             'Authorization': f"Bearer {api_key}",
@@ -281,28 +307,46 @@ def register(mcp: FastMCP):
 
         started_at = time.monotonic()
         try:
-            response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
-        except requests.RequestException as exc:
-            return f"Grok APIへの接続に失敗しました: {exc}"
+            execute_sync = getattr(gateway, "execute_sync", None)
+            if not callable(execute_sync):
+                return "Grok検索はプライバシー保護の設定を解決できないため停止しました。"
+
+            def send(protected_payload):
+                try:
+                    wire_payload = require_protected_x_payload(protected_payload)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "privacy protection returned no protected xAI payload"
+                    ) from exc
+                return requests.post(
+                    url,
+                    headers=headers,
+                    json=wire_payload,
+                    timeout=timeout_seconds,
+                    allow_redirects=False,
+                )
+
+            response = execute_sync(
+                payload,
+                provider="grok",
+                descriptor=_grok_egress_descriptor(xai_model, url),
+                sender=send,
+                base_url=xai_api_base,
+                source_kind="grok_x_search_mcp",
+                model=xai_model,
+            )
+        except requests.RequestException:
+            return "Grok検索に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+        except Exception:
+            return "Grok検索はプライバシー保護に失敗したため停止しました。"
 
         if response.status_code >= 300:
-            try:
-                error_payload = response.json()
-                err = error_payload.get('error', '')
-                if isinstance(err, dict):
-                    error_message = err.get('message', '') or json.dumps(err, ensure_ascii=False)
-                elif isinstance(err, str) and err:
-                    error_message = err
-                else:
-                    error_message = json.dumps(error_payload, ensure_ascii=False)
-            except Exception:
-                error_message = response.text
-            return f"Grok APIエラー({response.status_code}): {error_message}"
+            return "Grok検索プロバイダーがエラーを返しました。設定と承認済みエグレスを確認してください。"
 
         try:
             response_payload = response.json()
         except ValueError:
-            return f"Grok APIの応答を解析できませんでした: {response.text}"
+            return "Grok検索プロバイダーの応答を解析できませんでした。"
 
         usage = normalize_xai_response_usage(
             response_payload,

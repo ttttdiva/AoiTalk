@@ -1,5 +1,6 @@
 """タスク・スケジュール・タイマー・タグ系モデル。"""
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Dict
@@ -27,6 +28,36 @@ from ...task_time import DEFAULT_TASK_TIMEZONE
 from ...task_recurrence import normalize_skip_mode
 from ...services.project_color_service import extract_project_color
 from .base import Base, _encrypted_text_property
+
+
+_COMPACT_RECURRENCE_OVERRIDE_RE = re.compile(
+    r"^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z?$"
+)
+
+
+def _legacy_recurrence_override_original_start_at(
+    source_kind: str | None,
+) -> datetime | None:
+    """Parse canonical identity from legacy recurrence override source kinds."""
+
+    if not source_kind:
+        return None
+    if source_kind.startswith("recurrence_override:"):
+        try:
+            return datetime.fromisoformat(
+                source_kind[len("recurrence_override:") :].replace("Z", "")
+            )
+        except ValueError:
+            return None
+    if not source_kind.startswith("ro:"):
+        return None
+    matched = _COMPACT_RECURRENCE_OVERRIDE_RE.match(source_kind[len("ro:") :])
+    if not matched:
+        return None
+    year, month, day, hour, minute, second, millisecond = (
+        int(part) for part in matched.groups()
+    )
+    return datetime(year, month, day, hour, minute, second, millisecond * 1000)
 
 
 class LocalTask(Base):
@@ -217,6 +248,12 @@ class Task(Base):
         back_populates="task",
         cascade="all, delete-orphan",
         uselist=False,
+    )
+    recurrence_schedule_segments = relationship(
+        "TaskRecurrenceScheduleSegment",
+        back_populates="task",
+        cascade="all, delete-orphan",
+        order_by="TaskRecurrenceScheduleSegment.effective_from",
     )
     occurrences = relationship(
         "TaskOccurrence", back_populates="task", cascade="all, delete-orphan"
@@ -744,6 +781,62 @@ class TaskRecurrenceRule(Base):
         }
 
 
+class TaskRecurrenceScheduleSegment(Base):
+    """Effective-from schedule adjustment for a recurring task.
+
+    ``effective_from`` is always expressed in the canonical RRULE timeline,
+    rather than the displayed (possibly shifted) occurrence time.  Offsets
+    are absolute deltas from the task's base schedule; storing them this way
+    keeps repeated "this and following" edits independent from one another.
+    """
+
+    __tablename__ = "task_recurrence_schedule_segments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    effective_from = Column(DateTime, nullable=False)
+    start_offset_seconds = Column(Integer, nullable=False, default=0)
+    end_offset_seconds = Column(Integer, nullable=False, default=0)
+    all_day = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at = Column(
+        DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False
+    )
+
+    task = relationship("Task", back_populates="recurrence_schedule_segments")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "effective_from",
+            name="uq_task_recurrence_schedule_segments_task_boundary",
+        ),
+        Index(
+            "ix_task_recurrence_schedule_segments_task_effective",
+            "task_id",
+            "effective_from",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": str(self.id),
+            "task_id": str(self.task_id),
+            "effective_from": (
+                self.effective_from.isoformat() if self.effective_from else None
+            ),
+            "start_offset_seconds": int(self.start_offset_seconds or 0),
+            "end_offset_seconds": int(self.end_offset_seconds or 0),
+            "all_day": bool(self.all_day),
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 class TaskOccurrence(Base):
     """Materialized occurrence for scheduled or recurring tasks."""
 
@@ -755,6 +848,10 @@ class TaskOccurrence(Base):
     )
     start_at = Column(DateTime, nullable=False, index=True)
     end_at = Column(DateTime, nullable=False, index=True)
+    # Canonical RRULE occurrence start.  Legacy rows may leave this NULL and
+    # callers should fall back to their source_kind when reconstructing the
+    # identity of an exception.
+    original_start_at = Column(DateTime, nullable=True)
     status = Column(String(32), nullable=False, default="todo", index=True)
     all_day = Column(Boolean, default=False, nullable=False)
     reminder_offsets = Column(JSON, default=list)
@@ -771,10 +868,33 @@ class TaskOccurrence(Base):
     time_entries = relationship("TimeEntry", back_populates="occurrence")
 
     __table_args__ = (
-        UniqueConstraint("task_id", "start_at", name="unique_task_occurrence_start"),
+        # A future segment can move two canonical occurrences onto the same
+        # displayed timestamp.  Keep each canonical/source row addressable
+        # instead of rejecting the materialization at the legacy actual-start
+        # uniqueness constraint.  ``original_start_at`` remains nullable for
+        # legacy/non-recurring rows, where PostgreSQL permits multiple NULLs.
+        UniqueConstraint(
+            "task_id",
+            "original_start_at",
+            "source_kind",
+            name="uq_task_occurrence_canonical_source",
+        ),
     )
 
+    def canonical_start_at(self) -> datetime | None:
+        """Return the canonical RRULE identity with legacy fallbacks."""
+
+        if self.original_start_at is not None:
+            return self.original_start_at
+        parsed = _legacy_recurrence_override_original_start_at(self.source_kind)
+        if parsed is not None:
+            return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+        if self.source_kind in {"recurrence_skip", "task_schedule"}:
+            return self.start_at
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
+        canonical_start_at = self.canonical_start_at()
         return {
             "id": str(self.id),
             "task_id": str(self.task_id),
@@ -797,6 +917,9 @@ class TaskOccurrence(Base):
             "status": self.status,
             "start_at": self.start_at.isoformat() if self.start_at else None,
             "end_at": self.end_at.isoformat() if self.end_at else None,
+            "original_start_at": (
+                canonical_start_at.isoformat() if canonical_start_at else None
+            ),
             "all_day": self.all_day,
             "auto_close_on_due": bool(
                 self.task.auto_close_on_due

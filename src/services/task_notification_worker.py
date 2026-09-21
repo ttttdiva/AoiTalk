@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 from .task_management_service import TaskManagementService
 
@@ -14,15 +14,32 @@ logger = logging.getLogger(__name__)
 class TaskNotificationWorker:
     """Polls due task notifications and delivers them."""
 
-    def __init__(self, db_manager, broadcaster=None, poll_interval_seconds: int = 60):
+    def __init__(
+        self,
+        db_manager,
+        broadcaster=None,
+        poll_interval_seconds: int = 60,
+        *,
+        config: Any | None = None,
+        privacy_gateway: Any | None = None,
+        session_id: str | None = None,
+    ):
         self._db_manager = db_manager
         self._broadcaster = broadcaster
         self._poll_interval_seconds = poll_interval_seconds
+        self._config = config
+        self._privacy_gateway = privacy_gateway
+        self._session_id = str(session_id or "")
         self._task: Optional[asyncio.Task] = None
         self._running = False
 
     async def run_once(self, *, now=None) -> dict[str, int]:
-        service = TaskManagementService(broadcaster=self._broadcaster)
+        service = TaskManagementService(
+            broadcaster=self._broadcaster,
+            config=self._config,
+            privacy_gateway=self._privacy_gateway,
+            session_id=self._session_id,
+        )
         session = await self._db_manager.get_session()
         try:
             # Auto-close runs before notification generation.  A task that was

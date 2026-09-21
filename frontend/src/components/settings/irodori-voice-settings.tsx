@@ -52,6 +52,7 @@ export type IrodoriVoiceParameters = Record<string, unknown>;
 export const IRODORI_MODEL_DEFAULT = "v4.1-small" as const;
 export const IRODORI_MODEL_OPTIONS = [
   { value: IRODORI_MODEL_DEFAULT, label: "Irodori-TTS v4.1 Small" },
+  { value: "v4.1-anime", label: "Irodori-TTS v4.1 Anime" },
   { value: "v3-voice-design", label: "Irodori-TTS v3 VoiceDesign" },
 ] as const;
 export type IrodoriModel = (typeof IRODORI_MODEL_OPTIONS)[number]["value"];

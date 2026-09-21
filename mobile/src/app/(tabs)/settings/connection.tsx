@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import { goBackOrReplace } from "../../../lib/navigation";
@@ -8,57 +8,123 @@ import {
   Switch,
   Text,
   TextInput,
+  HelperText,
 } from "react-native-paper";
 import { ScreenHeader } from "../../../components/screen-header";
 import { ScreenShell } from "../../../components/screen-primitives";
-import { DEFAULT_API_URL, EXTERNAL_API_URL } from "../../../constants/config";
-import { clearApiUrlCache } from "../../../lib/api-client";
-import { getApiUrl, saveApiUrl } from "../../../lib/auth";
+import { DEFAULT_API_URL } from "../../../constants/config";
+import { getApiUrl } from "../../../lib/auth";
 import {
   getCurrentNetworkInfo,
   getNetworkEndpointRoutingConfig,
-  saveNetworkEndpointRoutingConfig,
 } from "../../../lib/connection-routing";
+import { saveEndpointSettings } from "../../../lib/endpoint-settings";
 
 export default function SettingsConnectionScreen() {
   const router = useRouter();
+  const [apiUrl, setApiUrl] = useState(DEFAULT_API_URL);
   const [routeEnabled, setRouteEnabled] = useState(false);
   const [wifiSsid, setWifiSsid] = useState("");
   const [wifiApiUrl, setWifiApiUrl] = useState("");
   const [cellularApiUrl, setCellularApiUrl] = useState("");
   const [currentNetwork, setCurrentNetwork] = useState("Checking...");
   const [routingSaved, setRoutingSaved] = useState(false);
+  const [error, setError] = useState("");
+  const [hydrating, setHydrating] = useState(true);
+  const [hydrationFailed, setHydrationFailed] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const mountedRef = useRef(true);
+  const loadInFlightRef = useRef(false);
+  const saveInFlightRef = useRef(false);
 
-  useEffect(() => {
-    (async () => {
-      const defaultApiUrl = (await getApiUrl()) || DEFAULT_API_URL;
+  const loadSettings = useCallback(async () => {
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
+    setHydrating(true);
+    setHydrationFailed(false);
+    setError("");
+    try {
+      const storedApiUrl = await getApiUrl();
       const routing = await getNetworkEndpointRoutingConfig();
+      if (!mountedRef.current) return;
+      setApiUrl(storedApiUrl || DEFAULT_API_URL);
       setRouteEnabled(routing.enabled);
       setWifiSsid(routing.wifiSsid);
-      setWifiApiUrl(routing.wifiApiUrl || defaultApiUrl);
-      setCellularApiUrl(routing.cellularApiUrl || EXTERNAL_API_URL);
-      const network = await getCurrentNetworkInfo();
-      setCurrentNetwork(
-        network.type === "wifi"
-          ? `Wi-Fi${network.ssid ? `: ${network.ssid}` : ""}`
-          : network.type,
-      );
-    })();
+      setWifiApiUrl(routing.wifiApiUrl);
+      setCellularApiUrl(routing.cellularApiUrl);
+
+      try {
+        const network = await getCurrentNetworkInfo();
+        if (!mountedRef.current) return;
+        setCurrentNetwork(
+          network.type === "wifi"
+            ? `Wi-Fi${network.ssid ? `: ${network.ssid}` : ""}`
+            : network.type,
+        );
+      } catch {
+        if (mountedRef.current) setCurrentNetwork("unknown");
+      }
+    } catch (loadError: unknown) {
+      if (mountedRef.current) {
+        setHydrationFailed(true);
+        setError(
+          loadError instanceof Error
+            ? loadError.message
+            : "接続設定を読み込めませんでした",
+        );
+      }
+    } finally {
+      if (mountedRef.current) setHydrating(false);
+      loadInFlightRef.current = false;
+    }
   }, []);
 
+  useEffect(() => {
+    mountedRef.current = true;
+    void loadSettings();
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [loadSettings]);
+
   const handleSaveRouting = async () => {
-    const defaultUrl = cellularApiUrl.trim() || DEFAULT_API_URL;
-    await saveApiUrl(defaultUrl);
-    await saveNetworkEndpointRoutingConfig({
-      enabled: routeEnabled,
-      wifiSsid: wifiSsid.trim(),
-      wifiApiUrl: wifiApiUrl.trim(),
-      cellularApiUrl: defaultUrl,
-    });
-    clearApiUrlCache();
-    setRoutingSaved(true);
-    setTimeout(() => setRoutingSaved(false), 2000);
+    if (
+      hydrating ||
+      hydrationFailed ||
+      saving ||
+      saveInFlightRef.current
+    ) {
+      return;
+    }
+    saveInFlightRef.current = true;
+    setSaving(true);
+    setError("");
+
+    try {
+      await saveEndpointSettings({
+        apiUrl,
+        routing: {
+          enabled: routeEnabled,
+          wifiSsid,
+          wifiApiUrl,
+          cellularApiUrl,
+        },
+      });
+      setRoutingSaved(true);
+      setTimeout(() => setRoutingSaved(false), 2000);
+    } catch (saveError: unknown) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "接続設定を保存できませんでした",
+      );
+    } finally {
+      saveInFlightRef.current = false;
+      setSaving(false);
+    }
   };
+
+  const canEdit = !hydrating && !hydrationFailed && !saving;
 
   return (
     <ScreenShell
@@ -75,54 +141,102 @@ export default function SettingsConnectionScreen() {
     >
 
       <Surface style={styles.card} elevation={0}>
+        <Text style={styles.cardTitle}>基本サーバー</Text>
+        <TextInput
+          mode="outlined"
+          label="基本API URL"
+          value={apiUrl}
+          onChangeText={(value) => {
+            if (canEdit) setApiUrl(value);
+          }}
+          style={styles.input}
+          autoCapitalize="none"
+          autoCorrect={false}
+          keyboardType="url"
+          disabled={hydrating || hydrationFailed || saving}
+        />
+        <Text style={styles.helperText}>
+          Wi-Fi別切り替えをOFFにすると、この基本API URLを使います。
+        </Text>
         <View style={styles.switchRow}>
           <View style={styles.switchText}>
             <Text style={styles.cardTitle}>接続先</Text>
             <Text style={styles.helperText}>
-              基本は「それ以外のURL」を使います。指定Wi-Fi名に一致した時だけWi-Fi用URLに切り替えます。
+              ONにすると指定Wi-Fi名に一致した時だけWi-Fi用URLへ切り替え、それ以外では公開用URLを使います。
             </Text>
           </View>
-          <Switch value={routeEnabled} onValueChange={setRouteEnabled} />
+          <Switch
+            value={routeEnabled}
+            onValueChange={(value) => {
+              if (canEdit) setRouteEnabled(value);
+            }}
+            disabled={hydrating || hydrationFailed || saving}
+          />
         </View>
         <TextInput
           mode="outlined"
           label="指定Wi-Fi名"
           value={wifiSsid}
-          onChangeText={setWifiSsid}
+          onChangeText={(value) => {
+            if (canEdit) setWifiSsid(value);
+          }}
           style={styles.input}
           autoCapitalize="none"
-          disabled={!routeEnabled}
+          disabled={!routeEnabled || hydrating || hydrationFailed || saving}
         />
         <TextInput
           mode="outlined"
           label="そのWi-Fiで使うURL"
           value={wifiApiUrl}
-          onChangeText={setWifiApiUrl}
+          onChangeText={(value) => {
+            if (canEdit) setWifiApiUrl(value);
+          }}
           style={styles.input}
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
-          disabled={!routeEnabled}
+          disabled={!routeEnabled || hydrating || hydrationFailed || saving}
         />
         <TextInput
           mode="outlined"
           label="それ以外で使うURL"
           value={cellularApiUrl}
-          onChangeText={setCellularApiUrl}
+          onChangeText={(value) => {
+            if (canEdit) setCellularApiUrl(value);
+          }}
           style={styles.input}
           autoCapitalize="none"
           autoCorrect={false}
           keyboardType="url"
+          disabled={hydrating || hydrationFailed || saving}
         />
         <Text style={styles.helperText}>
-          Wi-Fi別切り替えをOFFにすると「それ以外で使うURL」だけを使います。
+          {routeEnabled
+            ? "指定Wi-Fi以外では、設定した公開用URLを使います。空欄なら基本API URLに戻ります。"
+            : "Wi-Fi別切り替えはOFFです。基本API URLを使います。"}
         </Text>
+        {error ? (
+          <HelperText type="error" visible>
+            {error}
+          </HelperText>
+        ) : null}
+        {hydrationFailed ? (
+          <Button
+            mode="outlined"
+            onPress={() => void loadSettings()}
+            disabled={hydrating}
+          >
+            再読み込み
+          </Button>
+        ) : null}
         <View style={styles.buttonRow}>
           <Button
             mode="contained"
             buttonColor="#7c3aed"
             textColor="#cdd6f4"
             onPress={handleSaveRouting}
+            loading={saving}
+            disabled={hydrating || hydrationFailed || saving}
           >
             {routingSaved ? "Saved" : "保存"}
           </Button>

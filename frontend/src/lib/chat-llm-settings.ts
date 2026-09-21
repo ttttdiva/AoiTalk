@@ -89,6 +89,10 @@ export async function saveSessionLlmSettings(
   const response = await fetch("/api/python-proxy/llm/session-settings", {
     method: "PUT",
     credentials: "include",
+    // Selector changes are user intent and this payload is small. Allow the
+    // request to finish when the document is reloaded immediately after the
+    // selection changes.
+    keepalive: true,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ session_id: sessionId, settings }),
   });

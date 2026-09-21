@@ -1,14 +1,20 @@
 import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getToken, getTokenAuthScope } from "../lib/auth";
-import { isApiConnectionError, isApiHttpError } from "../lib/api-client";
+import { getConfiguredApiServerFingerprint, isApiConnectionError, isApiHttpError } from "../lib/api-client";
 import { requireCharacterSlug } from "../lib/character-api";
 import { chatApi, type ConversationMessagesResponse } from "../lib/chat-api";
-import { isServerKnownUnreachable, useNetworkStore } from "../stores/network";
+import {
+  canAttemptAoiTalkServer,
+  isServerKnownUnreachable,
+  useNetworkStore,
+} from "../stores/network";
 import type { ConversationMessage, ConversationSession } from "../types/api";
 import { pendingDispatchPayload } from "../features/conversation/pending-dispatch-payload";
 import { conversationPerformanceDiagnostics } from "../features/conversation/performance-diagnostics";
 import { randomId } from "./outbox";
+import { interruptConversationForSend } from "./conversation-interrupt";
 import {
   CONVERSATION_MESSAGE_UPSERT_CHUNK_SIZE,
   conversationMessageUpsertStatementCount,
@@ -377,13 +383,11 @@ function buildLocalSession(
 }
 
 async function canUseServer(): Promise<boolean> {
-  const network = useNetworkStore.getState();
-  return network.online && network.serverReachable && Boolean(await getToken());
+  return canAttemptAoiTalkServer() && Boolean(await getToken());
 }
 
 async function canAttemptServer(): Promise<boolean> {
-  const network = useNetworkStore.getState();
-  return network.online && Boolean(await getToken());
+  return canAttemptAoiTalkServer() && Boolean(await getToken());
 }
 
 async function canRefreshServer(): Promise<boolean> {
@@ -416,6 +420,81 @@ async function updateSessionStats(
   if (current) notifyConversationChanges();
 }
 
+// Explicit user deletion is permanent; ACL/scope reconciliation tombstones are not.
+function isUserDeletedSession(row: DbSession | undefined): boolean {
+  return (row?.sessionMetadata as Record<string, unknown> | null)?.user_deleted === true;
+}
+
+/** Filter after a remote response, without excluding sessions not cached on this device. */
+export async function excludeUserDeletedSessions<T>(
+  items: readonly T[],
+  sessionIdOf: (item: T) => string,
+): Promise<T[]> {
+  if (!items.length) return [];
+  const rows = await getDb().select().from(schema.conversationSessions)
+    .where(inArray(schema.conversationSessions.id, [...new Set(items.map(sessionIdOf))]));
+  const deleted = new Set(rows.filter(isUserDeletedSession).map((row) => row.id));
+  return items.filter((item) => !deleted.has(sessionIdOf(item)));
+}
+
+const sessionDeleteFlights = new Map<string, Promise<void>>();
+
+async function deleteConversationSessionOnce(sessionId: string): Promise<void> {
+  if (uploadInFlight.has(sessionId) || pendingFlushFlights.has(sessionId)) {
+    throw new Error("この会話は同期処理中です。完了後に削除を再試行してください。");
+  }
+  const authScope = getTokenAuthScope(await getToken());
+  const row = await runForegroundSqliteWrite(() => getDb().select()
+    .from(schema.conversationSessions).where(eq(schema.conversationSessions.id, sessionId)).get());
+  if (isUserDeletedSession(row)) return;
+  // A server-only search hit has no local row. It still requires a confirmed server deletion.
+  if (!row || isServerBackedSession(row)) {
+    if (!(await canAttemptServer())) {
+      throw new Error("サーバー上の会話の削除にはログインとネットワーク接続が必要です。");
+    }
+    try {
+      await chatApi.deleteSession(sessionId);
+    } catch (error) {
+      if (isApiConnectionError(error)) {
+        useNetworkStore.getState().setServerReachable(false);
+      }
+      // A retry after HTTP success + SQLite failure may find the server row already gone.
+      if (!isApiHttpError(error) || error.status !== 404) throw error;
+    }
+  }
+  if (getTokenAuthScope(await getToken()) !== authScope) {
+    throw new Error("認証状態が変更されたため、削除結果を保存できません。");
+  }
+  await runForegroundSqliteWrite(() => {
+    const db = getDb();
+    const now = new Date().toISOString();
+    db.transaction((tx) => {
+      const current = tx.select().from(schema.conversationSessions)
+        .where(eq(schema.conversationSessions.id, sessionId)).get();
+      const patch = {
+        deletedAt: now,
+        updatedAt: now,
+        sessionMetadata: {
+          ...((current?.sessionMetadata as Record<string, unknown> | null) ?? {}),
+          user_deleted: true,
+        },
+      };
+      if (current) {
+        tx.update(schema.conversationSessions).set(patch)
+          .where(eq(schema.conversationSessions.id, sessionId)).run();
+      } else {
+        // Persist a tombstone even for an uncached search result.
+        tx.insert(schema.conversationSessions).values({ id: sessionId, ...patch }).run();
+      }
+      tx.update(schema.conversationMessages).set({ deletedAt: now, updatedAt: now })
+        .where(eq(schema.conversationMessages.sessionId, sessionId)).run();
+      tx.delete(schema.syncState).where(eq(schema.syncState.tableName,
+        conversationMessageSyncStateKey(authScope, sessionId))).run();
+    });
+    notifyConversationChanges();
+  });
+}
+
 export async function applyRemoteConversationSessions(
   list: ConversationSession[],
 ): Promise<void> {
@@ -428,6 +507,7 @@ export async function applyRemoteConversationSessions(
       .from(schema.conversationSessions)
       .where(eq(schema.conversationSessions.id, session.id));
     const existing = existingRows.find((row) => row.id === session.id);
+    if (isUserDeletedSession(existing)) continue;
     const pendingSlug = pendingCharacterSlug(existing);
     const preservePendingCharacter =
       Boolean(pendingSlug) && session.character_name !== pendingSlug;
@@ -468,6 +548,8 @@ export async function applyRemoteConversationSessions(
       })
       .onConflictDoUpdate({
         target: schema.conversationSessions.id,
+        // The earlier read can race with deletion: enforce the invariant in SQLite too.
+        setWhere: sql.raw("coalesce(json_extract(conversation_sessions.session_metadata, '$.user_deleted'), 0) != 1"),
         set: {
           userId: session.user_id,
           characterName,
@@ -481,6 +563,16 @@ export async function applyRemoteConversationSessions(
       });
   }
   notifyConversationChanges();
+}
+
+/**
+ * Persist an interactive session creation without changing the priority of
+ * sync/reconciliation callers of applyRemoteConversationSessions().
+ */
+export async function applyForegroundConversationSessions(
+  list: ConversationSession[],
+): Promise<void> {
+  await runForegroundSqliteWrite(() => applyRemoteConversationSessions(list));
 }
 
 export async function applyConversationSessionTombstones(
@@ -564,14 +656,14 @@ async function updateLocalCharacter(
 ): Promise<ConversationSession> {
   const now = new Date().toISOString();
   const db = getDb();
-  await db
+  await runForegroundSqliteWrite(() => db
     .update(schema.conversationSessions)
     .set({
       characterName: characterSlug,
       sessionMetadata: withPendingCharacterSlug(session, characterSlug, pending),
       updatedAt: now,
     })
-    .where(eq(schema.conversationSessions.id, session.id));
+    .where(eq(schema.conversationSessions.id, session.id)));
   notifyConversationChanges();
   return {
     ...toSession(session),
@@ -588,9 +680,13 @@ async function listPendingMessagesForSessionId(
     (message) =>
       message.role === "user" &&
       isLocalOnlyMessage(message) &&
+      message.metadata?.delivery_route !== "direct" &&
+      !message.metadata?.direct_cloud &&
       Boolean(message.metadata?.pending),
   );
 }
+
+const sessionDispatchTails = new Map<string, Promise<void>>();
 
 const pendingMessageDispatchFlights = new Map<
   string,
@@ -602,12 +698,19 @@ async function dispatchPendingConversationMessageOnce(
   message: ConversationMessage,
   payload: ConversationDispatchPayload,
   checkRemoteDuplicate: boolean,
+  onHandoff?: () => void,
 ): Promise<Awaited<ReturnType<typeof chatApi.dispatchMessage>> | null> {
   const current = (
     await conversationsRepo.listMessagesLocal(sessionId)
   ).find((candidate) => candidate.id === message.id);
-  if (!current || !Boolean(current.metadata?.pending)) return null;
+  if (!current || !Boolean(current.metadata?.pending) || current.metadata?.delivery_route === "direct" || current.metadata?.direct_cloud) return null;
 
+  const expectedScope = current.metadata?.dispatch_auth_scope;
+  const expectedServer = current.metadata?.dispatch_server_fingerprint;
+  if ((typeof expectedScope === "string" && getTokenAuthScope(await getToken()) !== expectedScope) ||
+      (typeof expectedServer === "string" && await getConfiguredApiServerFingerprint() !== expectedServer)) {
+    throw new Error("この入力を受け付けた接続先またはアカウントと一致しません。元の接続先で再試行してください。");
+  }
   if (checkRemoteDuplicate) {
     // 履歴確認が失敗した状態でPOSTすると、Serverが旧版の場合に重複生成する。
     // pendingを維持して次回retryへ委ねるため、GET失敗はそのまま伝播する。
@@ -626,6 +729,13 @@ async function dispatchPendingConversationMessageOnce(
     }
   }
 
+  // Mobile send always interrupts. Duplicate detection above deliberately runs
+  // first: a retry of an accepted message must not stop its own response.
+  const stoppedMessages = await interruptConversationForSend(sessionId);
+  if (stoppedMessages.length) {
+    await runForegroundSqliteWrite(() => applyRemoteConversationMessages(stoppedMessages));
+  }
+  onHandoff?.();
   const result = await chatApi.dispatchMessage(sessionId, {
     ...payload,
     client_message_id: message.id,
@@ -647,22 +757,29 @@ export function dispatchPendingConversationMessage(
   sessionId: string,
   message: ConversationMessage,
   payload: ConversationDispatchPayload,
-  options?: { checkRemoteDuplicate?: boolean },
+  options?: { checkRemoteDuplicate?: boolean; onHandoff?: () => void },
 ): Promise<Awaited<ReturnType<typeof chatApi.dispatchMessage>> | null> {
   const key = `${sessionId}:${message.id}`;
   const existing = pendingMessageDispatchFlights.get(key);
   if (existing) return existing;
-  const flight = dispatchPendingConversationMessageOnce(
+  const previous = sessionDispatchTails.get(sessionId) ?? Promise.resolve();
+  const flight = previous.then(() => dispatchPendingConversationMessageOnce(
     sessionId,
     message,
     payload,
     options?.checkRemoteDuplicate !== false,
-  ).finally(() => {
+    options?.onHandoff,
+  )).finally(() => {
     if (pendingMessageDispatchFlights.get(key) === flight) {
       pendingMessageDispatchFlights.delete(key);
     }
   });
   pendingMessageDispatchFlights.set(key, flight);
+  const tail = flight.then(() => undefined, () => undefined);
+  sessionDispatchTails.set(sessionId, tail);
+  void tail.then(() => {
+    if (sessionDispatchTails.get(sessionId) === tail) sessionDispatchTails.delete(sessionId);
+  });
   return flight;
 }
 
@@ -675,9 +792,12 @@ async function flushPendingCharacterUpdate(
 
   try {
     const updated = await chatApi.updateCharacter(session.id, characterSlug);
-    await applyRemoteConversationSessions([updated]);
+    await applyForegroundConversationSessions([updated]);
   } catch (error) {
-    if (isRecoverableCharacterUpdateError(error)) {
+    // A 5xx is an HTTP response: the API is reachable even though this
+    // operation failed.  Only a transport failure should mark the endpoint
+    // temporarily unreachable.
+    if (isApiConnectionError(error)) {
       useNetworkStore.getState().setServerReachable(false);
     }
     throw error;
@@ -692,24 +812,32 @@ async function promoteLocalSession(
     requireCharacterSlug(session.characterName),
     session.projectId ?? undefined,
   );
-  await applyRemoteConversationSessions([remote]);
 
-  const now = new Date().toISOString();
-  await db
-    .update(schema.conversationMessages)
-    .set({ sessionId: remote.id, updatedAt: now })
-    .where(eq(schema.conversationMessages.sessionId, session.id));
-  await db
-    .update(schema.conversationSessions)
-    .set({
-      deletedAt: now,
-      updatedAt: now,
-      sessionMetadata: {
-        local_only: true,
-        promoted_to_session_id: remote.id,
-      },
-    })
-    .where(eq(schema.conversationSessions.id, session.id));
+  // appendLocalMessage() has already released its foreground slot before
+  // promotion starts. Promotion therefore takes a separate foreground slot
+  // rather than nesting coordinator callbacks. Keep all promotion writes in
+  // that one slot so a Docs background transaction cannot start between the
+  // remote-session upsert and the local-session reassignment/tombstone.
+  await runForegroundSqliteWrite(async () => {
+    await applyRemoteConversationSessions([remote]);
+
+    const now = new Date().toISOString();
+    await db
+      .update(schema.conversationMessages)
+      .set({ sessionId: remote.id, updatedAt: now })
+      .where(eq(schema.conversationMessages.sessionId, session.id));
+    await db
+      .update(schema.conversationSessions)
+      .set({
+        deletedAt: now,
+        updatedAt: now,
+        sessionMetadata: {
+          local_only: true,
+          promoted_to_session_id: remote.id,
+        },
+      })
+      .where(eq(schema.conversationSessions.id, session.id));
+  });
 
   notifyConversationChanges();
   return remote;
@@ -797,6 +925,9 @@ const uploadInFlight = new Set<string>();
  * 再開してオーファンセッションの増殖と重複投入を防ぐ。
  */
 export async function uploadLocalSession(sessionId: string): Promise<string> {
+  if (sessionDeleteFlights.has(sessionId)) {
+    throw new Error("このセッションは削除処理中です。");
+  }
   if (uploadInFlight.has(sessionId)) {
     throw new Error("このセッションは既に同期処理中です。");
   }
@@ -822,7 +953,7 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
       .from(schema.conversationSessions)
       .where(eq(schema.conversationSessions.id, sessionId))
   )[0];
-  if (!row) {
+  if (!row || row.deletedAt) {
     throw new Error("同期対象のセッションが見つかりません。");
   }
   if (isServerBackedSession(row)) {
@@ -866,6 +997,7 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
     );
     remoteId = remote.id;
     // 付替え・tombstone 前の中間状態マーカーを保存（再開の起点）。
+    await runForegroundSqliteWrite(async () => {
     await db
       .update(schema.conversationSessions)
       .set({
@@ -878,16 +1010,29 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
       })
       .where(eq(schema.conversationSessions.id, row.id));
     await applyRemoteConversationSessions([remote]);
+    });
   }
 
   for (let index = 0; index < uploads.length; index += 1) {
     if (uploadedClientMessageIds.has(uploadRows[index].id)) continue;
-    await chatApi.addMessage(remoteId, {
-      ...uploads[index],
-      client_message_id: uploadRows[index].id,
-    });
+    const upload = uploads[index];
+    const clientMessageId = uploadRows[index].id;
+    if (upload.role === "assistant") {
+      await chatApi.importLocalAssistantMessage(remoteId, {
+        role: "assistant",
+        content: upload.content,
+        client_message_id: clientMessageId,
+      });
+    } else {
+      await chatApi.addMessage(remoteId, {
+        role: "user",
+        content: upload.content,
+        client_message_id: clientMessageId,
+      });
+    }
   }
 
+  await runForegroundSqliteWrite(async () => {
   const now = new Date().toISOString();
   await db
     .update(schema.conversationMessages)
@@ -903,6 +1048,7 @@ async function uploadLocalSessionOnce(sessionId: string): Promise<string> {
     })
     .where(eq(schema.conversationSessions.id, row.id));
 
+  });
   notifyConversationChanges();
   return remoteId;
 }
@@ -960,6 +1106,7 @@ async function flushPendingConversationOnce(
 }
 
 export function flushPendingConversation(sessionId: string): Promise<string> {
+  if (sessionDeleteFlights.has(sessionId)) return Promise.resolve(sessionId);
   const existing = pendingFlushFlights.get(sessionId);
   if (existing) return existing;
   const flight = flushPendingConversationOnce(sessionId).finally(() => {
@@ -1180,7 +1327,23 @@ export async function applyRemoteConversationMessages(
       ),
     );
   const existingById = new Map(existingRows.map((row) => [row.id, row]));
+  const reconciledLocalIds = options.reconcileSessionId
+    ? await loadReconciledLocalMessageIds(options.reconcileSessionId, list)
+    : [];
+  // Synchronous reads after the final await: no deletion can interleave before the transaction.
+  const parentIds = [...new Set(list.map((message) => message.session_id))];
+  const deletedParents = new Set<string>();
+  let parentReadStatements = 0;
+  for (let offset = 0; offset < parentIds.length; offset += 500) {
+    const parents = db.select().from(schema.conversationSessions)
+      .where(inArray(schema.conversationSessions.id, parentIds.slice(offset, offset + 500))).all();
+    parentReadStatements += 1;
+    for (const parent of parents) {
+      if (isUserDeletedSession(parent)) deletedParents.add(parent.id);
+    }
+  }
   const changed = list.filter((message) => {
+    if (deletedParents.has(message.session_id)) return false;
     const existing = existingById.get(message.id);
     return !existing || !remoteRevisionMatches(existing, message);
   });
@@ -1188,16 +1351,13 @@ export async function applyRemoteConversationMessages(
     (message) => !existingById.has(message.id),
   ).length;
   const updatedCount = changed.length - insertedCount;
-  const reconciledLocalIds = options.reconcileSessionId
-    ? await loadReconciledLocalMessageIds(options.reconcileSessionId, list)
-    : [];
   const upsertStatementCount = conversationMessageUpsertStatementCount(
     changed.length,
   );
   const hasTransactionWrites =
     changed.length > 0 || reconciledLocalIds.length > 0;
   const bridgeStatementCount =
-    1 +
+    1 + parentReadStatements +
     (options.reconcileSessionId ? 1 : 0) +
     (hasTransactionWrites
       ? 2 + upsertStatementCount + (reconciledLocalIds.length ? 1 : 0)
@@ -1574,9 +1734,12 @@ export const conversationsRepo = {
         const refreshed = await this.refreshSessions(projectId);
         useNetworkStore.getState().setServerReachable(true);
         return refreshed;
-      } catch {
-        useNetworkStore.getState().setServerReachable(false);
-        return local;
+      } catch (error) {
+        if (isApiConnectionError(error)) {
+          useNetworkStore.getState().setServerReachable(false);
+        }
+        // Deletion may have completed while the request was failing.
+        return this.listSessionsLocal(projectId);
       }
     }
     return local;
@@ -1586,59 +1749,33 @@ export const conversationsRepo = {
     projectId?: string | null,
   ): Promise<ConversationSession[]> {
     const sessions = await chatApi.listSessions(projectId ?? undefined);
-    await applyRemoteConversationSessions(sessions);
-    return sessions;
+    await applyForegroundConversationSessions(sessions);
+    return excludeUserDeletedSessions(sessions, (session) => session.id);
   },
 
   async markSessionRead(sessionId: string): Promise<void> {
     const readAt = new Date().toISOString();
-    const db = getDb();
-    const rows = await db
-      .select()
-      .from(schema.conversationSessions)
-      .where(eq(schema.conversationSessions.id, sessionId));
-    const current = rows[0];
-    if (current) {
-      const metadata =
-        (current.sessionMetadata as Record<string, unknown> | null) ?? {};
-      await db
-        .update(schema.conversationSessions)
-        .set({
-          sessionMetadata: {
-            ...metadata,
-            last_read_at: readAt,
-            is_unread: false,
-          },
-        })
+    const applyReadAt = (timestamp: string) => runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const rows = await db.select().from(schema.conversationSessions)
         .where(eq(schema.conversationSessions.id, sessionId));
+      if (!rows[0]) return;
+      const metadata = (rows[0].sessionMetadata as Record<string, unknown> | null) ?? {};
+      await db.update(schema.conversationSessions).set({
+        sessionMetadata: { ...metadata, last_read_at: timestamp, is_unread: false },
+      }).where(eq(schema.conversationSessions.id, sessionId));
       notifyConversationChanges();
-    }
+    });
+    await applyReadAt(readAt);
 
     if (!(await canAttemptServer())) return;
     try {
+      // HTTP must not occupy the SQLite slot. Re-read current metadata after
+      // the response, once the next foreground write can safely begin.
       const response = await chatApi.markSessionRead(sessionId);
-      const serverReadAt = response.last_read_at ?? readAt;
-      if (!current) return;
-      const latestRows = await db
-        .select()
-        .from(schema.conversationSessions)
-        .where(eq(schema.conversationSessions.id, sessionId));
-      const latest = latestRows[0];
-      if (!latest) return;
-      const latestMetadata =
-        (latest.sessionMetadata as Record<string, unknown> | null) ?? {};
-      await db
-        .update(schema.conversationSessions)
-        .set({
-          sessionMetadata: {
-            ...latestMetadata,
-            last_read_at: serverReadAt,
-            is_unread: false,
-          },
-        })
-        .where(eq(schema.conversationSessions.id, sessionId));
+      await applyReadAt(response.last_read_at ?? readAt);
     } catch {
-      // ローカルの既読状態は維持し、オフラインからの復帰時に同期で再取得する。
+      // Keep the local read state; the next sync reconciles it after recovery.
     }
   },
 
@@ -1666,8 +1803,10 @@ export const conversationsRepo = {
         const refreshed = await this.refreshMessages(sessionId);
         useNetworkStore.getState().setServerReachable(true);
         return refreshed;
-      } catch {
-        useNetworkStore.getState().setServerReachable(false);
+      } catch (error) {
+        if (isApiConnectionError(error)) {
+          useNetworkStore.getState().setServerReachable(false);
+        }
         return local;
       }
     }
@@ -1681,7 +1820,6 @@ export const conversationsRepo = {
   async refreshMessagesDetailed(
     sessionId: string,
   ): Promise<RefreshConversationMessagesResult> {
-    const local = await this.listMessagesLocal(sessionId);
     const authScope = getTokenAuthScope(await getToken());
     const previousCursor = await readConversationMessageCursor(
       authScope,
@@ -1693,48 +1831,61 @@ export const conversationsRepo = {
       throw new Error("メッセージ同期のserver_timeが不正です");
     }
 
-    const applyResult = await applyRemoteConversationMessages(
-      response.messages,
-      { reconcileSessionId: sessionId },
-    );
-    const isFull = mode !== "delta";
-    const reconciledInactiveCount = isFull
-      ? reconcileFullActiveMessages(local, response.messages)
-      : 0;
-    const messages = mergeConversationMessageDelta(
-      local,
-      response.messages,
-      isFull,
-    );
-    await updateSessionMessageStatsIfChanged(sessionId, messages.length);
-
-    // cursorはremote適用・reconcile・session statsがすべて成功した後だけ進める。
-    // overlapで同じcursorが返った場合はsync_state自体も書き換えない。
-    if (response.server_time !== previousCursor) {
-      writeConversationMessageCursor(
-        authScope,
-        sessionId,
-        response.server_time,
+    // Keep message writes, reconciliation, stats and the cursor in one queued
+    // unit so they cannot overlap a native Docs promotion transaction.
+    return runForegroundSqliteWrite(async () => {
+      const session = getDb().select().from(schema.conversationSessions)
+        .where(eq(schema.conversationSessions.id, sessionId)).get();
+      if (isUserDeletedSession(session)) {
+        return {
+          messages: [], mode, receivedCount: response.messages.length,
+          upsertedCount: 0, inactiveCount: 0, cursor: response.server_time,
+        };
+      }
+      const local = await this.listMessagesLocal(sessionId);
+      const applyResult = await applyRemoteConversationMessages(
+        response.messages,
+        { reconcileSessionId: sessionId },
       );
-    }
+      const isFull = mode !== "delta";
+      const reconciledInactiveCount = isFull
+        ? reconcileFullActiveMessages(local, response.messages)
+        : 0;
+      const messages = mergeConversationMessageDelta(
+        local,
+        response.messages,
+        isFull,
+      );
+      await updateSessionMessageStatsIfChanged(sessionId, messages.length);
 
-    const inactiveCount =
-      response.messages.filter((message) => !remoteActiveBranch(message)).length +
-      reconciledInactiveCount;
-    conversationPerformanceDiagnostics.increment(
-      "merge",
-      "conversation-message-inactive",
-      inactiveCount,
-    );
-    return {
-      messages,
-      mode,
-      receivedCount: applyResult.receivedCount,
-      upsertedCount: applyResult.upsertedCount,
-      inactiveCount,
-      cursor: response.server_time,
-      ...(fallbackReason ? { fallbackReason } : {}),
-    };
+      // cursorはremote適用・reconcile・session statsがすべて成功した後だけ進める。
+      // overlapで同じcursorが返った場合はsync_state自体も書き換えない。
+      if (response.server_time !== previousCursor) {
+        writeConversationMessageCursor(
+          authScope,
+          sessionId,
+          response.server_time,
+        );
+      }
+
+      const inactiveCount =
+        response.messages.filter((message) => !remoteActiveBranch(message)).length +
+        reconciledInactiveCount;
+      conversationPerformanceDiagnostics.increment(
+        "merge",
+        "conversation-message-inactive",
+        inactiveCount,
+      );
+      return {
+        messages,
+        mode,
+        receivedCount: applyResult.receivedCount,
+        upsertedCount: applyResult.upsertedCount,
+        inactiveCount,
+        cursor: response.server_time,
+        ...(fallbackReason ? { fallbackReason } : {}),
+      };
+    });
   },
 
   async getSessionLocal(
@@ -1761,7 +1912,7 @@ export const conversationsRepo = {
     projectId?: string | null,
   ): Promise<ConversationSession> {
     const session = buildLocalSession(characterName, projectId);
-    await applyRemoteConversationSessions([session]);
+    await applyForegroundConversationSessions([session]);
     return session;
   },
 
@@ -1776,7 +1927,7 @@ export const conversationsRepo = {
           characterSlug,
           projectId ?? undefined,
         );
-        await applyRemoteConversationSessions([session]);
+        await applyForegroundConversationSessions([session]);
         return session;
       } catch (error) {
         if (!isApiConnectionError(error)) throw error;
@@ -1784,7 +1935,7 @@ export const conversationsRepo = {
       }
     }
     const session = buildLocalSession(characterSlug, projectId);
-    await applyRemoteConversationSessions([
+    await applyForegroundConversationSessions([
       {
         ...session,
         user_id: "",
@@ -1827,11 +1978,13 @@ export const conversationsRepo = {
             sessionId,
             normalizedSlug,
           );
-          await applyRemoteConversationSessions([updated]);
+          await applyForegroundConversationSessions([updated]);
           return updated;
         } catch (error) {
           if (!isRecoverableCharacterUpdateError(error)) throw error;
-          useNetworkStore.getState().setServerReachable(false);
+          if (isApiConnectionError(error)) {
+            useNetworkStore.getState().setServerReachable(false);
+          }
           // サーバー停止中も選択操作は端末側で完了させ、復旧後にsyncする。
           return updateLocalCharacter(row, normalizedSlug, true);
         }
@@ -1865,15 +2018,15 @@ export const conversationsRepo = {
 
     if (isServerBackedSession(row)) {
       const updated = await chatApi.updateProject(sessionId, projectId);
-      await applyRemoteConversationSessions([updated]);
+      await applyForegroundConversationSessions([updated]);
       return updated;
     }
 
     const now = new Date().toISOString();
-    await db
+    await runForegroundSqliteWrite(() => db
       .update(schema.conversationSessions)
       .set({ projectId, updatedAt: now })
-      .where(eq(schema.conversationSessions.id, sessionId));
+      .where(eq(schema.conversationSessions.id, sessionId)));
     notifyConversationChanges();
     return {
       ...toSession(row),
@@ -1882,34 +2035,14 @@ export const conversationsRepo = {
     };
   },
 
-  async deleteSession(sessionId: string): Promise<void> {
-    const authScope = getTokenAuthScope(await getToken());
-    if (await canUseServer()) {
-      try {
-        await chatApi.deleteSession(sessionId);
-      } catch {
-        // Fall back to local-first below.
-      }
-    }
-    const db = getDb();
-    const now = new Date().toISOString();
-    db.transaction((tx) => {
-      tx
-        .update(schema.conversationSessions)
-        .set({ deletedAt: now, updatedAt: now })
-        .where(eq(schema.conversationSessions.id, sessionId))
-        .run();
-      tx
-        .delete(schema.syncState)
-        .where(
-          eq(
-            schema.syncState.tableName,
-            conversationMessageSyncStateKey(authScope, sessionId),
-          ),
-        )
-        .run();
+  deleteSession(sessionId: string): Promise<void> {
+    const existing = sessionDeleteFlights.get(sessionId);
+    if (existing) return existing;
+    const flight = deleteConversationSessionOnce(sessionId).finally(() => {
+      if (sessionDeleteFlights.get(sessionId) === flight) sessionDeleteFlights.delete(sessionId);
     });
-    notifyConversationChanges();
+    sessionDeleteFlights.set(sessionId, flight);
+    return flight;
   },
 
   async updateTitle(
@@ -1946,7 +2079,7 @@ export const conversationsRepo = {
         // Fall back to local-first below.
       }
     }
-    await updateSessionStats(sessionId, (session) => ({
+    await runForegroundSqliteWrite(() => updateSessionStats(sessionId, (session) => ({
       title,
       sessionMetadata: {
         ...((session?.sessionMetadata as Record<string, unknown> | null) ?? {}),
@@ -1954,15 +2087,17 @@ export const conversationsRepo = {
           ? { title_generation: { source: options.source } }
           : {}),
       },
-    }));
+    })));
   },
 
   async saveLocalMessages(
     sessionId: string,
     messages: ConversationMessage[],
   ): Promise<void> {
-    await applyRemoteConversationMessages(messages);
-    await updateSessionMessageStatsIfChanged(sessionId, messages.length);
+    await runForegroundSqliteWrite(async () => {
+      await applyRemoteConversationMessages(messages);
+      await updateSessionMessageStatsIfChanged(sessionId, messages.length);
+    });
   },
 
   async appendLocalMessage(
@@ -1970,46 +2105,123 @@ export const conversationsRepo = {
     role: ConversationMessage["role"],
     content: string,
     metadata: Record<string, unknown> = {},
+    identity?: { id: string; created_at: string },
   ): Promise<ConversationMessage> {
-    const now = new Date().toISOString();
-    const db = getDb();
-    const message: ConversationMessage = {
-      id: randomId(),
-      session_id: sessionId,
-      role,
-      content,
-      metadata,
-      created_at: now,
-      updated_at: now,
-      parent_message_id: null,
-      branch_index: 0,
-      is_active_branch: true,
+    const now = identity?.created_at ?? new Date().toISOString();
+    let message: ConversationMessage = {
+      id: identity?.id ?? randomId(), session_id: sessionId, role, content, metadata,
+      created_at: now, updated_at: now, parent_message_id: null,
+      branch_index: 0, is_active_branch: true,
     };
-    await db.insert(schema.conversationMessages).values({
-      id: message.id,
-      sessionId,
-      role,
-      content,
-      messageMetadata: metadata,
-      tokenCount: null,
-      parentMessageId: null,
-      branchIndex: 0,
-      isActiveBranch: true,
-      createdAt: now,
-      updatedAt: now,
-      deletedAt: null,
+    await runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      // Retrying only this atomic unit is safe: a lock/error cannot leave an
+      // inserted message without its session count, or increment that count twice.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          db.transaction((tx) => {
+            const existing = tx.select().from(schema.conversationMessages)
+              .where(eq(schema.conversationMessages.id, message.id)).get();
+            if (existing) {
+              if (existing.sessionId !== sessionId || existing.role !== role || existing.content !== content) {
+                throw new Error("送信IDが別のメッセージに使用されています。");
+              }
+              message = toMessage(existing);
+              return;
+            }
+            tx.insert(schema.conversationMessages).values({
+              id: message.id, sessionId, role, content, messageMetadata: metadata,
+              tokenCount: null, parentMessageId: null, branchIndex: 0,
+              isActiveBranch: true, createdAt: now, updatedAt: now, deletedAt: null,
+            }).run();
+            const session = tx.select().from(schema.conversationSessions)
+              .where(eq(schema.conversationSessions.id, sessionId)).get();
+            const current = session?.sessionMetadata as Record<string, unknown> ?? {};
+            tx.update(schema.conversationSessions).set({ updatedAt: now,
+              sessionMetadata: { ...current, last_activity: now, message_count: Number(current.message_count ?? 0) + 1 },
+            }).where(eq(schema.conversationSessions.id, sessionId)).run();
+          });
+          break;
+        } catch (error) {
+          const busy = /database (?:table )?is locked|SQLITE_BUSY|SQLITE_LOCKED/i.test(String(error));
+          if (!busy || attempt >= 5) throw error;
+          // Yield the JS thread so another native async connection can finish.
+          await new Promise<void>((resolve) => setTimeout(resolve, 20 * 2 ** attempt));
+        }
+      }
     });
-    await updateSessionStats(sessionId, (session) => {
-      const currentMetadata =
-        (session?.sessionMetadata as Record<string, unknown> | null) ?? {};
-      return {
-        sessionMetadata: {
-          ...currentMetadata,
-          message_count: Number(currentMetadata.message_count ?? 0) + 1,
-        },
-      };
-    });
+    notifyConversationChanges();
     return message;
+  },
+
+  /** 自動再送のflightと競合させず、LLM要求前にDirectの送信元を確保する。 */
+  async beginDirectReply(userMessage: ConversationMessage): Promise<void> {
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const source = db.select().from(schema.conversationMessages).where(eq(schema.conversationMessages.id, userMessage.id)).get();
+      if (!source || source.deletedAt) throw new Error("送信元の履歴が見つかりません。");
+      const sourceMetadata = source.messageMetadata as Record<string, unknown> ?? {};
+      if (sourceMetadata.direct_cloud || sourceMetadata.message_state === "persisted") {
+        throw new Error("このメッセージは完了済みです。履歴を再読み込みしてください。");
+      }
+      if (sourceMetadata.server_message_id || (
+        sourceMetadata.delivery_route === "server" &&
+        (sourceMetadata.delivery_error || sourceMetadata.message_state === "dispatched")
+      )) {
+        throw new Error("サーバーの受理状況が未確認のためDirectへ切り替えられません。サーバーへ再接続して送信結果を確認してください。");
+      }
+      if (pendingMessageDispatchFlights.has(`${source.sessionId}:${source.id}`)) {
+        throw new Error("この入力のサーバー送信結果を確認中です。未送信一覧で結果を確認してから再試行してください。");
+      }
+      // flight確認からこの更新までawaitを挟まない。
+      db.update(schema.conversationMessages).set({
+        messageMetadata: { ...(source.messageMetadata as Record<string, unknown> ?? {}), pending: false, delivery_route: "direct", message_state: "direct-running", direct_error: null },
+        updatedAt: new Date().toISOString(),
+      }).where(eq(schema.conversationMessages.id, userMessage.id)).run();
+    });
+  },
+
+  /** 応答保存と送信元の完了を同一transactionにし、再接続・再試行で再生成しない。 */
+  async completeDirectReply(
+    userMessage: ConversationMessage,
+    content: string,
+    metadata: Record<string, unknown>,
+  ): Promise<ConversationMessage> {
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const now = new Date().toISOString();
+      const id = `direct-${userMessage.id}`;
+      const completed = { ...metadata, pending: false, direct_cloud: true, delivery_route: "direct", message_state: "persisted", direct_error: null };
+      const message: ConversationMessage = {
+        id, session_id: userMessage.session_id, role: "assistant", content,
+        metadata: { ...completed, local_only: true, reply_to_local_message_id: userMessage.id },
+        created_at: now, updated_at: now, parent_message_id: null, branch_index: 0, is_active_branch: true,
+      };
+      db.transaction((tx) => {
+        const source = tx.select().from(schema.conversationMessages).where(eq(schema.conversationMessages.id, userMessage.id)).get();
+        if (!source || source.deletedAt) throw new Error("送信元の履歴が見つからないためDirect応答を保存できません。");
+        // 生成中に別の保留入力が同期され、会話IDが昇格していても同じ履歴へ保存する。
+        message.session_id = source.sessionId;
+        const existing = tx.select().from(schema.conversationMessages).where(eq(schema.conversationMessages.id, id)).get();
+        if (existing) { message.content = existing.content; return; }
+        tx.insert(schema.conversationMessages).values({
+          id, sessionId: source.sessionId, role: "assistant", content,
+          messageMetadata: message.metadata, createdAt: now, updatedAt: now,
+          parentMessageId: null, branchIndex: 0, isActiveBranch: true, deletedAt: null,
+        }).run();
+        tx.update(schema.conversationMessages).set({
+          messageMetadata: { ...(source.messageMetadata as Record<string, unknown> ?? {}), ...completed }, updatedAt: now,
+        }).where(eq(schema.conversationMessages.id, userMessage.id)).run();
+        const session = tx.select().from(schema.conversationSessions).where(eq(schema.conversationSessions.id, source.sessionId)).get();
+        const sessionMetadata = session?.sessionMetadata as Record<string, unknown> ?? {};
+        tx.update(schema.conversationSessions).set({
+          updatedAt: now,
+          sessionMetadata: { ...sessionMetadata, last_activity: now, message_count: Number(sessionMetadata.message_count ?? 0) + 1 },
+        }).where(eq(schema.conversationSessions.id, source.sessionId)).run();
+      });
+      notifyConversationChanges();
+      return message;
+    });
   },
 
   async listPendingMessages(sessionId: string): Promise<ConversationMessage[]> {
@@ -2020,68 +2232,74 @@ export const conversationsRepo = {
     messageId: string,
     serverMessageId?: string,
   ): Promise<void> {
-    const db = getDb();
-    const row = (
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const row = (
+        await db
+          .select()
+          .from(schema.conversationMessages)
+          .where(eq(schema.conversationMessages.id, messageId))
+      )[0];
+      const metadata =
+        (row?.messageMetadata as Record<string, unknown> | null) ?? {};
       await db
-        .select()
-        .from(schema.conversationMessages)
-        .where(eq(schema.conversationMessages.id, messageId))
-    )[0];
-    const metadata =
-      (row?.messageMetadata as Record<string, unknown> | null) ?? {};
-    await db
-      .update(schema.conversationMessages)
-      .set({
-        messageMetadata: {
-          ...metadata,
-          pending: false,
-          queued_at: new Date().toISOString(),
-          ...(serverMessageId ? { server_message_id: serverMessageId } : {}),
-        },
-        updatedAt: new Date().toISOString(),
-      })
-      .where(eq(schema.conversationMessages.id, messageId));
+        .update(schema.conversationMessages)
+        .set({
+          messageMetadata: {
+            ...metadata,
+            pending: false,
+            queued_at: new Date().toISOString(),
+            ...(serverMessageId ? { server_message_id: serverMessageId } : {}),
+          },
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.conversationMessages.id, messageId));
+    });
   },
 
   async mergeMessageMetadata(
     messageId: string,
     patch: Record<string, unknown>,
   ): Promise<void> {
-    const db = getDb();
-    const row = (
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const row = (
+        await db
+          .select()
+          .from(schema.conversationMessages)
+          .where(eq(schema.conversationMessages.id, messageId))
+      )[0];
+      const metadata =
+        (row?.messageMetadata as Record<string, unknown> | null) ?? {};
       await db
-        .select()
-        .from(schema.conversationMessages)
-        .where(eq(schema.conversationMessages.id, messageId))
-    )[0];
-    const metadata =
-      (row?.messageMetadata as Record<string, unknown> | null) ?? {};
-    await db
-      .update(schema.conversationMessages)
-      .set({
-        messageMetadata: {
-          ...metadata,
-          ...patch,
-        },
-        updatedAt: new Date().toISOString(),
-      })
-      .where(eq(schema.conversationMessages.id, messageId));
+        .update(schema.conversationMessages)
+        .set({
+          messageMetadata: {
+            ...metadata,
+            ...patch,
+          },
+          updatedAt: new Date().toISOString(),
+        })
+        .where(eq(schema.conversationMessages.id, messageId));
+    });
   },
 
   async pruneSentLocalMessages(
     sessionId: string,
     remoteMessages: ConversationMessage[] = [],
   ): Promise<void> {
-    const db = getDb();
-    const matchedIds = await loadReconciledLocalMessageIds(
-      sessionId,
-      remoteMessages,
-    );
-    for (const id of matchedIds) {
-      await db
-        .delete(schema.conversationMessages)
-        .where(eq(schema.conversationMessages.id, id));
-    }
+    return runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const matchedIds = await loadReconciledLocalMessageIds(
+        sessionId,
+        remoteMessages,
+      );
+      for (const id of matchedIds) {
+        await db
+          .delete(schema.conversationMessages)
+          .where(eq(schema.conversationMessages.id, id));
+      }
+    });
   },
 
   async getBranchesLocal(messageId: string): Promise<ConversationMessage[]> {
@@ -2112,7 +2330,7 @@ export const conversationsRepo = {
     messageId: string,
   ): Promise<ConversationMessage[]> {
     const branches = await chatApi.getMessageBranches(sessionId, messageId);
-    await applyRemoteConversationMessages(branches);
+    await runForegroundSqliteWrite(() => applyRemoteConversationMessages(branches));
     return branches;
   },
 

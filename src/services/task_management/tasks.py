@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only, selectinload
 
@@ -30,10 +31,14 @@ from ...memory.models import (
     TaskDependency,
     TaskOccurrence,
     TaskRecurrenceRule,
+    TaskRecurrenceScheduleSegment,
+    TaskSchedulePlacement,
+    TaskAppLink,
     TaskTag,
     TimeEntry,
     User,
     KnowledgeNode,
+    KnowledgeNodeShare,
     DocsLibrary,
     KnowledgeNodeSupertag,
     KnowledgeSupertag,
@@ -41,6 +46,7 @@ from ...memory.models import (
 from ...memory.project_repository import ProjectRepository
 from ...task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
 from ..docs_acl import can_write_node
+from ..managed_docs_policy import policy_for_node
 from ..project_color_service import extract_project_color
 from ..task_reference_service import attach_agent_run_source_reference
 from ..task_project_invariants import (
@@ -59,7 +65,6 @@ from ._shared import (
     TaskManagementError,
     build_occurrence_schedule,
     build_time_report,
-    correct_likely_timer_started_at,
     normalize_priority,
     normalize_task_status,
     _ensure_reminder_offsets,
@@ -98,6 +103,78 @@ def _assert_generation_mutation_allowed() -> None:
 class TaskCrudMixin:
     """タスク CRUD / タグ / コメント。"""
 
+    async def _assert_task_docs_guide_binding_allowed(
+        self,
+        session: AsyncSession,
+        node: KnowledgeNode,
+    ) -> None:
+        """Reject only the repository-owned AoiTalk Guide subtree.
+
+        Other managed Docs domains (notably ``project_inbox_item:*``) are
+        legitimate task destinations for their owning workflows.  Walk the
+        complete parent chain here instead of relying on the target's own
+        metadata: legacy Guide descendants may have no stable key or display
+        props after an older migration.  A missing or cross-library ancestor
+        fails closed because we cannot prove that the target is ordinary.
+        """
+
+        current = node
+        visited: set[Any] = set()
+        docs_library_id = self._coerce_uuid(
+            getattr(node, "docs_library_id", None)
+            or getattr(node, "workspace_id", None)
+        )
+        depth = 0
+        while current is not None:
+            current_id = getattr(current, "id", None)
+            if current_id in visited:
+                raise TaskManagementError(
+                    "Docs nodeの親階層が循環しています",
+                    status_code=403,
+                )
+            visited.add(current_id)
+            policy = policy_for_node(current)
+            if policy is not None and policy.managed_domain == "aoitalk_guide":
+                raise TaskManagementError(
+                    "AoiTalk ガイドはタスク連携先にできません",
+                    status_code=409,
+                )
+            parent_id = getattr(current, "parent_id", None)
+            if parent_id is None:
+                return
+            if depth >= 512:
+                raise TaskManagementError(
+                    "Docs nodeの親階層を検証できません",
+                    status_code=403,
+                )
+            depth += 1
+            if isinstance(session, AsyncSession):
+                current = await session.get(
+                    KnowledgeNode,
+                    parent_id,
+                    populate_existing=True,
+                )
+            else:
+                current = await session.get(KnowledgeNode, parent_id)
+            if current is None:
+                raise TaskManagementError(
+                    "Docs nodeの親を検証できません",
+                    status_code=403,
+                )
+            ancestor_library_id = self._coerce_uuid(
+                getattr(current, "docs_library_id", None)
+                or getattr(current, "workspace_id", None)
+            )
+            if (
+                docs_library_id is None
+                or ancestor_library_id is None
+                or ancestor_library_id != docs_library_id
+            ):
+                raise TaskManagementError(
+                    "Docs nodeの親が別Libraryにあります",
+                    status_code=403,
+                )
+
     @staticmethod
     def _coerce_uuid(value: Any) -> Optional[UUID]:
         if value is None:
@@ -108,6 +185,239 @@ class TaskCrudMixin:
             return UUID(str(value))
         except (TypeError, ValueError, AttributeError):
             return None
+
+    async def _lock_project_acl_for_task_write(
+        self,
+        session: AsyncSession,
+        *,
+        project_ids: Iterable[UUID | str | None],
+        user_id: UUID,
+        require_read: bool = False,
+    ) -> None:
+        """Recheck project ACLs while holding the rows a mutation consults.
+
+        The public task APIs perform an early permission check for a useful
+        response, but that check is not a transaction boundary.  Acquire the
+        same project advisory locks used by task moves, then lock Project,
+        User, and ProjectMember rows in deterministic order before asking the
+        shared ProjectRepository authority for the current permissions.  A
+        concurrent membership revoke therefore either wins before this point
+        or waits until the task mutation commits.
+        """
+
+        if not isinstance(session, AsyncSession):
+            return
+        ordered_ids = sorted(
+            {
+                self._coerce_uuid(project_id)
+                for project_id in project_ids
+                if self._coerce_uuid(project_id) is not None
+            },
+            key=str,
+        )
+        if not ordered_ids:
+            raise TaskManagementError("Project permission denied", status_code=403)
+
+        await lock_task_project_ids(session, ordered_ids)
+
+        locked_projects: list[Project] = []
+        for project_id in ordered_ids:
+            project_result = await session.execute(
+                select(Project)
+                .where(Project.id == project_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            project = project_result.scalar_one_or_none()
+            if project is None or project.deleted_at is not None:
+                raise TaskManagementError("Project not found", status_code=404)
+            locked_projects.append(project)
+
+        user_result = await session.execute(
+            select(User)
+            .where(User.id == user_id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        if user_result.scalar_one_or_none() is None:
+            raise TaskManagementError("Project permission denied", status_code=403)
+
+        for project in locked_projects:
+            await session.execute(
+                select(ProjectMember)
+                .where(
+                    and_(
+                        ProjectMember.project_id == project.id,
+                        ProjectMember.user_id == user_id,
+                    )
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            if not await ProjectRepository.has_permission(
+                session,
+                project_id=project.id,
+                user_id=user_id,
+                permission="write",
+            ):
+                raise TaskManagementError("Project permission denied", status_code=403)
+            if require_read and not await ProjectRepository.has_permission(
+                session,
+                project_id=project.id,
+                user_id=user_id,
+                permission="read",
+            ):
+                raise TaskManagementError("Project permission denied", status_code=403)
+
+    async def _lock_docs_acl_for_binding(
+        self,
+        session: AsyncSession,
+        node: KnowledgeNode,
+        library: DocsLibrary,
+        user_id: UUID,
+    ) -> DocsLibrary:
+        """Lock every ACL row consulted by a task↔Docs binding.
+
+        ``can_write_node`` remains the shared decision authority, but its
+        point reads must run after the mutable library/project/member/share
+        rows are locked.  This gives a concurrent revoke a transaction
+        linearization point instead of allowing a stale preflight decision to
+        survive until the task flush.
+        """
+        # Generic Docs writes gather the full closure and lock node rows in
+        # ``KnowledgeNode.id`` order before locking the library.  Binding a
+        # task must use the same order: a target→parent walk can deadlock with
+        # a concurrent generic move that already owns the parent and waits for
+        # the target.  The unlocked walk is only a structural snapshot; every
+        # row is re-read under lock and a changed parent fails closed.
+        expected_parent_by_id: dict[UUID, UUID | None] = {
+            node.id: self._coerce_uuid(getattr(node, "parent_id", None)),
+        }
+        ancestor_ids: list[UUID] = [node.id]
+        seen: set[UUID] = {node.id}
+        current = node
+        for depth in range(512):
+            parent_id = self._coerce_uuid(getattr(current, "parent_id", None))
+            if parent_id is None:
+                break
+            if parent_id in seen:
+                raise TaskManagementError(
+                    "Docs nodeの親階層が循環しています",
+                    status_code=403,
+                )
+            parent_result = await session.execute(
+                select(KnowledgeNode)
+                .where(KnowledgeNode.id == parent_id)
+                .execution_options(populate_existing=True)
+            )
+            parent = parent_result.scalar_one_or_none()
+            if (
+                parent is None
+                or self._coerce_uuid(getattr(parent, "docs_library_id", None))
+                != self._coerce_uuid(getattr(library, "id", None))
+            ):
+                raise TaskManagementError(
+                    "Docs nodeの親を検証できません",
+                    status_code=403,
+                )
+            seen.add(parent_id)
+            ancestor_ids.append(parent_id)
+            expected_parent_by_id[parent_id] = self._coerce_uuid(
+                getattr(parent, "parent_id", None)
+            )
+            current = parent
+            if depth == 511 and getattr(current, "parent_id", None) is not None:
+                raise TaskManagementError(
+                    "Docs nodeの親階層を検証できません",
+                    status_code=403,
+                )
+
+        ordered_ancestor_ids = sorted(set(ancestor_ids), key=str)
+        locked_by_id: dict[UUID, KnowledgeNode] = {}
+        for ancestor_id in ordered_ancestor_ids:
+            locked_result = await session.execute(
+                select(KnowledgeNode)
+                .where(KnowledgeNode.id == ancestor_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            locked = locked_result.scalar_one_or_none()
+            if (
+                locked is None
+                or self._coerce_uuid(getattr(locked, "docs_library_id", None))
+                != self._coerce_uuid(getattr(library, "id", None))
+                or self._coerce_uuid(getattr(locked, "parent_id", None))
+                != expected_parent_by_id.get(ancestor_id)
+            ):
+                raise TaskManagementError(
+                    "Docs nodeの親階層が同時に変更されたためタスク連携を中止しました",
+                    status_code=409,
+                )
+            locked_by_id[ancestor_id] = locked
+
+        locked_node = locked_by_id.get(node.id)
+        if locked_node is None:
+            raise TaskManagementError("Docs node not found", status_code=404)
+        # Return the fresh target through the session identity map so callers
+        # do not continue evaluating a stale preflight object after the
+        # closure lock.
+        node = locked_node
+
+        # Match generic Docs writes: node closure first, then the mutable
+        # library and its ACL rows.  This avoids the library↔node inversion
+        # during a concurrent move.
+        library_result = await session.execute(
+            select(DocsLibrary)
+            .where(DocsLibrary.id == library.id)
+            .execution_options(populate_existing=True)
+            .with_for_update()
+        )
+        locked_library = library_result.scalar_one_or_none()
+        if locked_library is None:
+            raise TaskManagementError("Docs node not found", status_code=404)
+        library = locked_library
+        if node.project_id is not None:
+            await session.execute(
+                select(Project)
+                .where(Project.id == node.project_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            await session.execute(
+                select(ProjectMember)
+                .where(
+                    and_(
+                        ProjectMember.project_id == node.project_id,
+                        ProjectMember.user_id == user_id,
+                    )
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            await session.execute(
+                select(User)
+                .where(User.id == user_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            return library
+
+        # Shares are also locked in lexical node-id order.  ACL evaluation
+        # below still follows nearest→root so a nearer read share cannot be
+        # bypassed by a broader write share.
+        for ancestor_id in ordered_ancestor_ids:
+            await session.execute(
+                select(KnowledgeNodeShare)
+                .where(
+                    and_(
+                        KnowledgeNodeShare.user_id == user_id,
+                        KnowledgeNodeShare.node_id == ancestor_id,
+                    )
+                )
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+        return library
 
     async def _validate_knowledge_node_binding(
         self,
@@ -126,8 +436,61 @@ class TaskCrudMixin:
         """
 
         node = await session.get(KnowledgeNode, knowledge_node_id)
-        if node is None or getattr(node, "archived_at", None) is not None:
+        if node is None:
             raise TaskManagementError("Docs node not found", status_code=404)
+        if getattr(node, "archived_at", None) is not None:
+            raise TaskManagementError("Docs node not found", status_code=404)
+        # Project pointer/repair writers lock Project rows before their target
+        # node.  Lock the task Project and any reverse-pointer Projects first;
+        # the Docs helper below then acquires the complete node closure in
+        # lexical order.  Keeping pointer locks ahead of node locks matches
+        # canonical repair and generic Docs moves without a cross-project
+        # inversion.
+        if isinstance(session, AsyncSession):
+            project_lock_result = await session.execute(
+                select(Project)
+                .where(Project.id == task_project_id)
+                .order_by(Project.id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            locked_projects = list(project_lock_result.scalars().all())
+            node_result = await session.execute(
+                select(KnowledgeNode)
+                .where(KnowledgeNode.id == knowledge_node_id)
+                .execution_options(populate_existing=True)
+            )
+            node = node_result.scalar_one_or_none()
+            if node is None:
+                raise TaskManagementError("Docs node not found", status_code=404)
+            if getattr(node, "archived_at", None) is not None:
+                raise TaskManagementError("Docs node not found", status_code=404)
+            # Reject a foreign Project identity before consulting any Docs ACL
+            # rows.  Task create/update already holds the task Project lock;
+            # acquiring another Project after node locks would invert the
+            # Project→node order used by canonical repair.
+            node_project_id = self._coerce_uuid(getattr(node, "project_id", None))
+            if node_project_id is not None and node_project_id != task_project_id:
+                raise TaskManagementError("Docs node permission denied", status_code=403)
+            # A Project may have assigned this node as its canonical pointer
+            # while the initial preflight was running.  Lock reverse pointers
+            # before the node closure; ``nowait`` converts a conflicting
+            # canonical repair into a fail-closed 409 instead of waiting in a
+            # Project↔node lock cycle.
+            try:
+                pointer_result = await session.execute(
+                    select(Project)
+                    .where(Project.knowledge_node_id == knowledge_node_id)
+                    .order_by(Project.id)
+                    .execution_options(populate_existing=True)
+                    .with_for_update(nowait=True)
+                )
+                locked_projects.extend(pointer_result.scalars().all())
+            except Exception as exc:
+                raise TaskManagementError(
+                    "Docs node identity is being repaired; retry the binding",
+                    status_code=409,
+                ) from exc
         # ``workspace_id`` is the legacy alias still used by dependency-free
         # service doubles and rolling-deploy callers.  Persisted ORM rows use
         # ``docs_library_id``; accepting the alias here preserves the existing
@@ -144,6 +507,23 @@ class TaskCrudMixin:
             or self._coerce_uuid(getattr(library, "id", None)) != docs_library_id
         ):
             raise TaskManagementError("Docs node not found", status_code=404)
+
+        if isinstance(session, AsyncSession):
+            library = await self._lock_docs_acl_for_binding(
+                session,
+                node,
+                library,
+                user_id,
+            )
+            refreshed_node_result = await session.execute(
+                select(KnowledgeNode)
+                .where(KnowledgeNode.id == knowledge_node_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            node = refreshed_node_result.scalar_one_or_none()
+            if node is None or getattr(node, "archived_at", None) is not None:
+                raise TaskManagementError("Docs node not found", status_code=404)
 
         try:
             writable = await can_write_node(
@@ -168,6 +548,26 @@ class TaskCrudMixin:
         # authoritative task scope in that case).
         if node_project_id is not None and node_project_id != task_project_id:
             raise TaskManagementError("Docs node permission denied", status_code=403)
+
+        # A task link is also a future Docs mutation target: title updates are
+        # synchronized back to the bound node.  Perform the ACL and project
+        # identity checks first so a caller who cannot read/write a private
+        # Guide cannot learn its managed status.  For a real AsyncSession this
+        # runs after the target row is locked/refreshed, closing the reparent
+        # race between validation and task mutation; dependency-free service
+        # doubles still get the same preflight check here.
+        if isinstance(session, AsyncSession):
+            system_key = str(getattr(node, "system_key", "") or "").strip()
+            if (
+                system_key == "project_information_root"
+                or system_key.startswith("project_information:")
+                or any(project.knowledge_node_id == knowledge_node_id for project in locked_projects)
+            ):
+                raise TaskManagementError(
+                    "Project canonical Docs nodeはタスク連携先にできません",
+                    status_code=409,
+                )
+        await self._assert_task_docs_guide_binding_allowed(session, node)
         return node
 
     async def _load_task_for_update(
@@ -183,6 +583,7 @@ class TaskCrudMixin:
                 selectinload(Task.comments).selectinload(TaskComment.user),
                 selectinload(Task.activities).selectinload(TaskActivity.user),
                 selectinload(Task.recurrence_rule),
+                selectinload(Task.recurrence_schedule_segments),
                 selectinload(Task.occurrences),
                 selectinload(Task.time_entries).selectinload(TimeEntry.user),
                 selectinload(Task.task_tags).selectinload(TaskTag.tag),
@@ -244,6 +645,12 @@ class TaskCrudMixin:
             project_id=target_project_id,
             user_id=user_id,
             permission="read",
+        )
+        await self._lock_project_acl_for_task_write(
+            session,
+            project_ids=(target_project_id,),
+            user_id=user_id,
+            require_read=True,
         )
         if knowledge_node_id is not None:
             await self._validate_knowledge_node_binding(
@@ -318,6 +725,20 @@ class TaskCrudMixin:
         session.add(task)
         await session.flush()
 
+        # Verification provenance is request-local and server-authenticated;
+        # never infer it from task titles or caller metadata.  The ledger row
+        # and JSON marker are written in this same transaction.
+        from ..verification_provenance import register_current_entity
+
+        tagged_metadata = await register_current_entity(
+            session,
+            entity_type="task",
+            entity_id=task.id,
+            metadata=task.task_metadata,
+        )
+        if tagged_metadata is not None:
+            task.task_metadata = tagged_metadata
+
         # Agent RunのContextVarに依存せず、呼び出し元で捕捉したRun IDを使う。
         # 参照登録はタスク作成と同じトランザクションに含める。
         await attach_agent_run_source_reference(
@@ -355,13 +776,29 @@ class TaskCrudMixin:
             skip_holiday=bool(recurrence.skip_holiday) if recurrence else False,
             skip_mode=recurrence.skip_mode if recurrence else None,
         )
-        await self._record_activity(
+        task_created_activity = await self._record_activity(
             session,
             task_id=task.id,
             activity_type="task_created",
             user_id=user_id,
-            payload={"project_id": str(target_project_id)},
+            payload={
+                "project_id": str(target_project_id),
+                "status": normalized_status,
+            },
         )
+
+        if normalized_status == "closed":
+            from ..knowledge_capture_candidate_service import (
+                enqueue_for_completed_task,
+            )
+
+            activity_id = getattr(task_created_activity, "id", None)
+            if not isinstance(activity_id, UUID):
+                activity_id = None
+            enqueue_kwargs = {"trigger_user_id": user_id}
+            if activity_id is not None:
+                enqueue_kwargs["task_activity_id"] = activity_id
+            await enqueue_for_completed_task(session, task, **enqueue_kwargs)
 
         if commit:
             _assert_generation_mutation_allowed()
@@ -379,28 +816,20 @@ class TaskCrudMixin:
         user_id: UUID,
         project_id: Optional[UUID] = None,
         space_id: Optional[UUID] = None,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
         status: Optional[str] = None,
         assignee_id: Optional[UUID] = None,
         search: Optional[str] = None,
     ) -> list[dict[str, Any]]:
-        participating_project_ids = await self._get_participating_project_ids(
-            session, user_id
+        participating_project_ids = await self.resolve_read_project_ids(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            space_id=space_id,
+            browse_project_id=browse_project_id,
+            browse_space_id=browse_space_id,
         )
-        if project_id is not None:
-            await self.require_project_permission(
-                session, project_id=project_id, user_id=user_id, permission="read"
-            )
-            participating_project_ids = (
-                [project_id]
-                if project_id in participating_project_ids
-                else []
-            )
-        elif space_id is not None:
-            participating_project_ids = await self._filter_project_ids_by_space(
-                session,
-                project_ids=participating_project_ids,
-                space_id=space_id,
-            )
 
         if not participating_project_ids:
             return []
@@ -545,6 +974,7 @@ class TaskCrudMixin:
         *,
         user_id: UUID,
         task_id: UUID,
+        commit: bool = True,
     ) -> dict[str, Any]:
         """Soft-delete a task tree and return its canonical tombstone.
 
@@ -581,7 +1011,8 @@ class TaskCrudMixin:
                 ),
                 "idempotent": True,
             }
-            await self._broadcast("task_deleted", payload)
+            if commit:
+                await self._broadcast("task_deleted", payload)
             return payload
 
         task_ids = await self._collect_task_tree_ids(
@@ -654,8 +1085,9 @@ class TaskCrudMixin:
                 "task_ids": [str(value) for value in task_ids],
             },
         )
-        _assert_generation_mutation_allowed()
-        await session.commit()
+        if commit:
+            _assert_generation_mutation_allowed()
+            await session.commit()
         payload = {
             "id": str(task.id),
             "task_id": str(task.id),
@@ -664,7 +1096,8 @@ class TaskCrudMixin:
             "deletion_batch_id": str(deletion_batch_id),
             "idempotent": False,
         }
-        await self._broadcast("task_deleted", payload)
+        if commit:
+            await self._broadcast("task_deleted", payload)
         return payload
 
     async def restore_task(
@@ -823,6 +1256,324 @@ class TaskCrudMixin:
         await self._broadcast("task_restored", payload)
         return payload
 
+    async def purge_deleted_task_ids(
+        self,
+        session: AsyncSession,
+        *,
+        task_ids: Iterable[UUID | str],
+        expected_deletion_batch_id: UUID | str | None = None,
+        expected_batch_ids: Mapping[UUID | str, UUID | str] | None = None,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        """Permanently remove an explicitly approved set of task tombstones.
+
+        Unlike :meth:`purge_expired_task_deletions`, this method never scans
+        for expired rows.  The caller must provide the exact task UUIDs that
+        were selected by an evidence-backed cleanup manifest.  Every selected
+        row is locked and checked again in the same transaction; a caller may
+        supply one expected batch id for the complete set or a mapping keyed
+        by task UUID.  A stale/live/mismatched row fails closed before any
+        dependent rows are changed.  Missing rows are treated as an idempotent
+        retry because a previous invocation may already have purged them.
+
+        The deletion order intentionally mirrors the canonical retention
+        helper.  All task-owned rows are removed explicitly before the task
+        rows themselves, while the content-deletion ledger receives a
+        ``purged`` event so sync clients can converge after the physical row
+        disappears.
+        """
+
+        # ``task_ids`` is an iterable so callers can pass a manifest generator,
+        # but strings must never be interpreted as an iterable of characters.
+        if task_ids is None:  # type: ignore[comparison-overlap]
+            raw_task_ids: list[Any] = []
+        elif isinstance(task_ids, (str, bytes)):
+            raw_task_ids = [task_ids]
+        else:
+            raw_task_ids = list(task_ids)
+
+        def _normalize_uuid(value: Any, field_name: str) -> UUID:
+            try:
+                return value if isinstance(value, UUID) else UUID(str(value))
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise TaskManagementError(
+                    f"{field_name} must be a valid UUID", status_code=400
+                ) from exc
+
+        normalized_task_ids: list[UUID] = []
+        seen_task_ids: set[UUID] = set()
+        for raw_task_id in raw_task_ids:
+            task_id = _normalize_uuid(raw_task_id, "task_ids")
+            if task_id in seen_task_ids:
+                continue
+            seen_task_ids.add(task_id)
+            normalized_task_ids.append(task_id)
+
+        expected_batch: UUID | None = None
+        if expected_deletion_batch_id is not None:
+            expected_batch = _normalize_uuid(
+                expected_deletion_batch_id, "expected_deletion_batch_id"
+            )
+
+        expected_by_task: dict[UUID, UUID] | None = None
+        if expected_batch_ids is not None:
+            if not isinstance(expected_batch_ids, Mapping):
+                raise TaskManagementError(
+                    "expected_batch_ids must be a mapping", status_code=400
+                )
+            if expected_batch is not None:
+                raise TaskManagementError(
+                    "Provide either expected_deletion_batch_id or expected_batch_ids",
+                    status_code=400,
+                )
+            expected_by_task = {}
+            for raw_task_id, raw_batch_id in expected_batch_ids.items():
+                expected_by_task[_normalize_uuid(raw_task_id, "expected_batch_ids")] = (
+                    _normalize_uuid(raw_batch_id, "expected_batch_ids")
+                )
+
+        empty_result = {
+            "purged_batches": 0,
+            "purged_tasks": 0,
+            "task_ids": [],
+            "missing_task_ids": [str(task_id) for task_id in normalized_task_ids],
+            "skipped_task_ids": [],
+            "idempotent": True,
+        }
+        if not normalized_task_ids:
+            return empty_result
+
+        # Lock exactly the rows named by the manifest.  Do not replace this
+        # with a batch/retention query: a batch can contain legitimate rows
+        # outside the approved one-time cleanup scope.
+        result = await session.execute(
+            select(Task)
+            .where(Task.id.in_(normalized_task_ids))
+            .with_for_update()
+        )
+        selected_rows = list(result.scalars().all())
+        selected_by_id: dict[UUID, Task] = {}
+        for row in selected_rows:
+            row_id = _normalize_uuid(getattr(row, "id", None), "task.id")
+            # A primary-key result cannot contain duplicates, but retaining the
+            # first row makes lightweight test doubles and unusual adapters
+            # deterministic without widening the deletion scope.
+            selected_by_id.setdefault(row_id, row)
+
+        missing_task_ids = [
+            task_id for task_id in normalized_task_ids if task_id not in selected_by_id
+        ]
+        eligible_rows: list[Task] = []
+        skipped_task_ids: list[UUID] = []
+        for task_id in normalized_task_ids:
+            row = selected_by_id.get(task_id)
+            if row is None:
+                continue
+
+            deleted_at = getattr(row, "deleted_at", None)
+            deletion_batch_id = getattr(row, "deletion_batch_id", None)
+            if deleted_at is None or deletion_batch_id is None:
+                raise TaskManagementError(
+                    "Task is not a restorable deletion tombstone",
+                    status_code=409,
+                )
+            actual_batch = _normalize_uuid(
+                deletion_batch_id, "task.deletion_batch_id"
+            )
+
+            if expected_batch is not None and actual_batch != expected_batch:
+                raise TaskManagementError(
+                    "Deletion batch does not match task", status_code=409
+                )
+            if expected_by_task is not None:
+                expected_for_task = expected_by_task.get(task_id)
+                if expected_for_task is None or actual_batch != expected_for_task:
+                    raise TaskManagementError(
+                        "Deletion batch does not match task", status_code=409
+                    )
+
+            eligible_rows.append(row)
+
+        # Parent/child deletion is the one self-referential edge that can
+        # cascade outside the explicit manifest.  Refuse a partial tree rather
+        # than allowing a database-level ON DELETE CASCADE to remove an
+        # unapproved child.  ``with_for_update`` serializes an existing child
+        # against concurrent task writers in the maintenance transaction.
+        eligible_ids = [row.id for row in eligible_rows]
+        if eligible_ids:
+            child_result = await session.execute(
+                select(Task.id, Task.parent_task_id)
+                .where(Task.parent_task_id.in_(eligible_ids))
+                .with_for_update()
+            )
+            child_rows = list(child_result.all())
+            eligible_id_set = set(eligible_ids)
+            for child_id, _parent_id in child_rows:
+                child_uuid = _normalize_uuid(child_id, "task.id")
+                if child_uuid not in eligible_id_set:
+                    raise TaskManagementError(
+                        "Task purge requires the complete deleted task tree",
+                        status_code=409,
+                    )
+
+        if not eligible_rows:
+            return {
+                "purged_batches": 0,
+                "purged_tasks": 0,
+                "task_ids": [],
+                "missing_task_ids": [str(task_id) for task_id in missing_task_ids],
+                "skipped_task_ids": [str(task_id) for task_id in skipped_task_ids],
+                "idempotent": True,
+            }
+
+        # Keep the audit event's timestamp stable across all selected batches.
+        event_at = datetime.utcnow()
+        rows_by_batch: dict[UUID, list[Task]] = {}
+        for row in eligible_rows:
+            batch_id = _normalize_uuid(row.deletion_batch_id, "task.deletion_batch_id")
+            rows_by_batch.setdefault(batch_id, []).append(row)
+
+        # The shared task-deletion ledger is the durable sync source once the
+        # physical Task row is gone.  Preserve one event per task and retain
+        # its project scope for mobile/general sync queries.
+        for batch_id, batch_rows in rows_by_batch.items():
+            batch_task_ids = [row.id for row in batch_rows]
+            batch_deleted_at = min(
+                (row.deleted_at for row in batch_rows if row.deleted_at is not None),
+                default=event_at,
+            )
+            batch_project_ids = {
+                getattr(row, "project_id", None)
+                for row in batch_rows
+                if getattr(row, "project_id", None) is not None
+            }
+            project_id = (
+                next(iter(batch_project_ids), None)
+                if len(batch_project_ids) == 1
+                else None
+            )
+            batch_id_set = set(batch_task_ids)
+            root_task_id = next(
+                (
+                    row.id
+                    for row in batch_rows
+                    if getattr(row, "parent_task_id", None) not in batch_id_set
+                ),
+                batch_task_ids[0],
+            )
+            await self._append_task_deletion_audit(
+                session,
+                task_ids=batch_task_ids,
+                deletion_batch_id=batch_id,
+                deleted_at=batch_deleted_at,
+                action="purge",
+                root_task_id=root_task_id,
+                project_id=project_id,
+                event_at=event_at,
+            )
+
+        await self._remove_task_supertags_for_deleted_tasks(session, eligible_ids)
+
+        # Keep this order aligned with purge_expired_task_deletions.  In
+        # particular NotificationDelivery and TimeEntry rows may reference a
+        # TaskOccurrence, so both are removed before occurrences themselves.
+        # Include occurrence-only deliveries as older rows may not have a
+        # task_id populated.
+        occurrence_ids = select(TaskOccurrence.id).where(
+            TaskOccurrence.task_id.in_(eligible_ids)
+        )
+        await session.execute(
+            delete(NotificationDelivery).where(
+                or_(
+                    NotificationDelivery.task_id.in_(eligible_ids),
+                    NotificationDelivery.occurrence_id.in_(occurrence_ids),
+                )
+            )
+        )
+        await session.execute(
+            delete(TimeEntry).where(
+                or_(
+                    TimeEntry.task_id.in_(eligible_ids),
+                    TimeEntry.occurrence_id.in_(occurrence_ids),
+                )
+            )
+        )
+        await session.execute(
+            delete(TaskOccurrence).where(TaskOccurrence.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskDependency).where(
+                or_(
+                    TaskDependency.task_id.in_(eligible_ids),
+                    TaskDependency.depends_on_task_id.in_(eligible_ids),
+                )
+            )
+        )
+        await session.execute(
+            delete(TaskActivity).where(TaskActivity.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskRecurrenceRule).where(TaskRecurrenceRule.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskRecurrenceScheduleSegment).where(
+                TaskRecurrenceScheduleSegment.task_id.in_(eligible_ids)
+            )
+        )
+        await session.execute(
+            delete(TaskSchedulePlacement).where(
+                TaskSchedulePlacement.task_id.in_(eligible_ids)
+            )
+        )
+        await session.execute(
+            delete(TaskComment).where(TaskComment.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskAttachment).where(TaskAttachment.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskReference).where(TaskReference.task_id.in_(eligible_ids))
+        )
+        await session.execute(
+            delete(TaskRelation).where(
+                or_(
+                    TaskRelation.task_a_id.in_(eligible_ids),
+                    TaskRelation.task_b_id.in_(eligible_ids),
+                )
+            )
+        )
+        await session.execute(
+            delete(TaskAppLink).where(TaskAppLink.task_id.in_(eligible_ids))
+        )
+        await session.execute(delete(TaskTag).where(TaskTag.task_id.in_(eligible_ids)))
+        await session.execute(
+            delete(TaskAssignee).where(TaskAssignee.task_id.in_(eligible_ids))
+        )
+
+        # Detach the self-reference before deleting rows.  The complete-tree
+        # guard above ensures this cannot silently cascade into an unapproved
+        # child task.
+        await session.execute(
+            update(Task)
+            .where(Task.id.in_(eligible_ids))
+            .values(parent_task_id=None)
+        )
+        await session.execute(delete(Task).where(Task.id.in_(eligible_ids)))
+
+        if commit:
+            _assert_generation_mutation_allowed()
+            await session.commit()
+
+        purged_task_ids = [str(task_id) for task_id in eligible_ids]
+        return {
+            "purged_batches": len(rows_by_batch),
+            "purged_tasks": len(eligible_ids),
+            "task_ids": purged_task_ids,
+            "missing_task_ids": [str(task_id) for task_id in missing_task_ids],
+            "skipped_task_ids": [str(task_id) for task_id in skipped_task_ids],
+            "idempotent": False,
+        }
+
     async def _remove_task_supertags_for_deleted_tasks(
         self,
         session: AsyncSession,
@@ -936,8 +1687,23 @@ class TaskCrudMixin:
         *,
         user_id: UUID,
         task_id: UUID,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
     ) -> dict[str, Any]:
         task = await self._load_task(session, task_id)
+        scoped_project_ids: list[UUID] | None = None
+        if browse_project_id is not None or browse_space_id is not None:
+            # Resolve the explicit target before checking the task's project ACL
+            # so an out-of-scope/inaccessible task is consistently indistinguishable
+            # from a missing task (404), rather than leaking a 403.
+            scoped_project_ids = await self.resolve_browse_project_ids(
+                session,
+                user_id=user_id,
+                browse_project_id=browse_project_id,
+                browse_space_id=browse_space_id,
+            )
+            if task.project_id not in scoped_project_ids:
+                raise TaskManagementError("Task not found", status_code=404)
         await self.require_project_permission(
             session, project_id=task.project_id, user_id=user_id, permission="read"
         )
@@ -953,8 +1719,11 @@ class TaskCrudMixin:
             for occurrence in sorted(task.occurrences, key=lambda item: item.start_at)
             if occurrence.deleted_at is None
         ]
+        # Keep task detail entries on the same timer serializer as
+        # list/active/start/stop responses (including explicit API offsets and
+        # original_* metadata normalization).
         result["time_entries"] = [
-            entry.to_dict()
+            self._build_time_entry_payload(entry)
             for entry in task.time_entries
             if entry.deleted_at is None
         ]
@@ -999,6 +1768,39 @@ class TaskCrudMixin:
                 project_id=updates["project_id"],
                 require_write=True,
             )
+        await self._lock_project_acl_for_task_write(
+            session,
+            project_ids=(task.project_id, target_project_id),
+            user_id=user_id,
+        )
+        if isinstance(session, AsyncSession):
+            # Every ORM write must lock the Task only after the project
+            # advisory/ACL rows above.  Title-only updates used to rely on the
+            # initial identity read and therefore flushed a Task row while a
+            # concurrent TS/Python writer held the opposite Project/Task lock
+            # order.  Taking the row lock unconditionally also serializes the
+            # Docs-node binding path without orphaning a concurrently-created
+            # node.
+            locked_task = await self._load_task_for_update(session, task_id)
+            if locked_task.project_id != task.project_id:
+                raise TaskManagementError(
+                    "TaskのProjectが同時変更されたため更新できません",
+                    status_code=409,
+                )
+            requested_binding = self._coerce_uuid(updates.get("knowledge_node_id"))
+            locked_binding = self._coerce_uuid(locked_task.knowledge_node_id)
+            prior_binding = self._coerce_uuid(task.knowledge_node_id)
+            if (
+                locked_binding != prior_binding
+                and locked_binding != requested_binding
+            ):
+                raise TaskManagementError(
+                    "TaskのDocs node bindingが同時変更されたため更新できません",
+                    status_code=409,
+                )
+            task = locked_task
+            if "project_id" not in updates or updates.get("project_id") is None:
+                target_project_id = task.project_id
         project_will_change = target_project_id != task.project_id
         requested_parent_id = (
             updates.get("parent_task_id")
@@ -1065,7 +1867,8 @@ class TaskCrudMixin:
                     },
                 )
 
-        parent_was_closed = normalize_task_status(task.status) == "closed"
+        previous_task_status = normalize_task_status(task.status)
+        parent_was_closed = previous_task_status == "closed"
         completion_time = datetime.utcnow()
 
         next_knowledge_node_id = (
@@ -1091,6 +1894,16 @@ class TaskCrudMixin:
                 target_project_id=target_project_id,
                 target_parent_task_id=requested_parent_id,
             )
+            if task.knowledge_node_id is not None:
+                # A Project move must never leave a Docs-bound task pointing
+                # at the old Project's node.  The helper above re-reads the
+                # locked Task after the advisory Project locks, so this also
+                # rejects a binding that raced in after the initial
+                # validation (including an explicit unbind payload).
+                raise TaskManagementError(
+                    "Docs連携済みタスクは先にDocs連携を解除してからProjectを変更してください",
+                    status_code=409,
+                )
             locked_parent = target_parent
             if requested_parent_id is not None:
                 task.parent_task_id = target_parent.id if target_parent else None
@@ -1194,12 +2007,13 @@ class TaskCrudMixin:
             skip_holiday=bool(recurrence.skip_holiday) if recurrence else False,
             skip_mode=recurrence.skip_mode if recurrence else None,
         )
+        completed_children: list[tuple[Task, Any]] = []
         for child in incomplete_children:
             previous_status = normalize_task_status(child.status)
             child.status = "closed"
             child.completed_at = completion_time
             child.updated_at = completion_time
-            await self._record_activity(
+            child_activity = await self._record_activity(
                 session,
                 task_id=child.id,
                 activity_type="closed_by_parent",
@@ -1209,27 +2023,74 @@ class TaskCrudMixin:
                     "previous_status": previous_status,
                 },
             )
+            if previous_status not in {"closed", "cancelled"}:
+                completed_children.append((child, child_activity))
 
+        task_became_closed = (
+            previous_task_status not in {"closed", "cancelled"}
+            and normalize_task_status(task.status) == "closed"
+        )
         is_idempotent_close_replay = (
             parent_was_closed
             and not incomplete_children
             and set(updates) == {"status"}
         )
+        task_activity = None
         if not is_idempotent_close_replay:
             activity_payload = {
-                key: str(value) for key, value in updates.items() if value is not None
+                key: str(value)
+                for key, value in updates.items()
+                if value is not None and key != "status"
             }
+            if "status" in updates and updates.get("status") is not None:
+                # A status marker is a completion/lifecycle event only when
+                # the row actually changed status.  In particular, a
+                # closed->closed metadata request must not look like a new
+                # completion episode to recovery.
+                if task_became_closed:
+                    activity_payload["status"] = "closed"
+                elif previous_task_status != normalize_task_status(task.status):
+                    activity_payload["status"] = normalize_task_status(task.status)
             if incomplete_children:
                 activity_payload["closed_incomplete_subtask_count"] = len(
                     incomplete_children
                 )
-            await self._record_activity(
+            task_activity = await self._record_activity(
                 session,
                 task_id=task.id,
                 activity_type="task_updated",
                 user_id=user_id,
                 payload=activity_payload,
             )
+
+        # Knowledge Capture is a durable enqueue only.  Keep this local
+        # import out of the task-management module graph and do not run any
+        # LLM/research work in the Task transaction.
+        if task_became_closed:
+            from ..knowledge_capture_candidate_service import (
+                enqueue_for_completed_task,
+            )
+
+            activity_id = getattr(task_activity, "id", None)
+            if not isinstance(activity_id, UUID):
+                activity_id = None
+            enqueue_kwargs = {"trigger_user_id": user_id}
+            if activity_id is not None:
+                enqueue_kwargs["task_activity_id"] = activity_id
+            await enqueue_for_completed_task(session, task, **enqueue_kwargs)
+        if completed_children:
+            from ..knowledge_capture_candidate_service import (
+                enqueue_for_completed_task,
+            )
+
+            for child, child_activity in completed_children:
+                activity_id = getattr(child_activity, "id", None)
+                if not isinstance(activity_id, UUID):
+                    activity_id = None
+                enqueue_kwargs = {"trigger_user_id": user_id}
+                if activity_id is not None:
+                    enqueue_kwargs["task_activity_id"] = activity_id
+                await enqueue_for_completed_task(session, child, **enqueue_kwargs)
         if "title" in updates and task.knowledge_node_id is not None:
             await self._sync_bound_docs_node_title(
                 session,
@@ -1262,8 +2123,14 @@ class TaskCrudMixin:
                 task_project_id=task_project_id,
                 user_id=user_id,
             )
-        except Exception:
-            return
+        except TaskManagementError as exc:
+            # A revoked personal share or deleted/archived target is an
+            # expected stale binding; leave the Docs row untouched and keep
+            # the task update usable.  Canonical identity conflicts are a
+            # deterministic 409 and must remain visible to the caller.
+            if exc.status_code in {403, 404}:
+                return
+            raise
         if node.title == task.title:
             return
         node.title = task.title
@@ -1289,16 +2156,38 @@ class TaskCrudMixin:
         *,
         project_id: UUID,
         user_id: UUID,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
     ) -> list[dict[str, Any]]:
-        await self.require_project_permission(
-            session, project_id=project_id, user_id=user_id, permission="read"
-        )
+        if browse_project_id is not None or browse_space_id is not None:
+            scoped_project_ids = await self.resolve_browse_project_ids(
+                session,
+                user_id=user_id,
+                browse_project_id=browse_project_id,
+                browse_space_id=browse_space_id,
+            )
+            if project_id not in scoped_project_ids:
+                raise TaskManagementError("Browse target not found", status_code=404)
+        else:
+            await self.require_project_permission(
+                session, project_id=project_id, user_id=user_id, permission="read"
+            )
         space_id = await self._get_project_space_id(session, project_id=project_id)
         if space_id is None:
             return []
-        result = await session.execute(
-            select(Tag).where(Tag.space_id == space_id).order_by(Tag.name)
-        )
+        tag_query = select(Tag).where(Tag.space_id == space_id)
+        if browse_project_id is not None or browse_space_id is not None:
+            # Tags are Space-owned, but a browse detail must not turn the
+            # project tag catalog into a sibling-project metadata oracle. Only
+            # tags actually attached to live tasks in the requested Project are
+            # returned for an explicit browse.
+            tag_query = (
+                tag_query.join(TaskTag, TaskTag.tag_id == Tag.id)
+                .join(Task, Task.id == TaskTag.task_id)
+                .where(Task.project_id == project_id, Task.deleted_at.is_(None))
+                .distinct()
+            )
+        result = await session.execute(tag_query.order_by(Tag.name))
         tags = []
         for tag in result.scalars().all():
             payload = tag.to_dict()

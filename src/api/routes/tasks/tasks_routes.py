@@ -16,7 +16,6 @@ from ...uuid_http import parse_uuid_or_400
 from ...http_cache import etag_json_response
 from ....memory.models import (
     ConversationMessage,
-    ConversationParticipant,
     ConversationSession,
     KnowledgeNode,
     DocsLibrary,
@@ -33,6 +32,7 @@ from ....services.task_management_service import (
     normalize_task_status,
 )
 from ....services.docs_acl import can_read_node
+from ....services.task_reference_service import conversation_reference_visible
 from ....task_time import normalize_task_timezone
 from ._shared import (
     CreateTaskPayload,
@@ -42,10 +42,55 @@ from ._shared import (
     TaskRouterContext,
     UpdateTaskPayload,
     _build_update_task_updates,
+    _parse_browse_scope,
     _parse_wall_clock_datetime,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _normalize_conversation_message_id(value: object) -> str:
+    """Return one stable dedupe representation without changing persisted metadata."""
+
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ""
+    try:
+        return str(UUID(normalized))
+    except (TypeError, ValueError):
+        return normalized
+
+
+def _task_reference_dedupe_key(
+    reference_type: str,
+    *,
+    target_id: str | None,
+    target_path: str | None,
+    target_url: str | None,
+    metadata: dict | None,
+) -> str:
+    """Keep legacy keys except where message identity is part of the reference."""
+
+    base_key = f"{target_id or ''}|{target_path or ''}|{target_url or ''}"
+    if reference_type != "conversation_message":
+        return base_key
+    message_id = _normalize_conversation_message_id(
+        metadata.get("message_id") if isinstance(metadata, dict) else None
+    )
+    return f"{base_key}|{message_id}"
+
+
+def _legacy_message_reference_matches(
+    reference: object,
+    *,
+    legacy_dedupe_key: str,
+    canonical_message_id: str,
+) -> bool:
+    if not canonical_message_id or getattr(reference, "dedupe_key", None) != legacy_dedupe_key:
+        return False
+    metadata = getattr(reference, "reference_metadata", None)
+    message_id = metadata.get("message_id") if isinstance(metadata, dict) else None
+    return _normalize_conversation_message_id(message_id) == canonical_message_id
 
 
 async def _serialize_task_relation(
@@ -56,6 +101,7 @@ async def _serialize_task_relation(
     user_id: UUID,
     can_remove: bool,
     service,
+    allowed_project_ids: set[UUID] | None = None,
 ) -> dict:
     target_id = (
         relation.task_b_id
@@ -95,6 +141,8 @@ async def _serialize_task_relation(
     if row is None:
         return data
     target_task, project_name = row
+    if allowed_project_ids is not None and target_task.project_id not in allowed_project_ids:
+        return data
     try:
         await service.require_project_permission(
             session,
@@ -200,6 +248,15 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             tasks = await service.list_tasks(
                 session,
                 user_id=user_id,
@@ -214,6 +271,7 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                     request.query_params.get("assignee_id"), "assignee_id"
                 ),
                 search=request.query_params.get("search"),
+                **browse_kwargs,
             )
             # 低帯域環境向け ETag/304。本文（タスク配列）から弱い ETag を算出し、
             # If-None-Match 一致なら 304。ユーザー可視範囲のデータのため private。
@@ -232,10 +290,20 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             return await service.get_task(
                 session,
                 user_id=user_id,
                 task_id=parse_uuid_or_400(task_id, "task_id"),
+                **browse_kwargs,
             )
         except TaskManagementError as exc:
             raise _translate_service_error(exc)
@@ -362,9 +430,22 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_project_ids = None
+            if browse_project_id is not None or browse_space_id is not None:
+                browse_project_ids = set(
+                    await service.resolve_browse_project_ids(
+                        session,
+                        user_id=user_id,
+                        browse_project_id=browse_project_id,
+                        browse_space_id=browse_space_id,
+                    )
+                )
             task = await _load_task_for_attachment(
                 session, user_id=user_id, task_id=task_id, permission="read"
             )
+            if browse_project_ids is not None and task.project_id not in browse_project_ids:
+                raise TaskManagementError("Task not found", status_code=404)
             write_access = True
             try:
                 await service.require_project_permission(
@@ -380,12 +461,15 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 .where(TaskReference.task_id == task.id)
                 .order_by(TaskReference.created_at.desc())
             )
+            if browse_project_ids is not None:
+                write_access = False
             references = [
                 await _serialize_task_reference(
                     session,
                     reference,
                     user_id=user_id,
                     can_remove=write_access,
+                    allowed_project_ids=browse_project_ids,
                 )
                 for reference in result.scalars().all()
             ]
@@ -408,6 +492,7 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                         user_id=user_id,
                         can_remove=write_access,
                         service=service,
+                        allowed_project_ids=browse_project_ids,
                     )
                     for relation in relation_result.scalars().all()
                 ]
@@ -428,6 +513,12 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            if browse_project_id is not None or browse_space_id is not None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Browse scope is read-only",
+                )
             task = await _load_task_for_attachment(
                 session, user_id=user_id, task_id=task_id, permission="write"
             )
@@ -517,20 +608,11 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                     )
                 )
                 conversation = result.scalar_one_or_none()
-                participant = None
-                if conversation and conversation.user_id != str(user_id):
-                    participant = (
-                        await session.execute(
-                            select(ConversationParticipant.id).where(
-                                ConversationParticipant.session_id == conversation.id,
-                                ConversationParticipant.participant_type == "user",
-                                ConversationParticipant.participant_id == str(user_id),
-                                ConversationParticipant.status == "joined",
-                            )
-                        )
-                    ).scalar_one_or_none()
-                if conversation is None or (
-                    conversation.user_id != str(user_id) and participant is None
+                if not await conversation_reference_visible(
+                    session,
+                    conversation,
+                    user_id=user_id,
+                    project_id=task.project_id,
                 ):
                     raise HTTPException(status_code=404, detail="Reference target not found")
                 if payload.reference_type == "conversation_message":
@@ -569,7 +651,13 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 _, root_path = await _project_storage_root(task.project_id)
                 _resolve_attachment_file(root_path, target_path or "")
 
-            dedupe_key = f"{target_id or ''}|{target_path or ''}|{target_url or ''}"
+            dedupe_key = _task_reference_dedupe_key(
+                payload.reference_type,
+                target_id=target_id,
+                target_path=target_path,
+                target_url=target_url,
+                metadata=payload.metadata,
+            )
             result = await session.execute(
                 select(TaskReference).where(
                     TaskReference.task_id == task.id,
@@ -579,6 +667,29 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
                 )
             )
             existing = result.scalar_one_or_none()
+            if existing is None and payload.reference_type == "conversation_message":
+                canonical_message_id = _normalize_conversation_message_id(
+                    (payload.metadata or {}).get("message_id")
+                    if payload.metadata
+                    else None
+                )
+                if canonical_message_id:
+                    legacy_dedupe_key = f"{target_id or ''}|{target_path or ''}|{target_url or ''}"
+                    legacy_result = await session.execute(
+                        select(TaskReference).where(
+                            TaskReference.task_id == task.id,
+                            TaskReference.reference_type == payload.reference_type,
+                            TaskReference.relation_type == payload.relation_type,
+                            TaskReference.dedupe_key == legacy_dedupe_key,
+                        )
+                    )
+                    legacy_reference = legacy_result.scalar_one_or_none()
+                    if _legacy_message_reference_matches(
+                        legacy_reference,
+                        legacy_dedupe_key=legacy_dedupe_key,
+                        canonical_message_id=canonical_message_id,
+                    ):
+                        existing = legacy_reference
             if existing:
                 return await _serialize_task_reference(
                     session, existing, user_id=user_id, can_remove=True
@@ -686,7 +797,17 @@ def register_task_routes(router: APIRouter, ctx: TaskRouterContext) -> None:
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
             task = await service._load_task(session, parse_uuid_or_400(task_id, "task_id"))
+            if browse_project_id is not None or browse_space_id is not None:
+                scoped_project_ids = await service.resolve_browse_project_ids(
+                    session,
+                    user_id=user_id,
+                    browse_project_id=browse_project_id,
+                    browse_space_id=browse_space_id,
+                )
+                if task.project_id not in scoped_project_ids:
+                    raise TaskManagementError("Task not found", status_code=404)
             await service.require_project_permission(
                 session,
                 project_id=task.project_id,

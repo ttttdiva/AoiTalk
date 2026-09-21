@@ -37,6 +37,7 @@ from src.services.mage_vl_service import (
     get_mage_vl_service,
 )
 from src.services.outbound_privacy_service import (
+    EgressDescriptor,
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
     RawMediaBlocked,
@@ -54,6 +55,22 @@ def persist_usage_sync(*args: Any, **kwargs: Any) -> bool:
     from src.llm.conversation_context import persist_usage_sync as _persist
 
     return bool(_persist(*args, **kwargs))
+
+
+def _help_usage_persistence_suppressed() -> bool:
+    """Return whether this recognition belongs to an isolated Help turn."""
+
+    try:
+        from src.services.turn_context import get_turn_context
+
+        return bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+    except Exception:
+        # A missing/legacy context is an ordinary media request.  Do not
+        # accidentally suppress normal accounting when the optional context
+        # module is unavailable.
+        return False
 
 
 MEDIA_RECOGNITION_SYSTEM_PROMPT_VERSION = "2026-08-01-v2"
@@ -370,6 +387,9 @@ class MediaRecognitionService:
     ) -> bool:
         """Persist provider-confirmed usage, without inventing missing metrics."""
 
+        if _help_usage_persistence_suppressed():
+            return False
+
         try:
             raw_usage = self._response_usage(response)
             if raw_usage is None:
@@ -418,6 +438,9 @@ class MediaRecognitionService:
         usage_context: Any = None,
     ) -> bool:
         """Persist Gemini ``usage_metadata`` when the SDK exposes it."""
+
+        if _help_usage_persistence_suppressed():
+            return False
 
         metadata = getattr(response, "usage_metadata", None)
         if metadata is None and isinstance(response, Mapping):
@@ -503,6 +526,11 @@ class MediaRecognitionService:
             logger.debug("CLIメディア認識usageの取得に失敗しました", exc_info=True)
             return False
         if not raw_usage:
+            return False
+        # CLI backends keep their last usage in a mutable accumulator.  Drain
+        # that accumulator first, then discard the record for Help so it can
+        # never leak into the next ordinary turn.
+        if _help_usage_persistence_suppressed():
             return False
         try:
             usage = normalize_usage(raw_usage, provider=provider)
@@ -601,6 +629,27 @@ class MediaRecognitionService:
         if provider == "grok":
             return "https://api.x.ai/v1"
         return ""
+
+    @staticmethod
+    def _egress_descriptor(
+        *,
+        action: str,
+        transport: str,
+        destination: str,
+        provider: str,
+        model: str = "",
+        tool: str = "media_recognition",
+    ) -> EgressDescriptor:
+        """Build stable route metadata without embedding request content."""
+
+        return EgressDescriptor(
+            action=action,
+            transport=transport,
+            destination=destination,
+            provider=provider,
+            model=model,
+            tool=tool,
+        )
 
     async def recognize_images(
         self,
@@ -1060,6 +1109,12 @@ class MediaRecognitionService:
                 raise privacy_error
             if not provider or not model:
                 raise RuntimeError("画像認識モデルが未設定です")
+            capability = model_supports_vision(provider, model)
+            if capability is False:
+                raise RuntimeError(
+                    "現在の言語モデルは画像入力に対応していません。"
+                    "設定の画像認識で画像対応モデルを選択してください。"
+                )
             if provider in {"codex-cli", "antigravity-cli"}:
                 helper = self._recognize_cli_media
                 helper_kwargs = (
@@ -1155,14 +1210,6 @@ class MediaRecognitionService:
             backend = AntigravityCLIBackend(model=model)
         else:
             raise RuntimeError(f"{kind}入力に非対応のCLIプロバイダです: {provider}")
-        attachment = (
-            backend.prepare_image_attachment(media)
-            if kind == "image"
-            else getattr(backend, "prepare_audio_attachment", lambda _media: None)(media)
-        )
-        if not attachment:
-            raise RuntimeError(f"{backend.get_provider_name()} は{kind}入力に対応していません")
-        suffix, cleanup = attachment
         started = time.monotonic()
         request_type = "vision" if kind == "image" else "stt"
         # The configured model is the requested model.  When routing leaves it
@@ -1174,32 +1221,65 @@ class MediaRecognitionService:
                 os.getenv("CODEX_MODEL" if provider == "codex-cli" else "AGY_MODEL")
                 or ""
             ).strip()
-        try:
-            safe_user_text = self._protect_media_prompt(
-                user_text,
-                media,
-                route,
-                source_kind=f"media_{kind}_cli",
-                gateway=gateway,
-            )
-            prompt = (
-                f"{MEDIA_RECOGNITION_SYSTEM_PROMPT}\n\n"
-                f"{safe_user_text or ('添付画像を解析してください。' if kind == 'image' else '添付音声を文字起こししてください。')}"
-                f"{suffix}"
-            )
-            success, output = await asyncio.to_thread(backend.execute_prompt, prompt)
-        finally:
-            try:
-                cleanup()
-            finally:
-                self._record_cli_usage(
-                    backend,
-                    provider=provider,
-                    model=effective_model,
-                    request_type=request_type,
-                    started=started,
-                    usage_context=self._usage_client(),
+        destination = f"cli://{provider}/{kind}"
+        descriptor = self._egress_descriptor(
+            action=f"media.{kind}.cli",
+            transport="cli",
+            destination=destination,
+            provider=provider,
+            model=effective_model,
+            tool="media_recognition",
+        )
+
+        async def send_cli_request(protected_payload: Any) -> tuple[bool, Any]:
+            """Execute the CLI only with the gateway's final payload."""
+
+            if not isinstance(protected_payload, Mapping):
+                raise RuntimeError("privacy protection returned no CLI payload")
+            outbound_media = protected_payload.get("media")
+            if not isinstance(outbound_media, Mapping):
+                raise RuntimeError("privacy protection returned no CLI media")
+            outbound_text = str(protected_payload.get("text") or "")
+            attachment = (
+                backend.prepare_image_attachment(dict(outbound_media))
+                if kind == "image"
+                else getattr(backend, "prepare_audio_attachment", lambda _media: None)(
+                    dict(outbound_media)
                 )
+            )
+            if not attachment:
+                raise RuntimeError(
+                    f"{backend.get_provider_name()} は{kind}入力に対応していません"
+                )
+            suffix, cleanup = attachment
+            try:
+                prompt = (
+                    f"{MEDIA_RECOGNITION_SYSTEM_PROMPT}\n\n"
+                    f"{outbound_text or ('添付画像を解析してください。' if kind == 'image' else '添付音声を文字起こししてください。')}"
+                    f"{suffix}"
+                )
+                return await asyncio.to_thread(backend.execute_prompt, prompt)
+            finally:
+                cleanup()
+
+        try:
+            success, output = await gateway.execute(
+                {"text": user_text, "media": media},
+                provider=provider,
+                descriptor=descriptor,
+                sender=send_cli_request,
+                source_kind=f"media_{kind}_cli",
+                model=effective_model,
+            )
+        finally:
+            self._record_cli_usage(
+                backend,
+                provider=provider,
+                model=effective_model,
+                request_type=request_type,
+                started=started,
+                usage_context=self._usage_client(),
+            )
         if not success or not str(output or "").strip():
             raise RuntimeError(str(output or f"{backend.get_provider_name()} returned no output"))
         return str(output).strip()
@@ -1274,15 +1354,35 @@ class MediaRecognitionService:
         else:
             kwargs["temperature"] = 0
             kwargs["max_tokens"] = 1600
-        protected = await gateway.protect(
+        base_url = self._route_base_url(route)
+        descriptor = self._egress_descriptor(
+            action="media.image.vision",
+            transport="openai.chat.completions",
+            destination=base_url or "openai://chat.completions",
+            provider=route_provider,
+            model=str(route.get("model") or ""),
+        )
+
+        async def send_image_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, Mapping):
+                raise RuntimeError("privacy protection returned no image request")
+            return await self._create_chat_completion_with_fallback(
+                client,
+                dict(protected_payload),
+                # SDK/provider retries must be explicit gateway transactions;
+                # this sender is the single reviewed commit point.
+                allow_fallback=False,
+            )
+
+        response = await gateway.execute(
             kwargs,
             provider=route_provider,
-            base_url=self._route_base_url(route),
+            descriptor=descriptor,
+            sender=send_image_request,
+            base_url=base_url,
             source_kind="media_image",
+            model=str(route.get("model") or ""),
         )
-        if isinstance(protected.payload, Mapping):
-            kwargs = dict(protected.payload)
-        response = await self._create_chat_completion_with_fallback(client, kwargs)
         self._record_provider_usage(
             response,
             provider=route_provider,
@@ -1323,11 +1423,18 @@ class MediaRecognitionService:
         return None
 
     @staticmethod
-    async def _create_chat_completion_with_fallback(client: AsyncOpenAI, kwargs: dict[str, Any]):
+    async def _create_chat_completion_with_fallback(
+        client: AsyncOpenAI,
+        kwargs: dict[str, Any],
+        *,
+        allow_fallback: bool = True,
+    ):
         """chat.completions を叩き、reasoning 系モデルが拒否する sampling パラメータを\n        段階的に外して再試行する。\n\n        gpt-5 系などの reasoning モデルは ``max_tokens`` / ``temperature`` を拒否し\n        ``max_completion_tokens`` を要求する。呼び出し側が旧パラメータで組んでいても\n        認識が丸ごと失敗しないよう、既存の generate 経路と同じ「拒否されたら外して\n        再試行」戦略でフォールバックする。\n        """
         try:
             return await client.chat.completions.create(**kwargs)
         except Exception:
+            if not allow_fallback:
+                raise
             # 1) max_tokens -> max_completion_tokens へ振り替え、temperature と
             #    extra_body(reasoning_effort) を外す。extra_body を残すと、
             #    reasoning 非対応モデルでは1回目と同じ理由で必ず失敗し、
@@ -1377,17 +1484,35 @@ class MediaRecognitionService:
             temperature=0,
             max_tokens=2400,
         )
-        protected = await gateway.protect(
+        base_url = self._route_base_url(route)
+        descriptor = self._egress_descriptor(
+            action="media.audio.stt",
+            transport="openai.chat.completions",
+            destination=base_url or "openai://chat.completions",
+            provider=provider,
+            model=str(route.get("model") or ""),
+        )
+
+        async def send_audio_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, Mapping):
+                raise RuntimeError("privacy protection returned no audio request")
+            return await self._create_chat_completion_with_fallback(
+                client,
+                dict(protected_payload),
+                # Do not perform an unreviewed SDK retry.  If callers need a
+                # parameter fallback they must dispatch a fresh gateway
+                # transaction with a new descriptor.
+                allow_fallback=False,
+            )
+
+        response = await gateway.execute(
             kwargs,
             provider=provider,
-            base_url=self._route_base_url(route),
+            descriptor=descriptor,
+            sender=send_audio_request,
+            base_url=base_url,
             source_kind="media_audio",
-        )
-        if isinstance(protected.payload, Mapping):
-            kwargs = dict(protected.payload)
-        response = await self._create_chat_completion_with_fallback(
-            client,
-            kwargs,
+            model=str(route.get("model") or ""),
         )
         self._record_provider_usage(
             response,
@@ -1410,20 +1535,42 @@ class MediaRecognitionService:
             genai.configure(api_key=api_key)
         mime_type, image_bytes = data_url_to_bytes(str(image.get("data") or ""))
         model = genai.GenerativeModel(str(route.get("model")))
-        protected = gateway.protect_sync(
+        descriptor = self._egress_descriptor(
+            action="media.image.vision",
+            transport="google.generativeai",
+            destination="https://generativelanguage.googleapis.com",
+            provider="gemini",
+            model=str(route.get("model") or ""),
+        )
+
+        def send_image_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, Mapping):
+                raise RuntimeError("privacy protection returned no Gemini image request")
+            outbound_text = str(protected_payload.get("text") or "")
+            outbound_media = protected_payload.get("media")
+            if not isinstance(outbound_media, (bytes, bytearray)):
+                raise RuntimeError("privacy protection returned no Gemini image media")
+            return model.generate_content(
+                [
+                    MEDIA_RECOGNITION_SYSTEM_PROMPT,
+                    outbound_text or "添付画像を解析してください。",
+                    protos.Part(
+                        inline_data=protos.Blob(
+                            mime_type=mime_type,
+                            data=bytes(outbound_media),
+                        )
+                    ),
+                ]
+            )
+
+        response = gateway.execute_sync(
             {"text": user_text, "media": image_bytes},
             provider="gemini",
+            descriptor=descriptor,
+            sender=send_image_request,
+            base_url="https://generativelanguage.googleapis.com",
             source_kind="media_image",
-        )
-        safe_user_text = user_text
-        if isinstance(protected.payload, Mapping):
-            safe_user_text = str(protected.payload.get("text") or user_text)
-        response = model.generate_content(
-            [
-                MEDIA_RECOGNITION_SYSTEM_PROMPT,
-                safe_user_text or "添付画像を解析してください。",
-                protos.Part(inline_data=protos.Blob(mime_type=mime_type, data=image_bytes)),
-            ]
+            model=str(route.get("model") or ""),
         )
         self._record_gemini_usage(
             response,
@@ -1445,22 +1592,49 @@ class MediaRecognitionService:
             genai.configure(api_key=api_key)
         mime_type, audio_bytes = data_url_to_bytes(str(audio.get("data") or ""))
         suffix = "." + self._audio_format(mime_type, audio_bytes)
-        protected = gateway.protect_sync(
+        model = genai.GenerativeModel(str(route.get("model")))
+        descriptor = self._egress_descriptor(
+            action="media.audio.stt",
+            transport="google.generativeai",
+            destination="https://generativelanguage.googleapis.com",
+            provider="gemini",
+            model=str(route.get("model") or ""),
+        )
+
+        def send_audio_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, Mapping):
+                raise RuntimeError("privacy protection returned no Gemini audio request")
+            outbound_text = str(protected_payload.get("text") or "")
+            outbound_media = protected_payload.get("media")
+            if not isinstance(outbound_media, (bytes, bytearray)):
+                raise RuntimeError("privacy protection returned no Gemini audio media")
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as fp:
+                fp.write(bytes(outbound_media))
+                fp.flush()
+                uploaded = genai.upload_file(path=fp.name)
+                try:
+                    return model.generate_content(
+                        [
+                            MEDIA_RECOGNITION_SYSTEM_PROMPT,
+                            outbound_text or "添付音声を文字起こししてください。",
+                            uploaded,
+                        ]
+                    )
+                finally:
+                    try:
+                        uploaded.delete()
+                    except Exception:
+                        pass
+
+        response = gateway.execute_sync(
             {"text": user_text, "media": audio_bytes},
             provider="gemini",
+            descriptor=descriptor,
+            sender=send_audio_request,
+            base_url="https://generativelanguage.googleapis.com",
             source_kind="media_audio",
+            model=str(route.get("model") or ""),
         )
-        safe_user_text = user_text
-        if isinstance(protected.payload, Mapping):
-            safe_user_text = str(protected.payload.get("text") or user_text)
-        with tempfile.NamedTemporaryFile(suffix=suffix, delete=True) as fp:
-            fp.write(audio_bytes)
-            fp.flush()
-            uploaded = genai.upload_file(path=fp.name)
-            model = genai.GenerativeModel(str(route.get("model")))
-            response = model.generate_content(
-                [MEDIA_RECOGNITION_SYSTEM_PROMPT, safe_user_text or "添付音声を文字起こししてください。", uploaded]
-            )
         self._record_gemini_usage(
             response,
             model=str(route.get("model")),
@@ -1479,15 +1653,6 @@ class MediaRecognitionService:
         mime_type, image_bytes = data_url_to_bytes(str(image.get("data") or ""))
         import base64
 
-        protected = gateway.protect_sync(
-            {"text": user_text, "media": image_bytes},
-            provider="claude",
-            source_kind="media_image",
-        )
-        safe_user_text = user_text
-        if isinstance(protected.payload, Mapping):
-            safe_user_text = str(protected.payload.get("text") or user_text)
-
         payload = {
             "model": str(route.get("model")),
             "max_tokens": 1600,
@@ -1496,7 +1661,7 @@ class MediaRecognitionService:
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": safe_user_text or "添付画像を解析してください。"},
+                        {"type": "text", "text": user_text or "添付画像を解析してください。"},
                         {
                             "type": "image",
                             "source": {
@@ -1509,18 +1674,41 @@ class MediaRecognitionService:
                 }
             ],
         }
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "content-type": "application/json",
-                },
-                json=payload,
+        endpoint = "https://api.anthropic.com/v1/messages"
+        descriptor = self._egress_descriptor(
+            action="media.image.vision",
+            transport="httpx",
+            destination=endpoint,
+            provider="claude",
+            model=str(route.get("model") or ""),
+        )
+
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
+            async def send_claude_request(protected_payload: Any) -> Any:
+                if not isinstance(protected_payload, Mapping):
+                    raise RuntimeError("privacy protection returned no Claude image request")
+                response = await client.post(
+                    endpoint,
+                    headers={
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type": "application/json",
+                    },
+                    json=dict(protected_payload),
+                    follow_redirects=False,
+                )
+                response.raise_for_status()
+                return response.json()
+
+            data = await gateway.execute(
+                payload,
+                provider="claude",
+                descriptor=descriptor,
+                sender=send_claude_request,
+                base_url=endpoint,
+                source_kind="media_image",
+                model=str(route.get("model") or ""),
             )
-            response.raise_for_status()
-            data = response.json()
         self._record_provider_usage(
             data,
             provider="claude",
@@ -1556,7 +1744,6 @@ class MediaRecognitionService:
             if normalized_engine == "google"
             else "speech_recognition"
         )
-        safe_user_text = user_text
         if provider != "speech_recognition":
             route = {
                 "provider": provider,
@@ -1568,13 +1755,12 @@ class MediaRecognitionService:
                 "base_url": str(engine_settings.get("base_url") or speech_config.get("base_url") or ""),
             }
             self._check_media_privacy(route, gateway=gateway)
-            safe_user_text = self._protect_media_prompt(
-                user_text,
-                {"data": data_url},
-                route,
-                source_kind="media_audio_stt",
-                gateway=gateway,
-            )
+            # Gemini and Google Speech adapters own the complete provider
+            # transaction and perform their own media-aware ``execute_sync``
+            # call.  Do not pre-protect a data URL here: that would expose a
+            # second review prompt and could accidentally pass a protected
+            # text-only result while the engine still sends raw PCM.
+        safe_user_text = user_text
         manager = SpeechRecognitionManager(engine_name, speech_config)
         recognize_kwargs = {
             "sample_rate": sample_rate,
@@ -1683,7 +1869,13 @@ class MediaRecognitionService:
             api_key = api_key or str(config_get(self.config, "openai_compatible_local.api_key", "dummy"))
         else:
             api_key = api_key or str(config_get(self.config, "openai_api_key", "") or "")
-        return AsyncOpenAI(api_key=api_key or "dummy", base_url=base_url or None)
+        return AsyncOpenAI(
+            api_key=api_key or "dummy",
+            base_url=base_url or None,
+            # Provider retries are disabled so each attempt is an explicit
+            # privacy-gateway transaction rather than an SDK replay.
+            max_retries=0,
+        )
 
     def _mage_settings(self) -> dict[str, Any]:
         raw = config_get(self.config, "mage_vl", {}) or {}

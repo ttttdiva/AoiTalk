@@ -18,7 +18,6 @@ _DEFAULT_ROTATE_BYTES = 10 * 1024 * 1024
 _CADDY_ROLL_KEEP = 5
 _FRONTEND_GENERATION_KEEP = 10
 _MODEL_GENERATION_KEEP = 3
-_DESKTOP_GENERATION_KEEP = 3
 _APP_MAX_FILES = 20
 _APP_MAX_AGE_DAYS = 14
 _STARTUP_MAX_FILES = 20
@@ -40,8 +39,6 @@ def run_log_housekeeping(
         _housekeep_caddy_leftovers(layout, active)
         _housekeep_model_logs(layout, active)
         _housekeep_discord_logs(layout, active)
-        rotate_log_if_over_size(layout.desktop_backend_log())
-        _housekeep_desktop_generations(layout, active)
     except Exception as exc:
         logger.warning("ログ housekeeping に失敗しました（続行します）: %s", exc)
 
@@ -341,22 +338,4 @@ def _housekeep_discord_logs(layout: LogLayout, active_paths: set[Path]) -> None:
         oldest = candidates.pop(0)
         _safe_delete(oldest)
     if latest_pointer.is_file() and _is_active(latest_pointer, active_paths):
-        return
-
-
-def _housekeep_desktop_generations(layout: LogLayout, active_paths: set[Path]) -> None:
-    desktop_dir = layout.desktop_dir
-    if not desktop_dir.is_dir():
-        return
-    active_path = layout.desktop_backend_log()
-    candidates = [
-        path
-        for path in desktop_dir.glob("desktop-tauri-backend-*.log")
-        if path.is_file() and not _is_active(path, active_paths)
-    ]
-    candidates.sort(key=lambda p: p.stat().st_mtime)
-    while len(candidates) > _DESKTOP_GENERATION_KEEP:
-        oldest = candidates.pop(0)
-        _safe_delete(oldest)
-    if active_path.is_file() and _is_active(active_path, active_paths):
         return

@@ -28,6 +28,7 @@ import functools
 import logging
 import math
 import os
+import stat
 import threading
 import time
 from pathlib import Path
@@ -37,6 +38,19 @@ from uuid import UUID
 from .app_storage import get_workspaces_root
 
 logger = logging.getLogger(__name__)
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return stat.S_ISLNK(info.st_mode) or bool(
+        getattr(info, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    )
 
 #: ロック獲得を待つ既定の上限秒数。無限待ちを防ぐための安全弁。
 DEFAULT_ACQUIRE_TIMEOUT = 300.0
@@ -243,7 +257,15 @@ class AppOperationLock:
     # ワーカースレッド側
     # ------------------------------------------------------------------
     def _acquire_file(self, request: _AcquireRequest) -> BinaryIO:
+        if _is_link_or_reparse(self._path.parent):
+            raise AppOperationLockError(
+                "App operation lock directory cannot be a link/reparse point"
+            )
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        if _is_link_or_reparse(self._path.parent):
+            raise AppOperationLockError(
+                "App operation lock directory cannot be a link/reparse point"
+            )
         handle = self._path.open("a+b")
         try:
             if os.name == "nt":
@@ -426,7 +448,12 @@ def _get_lock(
     workspace_root: str | os.PathLike[str] | None,
 ) -> AppOperationLock:
     root = get_workspaces_root(workspace_root)
-    path = (root / ".locks" / f"{kind}_{value}.lock").resolve()
+    lock_root = root / ".locks"
+    if _is_link_or_reparse(lock_root):
+        raise AppOperationLockError(
+            "App operation lock directory cannot be a link/reparse point"
+        )
+    path = Path(os.path.abspath(lock_root / f"{kind}_{value}.lock"))
     key = _normalize_lock_key(path)
     with _LOCKS_GUARD:
         lock = _LOCKS.get(key)

@@ -153,7 +153,7 @@ export function StoryWorkspaceShell({ workId, children }: { workId: string; chil
   const { data, error, mutate } = useSWR(`story-work-shell:${workId}`, () => storyApi.getOverview(workId));
   const work = useMemo(() => data ? normalizeWork(data) : { ...EMPTY_WORK, id: workId }, [data, workId]);
   const [saveState, setSaveState] = useState<StorySaveState>("saved");
-  const [scopeSnapshot, setScopeSnapshot] = useState(0);
+  const [scopeSnapshot, setScopeSnapshot] = useState<StorySaveScope[]>([]);
   const [scopeFailed, setScopeFailed] = useState(false);
   const scopesRef = useRef<Map<string, StorySaveScope>>(new Map());
   const [editingTitle, setEditingTitle] = useState(false);
@@ -166,10 +166,10 @@ export function StoryWorkspaceShell({ workId, children }: { workId: string; chil
 
   const registerSaveScope = useCallback((scope: StorySaveScope) => {
     scopesRef.current.set(scope.id, scope);
-    setScopeSnapshot((value) => value + 1);
+    setScopeSnapshot(Array.from(scopesRef.current.values()));
     return () => {
       scopesRef.current.delete(scope.id);
-      setScopeSnapshot((value) => value + 1);
+      setScopeSnapshot(Array.from(scopesRef.current.values()));
     };
   }, []);
 
@@ -191,7 +191,7 @@ export function StoryWorkspaceShell({ workId, children }: { workId: string; chil
   );
 
   const aggregatedSaveState = useMemo<StorySaveState>(() => {
-    const scopes = Array.from(scopesRef.current.values());
+    const scopes = scopeSnapshot;
     if (saveState === "saving" || scopes.some((scope) => scope.isSaving?.())) return "saving";
     if (scopeFailed || scopes.some((scope) => scope.isFailed?.())) return "failed";
     if (saveState === "dirty" || scopes.some((scope) => scope.isDirty())) return "dirty";
@@ -317,19 +317,16 @@ export function StoryWorkspaceShell({ workId, children }: { workId: string; chil
 
   useEffect(() => {
     const trimmed = searchQuery.trim();
-    if (!trimmed) {
-      setSearchResults([]);
-      setSearchBusy(false);
-      return;
-    }
-    setSearchBusy(true);
+    if (!trimmed) return;
+    let active = true;
     const timer = window.setTimeout(() => {
+      setSearchBusy(true);
       void storyApi.searchWork(workId, trimmed)
-        .then((response) => setSearchResults(response.results ?? []))
-        .catch(() => setSearchResults([]))
-        .finally(() => setSearchBusy(false));
+        .then((response) => { if (active) setSearchResults(response.results ?? []); })
+        .catch(() => { if (active) setSearchResults([]); })
+        .finally(() => { if (active) setSearchBusy(false); });
     }, 300);
-    return () => window.clearTimeout(timer);
+    return () => { active = false; window.clearTimeout(timer); };
   }, [searchQuery, workId]);
 
   const openEpisodeFromSearch = useCallback(
@@ -465,7 +462,11 @@ export function StoryWorkspaceShell({ workId, children }: { workId: string; chil
                   <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
                   <Input
                     value={searchQuery}
-                    onChange={(event) => setSearchQuery(event.target.value)}
+                    onChange={(event) => {
+                      setSearchQuery(event.target.value);
+                      setSearchResults([]);
+                      setSearchBusy(Boolean(event.target.value.trim()));
+                    }}
                     onFocus={() => setSearchOpen(true)}
                     placeholder="作品内を検索"
                     className="h-8 pl-8 text-xs"

@@ -7,6 +7,7 @@ import {
   knowledgeNodes,
   knowledgeNodeSupertags,
   knowledgeSupertags,
+  projects,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { normalizeDocsNodeType } from "@/lib/docs-model";
@@ -54,6 +55,8 @@ import {
 } from "@/lib/server/project-information-hierarchy";
 import {
   assertGenericDocsMutationAllowed,
+  lockAndAssertGenericDocsMutationAllowed,
+  ManagedDocsAccessError,
   ManagedDocsMutationError,
 } from "@/lib/server/managed-docs-policy";
 
@@ -63,6 +66,11 @@ type DocsStateFilter = (
   visibleNodeIds: ReadonlySet<string>,
   visibleWorkspaceIds: ReadonlySet<string>,
 ) => DocsListState;
+
+class ProjectDocsLifecycleError extends Error {
+  readonly status = 409;
+  readonly code = "project_lifecycle_conflict";
+}
 
 /** Never serialize raw state when the ACL relation filter is unavailable. */
 function emptyStateAfterAclFailure(state: DocsListState): DocsListState {
@@ -240,6 +248,12 @@ export async function POST(request: NextRequest) {
     if (!projectAccess) {
       return NextResponse.json({ detail: "Projectへの書き込み権限がありません" }, { status: 403 });
     }
+    if (projectAccess.project.isCompleted) {
+      return NextResponse.json(
+        { detail: "完了済みProjectのDocsには新しいnodeを作成できません" },
+        { status: 409 },
+      );
+    }
     if (isDefaultInboxProject(projectAccess.project)) {
       return NextResponse.json(
         { detail: "Inboxは案件情報Docsの保存先ではありません" },
@@ -284,6 +298,12 @@ export async function POST(request: NextRequest) {
       .limit(1);
     if (!parentRow) {
       return NextResponse.json({ detail: "親nodeが見つかりません" }, { status: 404 });
+    }
+    if (parentRow.archivedAt) {
+      return NextResponse.json({ detail: "アーカイブ済みnodeの下には作成できません" }, { status: 409 });
+    }
+    if (String(parentRow.systemKey ?? "").trim() === "project_information_root" && !projectId) {
+      return NextResponse.json({ detail: "案件情報hub直下にはProject経由でのみ作成できます" }, { status: 409 });
     }
     parent = parentRow;
     try {
@@ -352,8 +372,102 @@ export async function POST(request: NextRequest) {
   const requestedFieldValues = Array.isArray(body.field_values)
     ? body.field_values
     : [];
+  // A caller may omit project_id when creating below an existing Project
+  // node.  The parent's project identity is still authoritative and must be
+  // rechecked under the Project row lock below.
+  const effectiveProjectId = projectId ?? parent?.projectId ?? null;
 
-  const result = await db.transaction(async (tx) => {
+  let result: typeof knowledgeNodes.$inferSelect;
+  try {
+    result = await db.transaction(async (tx) => {
+    let lockedParent = parent;
+    let lockedProject: { id: string; knowledgeNodeId: string | null; isCompleted: boolean; deletedAt: Date | null } | null = null;
+    if (effectiveProjectId) {
+      const [projectRow] = await tx
+        .select({
+          id: projects.id,
+          knowledgeNodeId: projects.knowledgeNodeId,
+          isCompleted: projects.isCompleted,
+          deletedAt: projects.deletedAt,
+        })
+        .from(projects)
+        .where(eq(projects.id, effectiveProjectId))
+        .for("update")
+        .limit(1);
+      if (!projectRow || projectRow.deletedAt || projectRow.isCompleted) {
+        throw new ProjectDocsLifecycleError(
+          "完了/削除済みProjectのDocsには新しいnodeを作成できません",
+        );
+      }
+      lockedProject = projectRow;
+    }
+    if (parentId) {
+      const [currentParent] = await tx
+        .select()
+        .from(knowledgeNodes)
+        .where(
+          and(
+            eq(knowledgeNodes.id, parentId),
+            eq(knowledgeNodes.docsLibraryId, workspace.id),
+          ),
+        )
+        .limit(1);
+      if (!currentParent || currentParent.archivedAt) {
+        throw new ProjectDocsLifecycleError("親nodeが同時変更されたため作成できません");
+      }
+      // Re-evaluate the managed Docs policy against the row/ancestor chain
+      // locked by this transaction. The preflight check above is only a
+      // usability guard; without this second check a concurrent reparent
+      // could attach an ordinary child below the AoiTalk Guide between the
+      // two reads.
+      await lockAndAssertGenericDocsMutationAllowed(currentParent, tx, user);
+      const [freshParent] = await tx
+        .select()
+        .from(knowledgeNodes)
+        .where(
+          and(
+            eq(knowledgeNodes.id, parentId),
+            eq(knowledgeNodes.docsLibraryId, workspace.id),
+          ),
+        )
+        .limit(1)
+        .for("update");
+      if (!freshParent || freshParent.archivedAt) {
+        throw new ProjectDocsLifecycleError("親nodeが同時変更されたため作成できません");
+      }
+      if (effectiveProjectId && freshParent.projectId !== effectiveProjectId) {
+        throw new ProjectDocsLifecycleError("親nodeのProject identityが同時変更されたため作成できません");
+      }
+      lockedParent = freshParent;
+    }
+    if (lockedProject?.knowledgeNodeId && lockedParent) {
+      // Re-read/lock the canonical pointer target inside the same Project
+      // transaction.  A pointer repair that committed after preflight must
+      // not leave a new child attached to the old rootPageId.
+      const [canonicalParent] = await tx
+        .select({ id: knowledgeNodes.id, rootPageId: knowledgeNodes.rootPageId })
+        .from(knowledgeNodes)
+        .where(
+          and(
+            eq(knowledgeNodes.id, lockedProject.knowledgeNodeId),
+            eq(knowledgeNodes.docsLibraryId, workspace.id),
+            eq(knowledgeNodes.projectId, lockedProject.id),
+            eq(knowledgeNodes.systemKey, `project_information:${lockedProject.id}`),
+            isNull(knowledgeNodes.archivedAt),
+          ),
+        )
+        .for("update")
+        .limit(1);
+      if (
+        !canonicalParent
+        || (lockedParent.id !== canonicalParent.id && lockedParent.rootPageId !== canonicalParent.rootPageId)
+      ) {
+        throw new ProjectDocsLifecycleError("Project canonical hierarchyが同時変更されたため作成できません");
+      }
+    }
+    if (projectNode && lockedProject?.knowledgeNodeId !== projectNode.id) {
+      throw new ProjectDocsLifecycleError("Project canonical identityが同時変更されたため作成できません");
+    }
     const [maxRow] = await tx
       .select({ maxSort: max(knowledgeNodes.sortOrder) })
       .from(knowledgeNodes)
@@ -369,8 +483,8 @@ export async function POST(request: NextRequest) {
       id: requestedId ?? undefined,
       docsLibraryId: workspace.id,
       parentId,
-      rootPageId: parent?.rootPageId ?? parent?.id ?? null,
-      projectId: projectId ?? parent?.projectId ?? null,
+      rootPageId: lockedParent?.rootPageId ?? lockedParent?.id ?? null,
+      projectId: effectiveProjectId,
       title,
       description: cleanOptionalString(body.description, 200000) ?? "",
       bodyJson,
@@ -457,8 +571,26 @@ export async function POST(request: NextRequest) {
 
     await syncKnowledgeNodeReferenceEdges(tx, finalNode, user.id);
 
-    return finalNode;
-  });
+      return finalNode;
+    });
+  } catch (error) {
+    const status = error && typeof error === "object" && "status" in error
+      ? Number((error as { status?: unknown }).status)
+      : 0;
+    if (status === 409 && error instanceof Error) {
+      return NextResponse.json(
+        {
+          detail: error.message,
+          ...("code" in error ? { code: String((error as { code?: unknown }).code) } : {}),
+        },
+        { status: 409 },
+      );
+    }
+    if (error instanceof ManagedDocsAccessError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    throw error;
+  }
 
   if (result.title.trim()) {
     try {
@@ -470,12 +602,18 @@ export async function POST(request: NextRequest) {
         nextSupertagIds: requestedSupertagIds,
       });
     } catch (error) {
+      console.error("Docs node POST: task binding reconciliation failed", {
+        nodeId: result.id,
+        error,
+      });
       return NextResponse.json(
         {
-          detail: "Docs nodeは作成されましたが、タスク連携に失敗しました",
-          error: error instanceof Error ? error.message : String(error),
+          node: serializeNode(result),
+          committed: true,
+          task_binding_error: "task_binding_reconcile_failed",
+          detail: "Docs nodeは保存されましたが、タスク連携の同期に失敗しました",
         },
-        { status: 502 },
+        { status: 201 },
       );
     }
   }

@@ -17,6 +17,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
+from ..tools.core import ToolArgumentValidationError
 from ..tools.registry import ToolRegistry
 from ..services.agent_team_service import (
     ToolFailureCircuitBreaker,
@@ -25,7 +26,10 @@ from ..services.agent_team_service import (
 )
 from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
 from .context_compression import model_tool_result_payload
-from .generation_cancellation import GenerationInterrupted
+from .generation_cancellation import (
+    GenerationInterrupted,
+    PlanningInteractionTerminated,
+)
 from .turn_stream_events import (
     SyncStreamEmitter,
     emit_assistant_text,
@@ -47,6 +51,7 @@ CLI_TOOL_LOOP_FAILURE_MESSAGE = (
 )
 DEFAULT_CLI_TOOL_CONTEXT_MAX_CHARS = 32_000
 MAX_CLI_TOOL_CONTEXT_MAX_CHARS = 64_000
+UNKNOWN_TOOL_NAME = "unknown_tool"
 
 
 def _follow_up_tool_choice(value: Any) -> Any:
@@ -84,6 +89,78 @@ def tool_output_indicates_success(output: Any) -> tuple[bool, str]:
     if lowered.startswith(("error:", "tool execution error:", "tool not found")):
         return False, text
     return True, ""
+
+
+def _observable_tool_arguments(
+    registry: ToolRegistry,
+    tool_name: str,
+    arguments: Any,
+) -> dict[str, Any]:
+    """Return only arguments accepted by the canonical tool contract.
+
+    Provider/model arguments are untrusted.  The router is authoritative for
+    execution, but turn callbacks and audit consumers must not receive the raw
+    rejected payload (which may contain credentials or other sensitive fields).
+    Normalize aliases such as Docs ``project_id`` to their canonical key and
+    emit an empty object when validation fails or a definition is unavailable.
+    """
+
+    try:
+        definition = registry.get(str(tool_name or ""))
+    except Exception:
+        definition = None
+    if definition is None:
+        return {}
+    normalizer = getattr(definition, "normalize_arguments", None)
+    if not callable(normalizer):
+        return {}
+    try:
+        normalized = normalizer(
+            arguments if isinstance(arguments, dict) else {}
+        )
+    except Exception:
+        # Observation must never leak rejected raw arguments or interfere with
+        # the router's authoritative failure result.
+        return {}
+    normalized = dict(normalized or {})
+    for name in getattr(definition, "hidden_argument_names", ()) or ():
+        normalized.pop(str(name), None)
+    return normalized
+
+
+def observable_tool_name(registry: ToolRegistry, tool_name: Any) -> str:
+    """Return a bounded public name for a provider-supplied tool marker.
+
+    Registered tool names are repository-controlled and remain unchanged.
+    Unknown provider names are reduced to one stable token before they reach
+    events, audit records, logs, or model-facing result objects.
+    """
+
+    candidate = str(tool_name or "").strip()
+    try:
+        definition = registry.get(candidate)
+    except Exception:
+        definition = None
+    if definition is not None:
+        return candidate
+    # Legacy embedders may expose only ``__contains__`` + ``execute`` rather
+    # than the full ToolRegistry definition API. Preserve those trusted names
+    # for execution while keeping genuinely unknown provider markers bounded.
+    try:
+        if candidate and candidate in registry:
+            return candidate
+    except Exception:
+        pass
+    return UNKNOWN_TOOL_NAME
+
+
+def _registry_contains(registry: ToolRegistry, tool_name: str) -> bool:
+    """Compatibility membership check for legacy registry adapters."""
+
+    try:
+        return bool(tool_name) and tool_name in registry
+    except Exception:
+        return False
 
 
 @dataclass(frozen=True)
@@ -196,6 +273,7 @@ class RegistryToolRouter:
         *,
         log_prefix: str = "UnifiedTurn",
         config: Any | None = None,
+        client: Any | None = None,
         user_input: str | None = None,
         enforce_tool_policy: bool = True,
         failure_breaker: ToolFailureCircuitBreaker | None = None,
@@ -203,6 +281,10 @@ class RegistryToolRouter:
         self.registry = registry
         self.log_prefix = log_prefix
         self.config = config
+        # Optional provider reference lets request-time policy follow a
+        # client's replaced Config object, not only mutations to the original
+        # mapping captured by a persistent registry.
+        self.client = client
         self.user_input = user_input
         self.enforce_tool_policy = enforce_tool_policy
         # The breaker is request/turn scoped.  Only schema-v3 Agent Team delegation
@@ -221,11 +303,98 @@ class RegistryToolRouter:
         else:
             self.failure_breaker = None
 
+    def _effective_config(self) -> Any | None:
+        current = getattr(self.client, "config", None) if self.client is not None else None
+        return current if current is not None else self.config
+
+    def _tool_definition(self, call: UnifiedToolCall) -> Any | None:
+        getter = getattr(self.registry, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(call.tool)
+        except Exception:  # noqa: BLE001 - compatibility fake registries
+            return None
+
+    def _observable_call(self, call: UnifiedToolCall) -> UnifiedToolCall:
+        """Return the public/audit view of a call without hidden arguments."""
+
+        observable_name = observable_tool_name(self.registry, call.tool)
+        return UnifiedToolCall(
+            tool=observable_name,
+            arguments=_observable_tool_arguments(
+                self.registry,
+                call.tool,
+                call.arguments,
+            ),
+            call_id=call.call_id,
+        )
+
+    def _observable_result(self, result: UnifiedToolResult) -> UnifiedToolResult:
+        """Strip trusted wrapper arguments before a result leaves the router."""
+
+        safe_call = self._observable_call(result.call)
+        if safe_call == result.call:
+            return result
+        return UnifiedToolResult(
+            call=safe_call,
+            output=result.output,
+            success=result.success,
+            error=result.error,
+            elapsed_ms=result.elapsed_ms,
+        )
+
+    def _runtime_capability_block_result(
+        self,
+        call: UnifiedToolCall,
+    ) -> UnifiedToolResult | None:
+        """Revalidate stale registry capability state before policy/execute."""
+
+        definition = self._tool_definition(call)
+        if definition is None:
+            return None
+        try:
+            from .tool_exposure import runtime_tool_capability_status
+
+            reason = runtime_tool_capability_status(
+                definition,
+                client=self.client,
+                config=self._effective_config(),
+            )
+        except Exception:
+            # A supplied runtime config must never widen a stale optional
+            # capability when the validator itself fails.  Config-less legacy
+            # callers retain the registry's historical execution seam.
+            reason = (
+                "runtime capability could not be validated"
+                if self._effective_config() is not None
+                else None
+            )
+        if not reason:
+            return None
+        observable_name = observable_tool_name(self.registry, call.tool)
+        output = f"Tool capability blocked `{observable_name}`: {reason}."
+        logger.warning(
+            "[%s] Runtime capability blocked %s: %s",
+            self.log_prefix,
+            observable_name,
+            reason,
+        )
+        return UnifiedToolResult(
+            call=call,
+            output=output,
+            success=False,
+            error=str(reason),
+        )
+
     def _breaker_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
         breaker = self.failure_breaker
         if breaker is None:
             return None
-        family = tool_failure_family(call.tool)
+        # Classify only the observable/registry-authoritative name.  A
+        # provider-controlled unknown such as ``docs_fake ...`` must not
+        # inherit the Docs breaker and poison a real Docs failure budget.
+        family = tool_failure_family(observable_tool_name(self.registry, call.tool))
         if not breaker.is_open(family):
             return None
         payload = {
@@ -237,7 +406,7 @@ class RegistryToolRouter:
         logger.warning(
             "[%s] Tool failure circuit open; suppressing %s (%s)",
             self.log_prefix,
-            call.tool,
+            observable_tool_name(self.registry, call.tool),
             family,
         )
         return UnifiedToolResult(
@@ -252,6 +421,8 @@ class RegistryToolRouter:
         call: UnifiedToolCall,
         result: UnifiedToolResult,
     ) -> UnifiedToolResult:
+        result = self._observable_result(result)
+        call = result.call
         breaker = self.failure_breaker
         if breaker is None or result.success:
             return result
@@ -276,12 +447,16 @@ class RegistryToolRouter:
         else:
             failure = parsed
         decision = breaker.check(
-            tool_failure_family(call.tool),
+            tool_failure_family(observable_tool_name(self.registry, call.tool)),
             failure,
         )
         if decision.allowed:
             return result
-        signature = decision.signature.key if decision.signature else tool_failure_family(call.tool)
+        signature = (
+            decision.signature.key
+            if decision.signature
+            else tool_failure_family(observable_tool_name(self.registry, call.tool))
+        )
         payload = {
             "success": False,
             "error_code": "circuit_open",
@@ -295,7 +470,7 @@ class RegistryToolRouter:
         logger.warning(
             "[%s] Tool failure circuit opened for %s: %s",
             self.log_prefix,
-            call.tool,
+            observable_tool_name(self.registry, call.tool),
             signature,
         )
         return UnifiedToolResult(
@@ -309,7 +484,8 @@ class RegistryToolRouter:
     def _policy_block_result(self, call: UnifiedToolCall) -> UnifiedToolResult | None:
         if not self.enforce_tool_policy:
             return None
-        if self.config is None and call.tool == "search_past_chats":
+        effective_config = self._effective_config()
+        if effective_config is None and call.tool == "search_past_chats":
             return None
         try:
             from .tool_policy import (
@@ -322,10 +498,15 @@ class RegistryToolRouter:
                 call.tool,
                 user_input=self.user_input or get_current_user_input(),
                 tool_args=dict(call.arguments or {}),
-                config=self.config,
+                config=effective_config,
+                tool_definition=self._tool_definition(call),
             )
-        except Exception:
-            logger.error("[%s] Tool policy check failed", self.log_prefix, exc_info=True)
+        except Exception as exc:
+            logger.error(
+                "[%s] Tool policy check failed: exception_type=%s",
+                self.log_prefix,
+                type(exc).__name__,
+            )
             return UnifiedToolResult(
                 call=call,
                 output=(
@@ -339,8 +520,14 @@ class RegistryToolRouter:
         if decision.allowed:
             return None
 
-        output = format_blocked_tool_result(call.tool, decision)
-        logger.warning("[%s] Tool policy blocked %s: %s", self.log_prefix, call.tool, decision.reason)
+        observable_name = observable_tool_name(self.registry, call.tool)
+        output = format_blocked_tool_result(observable_name, decision)
+        logger.warning(
+            "[%s] Tool policy blocked %s: %s",
+            self.log_prefix,
+            observable_name,
+            decision.reason,
+        )
         return UnifiedToolResult(
             call=call,
             output=output,
@@ -363,14 +550,20 @@ class RegistryToolRouter:
                 dict(call.arguments or {}),
                 f"Run tool `{call.tool}`",
             )
-        except Exception:
-            logger.exception("[%s] Tool approval check failed: %s", self.log_prefix, call.tool)
+        except Exception as exc:
+            logger.error(
+                "[%s] Tool approval check failed: tool=%s exception_type=%s",
+                self.log_prefix,
+                observable_tool_name(self.registry, call.tool),
+                type(exc).__name__,
+            )
             approved = False
         if approved:
             return None
+        observable_name = observable_tool_name(self.registry, call.tool)
         return UnifiedToolResult(
             call=call,
-            output=f"Tool permission denied: `{call.tool}` was not approved.",
+            output=f"Tool permission denied: `{observable_name}` was not approved.",
             success=False,
             error="",
         )
@@ -393,28 +586,138 @@ class RegistryToolRouter:
                 dict(call.arguments or {}),
                 f"Run tool `{call.tool}`",
             )
-        except Exception:
-            logger.exception("[%s] Tool approval check failed: %s", self.log_prefix, call.tool)
+        except Exception as exc:
+            logger.error(
+                "[%s] Tool approval check failed: tool=%s exception_type=%s",
+                self.log_prefix,
+                observable_tool_name(self.registry, call.tool),
+                type(exc).__name__,
+            )
             approved = False
         if approved:
             return None
+        observable_name = observable_tool_name(self.registry, call.tool)
         return UnifiedToolResult(
             call=call,
-            output=f"Tool permission denied: `{call.tool}` was not approved.",
+            output=f"Tool permission denied: `{observable_name}` was not approved.",
             success=False,
             error="",
         )
 
+    def _argument_validation_result(
+        self,
+        call: UnifiedToolCall,
+        exc: ToolArgumentValidationError,
+        *,
+        elapsed_ms: float = 0.0,
+    ) -> UnifiedToolResult:
+        payload = {
+            "success": False,
+            "error_code": exc.code,
+            "retryable": False,
+            "error": "Tool arguments were rejected by the server contract.",
+        }
+        logger.warning(
+            "[%s] Tool argument validation rejected %s: code=%s",
+            self.log_prefix,
+            observable_tool_name(self.registry, call.tool),
+            exc.code,
+        )
+        # Do not retain the rejected provider payload in the result object:
+        # callers may persist ``tool_results`` or forward them to callbacks.
+        safe_call = UnifiedToolCall(
+            tool=observable_tool_name(self.registry, call.tool),
+            arguments={},
+            call_id=call.call_id,
+        )
+        result = UnifiedToolResult(
+            call=safe_call,
+            output=json.dumps(payload, ensure_ascii=False),
+            success=False,
+            error=payload["error"],
+            elapsed_ms=elapsed_ms,
+        )
+        # Contract validation failures are deterministic caller/protocol
+        # errors, not failures of the tool implementation.  Do not consume
+        # the tool failure circuit budget or open its breaker.
+        return result
+
+    def _normalize_call_arguments(
+        self,
+        call: UnifiedToolCall,
+    ) -> tuple[UnifiedToolCall, UnifiedToolResult | None]:
+        """Canonicalize arguments before policy, approval, or Python execution."""
+
+        definition = self._tool_definition(call)
+        if definition is None:
+            if _registry_contains(self.registry, call.tool):
+                # Legacy registry adapters can execute a trusted name without
+                # exposing a ToolDefinition/schema. Keep their historical
+                # argument forwarding contract; observation remains empty.
+                return call, None
+            # Unknown tool names still produce a structured router failure,
+            # but their provider payload must not be retained in results or
+            # audit records where it could expose arbitrary fields.
+            return (
+                UnifiedToolCall(
+                    # Keep the provider name authoritative for the internal
+                    # registry lookup. Public/audit projections call
+                    # ``observable_tool_name`` and remain bounded.
+                    tool=call.tool,
+                    arguments={},
+                    call_id=call.call_id,
+                ),
+                None,
+            )
+        normalizer = getattr(definition, "normalize_arguments", None)
+        if not callable(normalizer):
+            # Compatibility fake definitions keep their legacy behavior.
+            return call, None
+        try:
+            normalized = normalizer(call.arguments)
+        except ToolArgumentValidationError as exc:
+            return call, self._argument_validation_result(call, exc)
+        except Exception as exc:
+            # A repository-controlled schema/normalizer defect must fail
+            # closed without serializing exception text or argument values.
+            logger.error(
+                "[%s] Tool argument normalizer failed for %s: exception_type=%s",
+                self.log_prefix,
+                observable_tool_name(self.registry, call.tool),
+                type(exc).__name__,
+            )
+            failure = ToolArgumentValidationError(
+                call.tool,
+                code="tool_argument_invalid",
+            )
+            return call, self._argument_validation_result(call, failure)
+
+        return (
+            UnifiedToolCall(
+                tool=call.tool,
+                arguments=dict(normalized),
+                call_id=call.call_id,
+                raw=call.raw,
+            ),
+            None,
+        )
+
     def execute(self, call: UnifiedToolCall) -> UnifiedToolResult:
+        call, invalid = self._normalize_call_arguments(call)
+        if invalid is not None:
+            return invalid
         blocked = self._breaker_block_result(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
+        blocked = self._runtime_capability_block_result(call)
+        if blocked is not None:
+            return self._observable_result(blocked)
         blocked = self._policy_block_result(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
         blocked = self._approval_block_result(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
 
         started = time.perf_counter()
         try:
@@ -430,31 +733,45 @@ class RegistryToolRouter:
                 reset_turn_context(tool_context_token)
             output = str(result)
             success, error = tool_output_indicates_success(result)
-        except GenerationInterrupted:
-            # Steering is a control-flow boundary, not a tool failure.  Let
-            # the active response handler regenerate the turn with the delta
+        except (GenerationInterrupted, PlanningInteractionTerminated):
+            # Generation control flow is not a tool failure.  Let the owning
+            # response/terminal layer handle steering or terminal planning
             # instead of serializing the exception as a model-visible result.
             raise
-        except Exception as exc:
-            output = str(exc)
-            success = False
-            error = str(exc)
-            logger.error(
-                "[%s] Tool execution failed: %s - %s",
-                self.log_prefix,
-                call.tool,
+        except ToolArgumentValidationError as exc:
+            return self._argument_validation_result(
+                call,
                 exc,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+            )
+        except Exception as exc:
+            # Provider/tool exception text may contain credentials, URLs, or
+            # document content.  Keep the result machine-readable and let the
+            # failure breaker classify it without echoing raw text to logs.
+            output = (
+                "Tool not found: unavailable"
+                if self._tool_definition(call) is None
+                else "Tool execution failed."
+            )
+            success = False
+            error = output
+            logger.error(
+                "[%s] Tool execution failed: tool=%s exception_type=%s",
+                self.log_prefix,
+                observable_tool_name(self.registry, call.tool),
+                type(exc).__name__,
             )
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info(
-            "[%s] Tool %s -> %s",
+            "[%s] Tool %s completed: success=%s elapsed_ms=%.1f",
             self.log_prefix,
-            call.tool,
-            (output if success else f"Error: {output}")[:160],
+            observable_tool_name(self.registry, call.tool),
+            success,
+            elapsed_ms,
         )
         result = UnifiedToolResult(
-            call=call,
+            call=self._observable_call(call),
             output=output,
             success=success,
             error=error,
@@ -463,15 +780,21 @@ class RegistryToolRouter:
         return self._apply_failure_breaker(call, result)
 
     async def execute_async(self, call: UnifiedToolCall) -> UnifiedToolResult:
+        call, invalid = self._normalize_call_arguments(call)
+        if invalid is not None:
+            return invalid
         blocked = self._breaker_block_result(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
+        blocked = self._runtime_capability_block_result(call)
+        if blocked is not None:
+            return self._observable_result(blocked)
         blocked = self._policy_block_result(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
         blocked = await self._approval_block_result_async(call)
         if blocked is not None:
-            return blocked
+            return self._observable_result(blocked)
 
         started = time.perf_counter()
         try:
@@ -490,30 +813,42 @@ class RegistryToolRouter:
                 reset_turn_context(tool_context_token)
             output = str(result)
             success, error = tool_output_indicates_success(result)
-        except GenerationInterrupted:
-            # Steering is a control-flow boundary, not a tool failure.  Let
-            # the active response handler regenerate the turn with the delta.
+        except (GenerationInterrupted, PlanningInteractionTerminated):
+            # Keep generation control flow out of model-visible tool errors.
             raise
-        except Exception as exc:
-            output = str(exc)
-            success = False
-            error = str(exc)
-            logger.error(
-                "[%s] Tool execution failed: %s - %s",
-                self.log_prefix,
-                call.tool,
+        except ToolArgumentValidationError as exc:
+            return self._argument_validation_result(
+                call,
                 exc,
+                elapsed_ms=(time.perf_counter() - started) * 1000,
+            )
+        except Exception as exc:
+            # Do not write raw provider/tool exception text into logs or the
+            # model-facing result object.
+            output = (
+                "Tool not found: unavailable"
+                if self._tool_definition(call) is None
+                else "Tool execution failed."
+            )
+            success = False
+            error = output
+            logger.error(
+                "[%s] Tool execution failed: tool=%s exception_type=%s",
+                self.log_prefix,
+                observable_tool_name(self.registry, call.tool),
+                type(exc).__name__,
             )
 
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info(
-            "[%s] Tool %s -> %s",
+            "[%s] Tool %s completed: success=%s elapsed_ms=%.1f",
             self.log_prefix,
-            call.tool,
-            (output if success else f"Error: {output}")[:160],
+            observable_tool_name(self.registry, call.tool),
+            success,
+            elapsed_ms,
         )
         result = UnifiedToolResult(
-            call=call,
+            call=self._observable_call(call),
             output=output,
             success=success,
             error=error,
@@ -602,7 +937,11 @@ def serialize_openai_tool_call(tool_call: Any) -> dict[str, Any]:
     }
 
 
-def serialize_openai_assistant_message(message: Any) -> dict[str, Any]:
+def serialize_openai_assistant_message(
+    message: Any,
+    *,
+    registry: ToolRegistry | None = None,
+) -> dict[str, Any]:
     if isinstance(message, dict):
         payload = dict(message)
     else:
@@ -631,7 +970,32 @@ def serialize_openai_assistant_message(message: Any) -> dict[str, Any]:
     payload["content"] = payload.get("content") or getattr(message, "content", "") or ""
     calls = list(payload.get("tool_calls") or getattr(message, "tool_calls", None) or [])
     if calls:
-        payload["tool_calls"] = [serialize_openai_tool_call(call) for call in calls]
+        serialized_calls = [serialize_openai_tool_call(call) for call in calls]
+        if registry is not None:
+            for serialized in serialized_calls:
+                function = serialized.get("function")
+                if not isinstance(function, dict):
+                    continue
+                provider_name = str(function.get("name") or "")
+                observable_name = observable_tool_name(registry, provider_name)
+                raw_arguments = function.get("arguments", "{}")
+                if isinstance(raw_arguments, dict):
+                    parsed_arguments = raw_arguments
+                else:
+                    try:
+                        parsed_arguments = json.loads(raw_arguments or "{}")
+                    except Exception:
+                        parsed_arguments = {}
+                function["name"] = observable_name
+                function["arguments"] = json.dumps(
+                    _observable_tool_arguments(
+                        registry,
+                        provider_name,
+                        parsed_arguments if isinstance(parsed_arguments, dict) else {},
+                    ),
+                    ensure_ascii=False,
+                )
+        payload["tool_calls"] = serialized_calls
     return payload
 
 
@@ -918,6 +1282,7 @@ def run_openai_compatible_turn_loop(
     max_tool_result_chars: int | None = None,
     message_content: Callable[[Any], str] | None = None,
     config: Any | None = None,
+    client: Any | None = None,
     user_input: str | None = None,
     enforce_tool_policy: bool = True,
     final_response_check: (
@@ -957,6 +1322,7 @@ def run_openai_compatible_turn_loop(
         registry,
         log_prefix=log_prefix,
         config=config,
+        client=client,
         user_input=effective_user_input,
         enforce_tool_policy=enforce_tool_policy,
     )
@@ -1002,7 +1368,12 @@ def run_openai_compatible_turn_loop(
                 else None
             )
             if continuation_prompt:
-                current_messages.append(serialize_openai_assistant_message(current_message))
+                current_messages.append(
+                    serialize_openai_assistant_message(
+                        current_message,
+                        registry=registry,
+                    )
+                )
                 current_messages.append(
                     {"role": "user", "content": continuation_prompt}
                 )
@@ -1026,22 +1397,32 @@ def run_openai_compatible_turn_loop(
                 audit_tool_results=list(all_results),
                 messages=[
                     *current_messages,
-                    serialize_openai_assistant_message(current_message),
+                    serialize_openai_assistant_message(
+                        current_message,
+                        registry=registry,
+                    ),
                 ],
             )
 
         # ツール呼び出しを伴うラウンドの通常テキストは途中経過として配信する。
         emit_assistant_text(event_callback, current_content, round_index=emit_round)
 
-        current_messages.append(serialize_openai_assistant_message(current_message))
+        current_messages.append(
+            serialize_openai_assistant_message(
+                current_message,
+                registry=registry,
+            )
+        )
 
         calls = [
             UnifiedToolCall(
+                # Keep the raw provider name for authoritative registry
+                # lookup; only events/results/messages use the safe projection.
                 tool=name,
                 arguments=(
                     _restore_arguments_for_tool(
                         restore_tool_arguments,
-                        name,
+                        observable_tool_name(registry, name),
                         dict(arguments),
                     )
                     if restore_tool_arguments is not None
@@ -1068,8 +1449,17 @@ def run_openai_compatible_turn_loop(
                 else None
             )
             if previous is not None:
+                safe_call = UnifiedToolCall(
+                    tool=observable_tool_name(router.registry, call.tool),
+                    arguments=_observable_tool_arguments(
+                        router.registry,
+                        call.tool,
+                        call.arguments,
+                    ),
+                    call_id=call.call_id,
+                )
                 suppressed = UnifiedToolResult(
-                    call=call,
+                    call=safe_call,
                     output=previous.output,
                     success=True,
                     elapsed_ms=previous.elapsed_ms,
@@ -1079,18 +1469,24 @@ def run_openai_compatible_turn_loop(
                 logger.info(
                     "[%s] Suppressed redundant successful OpenAI tool recall: %s",
                     log_prefix,
-                    call.tool,
+                    observable_tool_name(router.registry, call.tool),
                 )
                 continue
 
             operation_id = call.call_id.strip() or str(uuid.uuid4())
+            observable_arguments = _observable_tool_arguments(
+                router.registry,
+                call.tool,
+                call.arguments,
+            )
+            observable_name = observable_tool_name(router.registry, call.tool)
             _emit_sync(
                 event_callback,
                 "tool_start",
                 {
-                    "tool": call.tool,
-                    "tool_args": dict(call.arguments or {}),
-                    "message": f"Running {call.tool}",
+                    "tool": observable_name,
+                    "tool_args": observable_arguments,
+                    "message": f"Running {observable_name}",
                     "operation_id": operation_id,
                 },
             )
@@ -1103,9 +1499,9 @@ def run_openai_compatible_turn_loop(
                 event_callback,
                 "tool_end",
                 {
-                    "tool": call.tool,
-                    "tool_args": dict(call.arguments or {}),
-                    "message": f"Completed {call.tool}",
+                    "tool": observable_name,
+                    "tool_args": observable_arguments,
+                    "message": f"Completed {observable_name}",
                     "operation_id": operation_id,
                 },
             )
@@ -1144,7 +1540,10 @@ def run_openai_compatible_turn_loop(
                 )
                 final_message = {"role": "assistant", "content": final_content}
             else:
-                final_message = serialize_openai_assistant_message(message)
+                final_message = serialize_openai_assistant_message(
+                    message,
+                    registry=registry,
+                )
             return UnifiedTurnResult(
                 final_output=final_content,
                 tool_results=display_results,
@@ -1185,7 +1584,12 @@ def run_openai_compatible_turn_loop(
             else None
         )
         if continuation_prompt:
-            current_messages.append(serialize_openai_assistant_message(current_message))
+            current_messages.append(
+                serialize_openai_assistant_message(
+                    current_message,
+                    registry=registry,
+                )
+            )
             current_messages.append({"role": "user", "content": continuation_prompt})
             follow_up_kwargs = dict(api_kwargs)
             follow_up_kwargs["messages"] = current_messages
@@ -1211,7 +1615,10 @@ def run_openai_compatible_turn_loop(
             stopped_reason="final",
             messages=[
                 *current_messages,
-                serialize_openai_assistant_message(current_message),
+                serialize_openai_assistant_message(
+                    current_message,
+                    registry=registry,
+                ),
             ],
             audit_tool_results=list(all_results),
         )
@@ -1224,7 +1631,10 @@ def run_openai_compatible_turn_loop(
         stopped_reason="max_rounds",
         messages=[
             *current_messages,
-            serialize_openai_assistant_message(current_message),
+            serialize_openai_assistant_message(
+                current_message,
+                registry=registry,
+            ),
         ],
         audit_tool_results=list(all_results),
     )
@@ -1245,6 +1655,7 @@ def run_cli_tool_call_loop(
     max_rounds: int = 12,
     max_tool_result_chars: int | None = None,
     config: Any | None = None,
+    client: Any | None = None,
     user_input: str | None = None,
     enforce_tool_policy: bool = True,
     event_callback: Callable[[str, dict[str, Any]], Any] | None = None,
@@ -1259,6 +1670,7 @@ def run_cli_tool_call_loop(
         registry,
         log_prefix=log_prefix,
         config=config,
+        client=client,
         user_input=user_input or original_input,
         enforce_tool_policy=enforce_tool_policy,
     )
@@ -1366,7 +1778,17 @@ def run_cli_tool_call_loop(
                 audit_tool_results=list(all_results),
             )
 
-        calls = cli_tool_calls_from_parsed(parsed_calls)
+        calls = [
+            UnifiedToolCall(
+                # Do not let the public ``unknown_tool`` marker collide with a
+                # legitimately registered tool of that name.
+                tool=call.tool,
+                arguments=dict(call.arguments),
+                call_id=call.call_id,
+                raw=call.raw,
+            )
+            for call in cli_tool_calls_from_parsed(parsed_calls)
+        ]
         if _is_redundant_successful_cli_recall(calls, all_results):
             final_output = _redundant_cli_recall_final_output(calls, all_results)
             logger.info(
@@ -1395,13 +1817,19 @@ def run_cli_tool_call_loop(
                     stopped_reason="cancelled",
                     audit_tool_results=list(all_results),
                 )
+            observable_arguments = _observable_tool_arguments(
+                router.registry,
+                call.tool,
+                call.arguments,
+            )
+            observable_name = observable_tool_name(router.registry, call.tool)
             _emit_sync(
                 event_callback,
                 "tool_start",
                 {
-                    "tool": call.tool,
-                    "tool_args": dict(call.arguments or {}),
-                    "message": f"Running {call.tool}",
+                    "tool": observable_name,
+                    "tool_args": observable_arguments,
+                    "message": f"Running {observable_name}",
                 },
             )
             result = router.execute(call)
@@ -1419,12 +1847,12 @@ def run_cli_tool_call_loop(
                 event_callback,
                 "tool_end",
                 {
-                    "tool": call.tool,
-                    "tool_args": dict(call.arguments or {}),
-                    "message": f"Completed {call.tool}",
+                    "tool": observable_name,
+                    "tool_args": observable_arguments,
+                    "message": f"Completed {observable_name}",
                     "tool_result": {
-                        "tool": call.tool,
-                        "arguments": dict(call.arguments or {}),
+                        "tool": observable_name,
+                        "arguments": observable_arguments,
                         "output": result.model_output,
                         "error": result.error if not result.success else "",
                     },

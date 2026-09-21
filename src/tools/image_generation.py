@@ -1,4 +1,5 @@
 
+import asyncio
 import logging
 import os
 import time
@@ -9,6 +10,7 @@ import google.generativeai as genai
 
 from .core import tool
 from ..services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     get_privacy_policy_context,
 )
@@ -179,14 +181,6 @@ async def generate_image(prompt: str) -> str:
             session_context=inherited.session_context,
             project_metadata=inherited.project_metadata,
         )
-        protected_prompt = privacy_gateway.protect_sync(
-            {"prompt": prompt},
-            provider="gemini",
-            source_kind="image_generation",
-        )
-        if isinstance(protected_prompt.payload, dict):
-            prompt = str(protected_prompt.payload.get("prompt") or prompt)
-        
         # Initialize model
         # Using the specific model version requested by user
         model_name = "gemini-3-pro-image-preview" 
@@ -195,23 +189,38 @@ async def generate_image(prompt: str) -> str:
         except Exception as e:
             return f"エラー: モデル {model_name} の初期化に失敗しました: {e}"
             
-        # Generate content
+        # Generate content through the single outbound transaction boundary.
+        # The sender receives only the final reviewed/masked payload; it never
+        # closes over the raw prompt for a fallback request.
         print(f"[ImageGeneration] Generating image with model {model_name}...")
-        
-        # Run blocking generation in a thread to avoid blocking the event loop
-        import asyncio
-        import functools
-        
-        # Check if there is a running loop
-        try:
-            loop = asyncio.get_running_loop()
-            response = await loop.run_in_executor(
-                None, 
-                functools.partial(model.generate_content, prompt)
-            )
-        except RuntimeError:
-            # Fallback for sync execution (e.g. in tests)
-            response = model.generate_content(prompt)
+
+        descriptor = EgressDescriptor(
+            action="image.generate",
+            transport="google.generativeai",
+            destination="https://generativelanguage.googleapis.com",
+            provider="gemini",
+            tool="image_generation",
+            model=model_name,
+        )
+
+        def send_image_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, dict):
+                raise RuntimeError("privacy protection returned no image prompt")
+            outbound_prompt = str(protected_payload.get("prompt") or "")
+            if not outbound_prompt:
+                raise RuntimeError("image generation prompt is empty")
+            return model.generate_content(outbound_prompt)
+
+        response = await asyncio.to_thread(
+            privacy_gateway.execute_sync,
+            {"prompt": prompt},
+            provider="gemini",
+            descriptor=descriptor,
+            sender=send_image_request,
+            base_url="https://generativelanguage.googleapis.com",
+            source_kind="image_generation",
+            model=model_name,
+        )
 
         
         # Check if generation was successful

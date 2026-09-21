@@ -45,6 +45,56 @@ interface Heartbeat {
   last_result?: Record<string, unknown> | null;
 }
 
+interface HeartbeatRun {
+  id: string | null;
+  heartbeat_name: string;
+  mode?: string | null;
+  scope_type: string;
+  scope_id: string;
+  project_id?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  status: string;
+  success?: boolean | null;
+  memory_upsert_count: number;
+  forgotten_count: number;
+  question_count: number;
+  continuation_pending: boolean;
+  result_summary?: string | null;
+  questions: Array<Record<string, unknown> | string>;
+  safe_error_code?: string | null;
+  forced?: boolean;
+  generic_action_count?: number;
+  generic_action_failure_count?: number;
+}
+
+interface HeartbeatHistoryPage {
+  runs: HeartbeatRun[];
+  items?: HeartbeatRun[];
+  total_count?: number;
+  limit: number;
+  offset: number;
+  next_cursor?: string | null;
+  has_more?: boolean;
+}
+
+interface HeartbeatHistoryState {
+  loaded: boolean;
+  loading: boolean;
+  error: string | null;
+  data: HeartbeatHistoryPage;
+}
+
+const EMPTY_HISTORY_PAGE: HeartbeatHistoryPage = {
+  runs: [],
+  limit: 10,
+  offset: 0,
+  next_cursor: null,
+  has_more: false,
+};
+
+const HISTORY_PAGE_SIZE = 10;
+
 interface HeartbeatForm {
   name: string;
   description: string;
@@ -119,6 +169,164 @@ function buildPayload(form: HeartbeatForm, includeName: boolean) {
   return payload;
 }
 
+function formatRunDate(value?: string | null): string {
+  if (!value) return "-";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return parsed.toLocaleString("ja-JP", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+function questionText(question: Record<string, unknown> | string): string {
+  if (typeof question === "string") return question;
+  for (const key of ["question", "summary", "topic", "title", "message"]) {
+    const value = question[key];
+    if (typeof value === "string" && value.trim()) return value;
+  }
+  return "Question summary unavailable";
+}
+
+function runScopeLabel(run: HeartbeatRun): string {
+  if (run.scope_type === "project") {
+    return run.project_id || run.scope_id || "Project";
+  }
+  return "Global";
+}
+
+function HeartbeatHistoryPanel({
+  heartbeatName,
+  state,
+  onLoad,
+}: {
+  heartbeatName: string;
+  state?: HeartbeatHistoryState;
+  onLoad: (cursor: string | null) => void;
+}) {
+  const data = state?.data || EMPTY_HISTORY_PAGE;
+  const loading = state?.loading === true;
+  const totalCount = data.total_count;
+  const canPrevious = data.offset > 0;
+  const canNext = data.has_more === true || (
+    typeof totalCount === "number" && data.offset + data.runs.length < totalCount
+  );
+
+  return (
+    <div
+      className="mt-2 space-y-2 rounded border bg-muted/20 p-2"
+      aria-label={`${heartbeatName} recent execution history`}
+    >
+      {loading && data.runs.length === 0 ? (
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <Loader2 className="size-3 animate-spin" />
+          Loading recent runs...
+        </div>
+      ) : state?.error ? (
+        <div className="flex items-center justify-between gap-2 text-xs text-destructive">
+          <span>{state.error}</span>
+          <Button type="button" variant="outline" size="sm" onClick={() => onLoad(null)}>
+            Retry
+          </Button>
+        </div>
+      ) : data.runs.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No execution history.</p>
+      ) : (
+        <>
+          <div className="max-h-80 space-y-2 overflow-auto">
+            {data.runs.map((run, index) => {
+              const key = run.id || `${run.started_at || "run"}-${index}`;
+              const statusVariant =
+                run.status === "ok" || run.success === true ? "default" :
+                run.status === "running" ? "secondary" : "destructive";
+              return (
+                <div key={key} className="rounded border bg-background p-2 text-xs">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <Badge variant={statusVariant} className="text-[10px]">
+                      {run.status || "unknown"}
+                    </Badge>
+                    <span className="font-medium">{runScopeLabel(run)}</span>
+                    <span className="text-muted-foreground">
+                      {formatRunDate(run.started_at)} → {formatRunDate(run.completed_at)}
+                    </span>
+                    {run.forced ? (
+                      <Badge variant="outline" className="text-[10px]">
+                        Manual
+                      </Badge>
+                    ) : null}
+                    {run.continuation_pending ? (
+                      <Badge variant="outline" className="text-[10px]">
+                        Continuation pending
+                      </Badge>
+                    ) : null}
+                  </div>
+                  <p className="mt-1 text-muted-foreground">
+                    Memory {run.memory_upsert_count || 0} · Forgotten {run.forgotten_count || 0} ·
+                    Questions {run.question_count || 0}
+                    {run.generic_action_count ? (
+                      <> · Actions {run.generic_action_count} ({run.generic_action_failure_count || 0} failed)</>
+                    ) : null}
+                  </p>
+                  {run.result_summary ? (
+                    <p className="mt-1 whitespace-pre-wrap break-words">{run.result_summary}</p>
+                  ) : null}
+                  {run.questions?.length ? (
+                    <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                      {run.questions.slice(0, HISTORY_PAGE_SIZE).map((question, questionIndex) => (
+                        <li key={`${key}-question-${questionIndex}`} className="break-words">
+                          {questionText(question)}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+                  {run.safe_error_code ? (
+                    <p className="mt-1 break-words text-destructive">
+                      Error ({run.safe_error_code})
+                    </p>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+          <div className="flex items-center justify-between gap-2">
+            <span className="text-[11px] text-muted-foreground">
+              {typeof totalCount === "number"
+                ? `${data.offset + 1}-${Math.min(data.offset + data.runs.length, totalCount)} of ${totalCount}`
+                : `${data.runs.length}${data.has_more ? "+" : ""} recent runs`}
+            </span>
+            <div className="flex gap-1">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                disabled={!canPrevious || loading}
+                onClick={() => onLoad(null)}
+              >
+                Previous
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                className="h-7 px-2 text-xs"
+                disabled={!canNext || loading}
+                onClick={() =>
+                  onLoad(data.next_cursor || null)
+                }
+              >
+                Next
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
 export function HeartbeatsSection() {
   const confirm = useConfirm();
   const [expanded, setExpanded] = useState(false);
@@ -149,6 +357,10 @@ export function HeartbeatsSection() {
   const [form, setForm] = useState<HeartbeatForm>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [busyName, setBusyName] = useState<string | null>(null);
+  const [historyOpenName, setHistoryOpenName] = useState<string | null>(null);
+  const [historyByName, setHistoryByName] = useState<
+    Record<string, HeartbeatHistoryState>
+  >({});
 
   const loadHeartbeats = useCallback(async () => {
     setLoading(true);
@@ -224,6 +436,60 @@ export function HeartbeatsSection() {
     [loadHeartbeats, confirm],
   );
 
+  const loadHistory = useCallback(async (name: string, cursor: string | null = null) => {
+    setHistoryByName((previous) => ({
+      ...previous,
+      [name]: {
+        ...(previous[name] || { data: EMPTY_HISTORY_PAGE, loaded: false }),
+        loaded: previous[name]?.loaded ?? false,
+        loading: true,
+        error: null,
+      },
+    }));
+    try {
+      const params = new URLSearchParams({
+        heartbeat_name: name,
+        limit: String(HISTORY_PAGE_SIZE),
+      });
+      if (cursor) params.set("cursor", cursor);
+      const data = await pyFetch<HeartbeatHistoryPage>(
+        `/heartbeats/history?${params.toString()}`,
+      );
+      const normalized: HeartbeatHistoryPage = {
+        runs: Array.isArray(data?.runs)
+          ? data.runs
+          : Array.isArray(data?.items)
+            ? data.items
+            : [],
+        total_count:
+          typeof data?.total_count === "number" ? data.total_count : undefined,
+        limit: Number(data?.limit || HISTORY_PAGE_SIZE),
+        offset: Number(data?.offset || 0),
+        next_cursor: data?.next_cursor || null,
+        has_more: data?.has_more === true,
+      };
+      setHistoryByName((previous) => ({
+        ...previous,
+        [name]: {
+          loaded: true,
+          loading: false,
+          error: null,
+          data: normalized,
+        },
+      }));
+    } catch (error) {
+      setHistoryByName((previous) => ({
+        ...previous,
+        [name]: {
+          ...(previous[name] || { data: EMPTY_HISTORY_PAGE }),
+          loaded: previous[name]?.loaded ?? false,
+          loading: false,
+          error: error instanceof Error ? error.message : "Failed to load run history",
+        },
+      }));
+    }
+  }, []);
+
   const handleTrigger = useCallback(
     async (name: string) => {
       setBusyName(name);
@@ -232,6 +498,9 @@ export function HeartbeatsSection() {
           method: "POST",
         });
         await loadHeartbeats();
+        if (historyByName[name]?.loaded) {
+          await loadHistory(name, null);
+        }
         toast.success("Heartbeat triggered");
       } catch (error) {
         toast.error(error instanceof Error ? error.message : "Failed to trigger heartbeat");
@@ -239,7 +508,21 @@ export function HeartbeatsSection() {
         setBusyName(null);
       }
     },
-    [loadHeartbeats],
+    [historyByName, loadHeartbeats, loadHistory],
+  );
+
+  const toggleHistory = useCallback(
+    (name: string) => {
+      if (historyOpenName === name) {
+        setHistoryOpenName(null);
+        return;
+      }
+      setHistoryOpenName(name);
+      if (!historyByName[name]?.loaded && !historyByName[name]?.loading) {
+        void loadHistory(name, null);
+      }
+    },
+    [historyByName, historyOpenName, loadHistory],
   );
 
   const enabledCount = heartbeats.filter((item) => item.enabled !== false).length;
@@ -297,6 +580,11 @@ export function HeartbeatsSection() {
                         <p className="mt-1 text-xs text-muted-foreground">
                           {heartbeat.description || "No description"}
                         </p>
+                        {heartbeat.last_result?.status ? (
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            Last result: {String(heartbeat.last_result.status)}
+                          </p>
+                        ) : null}
                         {heartbeat.active_hours ? (
                           <p className="mt-1 text-[11px] text-muted-foreground">
                             Active {heartbeat.active_hours.start || "00:00"}-
@@ -310,6 +598,7 @@ export function HeartbeatsSection() {
                           variant="ghost"
                           size="icon"
                           className="size-7"
+                          aria-label={`Trigger ${heartbeat.name}`}
                           disabled={busyName === heartbeat.name}
                           onClick={() => handleTrigger(heartbeat.name)}
                         >
@@ -323,6 +612,7 @@ export function HeartbeatsSection() {
                           variant="ghost"
                           size="icon"
                           className="size-7"
+                          aria-label={`Edit ${heartbeat.name}`}
                           onClick={() => openEdit(heartbeat)}
                         >
                           <Pencil className="size-3.5" />
@@ -331,12 +621,41 @@ export function HeartbeatsSection() {
                           variant="ghost"
                           size="icon"
                           className="size-7 text-destructive"
+                          aria-label={`Delete ${heartbeat.name}`}
                           disabled={busyName === heartbeat.name}
                           onClick={() => handleDelete(heartbeat.name)}
                         >
                           <Trash2 className="size-3.5" />
                         </Button>
                       </div>
+                    </div>
+                    <div className="mt-3 border-t pt-2">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-7 px-2 text-xs"
+                        aria-expanded={historyOpenName === heartbeat.name}
+                        onClick={() => toggleHistory(heartbeat.name)}
+                      >
+                        {historyOpenName === heartbeat.name ? (
+                          <ChevronUp className="mr-1 size-3.5" />
+                        ) : (
+                          <ChevronDown className="mr-1 size-3.5" />
+                        )}
+                        {historyOpenName === heartbeat.name
+                          ? "Hide recent runs"
+                          : "Recent runs"}
+                      </Button>
+                      {historyOpenName === heartbeat.name ? (
+                        <HeartbeatHistoryPanel
+                          heartbeatName={heartbeat.name}
+                          state={historyByName[heartbeat.name]}
+                          onLoad={(nextCursor) =>
+                            void loadHistory(heartbeat.name, nextCursor)
+                          }
+                        />
+                      ) : null}
                     </div>
                   </div>
                 ))}

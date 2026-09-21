@@ -31,11 +31,19 @@ export type FilesSidebarSnapshot = {
   isAdmin: boolean;
   isRemoteWorkspace: boolean;
   bookmarks: ExplorerBookmark[];
+  /** Personal plus the active selected-Space collection with provenance. */
+  bookmarkCollections?: FilesSidebarBookmarkCollections;
   bookmarkScope?: ExplorerBookmarkScope;
   navigate: (path: string) => void;
   selectProjectForPath?: (path: string) => Promise<boolean>;
   closeEditor: () => void;
-  refreshBookmarks: () => Promise<void>;
+  refreshBookmarks: (owner?: ExplorerBookmarkScope) => Promise<void>;
+};
+
+/** Collections exposed across the provider/sidebar bridge. */
+export type FilesSidebarBookmarkCollections = {
+  personal: ExplorerBookmark[];
+  shared: { spaceId: string; bookmarks: ExplorerBookmark[] } | null;
 };
 
 /** A stable identity for one ExplorerProvider instance. */
@@ -60,6 +68,7 @@ const EMPTY_SNAPSHOT: FilesSidebarSnapshot = {
   isAdmin: false,
   isRemoteWorkspace: false,
   bookmarks: [],
+  bookmarkCollections: { personal: [], shared: null },
   bookmarkScope: { scope: "personal" },
   navigate: noop,
   selectProjectForPath: async () => true,
@@ -125,6 +134,7 @@ export function publishFilesSidebarState(
     snapshot.isAdmin === next.isAdmin &&
     snapshot.isRemoteWorkspace === next.isRemoteWorkspace &&
     snapshot.bookmarks === next.bookmarks &&
+    snapshot.bookmarkCollections === next.bookmarkCollections &&
     snapshot.bookmarkScope === next.bookmarkScope &&
     snapshot.navigate === next.navigate &&
     snapshot.selectProjectForPath === next.selectProjectForPath &&

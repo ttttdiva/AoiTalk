@@ -27,6 +27,21 @@ openai_compatible_local:
   base_url: http://gemma-vllm:8000/v1
   tools: true
 
+# The Enterprise model endpoint is an internal Docker service.  Declare its
+# hostname explicitly so the outbound privacy boundary classifies the primary
+# Gemma/Qwen-compatible generation path as local; public providers still
+# require their own approved-egress and credential checks.  A semantic privacy
+# sidecar, when enabled for external requests, remains a separate dedicated
+# model and never falls back to this primary reasoning model.
+external_model_privacy:
+  mode: protected
+  trusted_local_hosts:
+    - gemma-vllm
+    - sglang
+    - deepseek-llamacpp
+    - searxng
+    - host.docker.internal
+
 gemma_vllm:
   image: "${AOITALK_GEMMA_VLLM_IMAGE}"
   model: google/gemma-4-E4B-it
@@ -95,6 +110,14 @@ runtime_features:
   console_input: false
 
 mcp_enabled: false
+search:
+  # Fresh Enterprise databases must use the local search authority.  An
+  # operator-explicit hosted provider in persisted settings remains
+  # authoritative after egress/credential checks.
+  provider: local
+  x_enabled: false
+  grok_x_enabled: false
+  knowledge_enabled: false
 agents:
   filesystem:
     enabled: true
@@ -112,6 +135,22 @@ agents:
     enabled: false
   import:
     enabled: false
+
+# Ordinary employee Agents may use this capability only from a native Windows
+# AoiTalk process, and only for the mediated filesystem/RepoMap APIs.  The
+# authenticated AoiTalk user must be explicitly mapped to the current process
+# token SID.  Generic native shell/PowerShell remains disabled: a same-token
+# process cannot guarantee Project/Docs ACL mediation.  The canonical
+# Linux/Docker Enterprise process (shared `aoitalk` identity) is unsupported.
+# Keep the capability disabled until the native process and UUID-to-SID token
+# verification contract has been tested.  Bindings contain identifiers only;
+# credentials and private keys belong in the host secret store.
+native_employee_execution:
+  enabled: false
+  # Logical deployment identifier; this is not a remote shell/broker address.
+  endpoint_id: ''
+  capability_ttl_seconds: 300
+  windows_bindings: {}
 
 spotify:
   enabled: false

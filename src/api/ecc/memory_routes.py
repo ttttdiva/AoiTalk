@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
-from ...services.scoped_memory_service import ScopedMemoryError, ScopedMemoryService
+from ...services.scoped_memory_service import (
+    ScopedMemoryError,
+    ScopedMemoryService,
+    ScopedMemoryValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +53,19 @@ def build_memory_router(
     @router.patch("/settings")
     async def patch_settings(request: Request, _=Depends(require_auth)):
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except Exception as exc:
+                raise ScopedMemoryValidationError(
+                    "settings body must be valid JSON"
+                ) from exc
+            if not isinstance(body, Mapping):
+                raise ScopedMemoryValidationError("settings body must be object")
+            for key in ("user_auto_enabled", "project_auto_enabled"):
+                if key in body and body[key] is not None and not isinstance(
+                    body[key], bool
+                ):
+                    raise ScopedMemoryValidationError(f"{key} must be boolean")
             settings = await service.update_settings(
                 actor_id=await actor(request),
                 user_auto_enabled=body.get("user_auto_enabled"),
@@ -66,8 +83,49 @@ def build_memory_router(
         _=Depends(require_auth),
     ):
         try:
-            jobs = await service.list_jobs(actor_id=await actor(request), limit=limit)
-            return {"success": True, "jobs": jobs}
+            actor_id = await actor(request)
+            jobs = await service.list_jobs(actor_id=actor_id, limit=limit)
+            # Dreaming consolidation has its own append-only ledger.  Keep it
+            # alongside legacy per-turn extraction jobs so existing clients
+            # can continue reading ``jobs`` unchanged.
+            try:
+                dreaming_runs = await service.list_dreaming_runs(
+                    actor_id=actor_id, limit=limit
+                )
+            except Exception:
+                logger.debug("Dreaming run history unavailable", exc_info=True)
+                dreaming_runs = []
+            return {"success": True, "jobs": jobs, "dreaming_runs": dreaming_runs}
+        except Exception as exc:
+            raise mapped_error(exc) from exc
+
+    @router.get("/runs")
+    async def list_dreaming_runs(
+        request: Request,
+        limit: int = Query(default=50, ge=1, le=200),
+        _=Depends(require_auth),
+    ):
+        """Return the authenticated user's Dreaming consolidation history."""
+        try:
+            return {
+                "success": True,
+                "runs": await service.list_dreaming_runs(
+                    actor_id=await actor(request), limit=limit
+                ),
+            }
+        except Exception as exc:
+            raise mapped_error(exc) from exc
+
+    @router.get("/overview")
+    async def get_overview(request: Request, _=Depends(require_auth)):
+        """Return the personal Dreaming overview without project memories."""
+        try:
+            return {
+                "success": True,
+                "overview": await service.get_dreaming_overview(
+                    actor_id=await actor(request)
+                ),
+            }
         except Exception as exc:
             raise mapped_error(exc) from exc
 

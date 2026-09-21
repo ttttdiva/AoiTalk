@@ -13,6 +13,7 @@ import re
 import time
 from contextlib import nullcontext
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Optional, Sequence, Type
@@ -22,6 +23,7 @@ from openai import OpenAI
 from ..config import Config
 from ..features import Features
 from .sglang_url import resolve_sglang_base_url
+from .deployment_resolver import canonical_model_for_provider, is_retired_model
 from ..services.project_context import (
     format_project_context_for_prompt,
     get_runtime_project_context,
@@ -31,6 +33,7 @@ from ..services.project_context import (
 )
 from ..services.turn_context import get_turn_context
 from ..services.outbound_privacy_service import (
+    EgressDescriptor,
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
     get_privacy_policy_context,
@@ -118,6 +121,33 @@ _EXTERNAL_APPROVAL_PROVIDERS = {
 }
 
 
+def _create_openai_transport_client(*, base_url: str, api_key: str) -> OpenAI:
+    """Construct an OpenAI-compatible client without implicit retries.
+
+    The production SDK exposes ``max_retries``; a few embedding/test clients
+    intentionally implement the historical two-argument constructor.  Use
+    signature inspection rather than catching a constructor ``TypeError`` so
+    a real initialization error is never retried or hidden.
+    """
+
+    kwargs: dict[str, Any] = {"base_url": base_url, "api_key": api_key}
+    try:
+        parameters = inspect.signature(OpenAI).parameters.values()
+        supports_max_retries = any(
+            parameter.name == "max_retries"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        # The official SDK is known to support this option.  For opaque
+        # callables, pass it through and let the constructor report a genuine
+        # incompatibility rather than silently enabling retries.
+        supports_max_retries = True
+    if supports_max_retries:
+        kwargs["max_retries"] = 0
+    return OpenAI(**kwargs)
+
+
 def _requires_external_approval(subagent: dict[str, Any] | None) -> bool:
     if not isinstance(subagent, dict):
         return False
@@ -191,6 +221,7 @@ CLI_PROVIDER_NAMES = {"antigravity-cli", "claude-cli", "codex-cli", "grok-cli"}
 _CHILD_FORBIDDEN_TOOL_NAMES = frozenset(
     {
         "agent_team_delegate",
+        "consult_cloud_advisor",
         "use_mcp_tool",
         "git_commit",
         "git_push",
@@ -594,22 +625,25 @@ def _normalized_model(value: Any) -> Optional[str]:
 
 
 def _compact_tool_definition(tool_def: ToolDefinition) -> ToolDefinition:
-    return ToolDefinition(
-        name=tool_def.name,
+    """Compact model-facing prose without changing the tool contract."""
+
+    return replace(
+        tool_def,
         description=_COMPACT_TOOL_DESCRIPTIONS.get(tool_def.name, tool_def.name),
-        function=tool_def.function,
         parameters=[
-            ToolParam(
-                name=param.name,
-                type=param.type,
+            replace(
+                param,
                 description="",
-                required=param.required,
-                default=param.default,
-                enum=param.enum,
+                enum=deepcopy(param.enum),
+                schema=deepcopy(param.schema),
             )
             for param in tool_def.parameters
         ],
-        is_async=tool_def.is_async,
+        # Mutable contract metadata must not be shared with the canonical
+        # definition: a compact specialist registry is request-local.
+        availability=deepcopy(tool_def.availability),
+        argument_aliases=dict(tool_def.argument_aliases),
+        hidden_argument_names=tuple(tool_def.hidden_argument_names),
     )
 
 
@@ -755,9 +789,13 @@ class SpecialistDelegationRunner:
         # Character DB values may be ``None``, empty, or whitespace-only.
         # Normalize before deciding whether to inherit the effective Main
         # route, while preserving any explicit non-blank model verbatim.
-        self.model = _normalized_model(model) or _normalized_model(
-            self._select_model()
-        )
+        requested_model = _normalized_model(model)
+        if is_retired_model(requested_model):
+            requested_model = ""
+        selected_model = _normalized_model(self._select_model())
+        if is_retired_model(selected_model):
+            selected_model = ""
+        self.model = requested_model or selected_model
         self._deployment = None
         self._apply_deployment_contract()
         if self._uses_agent_team_subagent_target():
@@ -849,6 +887,13 @@ class SpecialistDelegationRunner:
         # so aliases can never leak across users/sessions.
         self._privacy_gateway: OutboundPrivacyGateway | None = None
         self._privacy_gateway_key: tuple[str, str] | None = None
+        # The provider request itself is the canonical review boundary.  The
+        # legacy approval helpers remain available for embedders/tests that
+        # call them directly, but normal Agent Team execution defers review to
+        # the gateway once the complete provider payload (system/context /
+        # tools) exists.  This prevents a request-preview dialog followed by
+        # a second gateway dialog with different policy semantics.
+        self._defer_unified_egress_review = False
 
     def _privacy_gateway_for_turn(
         self,
@@ -907,6 +952,41 @@ class SpecialistDelegationRunner:
                 project_metadata=_scope(resolved_project_metadata),
             )
         return self._privacy_gateway
+
+    def _execute_sync_model_request(
+        self,
+        client: OpenAI,
+        payload: dict[str, Any],
+        *,
+        base_url: str,
+        model: str,
+        transport: str = "openai.chat.completions",
+        source_kind: str = "agent_team_model_request",
+    ) -> Any:
+        """Send one specialist SDK request inside the privacy transaction."""
+
+        gateway = self._privacy_gateway_for_turn()
+        descriptor = EgressDescriptor(
+            action="model.generate",
+            transport=transport,
+            destination=str(base_url or ""),
+            provider=str(self.provider or ""),
+            tool=self.domain_key,
+            model=str(model or ""),
+        )
+
+        def send_request(outbound: dict[str, Any]) -> Any:
+            return client.chat.completions.create(**outbound)
+
+        return gateway.execute_sync(
+            payload,
+            provider=self.provider,
+            descriptor=descriptor,
+            sender=send_request,
+            base_url=str(base_url or ""),
+            source_kind=source_kind,
+            model=str(model or ""),
+        )
 
     def _apply_deployment_contract(self) -> None:
         """Apply the Enterprise provider boundary before any direct SDK call.
@@ -1043,11 +1123,20 @@ class SpecialistDelegationRunner:
                         "providers because their native sandbox can bypass the "
                         "declared AoiTalk read-only capabilities."
                     )
-                approved_request = await self._approve_pool_route_request(
-                    request,
-                    provider=lease.provider,
-                    model=lease.model,
-                )
+                # The actual provider call below owns the complete payload
+                # and therefore the canonical privacy/review transaction.
+                # Keep the helper call for compatibility/explicit test
+                # overrides, while its production implementation defers to
+                # that gateway instead of opening a duplicate dialog.
+                self._defer_unified_egress_review = True
+                try:
+                    approved_request = await self._approve_pool_route_request(
+                        request,
+                        provider=lease.provider,
+                        model=lease.model,
+                    )
+                finally:
+                    self._defer_unified_egress_review = False
                 if approved_request is None:
                     await finalize_route_lease(
                         lease,
@@ -1175,6 +1264,39 @@ class SpecialistDelegationRunner:
         if not _requires_external_approval({"provider": provider}):
             return request
         gateway = self._privacy_gateway_for_turn()
+        if self._defer_unified_egress_review:
+            # OutboundPrivacyGateway.execute[_sync] below owns the only
+            # review/redaction decision for the actual provider payload.  Do
+            # the local_only check here as a preflight, before pool client
+            # construction, but do not open the legacy prompt surface.
+            if gateway.mode == "local_only":
+                try:
+                    gateway.ensure_provider_allowed(provider)
+                except ExternalProviderBlocked:
+                    return None
+            # A review-capable external route without an authenticated
+            # user/session cannot reach the canonical gateway dialog later.
+            # Preserve the historical fail-closed cancellation seam for
+            # standalone embedders (and keep the permission scope contract)
+            # without creating a second review for real chat turns.
+            if (
+                gateway.settings.review_policy != "never"
+                and (
+                    not gateway.user_id.strip()
+                    or gateway.user_id.strip().casefold()
+                    in {"default", "default_user", "anonymous"}
+                    or not gateway.session_id.strip()
+                )
+            ):
+                return await request_external_model_prompt(
+                    request,
+                    provider=provider,
+                    model=model,
+                    confirm=True,
+                    notify=gateway.settings.notify,
+                    request_kind=f"{self.domain_key}_assistant",
+                )
+            return request
         privacy_mode = gateway.mode
         review_policy = gateway.settings.review_policy
         notify = gateway.settings.notify
@@ -1188,7 +1310,19 @@ class SpecialistDelegationRunner:
             # The existing Agent Team permission dialog is the review surface
             # for this path.  Let the gateway produce findings without asking
             # a second callback (and never fall back to raw text).
-            gateway.settings = replace(gateway.settings, review_policy="never")
+            gateway.settings = replace(
+                gateway.settings,
+                review_policy="never",
+                # With confirmation explicitly OFF, retain the historical
+                # deterministic-only masking path when no local semantic
+                # sidecar is configured.  Confirmation-ON still runs the
+                # strict gateway and fails closed on sidecar uncertainty.
+                semantic_redaction_enabled=(
+                    gateway.settings.semantic_redaction_enabled
+                    if review_policy != "never"
+                    else False
+                ),
+            )
             try:
                 protected = await gateway.protect(
                     request,
@@ -1201,6 +1335,24 @@ class SpecialistDelegationRunner:
             redaction_findings = [finding.as_dict() for finding in protected.findings]
         else:
             redacted_prompt, redaction_findings = request, []
+        # ``never`` is the explicit confirmation-OFF setting.  Protected mode
+        # still sends the deterministic candidate, but it must not invent a
+        # new modal when the user opted out of confirmation.
+        if review_policy == "never":
+            return await request_external_model_prompt(
+                request,
+                redacted_prompt=redacted_prompt,
+                redaction_findings=redaction_findings,
+                provider=provider,
+                model=model,
+                description=(
+                    f"Review the {self.display_name} assistant prompt before "
+                    f"sending it to {provider}/{model}."
+                ),
+                confirm=False,
+                notify=notify,
+                request_kind=f"{self.domain_key}_assistant",
+            )
         return await request_external_model_prompt(
             request,
             redacted_prompt=redacted_prompt,
@@ -1211,9 +1363,17 @@ class SpecialistDelegationRunner:
                 f"Review the {self.display_name} assistant prompt before "
                 f"sending it to {provider}/{model}."
             ),
-            confirm=review_policy != "never",
+            confirm=True,
             notify=notify,
             request_kind=f"{self.domain_key}_assistant",
+            egress_transaction=True,
+            original_payload=request,
+            candidate_payload=redacted_prompt,
+            action="agent_team.delegate",
+            transport="agent_team.prompt",
+            destination=f"{provider}/{model}",
+            tool=self.domain_key,
+            contract_version=2,
         )
 
     def _get_agent_configs(self) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1241,6 +1401,54 @@ class SpecialistDelegationRunner:
             return False
         return agent_team_workspace_access(subagent) in {"read", "write"}
 
+    def _enterprise_cli_native_scope_required(self) -> bool:
+        """Whether this Enterprise CLI child must run inside a repository scope.
+
+        Provider-native CLI tools are the only child capability that can open a
+        host process without crossing the managed AoiTalk tool boundary.  The
+        Enterprise profile therefore requires a trusted repository scope for
+        both read-only and write workspace ceilings.  Non-workspace specialists
+        and Personal's historical unscoped CLI path remain unchanged.
+        """
+
+        return bool(
+            Features.is_enterprise()
+            and str(self.provider or "").strip().lower() in CLI_PROVIDER_NAMES
+            and self._subagent_cli_native_allowed()
+        )
+
+    @staticmethod
+    def _active_repository_run_scope() -> Any:
+        """Return a trusted lower scope, adapting an active harness scope.
+
+        A parent normally injects both scopes into ``project_context``.  A
+        direct child invocation may instead inherit the ContextVars; when only
+        the server-issued HarnessExecutionScope is present, adapt it to the
+        repository AgentRunScope expected by ``CLIBackendBase``.  No raw
+        model/project payload is accepted here.
+        """
+
+        try:
+            from ..security.agent_run_scope import get_current_run_scope
+
+            scope = get_current_run_scope()
+        except Exception:
+            scope = None
+        if scope is not None:
+            return scope
+        try:
+            from ..security.harness_execution_scope import (
+                HarnessExecutionScope,
+                get_current_harness_execution_scope,
+            )
+
+            upper = get_current_harness_execution_scope()
+            if isinstance(upper, HarnessExecutionScope):
+                return upper.to_agent_run_scope()
+        except Exception:
+            pass
+        return None
+
     def _subagent_cli_workspace_access(self) -> str:
         """Resolve the actual native CLI sandbox ceiling for this child run."""
 
@@ -1261,7 +1469,15 @@ class SpecialistDelegationRunner:
 
     def _main_model_for_provider(self, provider: str) -> Optional[str]:
         selected = str(_config_get(self.config, "llm_model", "") or "").strip()
-        if selected:
+        persisted_provider = str(
+            _config_get(self.config, "llm_provider", "") or ""
+        ).strip().lower()
+        if selected and (
+            not persisted_provider
+            or persisted_provider == str(provider or "").strip().lower()
+        ):
+            if is_retired_model(selected):
+                return None
             return selected
 
         provider_model_keys = {
@@ -1284,7 +1500,7 @@ class SpecialistDelegationRunner:
         }
         for key in provider_model_keys.get(provider, ()):
             value = str(_config_get(self.config, key, "") or "").strip()
-            if value:
+            if value and not is_retired_model(value):
                 return value
         return None
 
@@ -1317,8 +1533,12 @@ class SpecialistDelegationRunner:
 
     def _select_native_openai_model(self) -> str:
         configured_model = self.model or self._main_model_for_provider(self.provider)
-        if configured_model and str(configured_model).strip().startswith(
-            NATIVE_OPENAI_MODEL_PREFIXES
+        if (
+            configured_model
+            and not is_retired_model(configured_model)
+            and str(configured_model).strip().startswith(
+                NATIVE_OPENAI_MODEL_PREFIXES
+            )
         ):
             return str(configured_model).strip()
 
@@ -1326,7 +1546,9 @@ class SpecialistDelegationRunner:
             return "gpt-5.6-luna"
 
         llm_model = str(_config_get(self.config, "llm_model", "")).strip()
-        if llm_model.startswith(NATIVE_OPENAI_MODEL_PREFIXES):
+        if not is_retired_model(llm_model) and llm_model.startswith(
+            NATIVE_OPENAI_MODEL_PREFIXES
+        ):
             return llm_model
 
         logger.warning(
@@ -1334,39 +1556,60 @@ class SpecialistDelegationRunner:
             "falling back to gpt-5.6-luna",
             self.display_name,
         )
-        return "gpt-5.6-luna"
+        return canonical_model_for_provider(self.config, "openai")
 
     def _select_model(self) -> Optional[str]:
         if self._agent_team_subagent_route:
-            return _normalized_model(self._agent_team_subagent_route.get("model"))
+            route_model = _normalized_model(
+                self._agent_team_subagent_route.get("model")
+            )
+            route_provider = str(
+                self._agent_team_subagent_route.get("provider") or self.provider or ""
+            ).strip().lower()
+            if not route_model or is_retired_model(route_model):
+                return canonical_model_for_provider(self.config, route_provider)
+            return route_model
 
         configured_model = _normalized_model(self._main_model_for_provider(self.provider))
 
         if self.provider in CLI_PROVIDER_NAMES:
-            return configured_model or _normalized_model(
-                _config_get(self.config, "llm_model")
-            )
+            fallback = _normalized_model(_config_get(self.config, "llm_model"))
+            return configured_model or ("" if is_retired_model(fallback) else fallback)
 
         if self.provider == OLLAMA_PROVIDER_NAME:
             ollama_config = _config_get(self.config, "ollama", {}) or {}
-            return configured_model or _normalized_model(
-                _config_get(self.config, "ollama_model")
-            ) or _normalized_model(
-                _config_get(self.config, "llm_model")
-            ) or _normalized_model(
-                ollama_config.get("model") if isinstance(ollama_config, dict) else None
-            ) or "gemma4:e4b"
+            candidates = (
+                configured_model,
+                _normalized_model(_config_get(self.config, "ollama_model")),
+                _normalized_model(_config_get(self.config, "llm_model")),
+                _normalized_model(
+                    ollama_config.get("model") if isinstance(ollama_config, dict) else None
+                ),
+            )
+            for candidate in candidates:
+                if candidate and not is_retired_model(candidate):
+                    return candidate
+            return canonical_model_for_provider(self.config, self.provider)
 
         if self.provider in OPENAI_COMPATIBLE_PROVIDER_NAMES:
-            return configured_model
+            return configured_model or canonical_model_for_provider(
+                self.config, self.provider
+            )
 
         if self.provider == "openai":
-            return configured_model or "gpt-5.6-luna"
+            return configured_model or canonical_model_for_provider(
+                self.config, "openai"
+            )
 
         if self.provider == "gemini":
-            return configured_model or "gemini-3-flash-preview"
+            return configured_model or canonical_model_for_provider(
+                self.config, "gemini"
+            )
 
-        return self._select_native_openai_model()
+        raise ValueError(
+            f"Unsupported specialist provider '{self.provider}'; refusing to "
+            "fall back to the official OpenAI transport"
+        )
 
     def _create_cli_backend(self):
         if self.provider == "antigravity-cli":
@@ -1573,10 +1816,17 @@ class SpecialistDelegationRunner:
         return self._agent_definition
 
     def _create_agent_instance(self, model: Optional[str] = None):
+        safe_model = _normalized_model(model or self.model)
+        if is_retired_model(safe_model):
+            safe_model = canonical_model_for_provider(self.config, self.provider)
+        if not safe_model or is_retired_model(safe_model):
+            raise ValueError(
+                f"No safe model is configured for specialist provider '{self.provider}'"
+            )
         try:
-            return self.agent_class(model=model, config=self.config)
+            return self.agent_class(model=safe_model, config=self.config)
         except TypeError:
-            return self.agent_class(model=model)
+            return self.agent_class(model=safe_model)
 
     def _build_tool_registry(self) -> ToolRegistry:
         if self._tool_registry is not None:
@@ -1818,13 +2068,13 @@ class SpecialistDelegationRunner:
         # inherit ``CLIBackendBase`` and route scoped execution through the
         # verified WSL2+bubblewrap process owner.  Unsupported custom runners
         # fail closed before the provider receives the request.
-        run_scope = None
-        try:
-            from ..security.agent_run_scope import get_current_run_scope
-
-            run_scope = get_current_run_scope()
-        except Exception:
-            run_scope = None
+        run_scope = self._active_repository_run_scope()
+        if self._enterprise_cli_native_scope_required() and run_scope is None:
+            return (
+                f"{self.display_name} delegation blocked: Enterprise CLI-native "
+                "workspace execution requires a trusted AgentRunScope/"
+                "HarnessExecutionScope"
+            )
         if run_scope is not None and not isinstance(self.cli_backend, CLIBackendBase):
             return (
                 f"{self.display_name} delegation blocked: active AgentRunScope "
@@ -1885,8 +2135,54 @@ class SpecialistDelegationRunner:
                         )
                     except Exception:
                         logger.debug("Agent Team Codex native context unavailable", exc_info=True)
+
+                gateway = self._privacy_gateway_for_turn()
+                descriptor = EgressDescriptor(
+                    action="model.generate",
+                    transport=f"{self.provider}.cli",
+                    destination=str(self.provider or ""),
+                    provider=str(self.provider or ""),
+                    tool=self.domain_key,
+                    model=str(
+                        getattr(self.cli_backend, "_model", None)
+                        or self.model
+                        or ""
+                    ),
+                )
+
+                def send_cli_request(outbound: dict[str, Any]) -> tuple[bool, str]:
+                    # ``cwd`` is a trusted local execution control and is not
+                    # user content.  Prompt/system_context, however, are
+                    # provider-bound values and must come from the gateway's
+                    # exact final payload.
+                    final_kwargs: dict[str, Any] = {
+                        "prompt": str(outbound.get("prompt") or ""),
+                        "cwd": kwargs["cwd"],
+                    }
+                    if "system_context" in outbound:
+                        final_kwargs["system_context"] = outbound.get(
+                            "system_context"
+                        )
+                    return self.cli_backend.execute_prompt(**final_kwargs)
+
+                egress_payload = {
+                    "prompt": kwargs["prompt"],
+                }
+                if "system_context" in kwargs:
+                    egress_payload["system_context"] = kwargs["system_context"]
                 with native_context:
-                    success, output = self.cli_backend.execute_prompt(**kwargs)
+                    success, output = gateway.execute_sync(
+                        egress_payload,
+                        provider=self.provider,
+                        descriptor=descriptor,
+                        sender=send_cli_request,
+                        source_kind="agent_team_model_request",
+                        model=str(
+                            getattr(self.cli_backend, "_model", None)
+                            or self.model
+                            or ""
+                        ),
+                    )
                 return success, output
             finally:
                 consume_usage = getattr(self.cli_backend, "consume_last_usage", None)
@@ -1986,7 +2282,7 @@ class SpecialistDelegationRunner:
             or ollama_config.get("api_key")
             or "ollama"
         )
-        client = OpenAI(base_url=base_url, api_key=api_key)
+        client = _create_openai_transport_client(base_url=base_url, api_key=api_key)
         model = self.model or "gemma4:e4b"
 
         initial_messages = [
@@ -2027,13 +2323,13 @@ class SpecialistDelegationRunner:
             if reasoning_effort:
                 api_kwargs["reasoning_effort"] = reasoning_effort
             started_at = time.perf_counter()
-            protected = self._privacy_gateway_for_turn().protect_sync(
+            response = self._execute_sync_model_request(
+                client,
                 api_kwargs,
-                provider=self.provider,
                 base_url=base_url,
+                model=model,
                 source_kind="agent_team_model_request",
             )
-            response = client.chat.completions.create(**protected.payload)
             self._persist_specialist_response_usage(
                 response,
                 started_at=started_at,
@@ -2134,22 +2430,20 @@ class SpecialistDelegationRunner:
         return clean_base_url, str(api_key or "dummy")
 
     def _create_openai_compatible_completion(self, client: OpenAI, api_kwargs: dict[str, Any]) -> Any:
-        gateway = self._privacy_gateway_for_turn()
         base_url = str(getattr(client, "base_url", "") or "")
-        protected_kwargs = gateway.protect_sync(
-            api_kwargs,
-            provider=self.provider,
-            base_url=base_url,
-            source_kind="agent_team_model_request",
-        ).payload
         try:
-            return client.chat.completions.create(**protected_kwargs)
+            return self._execute_sync_model_request(
+                client,
+                api_kwargs,
+                base_url=base_url,
+                model=str(api_kwargs.get("model") or self.model or ""),
+            )
         except Exception as exc:
             if _is_context_overflow_error(exc):
                 raise
             if self.provider in {"kimi", "deepseek", "deepinfra", "openrouter"}:
                 raise
-            retry_kwargs = dict(protected_kwargs)
+            retry_kwargs = dict(api_kwargs)
             removed = []
             preserve_qwen_effort = bool(
                 self.provider == "openai_compatible_local"
@@ -2176,7 +2470,12 @@ class SpecialistDelegationRunner:
                 ", ".join(removed),
                 exc,
             )
-            return client.chat.completions.create(**retry_kwargs)
+            return self._execute_sync_model_request(
+                client,
+                retry_kwargs,
+                base_url=base_url,
+                model=str(retry_kwargs.get("model") or self.model or ""),
+            )
 
     def _run_via_openai_compatible_tool_loop(
         self,
@@ -2188,7 +2487,7 @@ class SpecialistDelegationRunner:
         agent_definition = self._get_agent_definition()
         instructions = str(getattr(agent_definition, "instructions", "")).strip()
         base_url, api_key = self._openai_compatible_connection()
-        client = OpenAI(base_url=base_url, api_key=api_key)
+        client = _create_openai_transport_client(base_url=base_url, api_key=api_key)
         context_budget = resolve_context_budget(
             config=self.config,
             provider_key=self.provider,
@@ -2359,6 +2658,37 @@ class SpecialistDelegationRunner:
             return delegated_request
 
         gateway = self._privacy_gateway_for_turn()
+        if self._defer_unified_egress_review:
+            # Normal Agent Team execution must not perform a request-only
+            # approval followed by a second review from the real provider
+            # gateway.  Returning the request here lets the later
+            # gateway.execute call classify the complete outbound payload and
+            # apply never/high_risk/always consistently with every other
+            # external route.  Keep local_only fail-closed before MCP/client
+            # setup as a defence-in-depth preflight.
+            if gateway.mode == "local_only":
+                try:
+                    gateway.ensure_provider_allowed(self.provider)
+                except ExternalProviderBlocked:
+                    return None
+            if (
+                gateway.settings.review_policy != "never"
+                and (
+                    not gateway.user_id.strip()
+                    or gateway.user_id.strip().casefold()
+                    in {"default", "default_user", "anonymous"}
+                    or not gateway.session_id.strip()
+                )
+            ):
+                return await request_external_model_prompt(
+                    delegated_request,
+                    provider=self.provider,
+                    model=self.model or "",
+                    confirm=True,
+                    notify=gateway.settings.notify,
+                    request_kind=f"{self.domain_key}_assistant",
+                )
+            return delegated_request
         privacy_mode = gateway.mode
         review_policy = gateway.settings.review_policy
         notify = gateway.settings.notify
@@ -2369,7 +2699,15 @@ class SpecialistDelegationRunner:
                 return None
         if privacy_mode == "protected":
             original_settings = gateway.settings
-            gateway.settings = replace(gateway.settings, review_policy="never")
+            gateway.settings = replace(
+                gateway.settings,
+                review_policy="never",
+                semantic_redaction_enabled=(
+                    gateway.settings.semantic_redaction_enabled
+                    if review_policy != "never"
+                    else False
+                ),
+            )
             try:
                 protected = await gateway.protect(
                     delegated_request,
@@ -2382,6 +2720,21 @@ class SpecialistDelegationRunner:
             redaction_findings = [finding.as_dict() for finding in protected.findings]
         else:
             redacted_prompt, redaction_findings = delegated_request, []
+        if review_policy == "never":
+            return await request_external_model_prompt(
+                delegated_request,
+                redacted_prompt=redacted_prompt,
+                redaction_findings=redaction_findings,
+                provider=self.provider,
+                model=self.model or "",
+                description=(
+                    f"Review the {self.display_name} assistant prompt before "
+                    f"sending it to {self.provider}/{self.model}."
+                ),
+                confirm=False,
+                notify=notify,
+                request_kind=f"{self.domain_key}_assistant",
+            )
         return await request_external_model_prompt(
             delegated_request,
             redacted_prompt=redacted_prompt,
@@ -2392,9 +2745,17 @@ class SpecialistDelegationRunner:
                 f"Review the {self.display_name} assistant prompt before "
                 f"sending it to {self.provider}/{self.model}."
             ),
-            confirm=review_policy != "never",
+            confirm=True,
             notify=notify,
             request_kind=f"{self.domain_key}_assistant",
+            egress_transaction=True,
+            original_payload=delegated_request,
+            candidate_payload=redacted_prompt,
+            action="agent_team.delegate",
+            transport="agent_team.prompt",
+            destination=f"{self.provider}/{self.model or ''}",
+            tool=self.domain_key,
+            contract_version=2,
         )
 
     def _required_ollama_tool_names(self, request: str) -> set[str]:
@@ -2519,6 +2880,26 @@ class SpecialistDelegationRunner:
             project_metadata=project_metadata,
         )
 
+        # Reject local_only external delegation before MCP initialization or
+        # provider/client construction.  The later gateway transaction still
+        # performs the authoritative check, but this preflight prevents a
+        # blocked child route from touching any external-capable setup.
+        if privacy_gateway.mode == "local_only":
+            try:
+                privacy_gateway.ensure_provider_allowed(
+                    self.provider,
+                    base_url=(
+                        _config_get(self.config, f"{self.provider}.base_url")
+                        if self.provider not in CLI_PROVIDER_NAMES
+                        else None
+                    ),
+                )
+            except ExternalProviderBlocked:
+                return (
+                    f"{self.display_name} delegation blocked: external provider "
+                    "is disabled in local_only privacy mode"
+                )
+
         if self._route_intent is not None:
             delegated_request = self._augment_request_with_project_context(
                 request,
@@ -2569,7 +2950,17 @@ class SpecialistDelegationRunner:
                     return f"Failed to initialize {self.display_name} MCP"
                 set_mcp_plugin(plugin)
 
-            approved_request = await self._approve_external_model_request(delegated_request)
+            # Preserve the helper seam for compatibility, but defer the real
+            # privacy/review decision to the provider gateway where the full
+            # system/context/tool payload is available.  This guarantees one
+            # review surface and one meaning for never/high_risk/always.
+            self._defer_unified_egress_review = True
+            try:
+                approved_request = await self._approve_external_model_request(
+                    delegated_request
+                )
+            finally:
+                self._defer_unified_egress_review = False
             if approved_request is None:
                 return f"{self.display_name} delegation cancelled"
             delegated_request = approved_request
@@ -2828,6 +3219,17 @@ class SpecialistDelegationRunner:
         project_context: Optional[dict[str, Any]] = None,
     ) -> str:
         run_scope = self._run_scope_from_project_context(project_context)
+        if run_scope is None:
+            # Trusted ContextVars cover direct child calls that are already
+            # wrapped by the parent controller.  They are never derived from
+            # model/project fields.
+            run_scope = self._active_repository_run_scope()
+        if self._enterprise_cli_native_scope_required() and run_scope is None:
+            return (
+                f"{self.display_name} delegation blocked: Enterprise CLI-native "
+                "workspace execution requires a trusted AgentRunScope/"
+                "HarnessExecutionScope"
+            )
         if (
             self._uses_agent_team_subagent_target()
             and agent_team_workspace_access(self._agent_team_subagent) in {"read", "write"}
@@ -2847,9 +3249,22 @@ class SpecialistDelegationRunner:
             )
         if run_scope is None:
             return await self._run_async(request, project_context=project_context)
+        from contextlib import ExitStack
         from ..security.agent_run_scope import run_scope_context
+        from ..security.harness_execution_scope import harness_execution_scope_context
+        from ..services.agent_run_scope_service import (
+            HARNESS_EXECUTION_SCOPE_CONTEXT_KEY,
+        )
 
-        with run_scope_context(run_scope):
+        upper_scope = (
+            project_context.get(HARNESS_EXECUTION_SCOPE_CONTEXT_KEY)
+            if isinstance(project_context, dict)
+            else None
+        )
+        with ExitStack() as stack:
+            if upper_scope is not None:
+                stack.enter_context(harness_execution_scope_context(upper_scope))
+            stack.enter_context(run_scope_context(run_scope))
             return await self._run_async(request, project_context=project_context)
 
     @staticmethod
@@ -2871,6 +3286,21 @@ class SpecialistDelegationRunner:
         candidate = project_context.get("run_scope")
         if isinstance(candidate, AgentRunScope):
             return candidate
+        # Enterprise parent contexts may carry only the server-issued upper
+        # capability.  Adapt that trusted object to the lower repository
+        # scope consumed by the CLI backend; untrusted dictionaries are
+        # ignored rather than promoted.
+        try:
+            from ..security.harness_execution_scope import HarnessExecutionScope
+            from ..services.agent_run_scope_service import (
+                HARNESS_EXECUTION_SCOPE_CONTEXT_KEY,
+            )
+
+            upper = project_context.get(HARNESS_EXECUTION_SCOPE_CONTEXT_KEY)
+            if isinstance(upper, HarnessExecutionScope):
+                return upper.to_agent_run_scope()
+        except Exception:
+            pass
         # A child must not be able to turn an arbitrary model-supplied path
         # into a mutation scope.  The parent controller must construct and
         # pass the immutable AgentRunScope object itself.
@@ -3058,45 +3488,55 @@ def _bind_story_tools_to_turn(
             return turn_session_id
 
         if inspect.iscoroutinefunction(original):
-            async def _async_bound(
-                *args: Any,
-                _original: Any = original,
-                **kwargs: Any,
-            ) -> Any:
-                trusted_id = _trusted_id(kwargs)
-                return await _original(
-                    *args,
-                    conversation_id=trusted_id,
-                    **kwargs,
-                )
+            def _make_async_bound(original_fn: Any, trusted_id_fn: Any):
+                async def _async_bound(*args: Any, **kwargs: Any) -> Any:
+                    trusted_id = trusted_id_fn(kwargs)
+                    return await original_fn(
+                        *args,
+                        conversation_id=trusted_id,
+                        **kwargs,
+                    )
 
-            wrapper = _async_bound
+                return _async_bound
+
+            wrapper = _make_async_bound(original, _trusted_id)
         else:
-            def _sync_bound(
-                *args: Any,
-                _original: Any = original,
-                **kwargs: Any,
-            ) -> Any:
-                trusted_id = _trusted_id(kwargs)
-                return _original(
-                    *args,
-                    conversation_id=trusted_id,
-                    **kwargs,
-                )
+            def _make_sync_bound(original_fn: Any, trusted_id_fn: Any):
+                def _sync_bound(*args: Any, **kwargs: Any) -> Any:
+                    trusted_id = trusted_id_fn(kwargs)
+                    return original_fn(
+                        *args,
+                        conversation_id=trusted_id,
+                        **kwargs,
+                    )
 
-            wrapper = _sync_bound
-        bound.append(
-            replace(
-                item,
-                function=wrapper,
-                is_async=inspect.iscoroutinefunction(wrapper),
-                parameters=[
-                    param
-                    for param in item.parameters
-                    if param.name != "conversation_id"
-                ],
-            )
+                return _sync_bound
+
+            wrapper = _make_sync_bound(original, _trusted_id)
+        bound_item = replace(
+            item,
+            function=wrapper,
+            is_async=inspect.iscoroutinefunction(wrapper),
+            hidden_argument_names=tuple(
+                sorted(
+                    {
+                        *getattr(item, "hidden_argument_names", ()),
+                        "conversation_id",
+                    }
+                )
+            ),
+            parameters=[
+                param
+                for param in item.parameters
+                if param.name != "conversation_id"
+            ],
         )
+        # Removing the sole hidden parameter can leave an empty schema. Keep
+        # that wrapper closed so dataclass signature inference cannot turn its
+        # implementation closure (e.g. ``_original``) into a provider-visible
+        # variadic argument surface.
+        bound_item._legacy_variadic_kwargs = False
+        bound.append(bound_item)
     return bound
 
 
@@ -3377,6 +3817,13 @@ class AgentTeamSubagentDelegationRunner(SpecialistDelegationRunner):
         )
 
     def _create_agent_instance(self, model: Optional[str] = None):
+        safe_model = _normalized_model(model or self.model)
+        if is_retired_model(safe_model):
+            safe_model = canonical_model_for_provider(self.config, self.provider)
+        if not safe_model or is_retired_model(safe_model):
+            raise ValueError(
+                f"No safe model is configured for specialist provider '{self.provider}'"
+            )
         if agent_team_v3_enabled(self.config) and self._agent_team_subagent:
             subagent = self._agent_team_subagent
             subagent_policy = subagent
@@ -3427,7 +3874,7 @@ class AgentTeamSubagentDelegationRunner(SpecialistDelegationRunner):
                 # CLI provider and still requires its existing opt-in.
                 requested = tuple(dict.fromkeys([*requested, "workspace_read"]))
             return _AgentTeamSubagentAgent(
-                model=model or self.model or self._select_native_openai_model(),
+                model=safe_model,
                 subagent_id=self.domain_key,
                 label=self.display_name,
                 tools=_agent_team_tools_for_capabilities(
@@ -3446,7 +3893,7 @@ class AgentTeamSubagentDelegationRunner(SpecialistDelegationRunner):
                 instructions=str(subagent_policy.get("instructions") or "").strip(),
             )
         return _AgentTeamSubagentAgent(
-            model=model or self.model or self._select_native_openai_model(),
+            model=safe_model,
             subagent_id=self.domain_key,
             label=self.display_name,
             tools=_agent_team_read_tools(

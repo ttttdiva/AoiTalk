@@ -1,16 +1,13 @@
-import { Platform } from "react-native";
-
 /**
  * Mobile app configuration.
  */
 
-const LOCALHOST_API_URL = "http://127.0.0.1:3000";
-const ANDROID_EMULATOR_API_URL = "http://10.0.2.2:3000";
+export const PUBLIC_API_URL =
+  process.env.EXPO_PUBLIC_AOITALK_API_URL?.trim() || "";
 
-export const DEFAULT_API_URL =
-  Platform.OS === "android" ? ANDROID_EMULATOR_API_URL : LOCALHOST_API_URL;
-
-export const EXTERNAL_API_URL = "https://nk-h01.f5.si:6002";
+export const DEFAULT_API_URL: string = __DEV__
+  ? process.env.EXPO_PUBLIC_AOITALK_DEV_API_URL?.trim() || PUBLIC_API_URL
+  : PUBLIC_API_URL;
 
 // Public GitHub release metadata used by the in-app updater.
 export const UPDATE_CHECK_URL =

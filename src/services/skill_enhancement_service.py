@@ -24,6 +24,7 @@ from ..models.ecc_models import SkillCategory, SkillChain, SkillPreset
 from ..skills.loader import SKILLS_DIR, save_skill_to_yaml
 from ..skills.models import SkillDefinition, SkillTriggerMode
 from ..skills.registry import get_skill_registry, register_skill
+from ..skills.executor import invoke_resolved_skill
 from ..utils.uuid_utils import parse_uuid, parse_uuid_strict
 
 logger = logging.getLogger(__name__)
@@ -411,7 +412,12 @@ class SkillEnhancementService:
                     render_kwargs[param_key] = mapping_value
 
             try:
-                rendered = skill.render_prompt(current_input, **render_kwargs)
+                rendered = await invoke_resolved_skill(
+                    skill,
+                    current_input,
+                    invocation_path="chain",
+                    render_kwargs=render_kwargs,
+                )
                 step_results.append({
                     "step": i + 1,
                     "skill_name": skill_name,

@@ -5,6 +5,9 @@ import { BarChart3, Clock3, LineChart } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
+import type { Project, Space } from "@/lib/task-api";
+import type { TaskBrowseScope } from "@/lib/task-browse-scope";
+import { TaskBrowseScopePicker } from "@/components/tasks/task-browse-scope-picker";
 import type { PeriodPreset, ReportsViewMode, ScopeMode } from "./reports-utils";
 
 /** Reports の scope / 期間設定を SharedAppShell の左ナビへ表示する。 */
@@ -26,6 +29,12 @@ export function ReportsWorkspaceNavigation({
   onCustomToChange,
   onWeekOffsetChange,
   onShowScheduleFramesChange,
+  browseScope,
+  browseProjects,
+  browseSpaces,
+  participatingProjects,
+  participatingSpaces,
+  onBrowseScopeChange,
 }: {
   scope: ScopeMode;
   activeView: ReportsViewMode;
@@ -44,6 +53,12 @@ export function ReportsWorkspaceNavigation({
   onCustomToChange: (value: string) => void;
   onWeekOffsetChange: (offset: number) => void;
   onShowScheduleFramesChange: (checked: boolean) => void;
+  browseScope: TaskBrowseScope | null;
+  browseProjects?: Project[];
+  browseSpaces?: Space[];
+  participatingProjects?: Project[];
+  participatingSpaces?: Space[];
+  onBrowseScopeChange: (scope: TaskBrowseScope | null) => void;
 }) {
   const scopeOptions: Array<[ScopeMode, string]> = [
     ["project", "プロジェクト単位"],
@@ -84,9 +99,23 @@ export function ReportsWorkspaceNavigation({
           role="status"
           className="rounded-md border border-primary/35 bg-primary/10 px-3 py-2 text-[11px] leading-relaxed text-sidebar-foreground"
         >
-          リモートレポート（読み取り専用）
+          {browseScope ? "明示参照レポート（読み取り専用）" : "リモートレポート（読み取り専用）"}
         </div>
       )}
+
+      <section className="space-y-2" aria-labelledby="reports-browse-heading">
+        <h2 id="reports-browse-heading" className="sr-only">
+          Explicit browse scope
+        </h2>
+        <TaskBrowseScopePicker
+          browseScope={browseScope}
+          projects={browseProjects}
+          spaces={browseSpaces}
+          participatingProjects={participatingProjects}
+          participatingSpaces={participatingSpaces}
+          onBrowseScopeChange={onBrowseScopeChange}
+        />
+      </section>
 
       <section className="space-y-2" aria-labelledby="reports-scope-heading">
         <h2

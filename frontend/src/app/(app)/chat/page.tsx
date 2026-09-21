@@ -40,6 +40,7 @@ import { useProject } from "@/contexts/project-context";
 import {
   useChatSessions,
 } from "@/contexts/chat-session-context";
+import { useOptionalRuntimeContext } from "@/contexts/runtime-context";
 import { StoryChatAuthoringWorkspace } from "@/components/story/chat/story-chat-authoring-workspace";
 import { GroupChatDialog } from "@/components/chat/group-chat-dialog";
 import { SteeringPanel } from "@/components/chat/steering-panel";
@@ -111,6 +112,7 @@ import {
   ExternalModelPromptDialog,
   PlanApprovalDialog,
   ToolPermissionDialog,
+  buildPlanApprovalResponsePayload,
   type AskUserQuestionRequest,
   type ExternalModelPromptRequest,
   type PlanApprovalRequest,
@@ -172,6 +174,8 @@ function ChatPageInner() {
   const searchParams = useSearchParams();
   const router = useRouter();
   const currentUserId = useCurrentUserId();
+  const runtime = useOptionalRuntimeContext();
+  const refreshCharacters = runtime?.refreshCharacters;
   const searchParamSessionId = searchParams.get("s") || null;
   const appQueryId = searchParams.get("app_id") || null;
   const appQueryTargetId = searchParams.get("app_target_id") || null;
@@ -198,6 +202,14 @@ function ChatPageInner() {
       allProjects,
       sessions,
     });
+
+  // Character metadata is session-scoped on the backend. Refresh it whenever
+  // the active conversation changes so the picker follows the restored
+  // session without mutating global character state in the page itself.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    void refreshCharacters?.(activeSessionId);
+  }, [activeSessionId, refreshCharacters]);
 
   useEffect(() => {
     if (!activeSessionId) return;
@@ -261,7 +273,13 @@ function ChatPageInner() {
   const [sessionLoadError, setSessionLoadError] = useState<string | null>(null);
   const [sessionLoadAttempt, setSessionLoadAttempt] = useState(0);
   const { responseModelOptions, responseModelOptionsLoading } =
-    useResponseModelOptions();
+    useResponseModelOptions({
+      catalog: runtime?.llmCatalog ?? null,
+      // RuntimeProvider owns the /llm/models request. Skip the independent
+      // SWR fetch whenever that shared context is mounted; standalone callers
+      // keep the historical fetch behaviour.
+      shared: runtime != null,
+    });
   const [writingSession, setWritingSession] =
     useState<
       Awaited<ReturnType<typeof storyApi.getWritingSessionByConversation>>
@@ -719,7 +737,6 @@ function ChatPageInner() {
   );
   const [planApprovalRequest, setPlanApprovalRequest] =
     useState<PlanApprovalRequest | null>(null);
-  const [planApprovalDraft, setPlanApprovalDraft] = useState("");
   const [planApprovalFeedbackDraft, setPlanApprovalFeedbackDraft] = useState("");
 
   // ストリーミング内容を反映するための状態
@@ -758,7 +775,7 @@ function ChatPageInner() {
     setExternalModelPromptDraft,
   });
 
-  const { contextSnapshot, contextSnapshotStatus } = useContextSnapshot({
+  const { contextSnapshot, contextSnapshotStatus, contextBinding } = useContextSnapshot({
     activeSessionId,
     activeSessionIdRef,
     includeProjectContext,
@@ -807,6 +824,7 @@ function ChatPageInner() {
     bumpSessionForAssistant,
     handleCreateGroupChat,
     handleSendMessage,
+    retryDeepResearchAssistantPersistence,
     handleEditMessage,
     handleRerunMessage,
     handleSwitchBranch,
@@ -915,11 +933,11 @@ function ChatPageInner() {
     setToolPermissionRequest,
     setExternalModelPromptRequest,
     setExternalModelPromptDraft,
+    sendExternalModelPromptResponse,
     setAskUserQuestionRequest,
     setAskUserQuestionDraft,
     setAskUserQuestionChoices,
     setPlanApprovalRequest,
-    setPlanApprovalDraft,
     setPlanApprovalFeedbackDraft,
     setSteeringInstructions,
     setStreamingContent,
@@ -978,20 +996,17 @@ function ChatPageInner() {
 
   const handlePlanApprovalApprove = useCallback(() => {
     if (!planApprovalRequest) return;
+    const payload = buildPlanApprovalResponsePayload(planApprovalRequest);
+    if (!payload) return;
     sendHumanInteractionResponse(
       planApprovalRequest.requestId,
-      {
-        action: "approve",
-        plan_text: planApprovalDraft,
-        revision: planApprovalRequest.revision,
-      },
+      payload,
       planApprovalRequest.sessionId,
       "plan_approval_response",
     );
     setPlanApprovalRequest(null);
-    setPlanApprovalDraft("");
     setPlanApprovalFeedbackDraft("");
-  }, [planApprovalDraft, planApprovalRequest, sendHumanInteractionResponse]);
+  }, [planApprovalRequest, sendHumanInteractionResponse]);
 
   const handlePlanApprovalFeedback = useCallback(() => {
     if (!planApprovalRequest) return;
@@ -1000,17 +1015,15 @@ function ChatPageInner() {
       {
         action: "feedback",
         feedback: planApprovalFeedbackDraft,
-        plan_text: planApprovalDraft,
+        plan_text: planApprovalRequest.planText,
         revision: planApprovalRequest.revision,
       },
       planApprovalRequest.sessionId,
       "plan_approval_response",
     );
     setPlanApprovalRequest(null);
-    setPlanApprovalDraft("");
     setPlanApprovalFeedbackDraft("");
   }, [
-    planApprovalDraft,
     planApprovalFeedbackDraft,
     planApprovalRequest,
     sendHumanInteractionResponse,
@@ -1029,7 +1042,6 @@ function ChatPageInner() {
       "plan_approval_response",
     );
     setPlanApprovalRequest(null);
-    setPlanApprovalDraft("");
     setPlanApprovalFeedbackDraft("");
   }, [planApprovalRequest, sendHumanInteractionResponse]);
 
@@ -1140,6 +1152,7 @@ function ChatPageInner() {
         projectName={displayedProjectName}
         contextSnapshot={contextSnapshot}
         contextSnapshotStatus={contextSnapshotStatus}
+        contextBinding={contextBinding}
         persistent
       />
     ),
@@ -1158,6 +1171,7 @@ function ChatPageInner() {
       relatedAgentRunId,
       contextSnapshot,
       contextSnapshotStatus,
+      contextBinding,
     ],
   );
   useWorkspaceShellRegistration({
@@ -1322,6 +1336,7 @@ function ChatPageInner() {
               writingView ? handleForkStoryMessage : undefined
             }
             onRerunMessage={handleRerunMessage}
+            onRetryMessagePersistence={retryDeepResearchAssistantPersistence}
             onSwitchBranch={handleSwitchBranch}
             responseModelOptions={responseModelOptions}
             responseModelOptionsLoading={responseModelOptionsLoading}
@@ -1414,6 +1429,7 @@ function ChatPageInner() {
                   projectName={displayedProjectName}
                   contextSnapshot={contextSnapshot}
                   contextSnapshotStatus={contextSnapshotStatus}
+                  contextBinding={contextBinding}
                 />
               )}
             </div>
@@ -1490,9 +1506,7 @@ function ChatPageInner() {
             ? planApprovalRequest
             : null
         }
-        draft={planApprovalDraft}
         feedbackDraft={planApprovalFeedbackDraft}
-        onDraftChange={setPlanApprovalDraft}
         onFeedbackDraftChange={setPlanApprovalFeedbackDraft}
         onApprove={handlePlanApprovalApprove}
         onFeedback={handlePlanApprovalFeedback}

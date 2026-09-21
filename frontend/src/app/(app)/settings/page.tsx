@@ -54,9 +54,12 @@ import { WebexSection } from "@/components/settings/webex-section";
 import { RemoteServerSection } from "@/components/settings/remote-server-section";
 import { UserManagementConsole } from "@/components/settings/user-management-console";
 import { HeartbeatsSection } from "@/components/settings/heartbeats-section";
+import { VerificationDataSettings } from "@/components/settings/VerificationDataSettings";
 import { LlmModelSection } from "@/components/settings/llm-model-section";
 import { AutonomousTaskExecutionSection } from "@/components/settings/autonomous-task-execution-section";
 import { SearchSettingsSection } from "@/components/settings/search-settings-section";
+import { BrowserAgentSettingsSection } from "@/components/settings/browser-agent-settings-section";
+import { PcBridgeSettingsSection } from "@/components/settings/pc-bridge-settings-section";
 import { SpotifySection } from "@/components/settings/spotify-section";
 import { EditorSettingsSection } from "@/components/settings/editor-settings-section";
 import { YomiLinterSection } from "@/components/settings/yomi-linter-section";
@@ -173,6 +176,7 @@ interface AuthStatus {
     display_name: string | null;
     avatar_url: string | null;
     password_reset_required?: boolean | null;
+    auth_source?: "local" | "ad" | "active_directory" | null;
     user_settings?: Record<string, unknown>;
   };
 }
@@ -655,6 +659,9 @@ export default function SettingsPage() {
   );
   const [authStatusLoaded, setAuthStatusLoaded] = useState(false);
   const isAdmin = currentUser?.role === "admin";
+  const isActiveDirectoryUser =
+    currentUser?.auth_source === "ad" ||
+    currentUser?.auth_source === "active_directory";
   // 独立したサーバー状態（settings / mobileCommands / crawlers）は SWR で管理する。
   // currentUser は編集ドラフトの初期値を供給し、各保存操作で楽観的に patch される
   // ハイブリッド状態のため従来の useState のまま扱う。
@@ -1321,7 +1328,7 @@ export default function SettingsPage() {
         </SettingsDisclosure>
         <SettingsTargetFrame targetId="memory"><MemorySection /></SettingsTargetFrame>
         <SettingsTargetFrame targetId="characters"><CharactersSection /></SettingsTargetFrame>
-        <SettingsTargetFrame targetId="llm-model"><LlmModelSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="llm-model"><LlmModelSection isAdmin={isAdmin} /></SettingsTargetFrame>
       </SettingsGroup>
 
       <SettingsGroup
@@ -1535,6 +1542,8 @@ export default function SettingsPage() {
         icon={<Search className="size-4" />}
       >
         <SettingsTargetFrame targetId="search-provider"><SearchSettingsSection /></SettingsTargetFrame>
+        <SettingsTargetFrame targetId="pc-bridge"><PcBridgeSettingsSection /></SettingsTargetFrame>
+        {isAdmin && <SettingsTargetFrame targetId="browser-agent"><BrowserAgentSettingsSection /></SettingsTargetFrame>}
         <SettingsTargetFrame targetId="clip-ingest"><ClipIngestTargetsSection /></SettingsTargetFrame>
         <SettingsTargetFrame targetId="knowledge-sources"><KnowledgeSourcesSection /></SettingsTargetFrame>
         <SettingsDisclosure
@@ -1643,56 +1652,68 @@ export default function SettingsPage() {
         icon={<KeyRound className="size-4" />}
       >
         <SettingsDisclosure
-          title="パスワード変更"
+          title={isActiveDirectoryUser ? "Active Directory" : "パスワード変更"}
           icon={<Lock className="size-4" />}
           id="password"
           targetId="password"
         >
-          <div className="space-y-1">
-            <Label className="text-xs">現在のパスワード</Label>
-            <Input
-              type="password"
-              value={currentPassword}
-              onChange={(e) => setCurrentPassword(e.target.value)}
-              placeholder="現在のパスワード"
-              className="max-w-sm"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-xs">新しいパスワード</Label>
-            <Input
-              type="password"
-              value={newPassword}
-              onChange={(e) => setNewPassword(e.target.value)}
-              placeholder="6文字以上"
-              className="max-w-sm"
-            />
-          </div>
-          <div className="space-y-1">
-            <Label className="text-xs">新しいパスワード（確認）</Label>
-            <Input
-              type="password"
-              value={confirmPassword}
-              onChange={(e) => setConfirmPassword(e.target.value)}
-              placeholder="もう一度入力"
-              className="max-w-sm"
-            />
-          </div>
-          <Button
-            size="sm"
-            onClick={handleChangePassword}
-            disabled={passwordLoading}
-          >
-            {passwordLoading && <Loader2 className="mr-1 size-3 animate-spin" />}
-            変更
-          </Button>
-          {passwordMessage && (
-            <p className="text-xs text-green-600 dark:text-green-400">
-              {passwordMessage}
-            </p>
-          )}
-          {passwordError && (
-            <p className="text-xs text-destructive">{passwordError}</p>
+          {isActiveDirectoryUser ? (
+            <div className="rounded-md border border-primary/30 bg-primary/5 p-3 text-sm">
+              <p className="font-medium">Active Directory (AD自動生成)</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                このアカウントのパスワードとロック状態はActive Directoryで管理されます。
+                AoiTalkからローカルパスワードの変更・再設定はできません。
+              </p>
+            </div>
+          ) : (
+            <>
+              <div className="space-y-1">
+                <Label className="text-xs">現在のパスワード</Label>
+                <Input
+                  type="password"
+                  value={currentPassword}
+                  onChange={(e) => setCurrentPassword(e.target.value)}
+                  placeholder="現在のパスワード"
+                  className="max-w-sm"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">新しいパスワード</Label>
+                <Input
+                  type="password"
+                  value={newPassword}
+                  onChange={(e) => setNewPassword(e.target.value)}
+                  placeholder="6文字以上"
+                  className="max-w-sm"
+                />
+              </div>
+              <div className="space-y-1">
+                <Label className="text-xs">新しいパスワード（確認）</Label>
+                <Input
+                  type="password"
+                  value={confirmPassword}
+                  onChange={(e) => setConfirmPassword(e.target.value)}
+                  placeholder="もう一度入力"
+                  className="max-w-sm"
+                />
+              </div>
+              <Button
+                size="sm"
+                onClick={handleChangePassword}
+                disabled={passwordLoading}
+              >
+                {passwordLoading && <Loader2 className="mr-1 size-3 animate-spin" />}
+                変更
+              </Button>
+              {passwordMessage && (
+                <p className="text-xs text-green-600 dark:text-green-400">
+                  {passwordMessage}
+                </p>
+              )}
+              {passwordError && (
+                <p className="text-xs text-destructive">{passwordError}</p>
+              )}
+            </>
           )}
         </SettingsDisclosure>
         {isAdmin && currentUser && (
@@ -1713,6 +1734,7 @@ export default function SettingsPage() {
           <SettingsTargetFrame targetId="user-export"><UserExportSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="skills"><SkillsSection /></SettingsTargetFrame>
           <SettingsTargetFrame targetId="heartbeats"><HeartbeatsSection /></SettingsTargetFrame>
+          <SettingsTargetFrame targetId="verification-data"><VerificationDataSettings /></SettingsTargetFrame>
         </SettingsGroup>
       )}
 

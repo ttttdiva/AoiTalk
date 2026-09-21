@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { AppSelect } from "@/components/ui/app-select";
 
@@ -272,13 +272,25 @@ export function ProjectKnowledgePanel({
   }, [canManageSettings, loadKnowledge, pendingNodeId, priorityDrafts, projectId, saving]);
 
   return (
-    <Card className="border-border bg-card shadow-none" data-testid="project-knowledge-panel">
+    <Card className="mx-auto w-full max-w-5xl border-border bg-card shadow-none" data-testid="project-knowledge-panel">
       <CardHeader className="border-b border-border">
-        <CardTitle className="flex items-center gap-2 text-base font-semibold">
+        <CardTitle className="flex flex-wrap items-center gap-2 text-base font-semibold">
           <Link2 className="size-4" />
-          Project Knowledge
-          {projectName ? <span className="truncate text-sm font-normal text-muted-foreground">{projectName}</span> : null}
+          <span>関連Docs /</span>
+          <span>Project Knowledge</span>
+          {projectName ? <span className="max-w-full truncate text-sm font-normal text-muted-foreground">{projectName}</span> : null}
         </CardTitle>
+        <CardDescription>
+          このタブはプロジェクトで参照するDocsの索引です。本文はDocsで管理し、ここでは正本Docsと関連資料の参照だけを整理します。
+        </CardDescription>
+        <div className="flex flex-wrap gap-2 pt-1 text-xs text-muted-foreground" data-testid="project-knowledge-summary">
+          <span className="rounded-full border border-border px-2 py-0.5">
+            正本Docs: {canonical.length > 0 ? `${canonical.length}件` : "未設定"}
+          </span>
+          <span className="rounded-full border border-border px-2 py-0.5">
+            関連Docs: {related.length > 0 ? `${related.length}件` : "未設定"}
+          </span>
+        </div>
       </CardHeader>
       <CardContent className="space-y-6 pt-5">
         {error ? (
@@ -292,10 +304,15 @@ export function ProjectKnowledgePanel({
             <h3 id="project-knowledge-canonical-heading" className="text-sm font-semibold">Canonical Project Information</h3>
             <Badge variant="outline">read-only</Badge>
           </div>
+          <p className="text-xs leading-5 text-muted-foreground">
+            案件情報タブに紐づく唯一の正本Docsです。ここでは参照先を確認し、編集はDocsで行います。
+          </p>
           {loading ? (
             <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="size-4 animate-spin" />読み込み中…</p>
           ) : canonical.length === 0 ? (
-            <p className="text-sm text-muted-foreground">参照可能な正本Docsはありません。</p>
+            <p className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted-foreground">
+              正本Docsはまだ設定されていません。案件情報タブからProject Informationを作成・編集すると、ここに表示されます。
+            </p>
           ) : (
             <ul className="space-y-2">
               {canonical.map((item) => (
@@ -313,14 +330,17 @@ export function ProjectKnowledgePanel({
 
         <section aria-labelledby="project-knowledge-related-heading" className="space-y-3">
           <div className="flex items-center justify-between gap-2">
-            <h3 id="project-knowledge-related-heading" className="text-sm font-semibold">Related Knowledge</h3>
+            <h3 id="project-knowledge-related-heading" className="text-sm font-semibold">関連Docs</h3>
             {!canManageSettings ? <Badge variant="outline">read-only</Badge> : null}
           </div>
+          <p className="text-xs leading-5 text-muted-foreground">
+            Project Knowledgeは別のDocs本文ではなく、再利用する資料への参照インデックスです。関連付けを外してもDocs自体は削除されません。
+          </p>
 
           {canManageSettings ? (
             <div className="space-y-3 rounded-md border border-dashed border-border p-3" data-testid="project-knowledge-attach-form">
               <label className="space-y-1 text-sm font-medium" htmlFor="project-knowledge-node-search">
-                <span>Docsを検索して参照を追加</span>
+                <span>関連Docsを検索して参照を追加</span>
                 <div className="relative">
                   <Search className="pointer-events-none absolute left-2.5 top-2.5 size-4 text-muted-foreground" />
                   <Input
@@ -390,11 +410,13 @@ export function ProjectKnowledgePanel({
               ) : null}
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">このプロジェクトのメンバーはKnowledgeを閲覧できます。編集にはmanage_settings権限が必要です。</p>
+            <p className="text-sm text-muted-foreground">このプロジェクトのメンバーは関連Docsの索引を閲覧できます。編集にはmanage_settings権限が必要です。</p>
           )}
 
           {related.length === 0 ? (
-            <p className="text-sm text-muted-foreground">関連付けられたKnowledgeNodeはありません。</p>
+            <p className="rounded-md border border-dashed border-border px-3 py-3 text-sm text-muted-foreground">
+              関連Docsはまだありません。Docs検索で資料を選ぶと、このプロジェクトの参照インデックスに追加できます。
+            </p>
           ) : (
             <ul className="space-y-2">
               {related.map((item) => {

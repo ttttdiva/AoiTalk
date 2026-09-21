@@ -1,5 +1,7 @@
 import {
+  canRouteServerFileTransfer,
   getFilesMediaKind,
+  getParentPath,
   isTextEntry,
   type FilesEntry,
   type FilesScope,
@@ -38,11 +40,18 @@ export type LocationMetaState = Record<LocationKey, LocationMeta>;
 export type ClipboardOperation = "copy" | "move";
 export type ClipboardState = {
   operation: ClipboardOperation;
-  entry: FilesEntry;
+  entries: FilesEntry[];
   source: FilesSource;
   scope: FilesScope;
+  authScope?: string;
+  sourcePath?: string;
+  projectId?: string | null;
   projectRoot: string | null;
 };
+export type FilesPressAction =
+  | "open"
+  | "start-selection"
+  | "toggle-selection";
 export type ViewMode = "grid" | "list";
 export type AudioState = {
   track: FilesEntry | null;
@@ -82,6 +91,195 @@ export function locationKey(
   scope: FilesScope,
 ): LocationKey {
   return `${source}:${scope}`;
+}
+
+export function resolveFilesHomePath(options: {
+  source: FilesSource;
+  scope: FilesScope;
+  currentPath: string;
+  serverRootPath: string;
+}): string {
+  if (options.source === "server") return options.serverRootPath;
+
+  let cursor = options.currentPath;
+  while (cursor) {
+    const parent = getParentPath(options.source, cursor, options.scope);
+    if (parent == null) return cursor;
+    cursor = parent;
+  }
+  return options.currentPath;
+}
+
+/** Segment-aware comparison: project_a is not the parent of project_ab. */
+export function isFilesPathWithinRoot(path: string, root: string): boolean {
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const normalized = normalize(path);
+  const prefix = normalize(root);
+  return Boolean(prefix) && !normalized.split("/").includes("..") &&
+    (normalized === prefix || normalized.startsWith(`${prefix}/`));
+}
+
+/** A visible Up control must always have a usable, authorized destination. */
+export function resolveFilesParentPath(options: {
+  source: FilesSource;
+  scope: FilesScope;
+  currentPath: string;
+  isAdmin: boolean;
+  projectRoot: string;
+  parentPath: string | null;
+  canGoUp: boolean;
+}): string | null {
+  const workspace = options.source === "server" && options.scope === "workspace";
+  if (workspace && options.isAdmin) {
+    const current = options.currentPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+    if (!current) return null;
+    // Some project-root listings omit parent metadata. An administrator can
+    // still return through _projects to the administrator root.
+    return options.parentPath ?? current.split("/").slice(0, -1).join("/");
+  }
+  if (!options.canGoUp || options.parentPath == null) return null;
+  if (workspace && !isFilesPathWithinRoot(options.parentPath, options.projectRoot)) return null;
+  return options.parentPath;
+}
+
+export function canMutateFilesLocation(options: {
+  source: FilesSource;
+  staleActive: boolean;
+  offline: boolean;
+  authenticated: boolean;
+  activePath: string;
+  isAdminMode: boolean;
+}): boolean {
+  // A stale cache marker only describes a server listing. It must never make
+  // the device-local user directory read-only after switching back to Local.
+  const serverWriteBlocked =
+    options.source === "server" && (options.staleActive || options.offline);
+
+  return (
+    !serverWriteBlocked &&
+    (options.source === "local" || options.authenticated) &&
+    (Boolean(options.activePath) ||
+      (options.source === "server" && options.isAdminMode))
+  );
+}
+
+/**
+ * Return the stable identity used by selection state for one entry.
+ *
+ * Paths are only unique within a source, so include the source as well.  The
+ * location (scope/path/project/auth) is tracked by the screen and clears the
+ * selection when it changes.
+ */
+export function fileEntrySelectionKey(entry: FilesEntry): string {
+  return `${entry.source}:${entry.path}`;
+}
+
+/** Resolve the tap/long-press contract used by the mobile file list. */
+export function resolveFilesPressAction(options: {
+  wasLongPress: boolean;
+  selectionMode: boolean;
+}): FilesPressAction {
+  if (options.wasLongPress) return "start-selection";
+  return options.selectionMode ? "toggle-selection" : "open";
+}
+
+export function startFileSelection(entry: FilesEntry): FilesEntry[] {
+  return [entry];
+}
+
+export function fileSelectionCount(selected: readonly FilesEntry[]): number {
+  return selected.length;
+}
+
+/** Toggle an entry while preserving the order in which entries were selected. */
+export function toggleFileSelection(
+  selected: readonly FilesEntry[],
+  entry: FilesEntry,
+): FilesEntry[] {
+  const key = fileEntrySelectionKey(entry);
+  if (selected.some((candidate) => fileEntrySelectionKey(candidate) === key)) {
+    return selected.filter(
+      (candidate) => fileEntrySelectionKey(candidate) !== key,
+    );
+  }
+  return [...selected, entry];
+}
+
+/**
+ * Reconcile selection against a refreshed listing.  This drops entries that
+ * disappeared while retaining the latest metadata for entries still present.
+ */
+export function reconcileFileSelection(
+  selected: readonly FilesEntry[],
+  available: readonly FilesEntry[],
+): FilesEntry[] {
+  const latestByKey = new Map(
+    available.map((entry) => [fileEntrySelectionKey(entry), entry]),
+  );
+  return selected
+    .map((entry) => latestByKey.get(fileEntrySelectionKey(entry)))
+    .filter((entry): entry is FilesEntry => Boolean(entry));
+}
+
+export function dedupeFileEntries(entries: readonly FilesEntry[]): FilesEntry[] {
+  const seen = new Set<string>();
+  return entries.filter((entry) => {
+    const key = fileEntrySelectionKey(entry);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+/** A source/path boundary key for invalidating selection on navigation. */
+export function filesLocationIdentityKey(options: {
+  source: FilesSource;
+  scope: FilesScope;
+  path: string;
+  authScope?: string;
+  projectId?: string | null;
+}): string {
+  return JSON.stringify([
+    options.source,
+    options.scope,
+    options.path,
+    options.authScope ?? "",
+    options.projectId ?? "",
+  ]);
+}
+
+/** Validate every clipboard entry against a destination before mutation. */
+export function canRouteClipboardEntries(
+  clipboard: ClipboardState | null,
+  destinationPath: string,
+): boolean {
+  if (!clipboard || clipboard.entries.length === 0 || !destinationPath) {
+    return false;
+  }
+  return clipboard.entries.every(
+    (entry) =>
+      entry.source === clipboard.source &&
+      canRouteServerFileTransfer(entry.path, destinationPath),
+  );
+}
+
+/**
+ * Return every directory listing affected by a clipboard operation.
+ *
+ * A move changes both the captured source directory and the destination;
+ * copying changes only the destination.  Keeping this as pure logic makes
+ * the cross-directory cache contract explicit and easy to regression-test.
+ */
+export function getClipboardAffectedPaths(
+  clipboard: ClipboardState,
+  destinationPath: string,
+): string[] {
+  const affected = new Set<string>();
+  if (clipboard.operation === "move" && clipboard.sourcePath) {
+    affected.add(clipboard.sourcePath);
+  }
+  if (destinationPath) affected.add(destinationPath);
+  return [...affected];
 }
 
 export function getFileIcon(entry: FilesEntry): string {

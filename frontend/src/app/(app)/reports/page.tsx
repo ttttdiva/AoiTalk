@@ -21,10 +21,15 @@ import {
 } from "lucide-react";
 import {
   taskApi,
+  type Scope,
   type Task,
   type TimeReport,
   type TimeEntry,
 } from "@/lib/task-api";
+import {
+  taskBrowseScopeToQuery,
+  type TaskBrowseScope,
+} from "@/lib/task-browse-scope";
 import {
   getRemoteTimeReport,
   listRemoteTimeEntries,
@@ -40,10 +45,6 @@ import { useProject } from "@/contexts/project-context";
 import { useTheme } from "@/contexts/theme-context";
 import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
 import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
-import {
-  formatLocalDateTime,
-  formatLocalDateTimeWithMilliseconds,
-} from "@/lib/date-time";
 import { BucketBar } from "./reports-bucket-bar";
 import { ReportsEditDialog } from "./reports-edit-dialog";
 import { ReportsContextMenu } from "./reports-context-menu";
@@ -58,6 +59,7 @@ import {
   groupEntriesByDay,
   buildEntryColumnLayouts,
   isTaskScheduledInRange,
+  toExplicitInstant,
   type PeriodPreset,
   type ReportsViewMode,
   type ScopeMode,
@@ -65,6 +67,7 @@ import {
   type EntryColumnLayout,
 } from "./reports-utils";
 import { ReportsWorkspaceNavigation } from "./reports-workspace-navigation";
+import { TaskBrowseScopePicker } from "@/components/tasks/task-browse-scope-picker";
 
 // SWR キャッシュキー。レポートページで一意なので固定文字列を使う（安定キー）。
 // 取得タイミングは従来どおり呼び出し側の fetchReport で駆動する（呼び出し側駆動）。
@@ -87,12 +90,28 @@ export default function ReportsPage() {
     selectedSpace,
     allProjects,
     spaces,
+    accessibleProjects,
+    accessibleSpaces,
+    projects,
+    participatingProjects,
+    participatingSpaces,
   } = useProject();
+  const browseProjects = useMemo(
+    () => accessibleProjects ?? allProjects ?? projects ?? [],
+    [accessibleProjects, allProjects, projects],
+  );
+  const browseSpaces = useMemo(
+    () => accessibleSpaces ?? spaces ?? [],
+    [accessibleSpaces, spaces],
+  );
   const { resolvedTheme } = useTheme();
   const [scope, setScope] = useState<ScopeMode>("project");
   const [activeView, setActiveView] = useState<ReportsViewMode>("summary");
+  const [browseScope, setBrowseScope] = useState<TaskBrowseScope | null>(null);
   const remoteContext =
-    scope === "project" && selectedProject?.source === "remote"
+    browseScope
+      ? null
+      : scope === "project" && selectedProject?.source === "remote"
       ? selectedProject
       : scope === "space" && selectedSpace?.source === "remote"
         ? selectedSpace
@@ -100,6 +119,8 @@ export default function ReportsPage() {
           ? selectedProject
           : null;
   const remoteReadOnly = Boolean(remoteContext);
+  const browseReadOnly = Boolean(browseScope);
+  const interactionReadOnly = remoteReadOnly || browseReadOnly;
   const projectsById = useMemo(
     () => new Map(allProjects.map((project) => [project.id, project] as const)),
     [allProjects],
@@ -114,16 +135,21 @@ export default function ReportsPage() {
   );
   const isTimeEntryReadOnly = useCallback(
     (entry: TimeEntry) =>
-      entry.source === "remote" || isProjectReadOnly(entry.project_id),
-    [isProjectReadOnly],
+      browseReadOnly ||
+      entry.source === "remote" ||
+      isProjectReadOnly(entry.project_id),
+    [browseReadOnly, isProjectReadOnly],
   );
   const isReportBucketReadOnly = useCallback(
     (bucket: TimeReport["by_task"][number]) =>
-      bucket.source === "remote" || isProjectReadOnly(bucket.project_id),
-    [isProjectReadOnly],
+      browseReadOnly ||
+      bucket.source === "remote" ||
+      isProjectReadOnly(bucket.project_id),
+    [browseReadOnly, isProjectReadOnly],
   );
   const reportsReadOnly =
     remoteReadOnly ||
+    browseReadOnly ||
     selectedProject?.can_write === false;
   // レポート集計（report / timeEntries / scheduledTasks）のサーバー状態を SWR で保持する。
   // 取得は複雑にパラメータ化され早期 return・リモート分岐・相関する 3 出力を伴うため、
@@ -143,6 +169,39 @@ export default function ReportsPage() {
   const timeEntries = reportData?.timeEntries ?? EMPTY_ENTRIES;
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedEntry, setSelectedEntry] = useState<TimeEntry | null>(null);
+  const clearBrowseScope = useCallback(() => {
+    setBrowseScope(null);
+    setSelectedTaskId(null);
+    setSelectedEntry(null);
+  }, []);
+  const handleScopeChange = useCallback(
+    (nextScope: ScopeMode) => {
+      clearBrowseScope();
+      setScope(nextScope);
+    },
+    [clearBrowseScope],
+  );
+  const handleBrowseScopeChange = useCallback(
+    (nextScope: TaskBrowseScope | null) => {
+      if (nextScope) {
+        setSelectedTaskId(null);
+        setSelectedEntry(null);
+      }
+      setBrowseScope(nextScope);
+    },
+    [],
+  );
+  const normalSelectionRef = useRef({ selectedProjectId, selectedSpaceId });
+  useEffect(() => {
+    const previous = normalSelectionRef.current;
+    if (
+      previous.selectedProjectId !== selectedProjectId ||
+      previous.selectedSpaceId !== selectedSpaceId
+    ) {
+      clearBrowseScope();
+    }
+    normalSelectionRef.current = { selectedProjectId, selectedSpaceId };
+  }, [clearBrowseScope, selectedProjectId, selectedSpaceId]);
   const hasReadOnlyData = useMemo(
     () =>
       timeEntries.some(isTimeEntryReadOnly) ||
@@ -192,6 +251,9 @@ export default function ReportsPage() {
     () =>
       JSON.stringify({
         scope,
+        browseScope: browseScope
+          ? { kind: browseScope.kind, id: browseScope.id }
+          : null,
         selectedProjectId,
         selectedSpaceId,
         period,
@@ -206,6 +268,7 @@ export default function ReportsPage() {
       }),
     [
       customFrom,
+      browseScope,
       customTo,
       period,
       remoteContext?.remote_server_id,
@@ -320,8 +383,9 @@ export default function ReportsPage() {
         currentReportQueryKeyRef.current === reportQueryKey
       );
     };
-    const scopeArg: { project_id?: string; space_id?: string } | null =
-      scope === "all"
+    const scopeArg: Scope | null = browseScope
+      ? taskBrowseScopeToQuery(browseScope) ?? null
+      : scope === "all"
         ? {}
         : scope === "space"
           ? selectedSpaceId
@@ -346,23 +410,28 @@ export default function ReportsPage() {
 
     switch (period) {
       case "this_week": {
-        dateFrom = formatLocalDateTime(weekRange.monday);
-        dateTo = formatLocalDateTimeWithMilliseconds(weekRange.sunday);
+        dateFrom = toExplicitInstant(weekRange.monday);
+        dateTo = toExplicitInstant(weekRange.sunday);
         break;
       }
       case "this_month": {
         const { start, end } = getMonthRange();
-        dateFrom = formatLocalDateTime(start);
-        dateTo = formatLocalDateTimeWithMilliseconds(end);
+        dateFrom = toExplicitInstant(start);
+        dateTo = toExplicitInstant(end);
         break;
       }
       case "custom":
-        dateFrom = customFrom ? `${customFrom}T00:00:00` : undefined;
-        dateTo = customTo ? `${customTo}T23:59:59.999` : undefined;
+        dateFrom = customFrom
+          ? toExplicitInstant(`${customFrom}T00:00:00`)
+          : undefined;
+        dateTo = customTo
+          ? toExplicitInstant(`${customTo}T23:59:59.999`)
+          : undefined;
         break;
     }
 
     const shouldLoadScheduledTasks =
+      !browseScope &&
       showScheduleFrames &&
       scope === "project" &&
       period === "this_week" &&
@@ -467,6 +536,7 @@ export default function ReportsPage() {
       if (isCurrentRequest()) setLoading(false);
     }
   }, [
+    browseScope,
     scope,
     selectedProjectId,
     selectedProject,
@@ -527,7 +597,10 @@ export default function ReportsPage() {
   }, [entriesByDay, now]);
 
   const canShowScheduleFrames =
-    scope === "project" && period === "this_week" && !!selectedProjectId;
+    !browseScope &&
+    scope === "project" &&
+    period === "this_week" &&
+    !!selectedProjectId;
   const visibleScheduledTasks = canShowScheduleFrames ? scheduledTasks : [];
 
   const weekLabel = useMemo(() => {
@@ -570,7 +643,7 @@ export default function ReportsPage() {
     handleEditMoveTaskProject,
     handleEditMoveTaskSpace,
   } = useReportsEditEntry({
-    remoteReadOnly,
+    remoteReadOnly: interactionReadOnly,
     isEntryReadOnly: isTimeEntryReadOnly,
     isProjectReadOnly,
     allProjects,
@@ -614,7 +687,7 @@ export default function ReportsPage() {
     handleCtxDuplicate,
     handleCtxDelete,
   } = useReportsTimeline({
-    remoteReadOnly,
+    remoteReadOnly: interactionReadOnly,
     createReadOnly: reportsReadOnly,
     isEntryReadOnly: isTimeEntryReadOnly,
     selectedProjectId,
@@ -629,15 +702,22 @@ export default function ReportsPage() {
     setWeekOffset,
   });
 
-  const hasScope =
-    scope === "all"
+  const hasScope = browseScope
+    ? true
+    : scope === "all"
       ? true
       : scope === "space"
         ? !!selectedSpaceId
         : !!selectedProjectId;
 
-  const reportsScopeLabel =
-    scope === "all"
+  const browseScopeResource = browseScope
+    ? browseScope.kind === "project"
+      ? browseProjects.find((project) => project.id === browseScope.id)
+      : browseSpaces.find((space) => space.id === browseScope.id)
+    : null;
+  const reportsScopeLabel = browseScope
+    ? `参照: ${browseScopeResource?.name ?? browseScope.id}`
+    : scope === "all"
       ? "全プロジェクト横断"
       : scope === "space"
         ? selectedSpace
@@ -661,13 +741,19 @@ export default function ReportsPage() {
         weekOffset={weekOffset}
         showScheduleFrames={showScheduleFrames}
         canShowScheduleFrames={canShowScheduleFrames}
-        onScopeChange={setScope}
+        onScopeChange={handleScopeChange}
         onActiveViewChange={setActiveView}
         onPeriodChange={setPeriod}
         onCustomFromChange={setCustomFrom}
         onCustomToChange={setCustomTo}
         onWeekOffsetChange={setWeekOffset}
         onShowScheduleFramesChange={setShowScheduleFrames}
+        browseScope={browseScope}
+        browseProjects={browseProjects}
+        browseSpaces={browseSpaces}
+        participatingProjects={participatingProjects ?? projects ?? []}
+        participatingSpaces={participatingSpaces ?? spaces ?? []}
+        onBrowseScopeChange={handleBrowseScopeChange}
       />
     ),
   });
@@ -695,7 +781,11 @@ export default function ReportsPage() {
         <div className="flex flex-wrap items-center justify-end gap-2">
           {(reportsReadOnly || hasReadOnlyData) && (
             <span className="inline-flex items-center rounded-full border border-primary/35 bg-primary/10 px-2.5 py-1 text-xs text-primary">
-              {remoteReadOnly ? "リモート・読み取り専用" : "一部読み取り専用"}
+              {browseReadOnly
+                ? "明示参照・読み取り専用"
+                : remoteReadOnly
+                  ? "リモート・読み取り専用"
+                  : "一部読み取り専用"}
             </span>
           )}
           <div className="inline-flex items-center gap-1 rounded-md border border-border bg-card p-1 text-xs">
@@ -770,7 +860,7 @@ export default function ReportsPage() {
       </header>
       {/* ヘッダー */}
       <div className="flex flex-wrap items-center gap-3 md:hidden">
-        <Tabs value={scope} onValueChange={(v) => setScope(v as ScopeMode)}>
+        <Tabs value={scope} onValueChange={(v) => handleScopeChange(v as ScopeMode)}>
           <TabsList>
             <TabsTrigger value="project">プロジェクト単位</TabsTrigger>
             <TabsTrigger value="space">スペース単位</TabsTrigger>
@@ -779,7 +869,9 @@ export default function ReportsPage() {
         </Tabs>
 
         <div className="text-xs text-muted-foreground">
-          {scope === "all"
+          {browseScope
+            ? `参照: ${browseScopeResource?.name ?? browseScope.id}`
+            : scope === "all"
             ? "全プロジェクト横断"
             : scope === "space"
               ? selectedSpace
@@ -871,6 +963,15 @@ export default function ReportsPage() {
               <span>予定時間の枠を表示</span>
             </label>
           )}
+          <TaskBrowseScopePicker
+            className="w-full basis-full"
+            browseScope={browseScope}
+            projects={browseProjects}
+            spaces={browseSpaces}
+            participatingProjects={participatingProjects ?? projects ?? []}
+            participatingSpaces={participatingSpaces ?? spaces ?? []}
+            onBrowseScopeChange={handleBrowseScopeChange}
+          />
         </div>
       </div>
 
@@ -965,7 +1066,7 @@ export default function ReportsPage() {
               dragState={dragState}
               dragForm={dragForm}
               visibleScheduledTasks={visibleScheduledTasks}
-              readOnly={remoteReadOnly}
+              readOnly={interactionReadOnly}
               createReadOnly={reportsReadOnly}
               isEntryReadOnly={isTimeEntryReadOnly}
               dayColRefs={dayColRefs}
@@ -1134,7 +1235,7 @@ export default function ReportsPage() {
                     bucket={b}
                     maxSeconds={maxTaskSeconds}
                     onClick={
-                      remoteReadOnly || b.source === "remote"
+                      interactionReadOnly || b.source === "remote"
                         ? undefined
                         : () => {
                             setSelectedEntry(null);
@@ -1169,7 +1270,7 @@ export default function ReportsPage() {
         </>
       )}
 
-      {!remoteReadOnly && (
+      {(!remoteReadOnly || browseReadOnly) && (
         <TaskDetailModal
           taskId={selectedTaskId}
           entryFocus={selectedEntry}
@@ -1185,11 +1286,12 @@ export default function ReportsPage() {
             fetchReport();
             window.dispatchEvent(new Event("task-list-refresh"));
           }}
+          browseScope={browseScope}
         />
       )}
 
       {/* 実績編集ダイアログ (Toggl風) */}
-      {!remoteReadOnly &&
+      {!interactionReadOnly &&
         (!editingEntry || !isTimeEntryReadOnly(editingEntry)) && (
           <ReportsEditDialog
         editingEntry={editingEntry}
@@ -1229,7 +1331,7 @@ export default function ReportsPage() {
         )}
 
       {/* 右クリックメニュー */}
-      {!remoteReadOnly &&
+      {!interactionReadOnly &&
         (!ctxMenu || !isTimeEntryReadOnly(ctxMenu.entry)) && (
         <ReportsContextMenu
           ctxMenu={ctxMenu}

@@ -46,10 +46,9 @@ from .turn_context import (
     set_turn_context,
 )
 from .outbound_privacy_service import (
+    EgressDescriptor,
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
-    PrivacyReviewDenied,
-    RawMediaBlocked,
     get_privacy_policy_context,
     set_privacy_policy_context,
     reset_privacy_policy_context,
@@ -204,6 +203,9 @@ class LiveVoiceActor:
     # browser payload, and ``to_dict`` intentionally omits them.
     session_id: str = field(default="", repr=False, compare=False)
     project_id: str | None = field(default=None, repr=False, compare=False)
+    # Populated only by the internal SIP bridge, never from_user_info.
+    agent_id: str | None = field(default=None, repr=False)
+    agent_revision_id: str | None = field(default=None, repr=False)
 
     @classmethod
     def from_user_info(cls, user_info: Mapping[str, Any] | None) -> "LiveVoiceActor":
@@ -225,6 +227,9 @@ class LiveVoiceActor:
         )
 
     def to_dict(self) -> dict[str, str]:
+        if self.agent_id:
+            return {"kind": "agent", "id": self.agent_id,
+                    "agent_revision_id": self.agent_revision_id, "display_name": self.display_name}
         return {
             "id": self.user_id,
             "username": self.username,
@@ -795,9 +800,48 @@ class OpenAIRealtimeProvider:
         # raw database UUID is sent to the provider.
         return hashlib.sha256(actor.user_id.encode("utf-8")).hexdigest()
 
+    def _privacy_gateway(
+        self,
+        *,
+        actor: LiveVoiceActor | None = None,
+        session_context: Mapping[str, Any] | None = None,
+        project_metadata: Mapping[str, Any] | None = None,
+    ) -> OutboundPrivacyGateway:
+        """Build a gateway for provider lifecycle calls.
+
+        Realtime calls are long-lived, so the gateway created during unified
+        call setup is retained by ``call_id`` for subsequent sideband and
+        hangup transactions.  This helper is only used for lifecycle calls
+        that predate that mapping (or when a provider call is terminated
+        before OpenAI returns a call id).
+        """
+
+        inherited = get_privacy_policy_context()
+        return OutboundPrivacyGateway(
+            self._privacy_config,
+            user_id=str(getattr(actor, "user_id", "") or ""),
+            session_id=str(getattr(actor, "session_id", "") or ""),
+            session_context=(
+                dict(session_context)
+                if isinstance(session_context, Mapping)
+                else inherited.session_context
+            ),
+            project_metadata=(
+                dict(project_metadata)
+                if isinstance(project_metadata, Mapping)
+                else inherited.project_metadata
+            ),
+        )
+
     async def _client(self) -> httpx.AsyncClient:
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=self._timeout)
+            # Provider redirects are a second, unreviewed egress hop.  The
+            # realtime contract uses one fixed endpoint, so fail closed on
+            # any redirect rather than following it implicitly.
+            self._http_client = httpx.AsyncClient(
+                timeout=self._timeout,
+                follow_redirects=False,
+            )
         return self._http_client
 
     def check_ready(self) -> None:
@@ -881,35 +925,61 @@ class OpenAIRealtimeProvider:
                 )
             ),
         )
-        protected = await gateway.protect(
-            {"sdp": str(sdp), "session": session_config},
+        endpoint = f"{self._base_url}/v1/realtime/calls"
+        sent_session_config = dict(session_config)
+        descriptor = EgressDescriptor(
+            action="live_voice.connect",
+            transport="httpx.multipart",
+            destination=endpoint,
             provider=LIVE_VOICE_PROVIDER,
-            base_url=self._base_url,
-            source_kind="live_voice_connect",
+            tool="live_voice",
+            model=model,
         )
-        protected_payload = protected.payload
-        if isinstance(protected_payload, Mapping):
-            sdp = str(protected_payload.get("sdp") or sdp)
+
+        async def send_unified_call(protected_payload: Any) -> httpx.Response:
+            nonlocal sent_session_config
+            if not isinstance(protected_payload, Mapping):
+                raise LiveVoiceProviderError(
+                    "Realtime privacy protection returned no request payload",
+                    status_code=502,
+                )
+            outbound_sdp = str(protected_payload.get("sdp") or "")
             protected_session = protected_payload.get("session")
-            if isinstance(protected_session, Mapping):
-                session_config = dict(protected_session)
-        try:
+            if not isinstance(protected_session, Mapping):
+                raise LiveVoiceProviderError(
+                    "Realtime privacy protection returned no session payload",
+                    status_code=502,
+                )
+            sent_session_config = dict(protected_session)
             response = await client.post(
-                f"{self._base_url}/v1/realtime/calls",
+                endpoint,
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "OpenAI-Safety-Identifier": self._safety_identifier(actor),
                 },
                 files={
-                    "sdp": (None, str(sdp), "application/sdp"),
+                    "sdp": (None, outbound_sdp, "application/sdp"),
                     "session": (
                         None,
-                        json.dumps(session_config, ensure_ascii=False),
+                        json.dumps(sent_session_config, ensure_ascii=False),
                         "application/json",
                     ),
                 },
+                follow_redirects=False,
             )
             response.raise_for_status()
+            return response
+
+        try:
+            response = await gateway.execute(
+                {"sdp": str(sdp), "session": session_config},
+                provider=LIVE_VOICE_PROVIDER,
+                descriptor=descriptor,
+                sender=send_unified_call,
+                base_url=self._base_url,
+                source_kind="live_voice_connect",
+                model=model,
+            )
         except httpx.HTTPStatusError as exc:
             failure = classify_generation_error(exc)
             logger.warning(
@@ -939,7 +1009,7 @@ class OpenAIRealtimeProvider:
             "call_id": call_id,
             "provider": self.name,
             "model": model,
-            "session": session_config,
+            "session": sent_session_config,
         }
 
     async def _open_sideband(self, call_id: str) -> _RealtimeSidebandConnection:
@@ -976,12 +1046,14 @@ class OpenAIRealtimeProvider:
                     url,
                     extra_headers={"Authorization": f"Bearer {api_key}"},
                     open_timeout=self._timeout,
+                    max_redirects=0,
                 )
             except TypeError:
                 websocket = await websockets.connect(
                     url,
                     additional_headers={"Authorization": f"Bearer {api_key}"},
                     open_timeout=self._timeout,
+                    max_redirects=0,
                 )
             connection = _RealtimeSidebandConnection(websocket)
             await connection.start()
@@ -993,33 +1065,41 @@ class OpenAIRealtimeProvider:
     ) -> None:
         """Queue an event on the call's one persistent sideband writer."""
 
-        gateway = self._privacy_gateways.get(str(call_id or "").strip())
-        outbound = dict(event)
-        if gateway is not None:
-            event_type = str(outbound.get("type") or "")
-            if event_type == "input_audio_buffer.append" and gateway.mode in {
-                "protected",
-                "local_only",
-            }:
-                if gateway.settings.raw_media_policy == "block":
-                    raise RawMediaBlocked(
-                        "raw audio is blocked in protected live voice mode"
-                    )
-                raise PrivacyReviewDenied(
-                    "live voice raw audio requires an explicit review callback"
+        normalized_call_id = str(call_id or "").strip()
+        gateway = self._privacy_gateways.get(normalized_call_id)
+        if gateway is None:
+            gateway = self._privacy_gateway()
+        endpoint = (
+            f"{self._base_url}/v1/realtime?call_id={normalized_call_id}"
+        )
+        descriptor = EgressDescriptor(
+            action="live_voice.sideband.send",
+            transport="websocket",
+            destination=endpoint,
+            provider=LIVE_VOICE_PROVIDER,
+            tool="live_voice",
+        )
+
+        async def send_event(protected_payload: Any) -> None:
+            if not isinstance(protected_payload, Mapping):
+                raise LiveVoiceProviderError(
+                    "Realtime privacy protection returned no sideband event",
+                    status_code=502,
                 )
-            protected = await gateway.protect(
-                outbound,
-                provider=LIVE_VOICE_PROVIDER,
-                base_url=self._base_url,
-                source_kind="live_voice_sideband",
-            )
-            outbound = protected.payload
-        # Do not open a provider WebSocket until the event has passed the
-        # outbound gateway. This is especially important for local_only, where
-        # the policy must reject before any external transport is attempted.
-        connection = await self._open_sideband(call_id)
-        await connection.send(outbound)
+            # Do not open a provider WebSocket until the event has passed the
+            # outbound gateway. This is especially important for local_only,
+            # where policy must reject before any external transport attempt.
+            connection = await self._open_sideband(normalized_call_id)
+            await connection.send(dict(protected_payload))
+
+        await gateway.execute(
+            dict(event),
+            provider=LIVE_VOICE_PROVIDER,
+            descriptor=descriptor,
+            sender=send_event,
+            base_url=self._base_url,
+            source_kind="live_voice_sideband",
+        )
 
     async def close_sideband(self, call_id: str) -> None:
         normalized_call_id = str(call_id or "").strip()
@@ -1041,10 +1121,34 @@ class OpenAIRealtimeProvider:
 
         api_key = self._require_key()
         client = await self._client()
-        try:
-            response = await client.post(
-                f"{self._base_url}/v1/realtime/calls/{quote(normalized_call_id, safe='')}/hangup",
+        endpoint = (
+            f"{self._base_url}/v1/realtime/calls/"
+            f"{quote(normalized_call_id, safe='')}/hangup"
+        )
+        gateway = self._privacy_gateways.get(normalized_call_id) or self._privacy_gateway()
+        descriptor = EgressDescriptor(
+            action="live_voice.hangup",
+            transport="httpx",
+            destination=endpoint,
+            provider=LIVE_VOICE_PROVIDER,
+            tool="live_voice",
+        )
+
+        async def send_hangup(_protected_payload: Any) -> httpx.Response:
+            return await client.post(
+                endpoint,
                 headers={"Authorization": f"Bearer {api_key}"},
+                follow_redirects=False,
+            )
+
+        try:
+            response = await gateway.execute(
+                {"call_id": normalized_call_id},
+                provider=LIVE_VOICE_PROVIDER,
+                descriptor=descriptor,
+                sender=send_hangup,
+                base_url=self._base_url,
+                source_kind="live_voice_hangup",
             )
             # A second end request is intentionally idempotent. OpenAI may
             # answer 404 after the provider has already terminated the call.
@@ -2452,6 +2556,8 @@ class LiveVoiceService:
             session = self._sessions.get(normalized)
         if session is None:
             raise LiveVoiceNotFoundError()
+        if session.actor.agent_id and (actor.agent_id != session.actor.agent_id or actor.agent_revision_id != session.actor.agent_revision_id):
+            raise LiveVoicePermissionError()
         if actor.role != "admin" and session.actor.user_id != actor.user_id:
             raise LiveVoicePermissionError()
         return session
@@ -2524,8 +2630,8 @@ class LiveVoiceService:
                     "live_session_id": session.id,
                     **(dict(metadata) if metadata else {}),
                 },
-                sender_type="user" if role == "user" else "character",
-                sender_id=session.actor.user_id if role == "user" else session.provider,
+                sender_type=("service" if role == "user" else "agent") if session.actor.agent_id else ("user" if role == "user" else "character"),
+                sender_id=("telephony.caller" if role == "user" else session.actor.agent_id) if session.actor.agent_id else (session.actor.user_id if role == "user" else session.provider),
                 sender_display_name=session.actor.display_name if role == "user" else "Live Voice",
             )
             message_id = str(getattr(message, "id", "") or "").strip() or None
@@ -2721,14 +2827,14 @@ class LiveVoiceService:
                         session,
                         "live_voice.transcript",
                         status="succeeded",
-                        message=transcript,
+                        message="Telephone transcript persisted" if session.actor.agent_id else transcript,
                         payload={
                             "source": "live_voice",
                             "event_source": EVENT_SOURCE_SIDEBAND,
                             "event_type": event_type,
                             "event_id": incoming_id,
                             "role": transcript_role,
-                            "transcript": transcript,
+                            **({} if session.actor.agent_id else {"transcript": transcript}),
                             "message_id": message_id,
                         },
                     )
@@ -2960,6 +3066,10 @@ class LiveVoiceService:
             )
             return result
         safe_arguments = dict(_redact_json(dict(arguments)))
+        # SIP must never fall back to human permission/session defaults or the
+        # unrestricted legacy executor. The bridge supplies both typed gates.
+        if session.actor.agent_id and (self.permission_checker is None or self.tool_executor is None):
+            raise LiveVoicePermissionError("Agent tool boundary is unavailable")
         if normalized_tool not in self._allowed_tools:
             result = {
                 "call_id": call_id,

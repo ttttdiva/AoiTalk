@@ -23,6 +23,7 @@ DOCS_MUTATION_OPERATIONS = {
     "docs_place_workspace_file": "created",
     "docs_create_nodes": "created",
     "docs_update_node": "updated",
+    "docs_mutate": "updated",
     "inbox_update_item": "updated",
     "docs_move_node": "moved",
     "docs_archive_node": "archived",
@@ -152,6 +153,8 @@ def _base_mutation(
             source.get("updated_at"),
             source.get("created_at"),
         )
+        if resource_type == "docs_node" and "parent_id" in source:
+            mutation["parent_id"] = _first_text(source.get("parent_id"))
     return mutation
 
 
@@ -242,6 +245,8 @@ def _mutations_for_call(call: Any) -> list[dict[str, Any]]:
             call=call,
         )
         if mutation is not None:
+            if resource_type == "docs_node" and tool_name == "docs_create_nodes":
+                mutation["created_in_outline"] = True
             mutations.append(mutation)
     return mutations
 

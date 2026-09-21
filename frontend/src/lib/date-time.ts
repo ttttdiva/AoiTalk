@@ -28,6 +28,7 @@ const ISO_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})(?:[T\s].*)?$/;
 const DATE_ONLY_VALUE = /^(\d{4}-\d{2}-\d{2})$/;
 const LOCAL_DATE_TIME_MINUTE =
   /^(\d{4}-\d{2}-\d{2})[T\s](\d{2}):(\d{2})$/;
+const EXPLICIT_TIME_COMPONENT = /^\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}/;
 const DATE_ONLY_TIMESTAMP =
   /^(\d{4}-\d{2}-\d{2})(?:[T\s]00:00(?::00(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 const LOCAL_DATE_TIME =
@@ -75,6 +76,11 @@ export function isDateOnlyDateTimeValue(
   value: string | null | undefined,
 ): boolean {
   return getDateOnlyDatePrefix(value) !== null;
+}
+
+export function hasExplicitTimeComponent(value: string | null | undefined): boolean {
+  if (!value) return false;
+  return EXPLICIT_TIME_COMPONENT.test(value.trim());
 }
 
 export function toLocalDateTimeInputValue(

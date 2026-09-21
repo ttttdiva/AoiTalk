@@ -127,6 +127,7 @@ export type SettingsTargetId =
   | "integrations"
   | "custom-instructions"
   | "characters"
+  | "pet"
   | "llm-model"
   | "autonomous-task-execution"
   | "embed-card"
@@ -143,6 +144,8 @@ export type SettingsTargetId =
   | "editor-settings"
   | "audio-player"
   | "search-provider"
+  | "browser-agent"
+  | "pc-bridge"
   | "clip-ingest"
   | "mcp"
   | "remote-server"
@@ -157,6 +160,7 @@ export type SettingsTargetId =
   | "user-export"
   | "skills"
   | "heartbeats"
+  | "verification-data"
   | "feedback";
 
 export type SettingsTargetDefinition = {
@@ -184,6 +188,7 @@ export const SETTINGS_TARGET_REGISTRY: readonly SettingsTargetDefinition[] = [
   { id: "integrations", targetId: "integrations", category: "integrations", label: "外部連携", icon: Plug, quick: true, openDisclosure: false },
   { id: "custom-instructions", targetId: "custom-instructions", category: "conversation", label: "会話カスタム指示", icon: MessageSquareText, quick: true },
   { id: "characters", targetId: "characters", category: "conversation", label: "キャラクター", icon: MessageSquareText, quick: true },
+  { id: "pet", targetId: "pet", category: "overview", label: "ペット", icon: MessageSquareText },
   { id: "llm-model", targetId: "llm-model", category: "conversation", label: "言語モデル", icon: MessageSquareText, quick: true },
   { id: "autonomous-task-execution", targetId: "autonomous-task-execution", category: "tool-permissions", label: "自律タスク実行", icon: Workflow, quick: true },
   // The persisted quick id is kept for compatibility, but the physical
@@ -202,6 +207,8 @@ export const SETTINGS_TARGET_REGISTRY: readonly SettingsTargetDefinition[] = [
   { id: "editor-settings", targetId: "editor-settings", category: "input", label: "エディタ", icon: Keyboard },
   { id: "audio-player", targetId: "audio-player", category: "input", label: "音楽プレイヤー", icon: Keyboard },
   { id: "search-provider", targetId: "search-provider", category: "knowledge", label: "検索プロバイダ", icon: Search },
+  { id: "pc-bridge", targetId: "pc-bridge", category: "knowledge", label: "PC接続", icon: Workflow },
+  { id: "browser-agent", targetId: "browser-agent", category: "knowledge", label: "ブラウザ操作", icon: Workflow, adminOnly: true },
   { id: "clip-ingest", targetId: "clip-ingest", category: "knowledge", label: "クリップ取り込み", icon: Database },
   { id: "mcp", targetId: "mcp", category: "integrations", label: "MCP", icon: Plug },
   { id: "remote-server", targetId: "remote-server", category: "notifications", label: "外部AoiTalkサーバー", icon: Plug },
@@ -216,6 +223,7 @@ export const SETTINGS_TARGET_REGISTRY: readonly SettingsTargetDefinition[] = [
   { id: "user-export", targetId: "user-export", category: "admin", label: "ユーザーデータ", icon: UserCog, adminOnly: true },
   { id: "skills", targetId: "skills", category: "admin", label: "Skills", icon: UserCog, adminOnly: true },
   { id: "heartbeats", targetId: "heartbeats", category: "admin", label: "Heartbeats", icon: UserCog, adminOnly: true },
+  { id: "verification-data", targetId: "verification-data", category: "admin", label: "Verification / Test Data", icon: UserCog, adminOnly: true },
   { id: "feedback", targetId: "feedback", category: "support", label: "フィードバック", icon: CircleHelp, adminOnly: true },
 ] as const;
 

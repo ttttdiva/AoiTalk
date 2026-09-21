@@ -10,12 +10,56 @@ Based on Aider's repomap.py implementation.
 
 import logging
 import os
+import stat
 import warnings
 from collections import Counter, defaultdict, namedtuple
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
+
+
+# A per-call read authorizer is bound by ``repo_map.tools`` for Enterprise and
+# AgentRunScope calls.  The scanner and parser stay reusable for Personal
+# callers, where this ContextVar is unset and the legacy behavior is retained.
+RepoMapReadAuthorizer = Callable[[str], Optional[str]]
+_read_authorizer: ContextVar[RepoMapReadAuthorizer | None] = ContextVar(
+    "repo_map_read_authorizer",
+    default=None,
+)
+
+
+@contextmanager
+def repo_map_read_authorizer(
+    authorizer: RepoMapReadAuthorizer | None,
+) -> Iterator[None]:
+    """Bind a per-call authorizer used immediately before file reads.
+
+    The ContextVar keeps authorization scoped to the request/task and avoids
+    mutating the singleton ``RepoMap`` instance.  A callback may return a
+    canonical path (used for the open) or ``None`` to deny the read.
+    """
+
+    token = _read_authorizer.set(authorizer)
+    try:
+        yield
+    finally:
+        _read_authorizer.reset(token)
+
+
+def _authorize_read_path(path: str) -> Optional[str]:
+    """Authorize one file immediately before mtime/open operations."""
+
+    authorizer = _read_authorizer.get()
+    if authorizer is None:
+        return path
+    try:
+        return authorizer(path)
+    except Exception:
+        logger.exception("RepoMap read authorization failed for %s", path)
+        return None
 
 # Suppress tree-sitter FutureWarning
 warnings.simplefilter("ignore", category=FutureWarning)
@@ -76,6 +120,23 @@ SOURCE_EXTENSIONS = {
     ".yaml", ".yml", ".json", ".toml",
     ".md", ".rst", ".txt",
 }
+
+
+def _is_link_or_reparse(path: Path) -> bool:
+    """Return whether an existing directory entry is a link/reparse point."""
+
+    try:
+        metadata = os.lstat(path)
+    except FileNotFoundError:
+        return True
+    except (NotADirectoryError, PermissionError, OSError):
+        return True
+    reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+    return bool(
+        stat.S_ISLNK(metadata.st_mode)
+        or os.path.islink(path)
+        or bool(getattr(metadata, "st_file_attributes", 0) & reparse_flag)
+    )
 
 
 class RepoMap:
@@ -163,16 +224,36 @@ class RepoMap:
     def _find_source_files(self) -> List[str]:
         """Find all source files in the repository."""
         files = []
-        
-        for root_dir, dirs, filenames in os.walk(self.root):
+        constrained = _read_authorizer.get() is not None
+
+        for root_dir, dirs, filenames in os.walk(
+            self.root,
+            topdown=True,
+            followlinks=False,
+        ):
             # Filter out skip directories
-            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith(".")]
+            filtered_dirs = []
+            for dirname in dirs:
+                if dirname in SKIP_DIRS or dirname.startswith("."):
+                    continue
+                if constrained and _is_link_or_reparse(Path(root_dir) / dirname):
+                    # ``followlinks=False`` does not reliably prune Windows
+                    # junctions/reparse points.  A scoped call must never
+                    # descend through one; Personal retains the old scanner.
+                    continue
+                filtered_dirs.append(dirname)
+            dirs[:] = filtered_dirs
             
             for filename in filenames:
                 ext = Path(filename).suffix.lower()
                 if ext in SOURCE_EXTENSIONS:
                     filepath = Path(root_dir) / filename
-                    files.append(str(filepath))
+                    if constrained:
+                        authorised = _authorize_read_path(str(filepath))
+                        if authorised:
+                            files.append(str(authorised))
+                    else:
+                        files.append(str(filepath))
                     
         return files
         
@@ -187,6 +268,13 @@ class RepoMap:
         """Extract tags (definitions/references) from a file."""
         if not self._has_grep_ast:
             return []
+
+        # Re-authorize at the point where metadata/read processing begins so
+        # a descendant replaced after enumeration cannot bypass the boundary.
+        authorised_fname = _authorize_read_path(fname)
+        if not authorised_fname:
+            return []
+        fname = authorised_fname
             
         # Check cache
         mtime = self._get_mtime(fname)
@@ -224,7 +312,13 @@ class RepoMap:
                 logger.debug(f"Skipping {fname}: {e}")
             return
             
-        # Read file
+        # Re-authorize immediately before opening the file.  This is the final
+        # per-file guard against a symlink/junction/reparse swap between the
+        # mtime check above and the actual parser read.
+        authorised_fname = _authorize_read_path(fname)
+        if not authorised_fname:
+            return
+        fname = authorised_fname
         try:
             with open(fname, 'r', encoding='utf-8', errors='replace') as f:
                 code = f.read()

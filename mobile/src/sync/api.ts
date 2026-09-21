@@ -44,6 +44,13 @@ export interface SyncPullResponse {
   tables: Partial<Record<SyncTable, SyncTablePayload>>;
   server_time: string;
   has_more: boolean;
+  /** Additive bounded pagination for non-Docs tables. */
+  general_pagination_version?: number;
+  general_snapshot_token?: string;
+  /** Durable incremental watermark. General v1 currently returns null until
+   * the server has a commit-ordered change boundary, forcing a safe replay. */
+  general_watermark?: string | null;
+  general_has_more?: boolean;
   docs_pagination_version?: number;
   docs_scope_digest?: string;
   /** Opaque server snapshot token, stable across all pages in one run. */
@@ -82,6 +89,9 @@ export interface SyncPushResult {
 export async function pullSync(params: {
   since?: string | null;
   tables?: SyncTable[];
+  general_pagination?: boolean;
+  general_cursors?: Record<string, string>;
+  general_snapshot_token?: string;
   docs_digests?: Record<string, string>;
   docs_cursors?: Record<string, string>;
   docs_pagination?: boolean;
@@ -96,6 +106,14 @@ export async function pullSync(params: {
   const search = new URLSearchParams();
   if (params.since) search.set('since', params.since);
   if (params.tables?.length) search.set('tables', params.tables.join(','));
+  if (params.general_pagination) search.set('general_pagination', '1');
+  const generalCursors = params.general_cursors;
+  if (generalCursors && Object.keys(generalCursors).length > 0) {
+    search.set('general_cursors', JSON.stringify(generalCursors));
+  }
+  if (params.general_snapshot_token) {
+    search.set('general_snapshot_token', params.general_snapshot_token);
+  }
   // Docs digest はサーバ現在値と一致すれば全量再送を省ける。保存済み digest だけ
   // クエリパラメータ（URLエンコードJSON）で送る。RN の fetch は GET に body を
   // 付けられず、/pull は GET のみ受け付けるため、転送はクエリ経由に統一する。

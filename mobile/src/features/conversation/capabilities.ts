@@ -18,6 +18,8 @@ export type ConnectionStatusPresentation = {
   healthy: boolean;
 };
 
+export type ConversationNetworkTarget = "server" | "direct";
+
 export function inferSessionKind(session: ConversationSession | null): SessionKind {
   if (!session) return "normal";
   const characterName = session.character_name || "";
@@ -53,21 +55,35 @@ export function buildUserCapability(
 export function buildConnectionCapability(args: {
   isAuthenticated: boolean;
   isConnected: boolean;
+  /** Which transport the current response target uses. */
+  target?: ConversationNetworkTarget;
+  /** Physical network path (LAN or cellular), independent of Internet. */
+  connected?: boolean;
+  /** Internet reachability, required by Direct cloud providers. */
   online?: boolean;
   serverReachable?: boolean;
 }): ConnectionCapability {
   if (!args.isAuthenticated) return "local-only";
+  const hasNetworkPath =
+    args.target === "direct" ? args.online : args.connected ?? args.online;
+  if (hasNetworkPath === false) return "offline";
   if (args.isConnected) return "online";
-  if (args.online === false) return "offline";
   return args.serverReachable === false ? "degraded" : "online";
 }
 
 export function buildTransportState(args: {
   isAuthenticated: boolean;
   isConnected: boolean;
+  /** Which transport the current response target uses. */
+  target?: ConversationNetworkTarget;
+  /** Physical network path (LAN or cellular), independent of Internet. */
+  connected?: boolean;
+  /** Internet reachability, required by Direct cloud providers. */
   online?: boolean;
 }): TransportState {
-  if (!args.isAuthenticated || args.online === false) return "offline";
+  const hasNetworkPath =
+    args.target === "direct" ? args.online : args.connected ?? args.online;
+  if (!args.isAuthenticated || hasNetworkPath === false) return "offline";
   return args.isConnected ? "websocket-connected" : "rest-dispatch";
 }
 
@@ -76,8 +92,8 @@ export function buildConnectionStatusPresentation(
 ): ConnectionStatusPresentation {
   if (diagnostics.connectionCapability === "local-only") {
     return {
-      label: "ローカル",
-      detail: "端末内で保存",
+      label: "端末保存",
+      detail: "サーバー未ログイン",
       color: "#89b4fa",
       healthy: false,
     };
@@ -174,7 +190,7 @@ export function buildCommandRegistry(args: {
   const projectRequiredReason = "プロジェクト範囲を選ぶと利用できます";
   const busyReason = "現在の実行が終わるまで待機してください";
   const canServer = args.isAuthenticated && args.transportState !== "offline";
-  const canSend = capabilityEnabled(args.capabilities, "canChat") && !busy;
+  const canSend = capabilityEnabled(args.capabilities, "canChat");
   const canProject = Boolean(args.selectedProjectId);
 
   return [
@@ -185,7 +201,6 @@ export function buildCommandRegistry(args: {
       icon: "send",
       category: "message",
       enabled: canSend,
-      reason: busy ? busyReason : undefined,
     },
     {
       id: "project-context",

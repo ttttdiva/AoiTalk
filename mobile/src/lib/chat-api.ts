@@ -356,7 +356,7 @@ export const chatApi = {
   async addMessage(
     sessionId: string,
     data: {
-      role: "user" | "assistant";
+      role: "user";
       content: string;
       client_message_id?: string;
     },
@@ -366,6 +366,32 @@ export const chatApi = {
       message: ConversationMessage;
     }>(
       `/api/conversations/${sessionId}/messages`,
+      { method: "POST", body: JSON.stringify(data) },
+      CHAT_TIMEOUT,
+    );
+    return result.message;
+  },
+
+  /**
+   * Promote an assistant row from a native local-session transcript.
+   *
+   * The normal message endpoint intentionally accepts user rows only.  Keep
+   * this explicit method separate so callers cannot accidentally turn a
+   * regular client write into an assistant/system injection.
+   */
+  async importLocalAssistantMessage(
+    sessionId: string,
+    data: {
+      role: "assistant";
+      content: string;
+      client_message_id: string;
+    },
+  ): Promise<ConversationMessage> {
+    const result = await fetchApi<{
+      success?: boolean;
+      message: ConversationMessage;
+    }>(
+      `/api/conversations/${sessionId}/local-import/messages`,
       { method: "POST", body: JSON.stringify(data) },
       CHAT_TIMEOUT,
     );

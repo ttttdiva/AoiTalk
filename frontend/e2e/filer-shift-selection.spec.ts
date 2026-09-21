@@ -385,6 +385,38 @@ test.describe("ファイラーの選択操作", () => {
     await expect(item(page, paths.fileE)).not.toHaveClass(/bg-accent/);
   });
 
+  for (const view of ["grid", "list"] as const) {
+    test(`${view}: Ctrl+Shift+End/Homeで表示順の端まで範囲選択する`, async ({ page }) => {
+      await page.goto("/filer");
+      await expect(item(page, paths.fileC)).toBeVisible();
+      if (view === "list") await page.getByTitle("リスト表示").click();
+      await page.keyboard.press("F8");
+
+      const rows = page.locator("[data-explorer-item-path]");
+      const orderedPaths = await rows.evaluateAll((elements) =>
+        elements.map((element) => element.getAttribute("data-explorer-item-path")!),
+      );
+      const anchorIndex = orderedPaths.indexOf(paths.fileC);
+      expect(anchorIndex).toBeGreaterThan(0);
+      expect(anchorIndex).toBeLessThan(orderedPaths.length - 1);
+      await item(page, paths.fileC).click();
+
+      for (const [shortcut, toEnd] of [
+        ["Control+Shift+End", true],
+        ["Control+Shift+Home", false],
+        ["Shift+End", true],
+        ["Shift+Home", false],
+      ] as const) {
+        await page.keyboard.press(shortcut);
+        for (const [index, path] of orderedPaths.entries()) {
+          const selected = toEnd ? index >= anchorIndex : index <= anchorIndex;
+          if (selected) await expect(item(page, path)).toHaveClass(/bg-primary\/5/);
+          else await expect(item(page, path)).not.toHaveClass(/bg-primary\/5/);
+        }
+      }
+    });
+  }
+
   test("Ctrl+Hでプロジェクトルートへ戻る", async ({ page }) => {
     await page.goto("/filer");
     await expect(
@@ -423,6 +455,52 @@ test.describe("ファイラーの選択操作", () => {
     await expect(
       page.getByRole("button", { name: "上のフォルダへ" }),
     ).not.toBeVisible();
+  });
+
+  test("Backspace/Alt+LeftとForwardでフォーカスを復元する", async ({
+    page,
+  }) => {
+    await page.goto("/filer");
+    await expect(item(page, paths.folderB)).toBeVisible();
+
+    const openFolderB = async () => {
+      await item(page, paths.folderB).click();
+      const request = page.waitForRequest((request) => {
+        const url = new URL(request.url());
+        return (
+          url.pathname === "/api/python-proxy/explorer/list" &&
+          url.searchParams.get("path") === paths.folderB
+        );
+      });
+      await page.keyboard.press("Enter");
+      await request;
+    };
+
+    // The initial navigation is restored with plain Backspace.
+    await openFolderB();
+    await expect(item(page, paths.fileD)).toBeVisible();
+    await page.keyboard.press("Backspace");
+    await expect(item(page, paths.folderB)).toHaveClass(/border-primary/);
+    await expect(item(page, paths.folderB)).toHaveClass(/outline-primary/);
+
+    // Capture a different child-view focus, then exercise Alt+Left and its
+    // symmetric Alt+Right forward restore.
+    await openFolderB();
+    await item(page, paths.fileD).click();
+    await page.keyboard.press("Alt+ArrowLeft");
+    await expect(item(page, paths.folderB)).toHaveClass(/border-primary/);
+    await expect(item(page, paths.folderB)).toHaveClass(/outline-primary/);
+
+    await page.keyboard.press("Alt+ArrowRight");
+    await expect(item(page, paths.fileD)).toHaveClass(/border-primary/);
+    await expect(item(page, paths.fileD)).toHaveClass(/outline-primary/);
+    const navigationStateKeys = await page.evaluate(() =>
+      Object.keys(localStorage).filter((key) =>
+        /(history|focus|selection)/i.test(key),
+      ),
+    );
+    expect(navigationStateKeys).toEqual([]);
+    expect(runtimeErrors).toEqual([]);
   });
 
   test("Ctrl+ArrowLeft/RightでFilesタブを循環切り替えする", async ({

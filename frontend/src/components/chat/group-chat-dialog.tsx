@@ -40,7 +40,8 @@ interface GroupChatDialogProps {
   projectId?: string;
 }
 
-// SWR キャッシュキー。グループチャット作成ダイアログの参加候補は一意なので固定文字列。
+// グループチャット参加候補は Project ACL の境界内だけを返すため、
+// Project ごとにキャッシュを分離する。
 const GROUP_CHAT_PARTICIPANTS_SWR_KEY = "chat/group-chat-participants";
 
 type GroupChatParticipants = {
@@ -66,14 +67,19 @@ async function pyFetch<T = unknown>(
 
 // 参加候補（有効なキャラクター + 招待可能ユーザー）を取得する。
 // 各リクエストは個別に catch して空配列へフォールバックする（旧実装の挙動を踏襲）。
-async function fetchGroupChatParticipants(): Promise<GroupChatParticipants> {
+async function fetchGroupChatParticipants(
+  projectId?: string,
+): Promise<GroupChatParticipants> {
+  const projectQuery = projectId
+    ? `?project_id=${encodeURIComponent(projectId)}`
+    : "";
   const [characterData, userData] = await Promise.all([
     pyFetch<{ success: boolean; characters: CharacterInfo[] }>(
       "/characters/manage",
     ).catch(() => ({ success: false, characters: [] })),
-    pyFetch<{ users: UserInfo[] }>("/conversations/participants/users").catch(
-      () => ({ users: [] }),
-    ),
+    pyFetch<{ users: UserInfo[] }>(
+      `/conversations/participants/users${projectQuery}`,
+    ).catch(() => ({ users: [] })),
   ]);
   return {
     characters: (characterData.characters || []).filter((c) => c.is_enabled),
@@ -93,9 +99,10 @@ export function GroupChatDialog({
 
   // 取得・キャッシュ・重複排除は SWR に委譲する。自動 revalidation は全て無効化し、
   // 従来どおり「ダイアログを開くたびに再取得」する挙動は下の useEffect の mutate で駆動する。
+  const participantsKey = `${GROUP_CHAT_PARTICIPANTS_SWR_KEY}:${projectId || "none"}`;
   const { data, isValidating, mutate } = useSWR<GroupChatParticipants>(
-    GROUP_CHAT_PARTICIPANTS_SWR_KEY,
-    fetchGroupChatParticipants,
+    participantsKey,
+    () => fetchGroupChatParticipants(projectId),
     {
       revalidateOnMount: false,
       revalidateOnFocus: false,

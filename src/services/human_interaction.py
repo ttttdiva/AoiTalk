@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Awaitable, Callable, Optional
@@ -39,6 +40,7 @@ class HumanInteractionRequest:
     session_id: str = ""
     user_id: str = ""
     revision: int = 0
+    ws_type: str = ""
     status: HumanInteractionStatus = HumanInteractionStatus.PENDING
     future: Optional[asyncio.Future] = field(default=None, repr=False)
     loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
@@ -59,11 +61,142 @@ def set_human_interaction_manager(manager: "HumanInteractionManager") -> None:
 class HumanInteractionManager:
     """Pending request/response transport shared by planning interactions."""
 
-    def __init__(self, *, timeout_seconds: float = 600.0) -> None:
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = 600.0,
+        agent_run_service: Any | None = None,
+    ) -> None:
         self._timeout_seconds = timeout_seconds
         self._pending: dict[str, HumanInteractionRequest] = {}
         self._broadcast_callback: BroadcastCallback | None = None
         self._terminalized_run_ids: set[str] = set()
+        self._agent_run_service = agent_run_service
+
+    def _resolve_agent_run_service(self) -> Any | None:
+        if self._agent_run_service is not None:
+            return self._agent_run_service
+        try:
+            # Lazy import avoids a module cycle and keeps standalone unit tests
+            # (which have no configured database) lightweight.
+            from .agent_run_service import AgentRunService
+
+            self._agent_run_service = AgentRunService()
+        except Exception:
+            return None
+        return self._agent_run_service
+
+    @staticmethod
+    def _safe_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        """Redact and bound interaction payloads before writing an audit event.
+
+        Interaction payloads can contain provider-generated plan text, action
+        arguments, or user responses.  Redaction is therefore performed before
+        clipping and any failure omits the payload entirely; stringifying the
+        raw value as a fallback would turn an audit event into a disclosure
+        path.
+        """
+
+        try:
+            # Import lazily to keep this transport usable in dependency-light
+            # tests and to avoid introducing a module cycle at import time.
+            from .outbound_privacy_service import redact_secret_for_local_display
+
+            redacted = redact_secret_for_local_display(payload)
+
+            def clip(value: Any, depth: int = 0) -> Any:
+                # Leave enough room for the bounded material-action preview
+                # envelope (payload -> preview -> actions -> action -> args)
+                # while still preventing arbitrarily deep provider objects.
+                if depth > 8:
+                    return "[truncated]"
+                if isinstance(value, Mapping):
+                    output: dict[str, Any] = {}
+                    for key, item in list(value.items())[:64]:
+                        safe_key = redact_secret_for_local_display(str(key))
+                        if not isinstance(safe_key, str):
+                            raise ValueError("interaction payload key redaction failed")
+                        output[safe_key] = clip(item, depth + 1)
+                    return output
+                if isinstance(value, (list, tuple)):
+                    return [clip(item, depth + 1) for item in list(value)[:64]]
+                if isinstance(value, str):
+                    return value if len(value) <= 4000 else value[:4000] + "..."
+                if value is None or isinstance(value, (bool, int, float)):
+                    return value
+                # Unknown provider objects are not JSON-safe and their repr can
+                # contain credentials.  Omit them instead of stringifying.
+                return "[omitted]"
+
+            safe = clip(redacted)
+            if not isinstance(safe, dict):
+                raise ValueError("interaction payload redaction returned non-object")
+            return safe
+        except Exception:
+            # Never include exception text: provider adapters may embed the raw
+            # payload in it.  This stable marker is the only safe audit value.
+            return {
+                "payload_omitted": True,
+                "redaction_error": "redaction_failed",
+            }
+
+    async def _persist_interaction_event(
+        self,
+        request: HumanInteractionRequest,
+        event_type: str,
+        *,
+        status: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        run_id = str(request.agent_run_id or "").strip()
+        if not run_id:
+            return
+        service = self._resolve_agent_run_service()
+        if service is None:
+            return
+        payload: dict[str, Any] = {
+            "pending_interaction_id": request.request_id,
+            "interaction_kind": request.kind.value,
+            "revision": int(request.revision or 0),
+            "session_id": request.session_id,
+            "user_id": request.user_id,
+        }
+        if event_type == "interaction.requested":
+            payload["request"] = self._safe_event_payload(request.payload)
+        if result is not None:
+            payload["resolution"] = self._safe_event_payload(result)
+        try:
+            await service.record_event(
+                run_id,
+                event_type,
+                status=status,
+                payload=payload,
+            )
+        except Exception as exc:
+            logger.debug("Interaction audit event skipped (%s): %s", event_type, exc)
+
+    def _schedule_interaction_event(
+        self,
+        request: HumanInteractionRequest,
+        event_type: str,
+        *,
+        status: str | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            loop = request.loop or asyncio.get_running_loop()
+            if loop.is_closed() or not loop.is_running():
+                return
+            loop.create_task(
+                self._persist_interaction_event(
+                    request,
+                    event_type,
+                    status=status,
+                    result=result,
+                )
+            )
+        except Exception:
+            return
 
     def set_broadcast_callback(self, callback: BroadcastCallback | None) -> None:
         self._broadcast_callback = callback
@@ -80,10 +213,110 @@ class HumanInteractionManager:
                     result={"cancelled": True},
                     status=HumanInteractionStatus.CANCELLED,
                 )
+                self._schedule_interaction_event(
+                    request,
+                    "interaction.cancelled",
+                    status="cancelled",
+                    result={"cancelled": True},
+                )
                 self._pending.pop(request_id, None)
 
     def clear_terminalized_run(self, agent_run_id: str) -> None:
         self._terminalized_run_ids.discard(str(agent_run_id or "").strip())
+
+    @classmethod
+    def _request_envelope(
+        cls,
+        request: HumanInteractionRequest,
+    ) -> dict[str, Any]:
+        """Build the canonical initial/replay websocket envelope."""
+
+        revision = int(request.revision or 0)
+        event_id = f"human-interaction:{request.request_id}:{revision}"
+        # Redact before either initial delivery or replay.  Planning callers
+        # already provide a display projection, but keeping this transport
+        # boundary defensive protects generic human interactions too.
+        data = cls._safe_event_payload(request.payload)
+        # Correlation and scope fields are server-owned.  Apply them after the
+        # provider payload so a payload cannot retarget or replace a pending
+        # interaction during either initial delivery or replay.
+        data.update(
+            {
+                "request_id": request.request_id,
+                "pending_interaction_id": request.request_id,
+                "kind": request.kind.value,
+                "interaction_kind": request.kind.value,
+                "agent_run_id": request.agent_run_id,
+                "session_id": request.session_id,
+                "revision": revision,
+                "event_id": event_id,
+            }
+        )
+        return {
+            "type": request.ws_type or cls._default_ws_type(request.kind),
+            "event_id": event_id,
+            "data": data,
+        }
+
+    async def select_pending_replays(
+        self,
+        *,
+        user_id: str,
+        session_id: str,
+    ) -> list[dict[str, Any]]:
+        """Select live pending interactions for one authenticated socket scope.
+
+        ``_pending`` remains the only actionable source.  Durable audit events
+        are intentionally not consulted because they cannot recreate the
+        in-memory Future that owns response consumption.
+        """
+
+        scoped_user_id = str(user_id or "").strip()
+        scoped_session_id = str(session_id or "").strip()
+        if not scoped_user_id or not scoped_session_id:
+            return []
+
+        service = self._resolve_agent_run_service()
+        if service is None:
+            return []
+
+        selected: list[dict[str, Any]] = []
+        for request_id, request in list(self._pending.items()):
+            run_id = str(request.agent_run_id or "").strip()
+            if (
+                request.status != HumanInteractionStatus.PENDING
+                or request.user_id != scoped_user_id
+                or request.session_id != scoped_session_id
+                or not run_id
+                or run_id in self._terminalized_run_ids
+            ):
+                continue
+            try:
+                run = await service.get_run(run_id)
+            except Exception as exc:
+                logger.debug(
+                    "[HumanInteraction] Pending replay run lookup failed (%s): %s",
+                    run_id,
+                    exc,
+                )
+                continue
+            run_status = (
+                str(run.get("status") or "").strip()
+                if isinstance(run, dict)
+                else ""
+            )
+            if not run_status or run_status in {"succeeded", "failed", "cancelled"}:
+                continue
+            # A response or terminalization may have raced the durable lookup.
+            # Recheck the authoritative in-memory entry before exposing it.
+            if (
+                self._pending.get(request_id) is not request
+                or request.status != HumanInteractionStatus.PENDING
+                or run_id in self._terminalized_run_ids
+            ):
+                continue
+            selected.append(self._request_envelope(request))
+        return selected
 
     async def request_interaction(
         self,
@@ -123,30 +356,31 @@ class HumanInteractionManager:
             session_id=effective_session_id,
             user_id=effective_user_id,
             revision=revision,
+            ws_type=ws_type or self._default_ws_type(kind),
             future=future,
             loop=loop,
         )
         self._pending[request_id] = request
 
-        message_type = ws_type or self._default_ws_type(kind)
+        # Persist the request before broadcasting it.  A websocket disconnect
+        # can therefore still be audited and reconciled after process restart.
+        await self._persist_interaction_event(
+            request,
+            "interaction.requested",
+            status="pending",
+        )
+
         try:
-            await self._broadcast_callback(
-                {
-                    "type": message_type,
-                    "data": {
-                        "request_id": request_id,
-                        "interaction_kind": kind.value,
-                        "agent_run_id": run_id,
-                        "session_id": effective_session_id,
-                        "revision": revision,
-                        **payload,
-                    },
-                }
-            )
+            await self._broadcast_callback(self._request_envelope(request))
             return await asyncio.wait_for(future, timeout=self._timeout_seconds)
         except asyncio.TimeoutError:
             request.status = HumanInteractionStatus.TIMEOUT
             logger.warning("[HumanInteraction] Timed out: %s", request_id)
+            await self._persist_interaction_event(
+                request,
+                "interaction.timeout",
+                status="timeout",
+            )
             return None
         finally:
             self._pending.pop(request_id, None)
@@ -180,6 +414,12 @@ class HumanInteractionManager:
             logger.warning("[HumanInteraction] Run terminalized for %s", request_id)
             return False
         self._resolve_request(request, result=result, status=HumanInteractionStatus.RESOLVED)
+        self._schedule_interaction_event(
+            request,
+            "interaction.resolution",
+            status="resolved",
+            result=result,
+        )
         self._pending.pop(request_id, None)
         return True
 
@@ -192,9 +432,12 @@ class HumanInteractionManager:
             pending.append(
                 {
                     "request_id": request.request_id,
+                    "pending_interaction_id": request.request_id,
                     "interaction_kind": request.kind.value,
                     "revision": request.revision,
-                    "payload": dict(request.payload),
+                    # Keep this inspection surface on the same redacted side
+                    # as websocket replay and interaction audit events.
+                    "payload": self._safe_event_payload(request.payload),
                 }
             )
         return pending

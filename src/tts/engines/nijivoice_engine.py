@@ -7,6 +7,12 @@ from typing import Optional, List, Dict, Any
 import httpx
 import json
 import io
+from collections.abc import Mapping
+from ...services.outbound_privacy_service import (
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
 try:
     from pydub import AudioSegment
 except ImportError:
@@ -16,10 +22,43 @@ except ImportError:
     AudioSegment = None
 
 
+def _nijivoice_descriptor(*, action: str, destination: str, model: str = ""):
+    """Create the canonical outbound descriptor lazily."""
+
+    try:
+        from ...services.outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action=action,
+            transport="httpx",
+            destination=destination,
+            provider="nijivoice",
+            tool="tts.nijivoice",
+            model=model,
+        )
+    except ImportError:  # pragma: no cover - stripped/legacy embedding
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            action=action,
+            transport="httpx",
+            destination=destination,
+            provider="nijivoice",
+            tool="tts.nijivoice",
+            model=model,
+        )
+
+
 class NijivoiceEngine:
     """Nijivoice Text-to-Speech engine"""
     
-    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://api.nijivoice.com"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: str = "https://api.nijivoice.com",
+        config: Any | None = None,
+        privacy_gateway: Any | None = None,
+    ):
         """
         Initialize Nijivoice engine
         
@@ -29,9 +68,61 @@ class NijivoiceEngine:
         """
         self.api_key = api_key or os.getenv("NIJIVOICE_API_KEY")
         self.base_url = base_url.rstrip('/')
+        self.config = config
+        self._privacy_gateway = privacy_gateway
         self.client = None
         self.voices = []
         self.current_voice = None
+
+    def _gateway(self) -> OutboundPrivacyGateway:
+        """Return a request-scoped gateway with the active privacy scope."""
+
+        if self._privacy_gateway is not None:
+            return self._privacy_gateway
+        try:
+            from ...services.turn_context import get_turn_context
+
+            turn = get_turn_context()
+        except Exception:
+            turn = None
+        scope = get_privacy_policy_context()
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(getattr(turn, "user_id", "") or ""),
+            session_id=str(getattr(turn, "session_id", "") or ""),
+            session_context=scope.session_context,
+            project_metadata=scope.project_metadata,
+        )
+
+    async def _execute_external(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        destination: str,
+        sender,
+    ) -> Any:
+        """Run one Nijivoice request through the single outbound boundary."""
+
+        gateway = self._gateway()
+        execute = getattr(gateway, "execute", None)
+        if not callable(execute):
+            # Never fall back to a raw client or a pre-protected payload: a
+            # mixed-version runtime without the transaction API must fail
+            # closed rather than bypass review/masking.
+            raise PrivacyError("outbound privacy gateway does not support execution")
+        descriptor = _nijivoice_descriptor(
+            action=action,
+            destination=destination,
+        )
+        return await execute(
+            payload,
+            provider="nijivoice",
+            descriptor=descriptor,
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=action,
+        )
         
     async def initialize(self) -> bool:
         """Initialize the Nijivoice engine"""
@@ -41,13 +132,25 @@ class NijivoiceEngine:
                 return False
                 
             # Create async HTTP client
-            self.client = httpx.AsyncClient(
-                headers={
+            client_kwargs = {
+                "headers": {
                     "accept": "application/json",
-                    "x-api-key": self.api_key
+                    "x-api-key": self.api_key,
                 },
-                timeout=30.0
-            )
+                "timeout": 30.0,
+                # Provider redirects are not part of the Nijivoice contract;
+                # keeping them disabled prevents an unreviewed second hop.
+                "follow_redirects": False,
+            }
+            try:
+                self.client = httpx.AsyncClient(**client_kwargs)
+            except TypeError as exc:
+                # Small test/embedding clients may expose only headers and
+                # timeout.  Do not hide unrelated constructor failures.
+                if "follow_redirects" not in str(exc):
+                    raise
+                client_kwargs.pop("follow_redirects", None)
+                self.client = httpx.AsyncClient(**client_kwargs)
             
             # Test connection and get available voices
             await self._get_voices()
@@ -67,7 +170,17 @@ class NijivoiceEngine:
     async def _get_voices(self) -> List[Dict[str, Any]]:
         """Get available voices from Nijivoice API"""
         try:
-            response = await self.client.get(f"{self.base_url}/api/platform/v1/voice-actors")
+            endpoint = f"{self.base_url}/api/platform/v1/voice-actors"
+
+            async def send(_payload):
+                return await self.client.get(endpoint)
+
+            response = await self._execute_external(
+                {},
+                action="tts.nijivoice.voice_actors",
+                destination=endpoint,
+                sender=send,
+            )
             response.raise_for_status()
             
             data = response.json()
@@ -119,9 +232,23 @@ class NijivoiceEngine:
             }
             
             # Make synthesis request using the voice actor ID
-            response = await self.client.post(
-                f"{self.base_url}/api/platform/v1/voice-actors/{voice_id}/generate-voice",
-                json=payload
+            endpoint = (
+                f"{self.base_url}/api/platform/v1/voice-actors/"
+                f"{voice_id}/generate-voice"
+            )
+
+            async def send(protected_payload):
+                if not isinstance(protected_payload, Mapping):
+                    raise RuntimeError("privacy protection returned no protected payload")
+                # The gateway's final candidate is the only payload sent to
+                # the provider.  Do not re-read the raw text from kwargs.
+                return await self.client.post(endpoint, json=dict(protected_payload))
+
+            response = await self._execute_external(
+                payload,
+                action="tts.nijivoice.synthesize",
+                destination=endpoint,
+                sender=send,
             )
             response.raise_for_status()
             
@@ -147,7 +274,23 @@ class NijivoiceEngine:
             
             # Download the audio file
             print(f"[Nijivoice] Downloading audio from: {audio_url}")
-            audio_response = await self.client.get(audio_url)
+            async def download(protected_payload):
+                # URL values are provider output, not user-authored text, but
+                # the follow-up request still crosses the same no-redirect
+                # egress boundary and is never allowed to follow a second hop.
+                target = (
+                    protected_payload.get("url", audio_url)
+                    if isinstance(protected_payload, Mapping)
+                    else audio_url
+                )
+                return await self.client.get(target)
+
+            audio_response = await self._execute_external(
+                {"url": audio_url},
+                action="tts.nijivoice.audio_download",
+                destination=str(audio_url),
+                sender=download,
+            )
             audio_response.raise_for_status()
             
             # Convert MP3 to WAV for compatibility with AudioPlayer

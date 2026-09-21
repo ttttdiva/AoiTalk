@@ -8,6 +8,7 @@ import type {
   ChatResponseModelSelection,
 } from "@/lib/chat-api";
 import type { MentionItem } from "@/components/chat/mention-menu";
+import type { ExternalModelPromptResponseInput } from "@/components/chat/chat-permission-dialogs";
 import { isWebSocketMessageForSession } from "@/lib/chat-websocket-events";
 import { isOversizedMailAttachment } from "@/lib/chat-attachment-validation";
 import { buildWebSocketUrl } from "@/lib/websocket-url";
@@ -494,27 +495,90 @@ export function useWebSocket(
     [],
   );
 
+  /**
+   * Send the v2 external-send review response.  The optional positional
+   * arguments keep the call site source-compatible while the review hook is
+   * being migrated; missing nonce/binding values deliberately fail closed and
+   * never emit the legacy response shape.
+   */
   const sendExternalModelPromptResponse = useCallback(
     (
-      requestId: string,
-      approved: boolean,
-      prompt: string,
+      requestOrInput: string | ExternalModelPromptResponseInput,
+      approved?: boolean,
+      finalPayload?: string,
       targetSessionId?: string | null,
-    ) => {
-      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
-      const responseSessionId = targetSessionId ?? sessionIdRef.current;
-      if (!responseSessionId || responseSessionId !== sessionIdRef.current) return;
-      wsRef.current.send(
-        JSON.stringify({
-          type: "external_model_prompt_response",
-          data: {
-            request_id: requestId,
-            approved,
-            prompt,
-            session_id: responseSessionId,
-          },
-        }),
-      );
+      reviewNonce?: string,
+      bindingDigest?: string,
+    ): boolean => {
+      if (
+        requestOrInput === null ||
+        requestOrInput === undefined ||
+        (typeof requestOrInput !== "string" &&
+          (typeof requestOrInput !== "object" ||
+            Array.isArray(requestOrInput)))
+      ) {
+        return false;
+      }
+      const input: ExternalModelPromptResponseInput =
+        typeof requestOrInput === "string"
+          ? {
+              requestId: requestOrInput,
+              approved: approved === true,
+              finalPayload: typeof finalPayload === "string" ? finalPayload : "",
+              targetSessionId,
+              reviewNonce: typeof reviewNonce === "string" ? reviewNonce : "",
+              bindingDigest:
+                typeof bindingDigest === "string" ? bindingDigest : "",
+            }
+          : requestOrInput;
+
+      const ws = wsRef.current;
+      if (
+        !ws ||
+        typeof WebSocket === "undefined" ||
+        ws.readyState !== WebSocket.OPEN
+      ) {
+        return false;
+      }
+      const responseSessionId =
+        input.targetSessionId ?? sessionIdRef.current;
+      if (
+        !responseSessionId ||
+        responseSessionId !== sessionIdRef.current ||
+        typeof input.requestId !== "string" ||
+        !input.requestId.trim() ||
+        typeof input.reviewNonce !== "string" ||
+        !input.reviewNonce.trim() ||
+        typeof input.bindingDigest !== "string" ||
+        !input.bindingDigest.trim() ||
+        typeof input.approved !== "boolean" ||
+        typeof input.finalPayload !== "string" ||
+        (input.approved && !input.finalPayload.trim())
+      ) {
+        return false;
+      }
+
+      try {
+        ws.send(
+          JSON.stringify({
+            type: "external_model_prompt_response",
+            data: {
+              contract_version: 2,
+              request_id: input.requestId,
+              review_nonce: input.reviewNonce,
+              binding_digest: input.bindingDigest,
+              approved: input.approved,
+              final_payload: input.approved ? input.finalPayload : "",
+              session_id: responseSessionId,
+            },
+          }),
+        );
+        return true;
+      } catch {
+        // A close racing the click must not surface an unhandled exception or
+        // leave the caller believing that content was sent.
+        return false;
+      }
     },
     [],
   );

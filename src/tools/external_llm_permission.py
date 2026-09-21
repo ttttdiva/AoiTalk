@@ -9,14 +9,19 @@ for the user's approve/deny response.
 
 import asyncio
 import contextvars
+import hmac
+import hashlib
+import json
 import logging
 import os
 import re
 import shlex
 import uuid
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
+
+from .operations_direct import OPERATIONS_MUTATION_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +63,11 @@ class PermissionRequest:
     """Represents a pending permission request"""
     request_id: str
     tool_name: str
-    tool_args: Dict[str, Any]
-    description: str
+    # Tool arguments/descriptions can contain prompts, paths, or credentials;
+    # callers should inspect the explicit fields rather than accidentally
+    # serializing a pending request via ``repr`` into logs or diagnostics.
+    tool_args: Dict[str, Any] = field(repr=False)
+    description: str = field(repr=False)
     status: PermissionStatus = PermissionStatus.PENDING
     future: Optional[asyncio.Future] = field(default=None, repr=False)
     loop: Optional[asyncio.AbstractEventLoop] = field(default=None, repr=False)
@@ -68,6 +76,15 @@ class PermissionRequest:
     scope: str = "once"
     user_id: Optional[str] = field(default=None, repr=False)
     session_id: Optional[str] = field(default=None, repr=False)
+    # v2 egress review transaction metadata.  Ordinary tool permission keeps
+    # the historical fields above and never needs these values.
+    contract_version: int = 1
+    review_nonce: Optional[str] = field(default=None, repr=False)
+    binding_digest: Optional[str] = field(default=None, repr=False)
+    egress_transaction: bool = False
+    descriptor: Dict[str, Any] = field(default_factory=dict, repr=False)
+    original_payload: Any = field(default=None, repr=False)
+    candidate_payload: Any = field(default=None, repr=False)
 
 
 def get_permission_request_scope() -> tuple[Optional[str], Optional[str]]:
@@ -77,6 +94,287 @@ def get_permission_request_scope() -> tuple[Optional[str], Optional[str]]:
         return None, None
     user_id, session_id = value.split("|", 1)
     return user_id or None, session_id or None
+
+
+def _canonical_json(value: Any) -> str:
+    """Serialize a value deterministically for an egress binding digest.
+
+    The digest is a protocol binding, not an audit projection.  Bytes are
+    represented by a type/length/hash marker so this helper never needs to
+    copy binary content into a JSON event or log line.
+    """
+
+    def normalize(node: Any) -> Any:
+        if isinstance(node, (bytes, bytearray, memoryview)):
+            raw = bytes(node)
+            return {
+                "__bytes__": True,
+                "length": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        if isinstance(node, Mapping):
+            return {str(key): normalize(item) for key, item in node.items()}
+        if isinstance(node, (list, tuple)):
+            return [normalize(item) for item in node]
+        if isinstance(node, (set, frozenset)):
+            return sorted((normalize(item) for item in node), key=repr)
+        if node is ...:
+            return "__ellipsis__"
+        return node
+
+    try:
+        return json.dumps(
+            normalize(value),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+    except Exception:
+        return repr(value)
+
+
+def payload_digest(value: Any) -> str:
+    """Return a stable SHA-256 digest for a transaction payload."""
+
+    return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _constant_time_equal(left: str, right: str) -> bool:
+    try:
+        return hmac.compare_digest(str(left), str(right))
+    except Exception:
+        return False
+
+
+_EVENT_MEDIA_KEYS = {
+    "image",
+    "image_url",
+    "input_image",
+    "input_audio",
+    "audio",
+    "video",
+    "media",
+    "inline_data",
+    "source",
+    "content_block",
+    "base64",
+    "base64_data",
+    "content_base64",
+    "data_base64",
+    "image_base64",
+    "audio_base64",
+    "video_base64",
+    "reference_base64",
+    "reference_audio_base64",
+}
+
+
+def _safe_event_payload(value: Any, *, media_context: bool = False) -> Any:
+    """Project payloads for the browser without exposing raw media bytes."""
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        raw = bytes(value)
+        return {
+            "kind": "binary",
+            "size": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "redacted": True,
+        }
+
+    if isinstance(value, str):
+        text = value.strip()
+        is_data_url = text.lower().startswith(("data:image/", "data:audio/", "data:video/"))
+        is_b64 = media_context and len(text) >= 4 and len(text) % 4 == 0 and re.fullmatch(
+            r"[A-Za-z0-9+/]+={0,2}", text
+        )
+        if is_data_url or is_b64:
+            if is_data_url:
+                header, _, body = text.partition(",")
+                mime = header[5:].split(";", 1)[0]
+                raw_repr = body.encode("utf-8", "replace")
+            else:
+                mime = "application/octet-stream"
+                raw_repr = text.encode("ascii", "ignore")
+            return {
+                "kind": "media",
+                "mime": mime,
+                "size": len(raw_repr),
+                "sha256": hashlib.sha256(raw_repr).hexdigest(),
+                "redacted": True,
+            }
+        return value
+    if isinstance(value, Mapping):
+        projected: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized = str(key or "").strip().lower().replace("-", "_")
+            child_media = media_context or normalized in _EVENT_MEDIA_KEYS
+            projected[str(key)] = _safe_event_payload(item, media_context=child_media)
+        return projected
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_safe_event_payload(item, media_context=media_context) for item in value]
+    try:
+        json.dumps(value, ensure_ascii=False)
+        return value
+    except Exception:
+        text = repr(value)
+        return {
+            "kind": "opaque",
+            "type": type(value).__name__,
+            "sha256": hashlib.sha256(text.encode("utf-8", "replace")).hexdigest(),
+            "redacted": True,
+        }
+
+
+def _safe_event_payload_text(value: Any) -> str:
+    """Return the canonical text shown by the v2 review editor."""
+
+    projected = _safe_event_payload_projection(value)
+    if projected is _EVENT_PROJECTION_FAILED:
+        return "[REDACTED_PAYLOAD]"
+    if isinstance(projected, str):
+        return projected
+    try:
+        return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return "[REDACTED_PAYLOAD]"
+
+
+def _review_event_payload_text(value: Any) -> str:
+    """Serialize exact review evidence while withholding raw media bytes.
+
+    The authenticated review dialog must show the true pre-transform
+    original and the exact candidate; applying the secret redactor here would
+    make the UI evidence differ from the transaction values.  ``_safe_event_payload``
+    still projects binary/data-URL media to a digest descriptor, so raw media
+    never crosses the websocket.  This helper is used only for the interactive
+    v2 event; audit/diagnostic projections continue to use the secret-safe
+    ``_safe_event_payload_text`` path.
+    """
+
+    projected = _safe_event_payload(value)
+    try:
+        if isinstance(projected, str):
+            return projected
+        return json.dumps(projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        # Never stringify an opaque value into a websocket event.  A digest
+        # descriptor is safe and still gives the reviewer a stable reference.
+        return "[REDACTED_PAYLOAD]"
+
+
+_EVENT_PROJECTION_FAILED = object()
+
+
+def _safe_event_payload_projection(value: Any) -> Any:
+    """Project an event payload without exposing raw credential material."""
+
+    projected = _safe_event_payload(value)
+    # Egress events are sent over the websocket and may be inspected by a
+    # browser extension or a test/logger projection.  Media is handled above;
+    # apply the shared secret-only display redactor to all remaining values so
+    # labelled credentials, bearer/JWT/API tokens, and credential-keyed fields
+    # cannot appear in the review event.  Import lazily to keep this module's
+    # historical standalone import path free of a service-level cycle.
+    try:
+        from ..services.outbound_privacy_service import redact_secret_for_local_display
+
+        return redact_secret_for_local_display(projected)
+    except Exception:
+        # A projection failure must not fall back to ``str(projected)`` (which
+        # could contain the very secret that caused the failure).
+        return _EVENT_PROJECTION_FAILED
+
+
+def _scope_is_real(user_id: Optional[str], session_id: Optional[str]) -> bool:
+    """Reject synthetic/default identifiers for strict egress review."""
+
+    normalized_user = str(user_id or "").strip().casefold()
+    normalized_session = str(session_id or "").strip().casefold()
+    return bool(
+        normalized_user
+        and normalized_session
+        and normalized_user not in {"default", "default_user", "none", "null"}
+        and normalized_session not in {"default", "default_session", "none", "null"}
+    )
+
+
+_FINAL_PAYLOAD_UNSET = object()
+
+
+def build_egress_binding_digest(
+    *,
+    request_id: str,
+    review_nonce: str,
+    descriptor: Mapping[str, Any],
+    original_payload: Any,
+    candidate_payload: Any,
+    user_id: Optional[str] = None,
+    session_id: Optional[str] = None,
+    final_payload: Any = _FINAL_PAYLOAD_UNSET,
+) -> str:
+    """Bind one review to its exact request, scope, route and candidate.
+
+    Responses must echo this digest.  Any route/payload/scope mutation then
+    fails closed before a sender is invoked.  Only hashes of payload values
+    are included in the binding envelope; the raw values stay in memory for
+    the duration of the transaction and are never written to audit logs.
+    """
+
+    envelope = {
+        "contract_version": 2,
+        "request_id": str(request_id),
+        "review_nonce": str(review_nonce),
+        "user_id": str(user_id or ""),
+        "session_id": str(session_id or ""),
+        "descriptor": {str(key): value for key, value in descriptor.items()},
+        "original_digest": payload_digest(original_payload),
+        "candidate_digest": payload_digest(candidate_payload),
+    }
+    if final_payload is not _FINAL_PAYLOAD_UNSET:
+        envelope["final_digest"] = payload_digest(final_payload)
+    return hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+
+
+def build_egress_final_binding_digest(
+    *,
+    binding_digest: str,
+    final_payload: Any,
+) -> str:
+    """Bind the exact user-edited final wire value to one v2 approval.
+
+    ``binding_digest`` already covers request identity, route, scope,
+    original, and candidate.  Chaining the final payload digest keeps the
+    initial challenge stable while allowing the server to attest the exact
+    editor value that the gateway must send.
+    """
+
+    envelope = {
+        "contract_version": 2,
+        "binding_digest": str(binding_digest),
+        "final_digest": payload_digest(final_payload),
+    }
+    return hashlib.sha256(_canonical_json(envelope).encode("utf-8")).hexdigest()
+
+
+class EgressApproval(str):
+    """String-compatible v2 approval carrying non-sensitive binding metadata."""
+
+    def __new__(
+        cls,
+        value: str,
+        *,
+        request_id: str,
+        review_nonce: str,
+        binding_digest: str,
+        final_binding_digest: str,
+    ):
+        instance = super().__new__(cls, value)
+        instance.request_id = request_id
+        instance.review_nonce = review_nonce
+        instance.binding_digest = binding_digest
+        instance.final_binding_digest = final_binding_digest
+        return instance
 
 
 def _enterprise_permission_scope_required() -> bool:
@@ -158,6 +456,7 @@ DEFAULT_PERMISSION_TOOLS = sorted(
     | FILE_WRITE_TOOLS
     | FILE_DELETE_TOOLS
     | COMMAND_TOOLS
+    | OPERATIONS_MUTATION_TOOL_NAMES
     | PROJECT_MANAGEMENT_MUTATION_TOOLS
     | DOCS_MUTATION_TOOLS
 )
@@ -166,6 +465,7 @@ MUTATION_TOOLS = (
     FILE_WRITE_TOOLS
     | FILE_DELETE_TOOLS
     | COMMAND_TOOLS
+    | OPERATIONS_MUTATION_TOOL_NAMES
     | PROJECT_MANAGEMENT_MUTATION_TOOLS
     | DOCS_MUTATION_TOOLS
 )
@@ -297,6 +597,11 @@ class ExternalLLMPermissionManager:
         self._timeout_seconds = 300  # 5 minutes timeout
         # (session_key, tool_name, signature) -> セッション中は許可
         self._session_approvals: set[Tuple[str, str, str]] = set()
+        # v2 review transactions are one-shot.  Keep only opaque token pairs
+        # after completion so a late/replayed browser response cannot resolve
+        # a newly-created request that happens to reuse an id in a test or
+        # embedding.
+        self._consumed_egress_tokens: set[tuple[str, str]] = set()
 
         # Load config
         self._load_config()
@@ -468,6 +773,18 @@ class ExternalLLMPermissionManager:
         Returns:
             True if approved, False if denied or timeout
         """
+        permission_user_id, permission_session_id = get_permission_request_scope()
+        # Validate Enterprise scope before both the AUTO_APPROVE shortcut and
+        # the ordinary session-approval cache.  Otherwise a synthetic/default
+        # context could inherit a previously cached mutation approval.
+        if _enterprise_permission_scope_required() and not (
+            permission_user_id and permission_session_id
+        ):
+            logger.error(
+                "[ExternalLLMPermission] Enterprise permission request has no user/session scope; denying"
+            )
+            return False
+
         # Auto-approve if configured/current mode allows it.
         if not self.is_permission_required(tool_name, tool_args):
             return True
@@ -484,15 +801,6 @@ class ExternalLLMPermissionManager:
         # Require broadcast callback
         if self._broadcast_callback is None:
             logger.warning("[ExternalLLMPermission] No broadcast callback set, denying")
-            return False
-
-        permission_user_id, permission_session_id = get_permission_request_scope()
-        if _enterprise_permission_scope_required() and not (
-            permission_user_id and permission_session_id
-        ):
-            logger.error(
-                "[ExternalLLMPermission] Enterprise permission request has no user/session scope; denying"
-            )
             return False
 
         # Create request
@@ -542,8 +850,11 @@ class ExternalLLMPermissionManager:
                 request.status = PermissionStatus.TIMEOUT
                 return False
                 
-        except Exception as e:
-            logger.error(f"[ExternalLLMPermission] Error requesting permission: {e}")
+        except Exception:
+            # Exception text from a provider/UI callback can echo tool
+            # arguments or credentials.  Keep diagnostics stable and
+            # non-sensitive; the permission result itself remains fail-closed.
+            logger.error("[ExternalLLMPermission] Error requesting permission")
             return False
         finally:
             # Clean up
@@ -565,9 +876,70 @@ class ExternalLLMPermissionManager:
         risk_level: str = "",
         semantic_status: str = "",
         warning: str = "",
+        # v2 canonical egress transaction fields.  These are optional so the
+        # legacy advanced-model prompt API remains source compatible; a
+        # caller that supplies ``egress_transaction=True`` always gets the
+        # strict v2 contract regardless of generation AUTO_APPROVE policy.
+        egress_transaction: bool = False,
+        original_payload: Any = None,
+        candidate_payload: Any = None,
+        action: str = "",
+        transport: str = "",
+        destination: str = "",
+        tool: str = "",
+        review_nonce: str = "",
+        binding_digest: str = "",
+        contract_version: int = 1,
     ) -> Optional[str]:
         """Ask the WebUI to approve or edit a prompt before an external model call."""
+        # Prompt text is a legacy textual editor input.  Reject malformed
+        # values rather than invoking ``.strip`` on arbitrary objects (or
+        # silently stringifying a mapping that could contain raw credentials).
+        if not isinstance(prompt, str):
+            logger.warning("[ExternalLLMPermission] Malformed external model prompt")
+            return None
+        if redacted_prompt is not None and not isinstance(redacted_prompt, str):
+            logger.warning("[ExternalLLMPermission] Malformed redacted prompt")
+            return None
         outbound_prompt = (redacted_prompt or "").strip() or prompt
+        # Egress approval is independent of ordinary tool permission.  In
+        # particular, an autonomous/AUTO_APPROVE generation policy may not
+        # suppress this confirmation.  ``original_payload`` and
+        # ``candidate_payload`` are deliberately explicit for v2, including
+        # when they happen to be equal in direct mode.
+        if type(egress_transaction) is not bool:
+            # Do not let a string/number supplied by an embedding accidentally
+            # opt into (or out of) the strict protocol through Python truthiness.
+            logger.warning("[ExternalLLMPermission] Malformed egress transaction flag")
+            return None
+        # A v2 transaction is an exact protocol, not a truthy/convertible
+        # option.  Keep legacy callers on v1, but reject strings such as
+        # ``"2"`` rather than silently upgrading an untrusted request.
+        inferred_egress = (
+            egress_transaction
+            or original_payload is not None
+            or candidate_payload is not None
+            or contract_version == 2
+        )
+        if inferred_egress and (type(contract_version) is not int or contract_version != 2):
+            logger.warning("[ExternalLLMPermission] Malformed egress contract version")
+            return None
+        egress_transaction = (
+            inferred_egress
+        )
+
+        if egress_transaction:
+            confirm = True
+            contract_version = 2
+            if type(provider) is not str or not provider.strip():
+                logger.warning("[ExternalLLMPermission] Malformed egress provider")
+                return None
+            if type(model) is not str:
+                logger.warning("[ExternalLLMPermission] Malformed egress model")
+                return None
+            if any(type(value) is not str for value in (action, transport, destination, tool)):
+                logger.warning("[ExternalLLMPermission] Malformed egress descriptor")
+                return None
         if not confirm:
             return outbound_prompt
 
@@ -576,15 +948,59 @@ class ExternalLLMPermissionManager:
             return None
 
         permission_user_id, permission_session_id = get_permission_request_scope()
-        if _enterprise_permission_scope_required() and not (
-            permission_user_id and permission_session_id
+        if egress_transaction and not _scope_is_real(
+            permission_user_id, permission_session_id
         ):
             logger.error(
-                "[ExternalLLMPermission] Enterprise external-model prompt has no user/session scope; denying"
+                "[ExternalLLMPermission] External egress review has no real user/session scope; denying"
+            )
+            return None
+        if _enterprise_permission_scope_required() and not _scope_is_real(
+            permission_user_id, permission_session_id
+        ):
+            logger.error(
+                "[ExternalLLMPermission] External-model prompt has no user/session scope; denying"
             )
             return None
 
         request_id = str(uuid.uuid4())
+        if egress_transaction:
+            review_nonce = str(review_nonce or uuid.uuid4().hex)
+            descriptor = {
+                "action": str(action or ""),
+                "transport": str(transport or ""),
+                "destination": str(destination or ""),
+                "provider": str(provider or ""),
+                "tool": str(tool or ""),
+                "model": str(model or ""),
+            }
+            if not all(
+                isinstance(descriptor[key], str) and descriptor[key].strip()
+                for key in ("action", "transport", "destination", "provider")
+            ):
+                logger.warning(
+                    "[ExternalLLMPermission] Egress descriptor is missing required metadata"
+                )
+                return None
+            if not isinstance(notify, bool):
+                logger.warning("[ExternalLLMPermission] Malformed egress notify flag")
+                return None
+            if redaction_findings is not None and not isinstance(redaction_findings, list):
+                logger.warning("[ExternalLLMPermission] Malformed egress findings")
+                return None
+            # The gateway normally computes this before entering the manager,
+            # but computing it here as a defensive fallback keeps direct
+            # manager embeddings bound as well.
+            if not binding_digest:
+                binding_digest = build_egress_binding_digest(
+                    request_id=request_id,
+                    review_nonce=review_nonce,
+                    descriptor=descriptor,
+                    original_payload=(prompt if original_payload is None else original_payload),
+                    candidate_payload=(outbound_prompt if candidate_payload is None else candidate_payload),
+                    user_id=permission_user_id,
+                    session_id=permission_session_id,
+                )
         loop = asyncio.get_event_loop()
         future = loop.create_future()
 
@@ -603,31 +1019,120 @@ class ExternalLLMPermissionManager:
             loop=loop,
             user_id=permission_user_id,
             session_id=permission_session_id,
+            contract_version=2 if egress_transaction else 1,
+            review_nonce=review_nonce or None,
+            binding_digest=binding_digest or None,
+            egress_transaction=egress_transaction,
+            descriptor=(descriptor if egress_transaction else {}),
+            original_payload=original_payload,
+            candidate_payload=(candidate_payload if candidate_payload is not None else outbound_prompt),
         )
         self._pending_requests[request_id] = request
 
         try:
+            event_data: dict[str, Any] = {
+                "request_id": request_id,
+                "provider": provider,
+                "model": model,
+                "prompt": prompt,
+                "original_prompt": prompt,
+                "redacted_prompt": outbound_prompt,
+                "redaction_findings": redaction_findings or [],
+                "description": request.description,
+                "notify": notify,
+                "source_kind": source_kind,
+                "risk_level": risk_level,
+                "semantic_status": semantic_status,
+                "warning": warning,
+            }
+            if egress_transaction:
+                # Never include the old v1 aliases as the authoritative value:
+                # the browser must use candidate_payload and return a
+                # final_payload string tied to the nonce/digest below.
+                event_data.pop("prompt", None)
+                event_data.pop("original_prompt", None)
+                event_data.pop("redacted_prompt", None)
+                # The authenticated v2 dialog is the one place where the
+                # reviewer must see the true pre-transform original and the
+                # exact candidate.  Keep raw media as digest descriptors, but
+                # do not apply the secret redactor: masking itself is
+                # represented by the candidate value and masking_status.
+                original_event_text = _review_event_payload_text(original_payload)
+                candidate_event_text = _review_event_payload_text(
+                    candidate_payload
+                    if candidate_payload is not None
+                    else outbound_prompt
+                )
+                # The browser editor requires non-empty textual projections;
+                # an empty/malformed transaction is denied before it can wait
+                # for a UI response and eventually time out.
+                if not original_event_text.strip() or not candidate_event_text.strip():
+                    self._deny_egress_request(request, "empty_payload_projection")
+                    return None
+                event_data.update(
+                    {
+                        "contract_version": 2,
+                        "review_nonce": review_nonce,
+                        "binding_digest": binding_digest,
+                        "action": descriptor["action"],
+                        "transport": descriptor["transport"],
+                        "destination": descriptor["destination"],
+                        "tool": descriptor["tool"],
+                        "original_payload": original_event_text,
+                        "candidate_payload": candidate_event_text,
+                        "masking_status": (
+                            "MASKING_APPLIED"
+                            if original_payload is not None
+                            and payload_digest(original_payload)
+                            != payload_digest(
+                                candidate_payload
+                                if candidate_payload is not None
+                                else outbound_prompt
+                            )
+                            else "MASKING_UNNECESSARY"
+                        ),
+                    }
+                )
             await self._broadcast_callback(
                 {
                     "type": "external_model_prompt_request",
-                    "data": {
-                        "request_id": request_id,
-                        "provider": provider,
-                        "model": model,
-                        "prompt": prompt,
-                        "original_prompt": prompt,
-                        "redacted_prompt": outbound_prompt,
-                        "redaction_findings": redaction_findings or [],
-                        "description": request.description,
-                        "notify": notify,
-                        "source_kind": source_kind,
-                        "risk_level": risk_level,
-                        "semantic_status": semantic_status,
-                        "warning": warning,
-                    },
+                    "data": event_data,
                 }
             )
             result = await asyncio.wait_for(future, timeout=self._timeout_seconds)
+            if egress_transaction:
+                if (
+                    not isinstance(result, Mapping)
+                    or type(result.get("approved")) is not bool
+                    or result.get("approved") is not True
+                ):
+                    return None
+                final_payload = result.get("final_payload")
+                if not isinstance(final_payload, str) or not final_payload.strip():
+                    # Do not fall back to candidate on a malformed v2
+                    # response.  The transport must be denied instead.
+                    return None
+                final_binding_digest = result.get("final_binding_digest")
+                if not isinstance(final_binding_digest, str) or not final_binding_digest:
+                    # Compatibility callbacks may resolve the future directly
+                    # with the old v2 shape.  Compute the attestation from
+                    # the pending immutable request rather than accepting an
+                    # unbound final value.
+                    final_binding_digest = build_egress_final_binding_digest(
+                        binding_digest=str(
+                            result.get("binding_digest") or request.binding_digest or ""
+                        ),
+                        final_payload=final_payload,
+                    )
+                return EgressApproval(
+                    final_payload,
+                    request_id=str(result.get("request_id") or request_id),
+                    review_nonce=str(result.get("review_nonce") or review_nonce),
+                    binding_digest=str(
+                        result.get("binding_digest") or binding_digest or ""
+                    ),
+                    final_binding_digest=final_binding_digest,
+                )
             if isinstance(result, dict) and result.get("approved"):
                 edited_prompt = str(result.get("prompt") or "").strip()
                 return edited_prompt or outbound_prompt
@@ -636,11 +1141,89 @@ class ExternalLLMPermissionManager:
             logger.warning("[ExternalLLMPermission] External model prompt request timed out: %s", request_id)
             request.status = PermissionStatus.TIMEOUT
             return None
-        except Exception as e:
-            logger.error("[ExternalLLMPermission] External model prompt request failed: %s", e)
+        except Exception:
+            # Do not interpolate callback/transport exception text: provider
+            # SDKs frequently include the rejected prompt or authorization
+            # header in their exception message.
+            logger.error("[ExternalLLMPermission] External model prompt request failed")
             return None
         finally:
+            if egress_transaction:
+                self._consumed_egress_tokens.add((request_id, str(review_nonce)))
             self._pending_requests.pop(request_id, None)
+
+    async def request_external_egress_review(
+        self,
+        *,
+        original_payload: Any,
+        candidate_payload: Any,
+        provider: str,
+        model: str = "",
+        descriptor: Optional[Mapping[str, Any]] = None,
+        description: str = "",
+        notify: bool = True,
+        redaction_findings: Optional[list[dict[str, str]]] = None,
+        source_kind: str = "external_egress",
+        risk_level: str = "high",
+        semantic_status: str = "",
+        warning: str = "",
+    ) -> Optional[str]:
+        """Issue one strict v2 egress review transaction.
+
+        This named wrapper is convenient for adapters that do not need the
+        legacy prompt terminology.  It serializes the candidate only for the
+        compatibility ``prompt`` field; the authoritative event fields are
+        the typed original/candidate payloads.
+        """
+
+        try:
+            prompt = json.dumps(candidate_payload, ensure_ascii=False, sort_keys=True, default=str)
+        except Exception:
+            prompt = str(candidate_payload)
+        details = dict(descriptor or {})
+        return await self.request_external_model_prompt(
+            prompt,
+            redacted_prompt=prompt,
+            redaction_findings=redaction_findings,
+            provider=provider,
+            model=model,
+            description=description,
+            confirm=True,
+            notify=notify,
+            request_kind="external_data_review",
+            source_kind=source_kind,
+            risk_level=risk_level,
+            semantic_status=semantic_status,
+            warning=warning,
+            egress_transaction=True,
+            original_payload=original_payload,
+            candidate_payload=candidate_payload,
+            action=str(details.get("action") or ""),
+            transport=str(details.get("transport") or ""),
+            destination=str(details.get("destination") or ""),
+            tool=str(details.get("tool") or ""),
+            contract_version=2,
+        )
+
+    def _deny_egress_request(self, request: PermissionRequest, reason: str) -> None:
+        """Resolve a v2 request as denied and consume its one-shot token."""
+
+        request.status = PermissionStatus.DENIED
+        token = (str(request.request_id), str(request.review_nonce or ""))
+        self._consumed_egress_tokens.add(token)
+        payload = {
+            "approved": False,
+            "final_payload": "",
+            "contract_version": 2,
+            "review_nonce": str(request.review_nonce or ""),
+            "binding_digest": str(request.binding_digest or ""),
+        }
+        if request.future and not request.future.done():
+            if request.loop and request.loop.is_running():
+                request.loop.call_soon_threadsafe(request.future.set_result, payload)
+            else:
+                request.future.set_result(payload)
+        logger.warning("[ExternalLLMPermission] Egress review denied (%s)", reason)
     
     def handle_permission_response(
         self,
@@ -659,10 +1242,17 @@ class ExternalLLMPermissionManager:
             approved: True if user approved, False if denied
             scope: ``"once"`` なら今回だけ、``"session"`` ならセッション中は許可を記憶する
         """
+        if not isinstance(request_id, str) or not request_id.strip():
+            logger.warning("[ExternalLLMPermission] Malformed permission request ID")
+            return
+        if type(approved) is not bool:
+            logger.warning("[ExternalLLMPermission] Malformed permission approval: %s", request_id)
+            return
         request = self._pending_requests.get(request_id)
         if not request:
             logger.warning(f"[ExternalLLMPermission] Unknown request ID: {request_id}")
             return
+
         if (
             request.user_id
             and request.user_id != str(requester_user_id or "")
@@ -713,29 +1303,103 @@ class ExternalLLMPermissionManager:
         approved: bool,
         prompt: str = "",
         *,
+        final_payload: Any = None,
+        contract_version: Any = None,
+        review_nonce: Any = None,
+        binding_digest: Any = None,
+        scope: Any = "once",
         requester_user_id: Optional[str] = None,
         requester_session_id: Optional[str] = None,
     ):
         """Handle user response for an external model prompt request."""
+        if not isinstance(request_id, str) or not request_id.strip():
+            logger.warning("[ExternalLLMPermission] Malformed external prompt request ID")
+            return
         request = self._pending_requests.get(request_id)
         if not request:
-            logger.warning("[ExternalLLMPermission] Unknown external model prompt request ID: %s", request_id)
-            return
-        if (
-            request.user_id
-            and request.user_id != str(requester_user_id or "")
-        ) or (
-            request.session_id
-            and request.session_id != str(requester_session_id or "")
-        ):
+            # Unknown/expired ids are intentionally indistinguishable from a
+            # replay to callers.  Never resurrect a completed transaction.
             logger.warning(
-                "[ExternalLLMPermission] External prompt scope mismatch: %s",
+                "[ExternalLLMPermission] Unknown external model prompt request ID: %s",
                 request_id,
             )
             return
 
+        scope_matches = not (
+            (request.user_id and request.user_id != str(requester_user_id or ""))
+            or (request.session_id and request.session_id != str(requester_session_id or ""))
+        )
+        if request.egress_transaction:
+            token = (str(request.request_id), str(request.review_nonce or ""))
+            if token in self._consumed_egress_tokens or (
+                request.future is not None and request.future.done()
+            ):
+                logger.warning(
+                    "[ExternalLLMPermission] Replayed external egress response: %s",
+                    request_id,
+                )
+                return
+            if not scope_matches:
+                self._deny_egress_request(request, "scope_mismatch")
+                return
+            if type(approved) is not bool:
+                self._deny_egress_request(request, "malformed_approval")
+                return
+            if type(contract_version) is not int or contract_version != 2:
+                self._deny_egress_request(request, "stale_contract")
+                return
+            if not isinstance(review_nonce, str) or not review_nonce:
+                self._deny_egress_request(request, "missing_nonce")
+                return
+            if not isinstance(binding_digest, str) or not binding_digest:
+                self._deny_egress_request(request, "missing_binding")
+                return
+            if review_nonce != request.review_nonce or not _constant_time_equal(
+                binding_digest, request.binding_digest or ""
+            ):
+                self._deny_egress_request(request, "binding_mismatch")
+                return
+            # Egress approvals are transaction-scoped.  A session grant would
+            # make a later route/payload eligible without a fresh digest.
+            if type(scope) is not str or scope not in {"", "once"}:
+                self._deny_egress_request(request, "invalid_scope")
+                return
+            if not isinstance(final_payload, str):
+                self._deny_egress_request(request, "malformed_final_payload")
+                return
+            final_binding_digest = ""
+            if approved:
+                final_binding_digest = build_egress_final_binding_digest(
+                    binding_digest=binding_digest,
+                    final_payload=final_payload,
+                )
+            payload = {
+                "approved": approved,
+                "final_payload": final_payload if approved else "",
+                "contract_version": 2,
+                "request_id": request.request_id,
+                "review_nonce": review_nonce,
+                "binding_digest": binding_digest,
+                "final_binding_digest": final_binding_digest,
+            }
+            self._consumed_egress_tokens.add(token)
+        else:
+            if not scope_matches:
+                logger.warning(
+                    "[ExternalLLMPermission] External prompt scope mismatch: %s",
+                    request_id,
+                )
+                return
+            if type(approved) is not bool:
+                logger.warning(
+                    "[ExternalLLMPermission] Malformed external model approval: %s",
+                    request_id,
+                )
+                return
+            request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
+            payload = {"approved": approved, "prompt": prompt}
+
         request.status = PermissionStatus.APPROVED if approved else PermissionStatus.DENIED
-        payload = {"approved": approved, "prompt": prompt}
 
         if request.future and not request.future.done():
             if request.loop and request.loop.is_running():
@@ -835,11 +1499,34 @@ async def request_external_model_prompt(
     risk_level: str = "",
     semantic_status: str = "",
     warning: str = "",
+    egress_transaction: bool = False,
+    original_payload: Any = None,
+    candidate_payload: Any = None,
+    action: str = "",
+    transport: str = "",
+    destination: str = "",
+    tool: str = "",
+    review_nonce: str = "",
+    binding_digest: str = "",
+    contract_version: int = 1,
 ) -> Optional[str]:
+    if type(egress_transaction) is not bool:
+        # Keep malformed v2 flags fail-closed even when the process is
+        # between server lifecycles and no permission manager is installed.
+        return None
     manager = get_permission_manager()
     if manager is None:
         outbound_prompt = (redacted_prompt or "").strip() or prompt
-        return outbound_prompt if not confirm else None
+        # Missing UI/manager is fail-closed for all egress transactions,
+        # including when an autonomous caller attempted ``confirm=False``.
+        is_v2 = type(contract_version) is int and contract_version == 2
+        inferred_egress = bool(
+            egress_transaction
+            or original_payload is not None
+            or candidate_payload is not None
+            or is_v2
+        )
+        return outbound_prompt if not (confirm or inferred_egress) else None
 
     return await manager.request_external_model_prompt(
         prompt,
@@ -855,6 +1542,16 @@ async def request_external_model_prompt(
         risk_level=risk_level,
         semantic_status=semantic_status,
         warning=warning,
+        egress_transaction=egress_transaction,
+        original_payload=original_payload,
+        candidate_payload=candidate_payload,
+        action=action,
+        transport=transport,
+        destination=destination,
+        tool=tool,
+        review_nonce=review_nonce,
+        binding_digest=binding_digest,
+        contract_version=contract_version,
     )
 
 
@@ -901,6 +1598,6 @@ def check_permission_sync(
         return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
     except RuntimeError:
         return bool(asyncio.run(check_permission(tool_name, tool_args, description)))
-    except Exception as exc:
-        logger.error("[ExternalLLMPermission] Permission check failed: %s", exc)
+    except Exception:
+        logger.error("[ExternalLLMPermission] Permission check failed")
         return False

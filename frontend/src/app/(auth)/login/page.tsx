@@ -6,31 +6,36 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
+import { AppSelect } from "@/components/ui/app-select";
 import { BlurFade } from "@/components/magicui/blur-fade";
 import { BorderBeam } from "@/components/magicui/border-beam";
+
+type CredentialSource = "local" | "active_directory";
 
 function LoginForm() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [credentialSource, setCredentialSource] =
+    useState<CredentialSource>("local");
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const searchParams = useSearchParams();
   const next = searchParams.get("next") ?? "";
 
-  /*
-  const searchError = useMemo(() => {
-    const err = searchParams.get("error");
-    if (err === "auth_failed") setError("認証に失敗しました");
-    else if (err === "inactive") setError("アカウントが無効です");
-    else if (err === "missing") setError("ユーザー名とパスワードが必要です");
-  }, [searchParams]);
-  */
-
   const searchError = useMemo(() => {
     const err = searchParams.get("error");
     if (err === "auth_failed") return "Authentication failed";
+    if (err === "auth_unavailable") {
+      return "認証サービスを利用できません。管理者にお問い合わせください。";
+    }
+    if (err === "auth_conflict") {
+      return "アカウントを安全に作成できませんでした。管理者にお問い合わせください。";
+    }
     if (err === "inactive") return "Account is inactive";
     if (err === "missing") return "Username and password are required";
+    if (err === "audit_unavailable") {
+      return "認証監査サービスを利用できません。管理者にお問い合わせください。";
+    }
     return "";
   }, [searchParams]);
 
@@ -58,6 +63,12 @@ function LoginForm() {
     p.name = "password";
     p.value = password;
     form.appendChild(p);
+
+    const source = document.createElement("input");
+    source.type = "hidden";
+    source.name = "credential_source";
+    source.value = credentialSource;
+    form.appendChild(source);
 
     if (next) {
       const n = document.createElement("input");
@@ -88,6 +99,7 @@ function LoginForm() {
           value={username}
           onChange={(e) => setUsername(e.target.value)}
           autoFocus
+          autoComplete="username"
         />
       </div>
       <div className="space-y-2">
@@ -97,7 +109,25 @@ function LoginForm() {
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
+          autoComplete="current-password"
         />
+      </div>
+      <div className="space-y-2">
+        <Label htmlFor="credential-source">認証方式</Label>
+        <AppSelect
+          id="credential-source"
+          value={credentialSource}
+          onChange={(event) =>
+            setCredentialSource(event.target.value as CredentialSource)
+          }
+          className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
+        >
+          <option value="local">ローカル</option>
+          <option value="active_directory">Active Directory (AD自動生成)</option>
+        </AppSelect>
+        <p className="text-xs text-muted-foreground">
+          Active Directory を選ぶと、初回成功時にADの識別子へローカル利用者を安全に紐付けます。
+        </p>
       </div>
       {(error || searchError) && (
         <p className="text-sm text-destructive">{error || searchError}</p>

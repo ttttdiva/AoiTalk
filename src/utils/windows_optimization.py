@@ -14,6 +14,10 @@ import yaml
 import logging
 
 from src.utils.startup_timing import get_startup_timer
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
 
 
 class WindowsOptimization:
@@ -61,11 +65,17 @@ class WindowsOptimization:
             if cpu_affinity is not None:
                 self._set_cpu_affinity(cpu_affinity)
                 
-            print(f"[WindowsOptimization] システム最適化を適用しました")
+            logger.info(
+                "Windows system optimizations applied",
+            )
             self._applied_optimizations.append("system_optimization")
-            
+
         except Exception as e:
-            print(f"[WindowsOptimization] システム最適化エラー: {e}")
+            logger.warning(
+                "Windows system optimization failed; continuing without it",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
     
     def _set_process_priority(self, priority: str) -> None:
         """プロセス優先度を設定
@@ -86,10 +96,17 @@ class WindowsOptimization:
             else:  # normal
                 process.nice(psutil.NORMAL_PRIORITY_CLASS)
                 
-            print(f"[WindowsOptimization] プロセス優先度を{priority}に設定")
-            
+            logger.info(
+                "Windows process priority set to %s",
+                priority,
+            )
+
         except Exception as e:
-            print(f"[WindowsOptimization] プロセス優先度設定エラー: {e}")
+            logger.warning(
+                "Unable to set Windows process priority; continuing",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
     
     def _set_cpu_affinity(self, cpu_list: List[int]) -> None:
         """CPU親和性を設定
@@ -103,10 +120,17 @@ class WindowsOptimization:
         try:
             process = psutil.Process()
             process.cpu_affinity(cpu_list)
-            print(f"[WindowsOptimization] CPU親和性を設定: {cpu_list}")
-            
+            logger.info(
+                "Windows CPU affinity set: %s",
+                cpu_list,
+            )
+
         except Exception as e:
-            print(f"[WindowsOptimization] CPU親和性設定エラー: {e}")
+            logger.warning(
+                "Unable to set Windows CPU affinity; continuing",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
     
     def get_database_config_overrides(self) -> Dict[str, Any]:
         """データベース設定のオーバーライドを取得
@@ -150,11 +174,17 @@ class WindowsOptimization:
             # Windows環境でのイベントループポリシーを設定
             if hasattr(asyncio, 'WindowsProactorEventLoopPolicy'):
                 asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-                print("[WindowsOptimization] ProactorEventLoopPolicyを設定")
+                logger.info(
+                    "Windows ProactorEventLoopPolicy configured",
+                )
                 self._applied_optimizations.append("asyncio_optimization")
-                
+
         except Exception as e:
-            print(f"[WindowsOptimization] AsyncIO最適化エラー: {e}")
+            logger.warning(
+                "AsyncIO Windows optimization failed; continuing",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             
     def suppress_asyncio_errors(self) -> None:
         """AsyncIOの特定のエラーログを抑制
@@ -182,10 +212,16 @@ class WindowsOptimization:
         try:
             logger = logging.getLogger("asyncio")
             logger.addFilter(ConnectionResetFilter())
-            print("[WindowsOptimization] AsyncIOエラーフィルターを適用しました")
+            logger.info(
+                "AsyncIO connection-reset error filter applied",
+            )
             self._applied_optimizations.append("asyncio_error_filter")
         except Exception as e:
-            print(f"[WindowsOptimization] エラーフィルター適用エラー: {e}")
+            logger.warning(
+                "AsyncIO error filter could not be applied; continuing",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
     
     def get_concurrency_settings(self) -> Dict[str, int]:
         """並行処理設定を取得
@@ -218,11 +254,17 @@ class WindowsOptimization:
                     futures = [executor.submit(lambda: None) for _ in range(2)]
                     concurrent.futures.wait(futures, timeout=1.0)
                 
-                print("[WindowsOptimization] コンポーネントのウォームアップ完了")
+                logger.info(
+                    "Windows component warm-up completed",
+                )
                 self._applied_optimizations.append("component_warmup")
-                
+
             except Exception as e:
-                print(f"[WindowsOptimization] ウォームアップエラー: {e}")
+                logger.warning(
+                    "Windows component warm-up failed; continuing",
+                    exc_info=True,
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
         
         # バックグラウンドで実行
         threading.Thread(target=warm_up_thread, daemon=True).start()
@@ -276,8 +318,10 @@ class WindowsOptimization:
             
             # サービスが存在しない場合
             if result.returncode != 0:
-                print(f"[WindowsOptimization] PostgreSQLサービス '{service_name}' が見つかりません")
-                print(f"[WindowsOptimization] POSTGRES_SERVICE_NAME環境変数で正しいサービス名を設定してください")
+                logger.warning(
+                    "PostgreSQL service '%s' was not found; set POSTGRES_SERVICE_NAME to the installed service",
+                    service_name,
+                )
                 return False
             
             # STATE行を探して状態を確認
@@ -288,11 +332,15 @@ class WindowsOptimization:
                     break
             
             if is_running:
-                print(f"[WindowsOptimization] PostgreSQLサービスは既に起動しています")
+                logger.info(
+                    "PostgreSQL service is already running",
+                )
                 return True
-            
+
             # サービスが停止している場合は起動
-            print(f"[WindowsOptimization] PostgreSQLサービスが停止しています。起動します...")
+            logger.info(
+                "PostgreSQL service is stopped; starting it",
+            )
             
             start_result = subprocess.run(
                 ['net', 'start', service_name],
@@ -302,11 +350,15 @@ class WindowsOptimization:
             )
             
             if start_result.returncode == 0:
-                print(f"[WindowsOptimization] PostgreSQLサービスを起動しました")
+                logger.info(
+                    "PostgreSQL service started",
+                )
                 self._applied_optimizations.append("postgresql_service_start")
-                
+
                 # PostgreSQLが接続可能になるまで待機
-                print(f"[WindowsOptimization] PostgreSQLが接続可能になるまで待機中...")
+                logger.info(
+                    "Waiting for PostgreSQL to accept connections",
+                )
                 import time
                 import socket
                 
@@ -323,9 +375,12 @@ class WindowsOptimization:
                         sock.settimeout(2)
                         result = sock.connect_ex((postgres_host, postgres_port))
                         sock.close()
-                        
+
                         if result == 0:
-                            print(f"[WindowsOptimization] PostgreSQLが接続可能になりました ({waited}秒後)")
+                            logger.info(
+                                "PostgreSQL accepted connections after %ss",
+                                waited,
+                            )
                             return True
                     except Exception:
                         pass
@@ -333,41 +388,50 @@ class WindowsOptimization:
                     time.sleep(wait_interval)
                     waited += wait_interval
                 
-                print(f"[WindowsOptimization] ⚠️ PostgreSQL接続待機がタイムアウト ({max_wait}秒)")
+                logger.warning(
+                    "PostgreSQL did not accept connections within %ss; check the service and port",
+                    max_wait,
+                )
                 return False
             else:
                 error_msg = start_result.stderr.strip() if start_result.stderr else start_result.stdout.strip()
-                
+                error_msg = " ".join(error_msg.split())[:300]
+
                 # 管理者権限が必要な場合
                 if 'アクセスが拒否されました' in error_msg or 'Access is denied' in error_msg:
-                    print(f"[WindowsOptimization] ⚠️ PostgreSQLサービスの起動に管理者権限が必要です")
-                    print(f"[WindowsOptimization] 管理者権限でコマンドプロンプトを開き、以下を実行してください:")
-                    print(f"[WindowsOptimization]   net start {service_name}")
+                    logger.warning(
+                        "PostgreSQL service start requires administrator privileges; run 'net start %s' as administrator",
+                        service_name,
+                    )
                 else:
-                    print(f"[WindowsOptimization] ⚠️ PostgreSQLサービスの起動に失敗: {error_msg}")
-                
+                    logger.warning(
+                        "PostgreSQL service could not be started%s",
+                        f": {error_msg}" if error_msg else "",
+                    )
+
                 return False
-                
+
         except subprocess.TimeoutExpired:
-            print(f"[WindowsOptimization] PostgreSQLサービスの起動がタイムアウトしました")
+            logger.warning("PostgreSQL service status/start command timed out")
             return False
         except Exception as e:
-            print(f"[WindowsOptimization] PostgreSQLサービス確認エラー: {e}")
+            logger.error(
+                "PostgreSQL service check failed",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             return False
     
     def print_optimization_summary(self) -> None:
         """最適化の適用状況を表示"""
         if not self.is_windows:
-            print("[WindowsOptimization] Windows環境ではないため、最適化はスキップされました")
+            logger.debug("Windows optimizations skipped on non-Windows host")
             return
-            
-        print("\n[WindowsOptimization] 適用された最適化:")
-        if self._applied_optimizations:
-            for opt in self._applied_optimizations:
-                print(f"  ✅ {opt}")
-        else:
-            print("  なし")
-        print()
+
+        logger.info(
+            "Windows optimization summary: %s",
+            self._applied_optimizations or "none",
+        )
 
 
 # グローバルインスタンス

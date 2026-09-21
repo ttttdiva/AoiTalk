@@ -24,6 +24,10 @@ import {
 } from "@/lib/tasks-page-utils";
 import type { FilterTab } from "@/lib/tasks-page-utils";
 import {
+  taskBrowseScopeKey,
+  type TaskBrowseScope,
+} from "@/lib/task-browse-scope";
+import {
   EMPTY_FILTER,
   type FilterConfig,
 } from "@/components/tasks/task-filter-builder";
@@ -45,6 +49,7 @@ import {
 } from "@/components/tasks/remote-task-dialog";
 import { TaskProjectTabs } from "@/components/tasks/task-project-tabs";
 import { TasksWorkspaceNavigation } from "@/components/tasks/tasks-workspace-navigation";
+import { TaskBrowseScopePicker } from "@/components/tasks/task-browse-scope-picker";
 import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -65,6 +70,7 @@ export default function TasksPage() {
     projects,
     allProjects,
     spaces,
+    participatingSpaces,
     participatingProjects,
     selectedProjectId,
     selectedProject,
@@ -76,6 +82,23 @@ export default function TasksPage() {
     refreshProjects,
     initialLoadComplete,
   } = projectContext;
+  const catalogSpaces = useMemo(
+    () => projectContext.accessibleSpaces ?? spaces ?? [],
+    [projectContext.accessibleSpaces, spaces],
+  );
+  const catalogProjects = useMemo(
+    () => projectContext.accessibleProjects ?? allProjects ?? projects ?? [],
+    [allProjects, projectContext.accessibleProjects, projects],
+  );
+  const normalSpaces = useMemo(
+    () => participatingSpaces ?? spaces ?? [],
+    [participatingSpaces, spaces],
+  );
+  const normalProjects = useMemo(
+    () => participatingProjects ?? projects ?? [],
+    [participatingProjects, projects],
+  );
+  const [browseScope, setBrowseScope] = useState<TaskBrowseScope | null>(null);
 
   useEffect(() => {
     if (appFilterProjectId && appFilterProjectId !== selectedProjectId) {
@@ -88,6 +111,8 @@ export default function TasksPage() {
     selectedProject,
     selectedSpaceId,
     selectedSpace,
+    initialLoadComplete,
+    browseScope,
   );
   // useTasksData は毎レンダー新しい戻り値オブジェクトを返すため、これを
   // TaskDetailModal へ渡す callback の依存配列に置くと、一覧更新のたびに
@@ -98,6 +123,7 @@ export default function TasksPage() {
     taskDataRef.current = taskData;
   }, [taskData]);
   const { fetchData, setTasks } = taskData;
+  const lastFetchedTaskScopeRef = useRef<string | null>(null);
   const [filter, setFilter] = useState<FilterTab>("all");
   const [showClosed, setShowClosed] = useState(false);
   const [showFuture, setShowFuture] = useState(false);
@@ -121,14 +147,6 @@ export default function TasksPage() {
   const activeProjects = useMemo(
     () => projects.filter((project) => projectTaskCounts.has(project.id)),
     [projectTaskCounts, projects],
-  );
-  // The workspace tree is an operational view.  Completed Projects remain
-  // available to other project-level surfaces, but should not disappear from
-  // the task scope merely because they have no tasks; only completion filters
-  // them out here.
-  const activeParticipatingProjects = useMemo(
-    () => participatingProjects.filter((project) => !project.is_completed),
-    [participatingProjects],
   );
   const projectIds = useMemo(
     () => new Set(projects.map((project) => project.id)),
@@ -159,16 +177,62 @@ export default function TasksPage() {
     customFilter,
   });
 
+  const handleTaskProjectChange = useCallback(
+    (nextProjectId: string, targetSpaceId?: string | null) => {
+      const nextProject = catalogProjects.find(
+        (project) => project.id === nextProjectId,
+      );
+      if (!nextProject) return;
+      if (!normalProjects.some((project) => project.id === nextProjectId)) {
+        // Explicit browse is route-local. Never push an admin-only target into
+        // ProjectContext or its normal localStorage contract.
+        setBrowseScope({ kind: "project", id: nextProjectId });
+        return;
+      }
+      setBrowseScope(null);
+      setProjectTabAndSelection(
+        nextProjectId,
+        targetSpaceId ?? nextProject.space_id ?? null,
+      );
+    },
+    [catalogProjects, normalProjects, setProjectTabAndSelection],
+  );
+
   const handleTaskSpaceChange = useCallback(
     (nextSpaceId: string) => {
+      const nextSpace = catalogSpaces.find((space) => space.id === nextSpaceId);
+      if (!nextSpace) return;
+      if (!normalSpaces.some((space) => space.id === nextSpaceId)) {
+        setBrowseScope({ kind: "space", id: nextSpaceId });
+        return;
+      }
+      setBrowseScope(null);
       // This is one user intent, not two independent state changes.  The
       // marker prevents useProjectTabs from restoring a remembered Project
       // tab after Context switches to the new Space.
       setSelectedSpaceId(nextSpaceId);
       setProjectTabAndSelection("all", nextSpaceId, { source: "space-wide" });
     },
-    [setProjectTabAndSelection, setSelectedSpaceId],
+    [catalogSpaces, normalSpaces, setProjectTabAndSelection, setSelectedSpaceId],
   );
+
+  const previousNormalSelectionRef = useRef({
+    selectedSpaceId,
+    selectedProjectId,
+  });
+  useEffect(() => {
+    const previous = previousNormalSelectionRef.current;
+    const changed =
+      previous.selectedSpaceId !== selectedSpaceId ||
+      previous.selectedProjectId !== selectedProjectId;
+    previousNormalSelectionRef.current = { selectedSpaceId, selectedProjectId };
+    if (changed && browseScope) {
+      // Header navigation is an explicit return to normal scope. The effect
+      // also covers header changes originating outside this page.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setBrowseScope(null);
+    }
+  }, [browseScope, selectedProjectId, selectedSpaceId]);
 
   useEffect(() => {
     function handleSwitchSpace(e: Event) {
@@ -196,7 +260,7 @@ export default function TasksPage() {
 
   const handleProjectColorChange = useCallback(
     async (projectId: string, color: string) => {
-      const project = participatingProjects.find((item) => item.id === projectId);
+    const project = normalProjects.find((item) => item.id === projectId);
       if (
         !project ||
         project.source === "remote" ||
@@ -207,7 +271,7 @@ export default function TasksPage() {
       await taskApi.updateProject(projectId, { color: color || null });
       await Promise.all([refreshSpaces(), refreshProjects()]);
     },
-    [participatingProjects, refreshProjects, refreshSpaces],
+    [normalProjects, refreshProjects, refreshSpaces],
   );
 
   useEffect(() => {
@@ -252,8 +316,11 @@ export default function TasksPage() {
   }, []);
   useEffect(() => {
     if (!initialLoadComplete) return;
-    void fetchData({ forceLoading: true });
-  }, [fetchData, initialLoadComplete]);
+    const scopeKey = taskBrowseScopeKey(browseScope);
+    if (lastFetchedTaskScopeRef.current === scopeKey) return;
+    lastFetchedTaskScopeRef.current = scopeKey;
+    void taskDataRef.current.fetchData({ forceLoading: true });
+  }, [browseScope, initialLoadComplete]);
   useEffect(() => {
     const handleRefresh = () => fetchData({ notifySidebar: false });
     window.addEventListener("task-list-refresh", handleRefresh);
@@ -339,6 +406,8 @@ export default function TasksPage() {
   const remoteReadOnly =
     selectedProject?.source === "remote" ||
     selectedProject?.can_write === false;
+  const browseReadOnly = Boolean(browseScope);
+  const interactionReadOnly = remoteReadOnly || browseReadOnly;
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const selectedTaskIdRef = useRef<string | null>(null);
   const [loadedDetailTask, setLoadedDetailTask] = useState<Task | null>(null);
@@ -348,14 +417,16 @@ export default function TasksPage() {
   const selectedSpaceIdRef = useRef(selectedSpaceId);
   const selectedSpaceRef = useRef(selectedSpace);
   const selectedProjectRef = useRef(selectedProject);
-  const projectsRef = useRef(allProjects?.length ? allProjects : projects);
+  const projectsRef = useRef(catalogProjects);
   const draftTaskRef = useRef(draftTask);
+  const browseScopeRef = useRef<TaskBrowseScope | null>(browseScope);
   useLayoutEffect(() => {
     selectedSpaceIdRef.current = selectedSpaceId;
     selectedSpaceRef.current = selectedSpace;
     selectedProjectRef.current = selectedProject;
-    projectsRef.current = allProjects?.length ? allProjects : projects;
+    projectsRef.current = catalogProjects;
     draftTaskRef.current = draftTask;
+    browseScopeRef.current = browseScope;
   }, [
     allProjects,
     draftTask,
@@ -363,6 +434,8 @@ export default function TasksPage() {
     selectedProject,
     selectedSpace,
     selectedSpaceId,
+    catalogProjects,
+    browseScope,
   ]);
 
   const openTaskById = useCallback(
@@ -392,8 +465,21 @@ export default function TasksPage() {
     setSelectedOccurrenceContext(null);
     setDraftTask(nextDraft);
   }, []);
+  const handleBrowseScopeChange = useCallback(
+    (nextScope: TaskBrowseScope | null) => {
+      if (nextScope) {
+        selectedTaskIdRef.current = null;
+        setSelectedTaskId(null);
+        setLoadedDetailTask(null);
+        setSelectedOccurrenceContext(null);
+        setDraftTask(null);
+      }
+      setBrowseScope(nextScope);
+    },
+    [],
+  );
   const handleCreateNewTask = useCallback(() => {
-    if (!selectedProjectId || remoteReadOnly) return;
+    if (!selectedProjectId || interactionReadOnly) return;
     startDraft({
       project_id: projectTab !== "all" ? projectTab : selectedProjectId,
       title: "",
@@ -401,7 +487,7 @@ export default function TasksPage() {
     });
   }, [
     projectTab,
-    remoteReadOnly,
+    interactionReadOnly,
     selectedProjectId,
     startDraft,
     taskNotificationsDefaultEnabled,
@@ -417,16 +503,18 @@ export default function TasksPage() {
       <TasksWorkspaceNavigation
         viewMode={viewMode}
         onViewModeChange={setViewMode}
-        spaces={spaces}
-        projects={activeParticipatingProjects}
+        spaces={catalogSpaces}
+        projects={catalogProjects.filter((project) => !project.is_completed)}
         selectedSpaceId={selectedSpaceId}
         onSpaceChange={handleTaskSpaceChange}
         projectTab={projectTab}
         activeProjects={activeProjects}
         projectTaskCounts={projectTaskCounts}
-        onProjectChange={setProjectTabAndSelection}
+        onProjectChange={handleTaskProjectChange}
         onSpaceColorChange={handleSpaceColorChange}
         onProjectColorChange={handleProjectColorChange}
+        browseScope={browseScope}
+        onResetBrowse={() => handleBrowseScopeChange(null)}
       />
     ),
   });
@@ -447,7 +535,7 @@ export default function TasksPage() {
       const detailId = eventTaskId ?? params.get("detail");
       const isNew = params.get("new");
       if (detailId) openTaskById(detailId, null);
-      if (isNew && selectedProjectId && !remoteReadOnly) {
+      if (isNew && selectedProjectId && !interactionReadOnly) {
         startDraft({
           project_id: selectedProjectId,
           title: "",
@@ -466,13 +554,14 @@ export default function TasksPage() {
     return () => window.removeEventListener("task-detail-open", checkParams);
   }, [
     openTaskById,
-    remoteReadOnly,
+    interactionReadOnly,
     selectedProjectId,
     startDraft,
     taskNotificationsDefaultEnabled,
   ]);
   const handleDetailTaskUpdated = useCallback(
     (updated?: Task | null, options?: { removedTaskId?: string }) => {
+      if (browseScopeRef.current) return;
       const currentTaskId = selectedTaskIdRef.current;
       const isStaleCallback = currentTaskId !== selectedTaskId;
       const currentTaskData = taskDataRef.current;
@@ -549,6 +638,7 @@ export default function TasksPage() {
   const handleDetailTaskLoaded = useCallback((loaded: Task) => {
     if (selectedTaskIdRef.current !== loaded.id) return;
     setLoadedDetailTask(loaded);
+    if (browseScopeRef.current) return;
     const currentTaskData = taskDataRef.current;
     if (currentTaskData.tasks.some((task) => task.id === loaded.id)) {
       currentTaskData.applyTaskPatchLocally(loaded.id, loaded);
@@ -559,7 +649,7 @@ export default function TasksPage() {
       ? loadedDetailTask
       : taskData.tasks.find((task) => task.id === selectedTaskId)
     : null;
-  const availableProjects = allProjects?.length ? allProjects : projects;
+  const availableProjects = catalogProjects;
   const selectedTaskProject = selectedTask
     ? availableProjects.find(
         (project) => project.id === selectedTask.project_id,
@@ -567,13 +657,15 @@ export default function TasksPage() {
     : null;
   const selectedRemoteTask =
     selectedTask?.source === "remote" ? selectedTask : null;
-  const selectedTaskReadOnly = selectedTaskId
-    ? !selectedTask ||
+  const selectedTaskReadOnly = browseReadOnly
+    ? true
+    : selectedTaskId
+      ? !selectedTask ||
       !selectedTaskProject ||
       selectedTask.source === "remote" ||
       selectedTaskProject.source === "remote" ||
       selectedTaskProject.can_write === false
-    : remoteReadOnly;
+      : remoteReadOnly;
   const remoteDialogTarget: RemoteTaskDialogTarget | null =
     selectedRemoteTask?.remote_server_id && selectedRemoteTask.resource_id
       ? {
@@ -589,12 +681,17 @@ export default function TasksPage() {
           endAt: selectedRemoteTask.end_at,
         }
       : null;
-  const currentScopeLabel =
-    selectedProject?.name ??
-    (selectedSpaceId
-      ? (spaces.find((space) => space.id === selectedSpaceId)?.name ??
-        "スペース")
-      : "すべてのスペース");
+  const currentScopeLabel = browseScope
+    ? browseScope.kind === "project"
+      ? catalogProjects.find((project) => project.id === browseScope.id)?.name ??
+        "プロジェクト"
+      : catalogSpaces.find((space) => space.id === browseScope.id)?.name ??
+        "スペース"
+    : selectedProject?.name ??
+      (selectedSpaceId
+        ? (spaces.find((space) => space.id === selectedSpaceId)?.name ??
+          "スペース")
+        : "すべてのスペース");
 
   return (
     <div
@@ -628,7 +725,7 @@ export default function TasksPage() {
             variant="outline"
             size="sm"
             onClick={handleCreateNewTask}
-            disabled={remoteReadOnly}
+            disabled={interactionReadOnly}
             className="hidden"
           >
             <Plus className="size-4" />
@@ -653,7 +750,7 @@ export default function TasksPage() {
           >
             <SlidersHorizontal className="size-4 md:hidden" />
             <span className="max-w-28 truncate md:hidden">
-              {selectedProject?.name ?? "全体"}
+              {currentScopeLabel}
             </span>
             {projectTabsCollapsed ? (
               <ChevronDown className="hidden size-4 md:block" />
@@ -662,7 +759,7 @@ export default function TasksPage() {
             )}
           </button>
         </div>
-        {!projectTabsCollapsed && (
+        {!projectTabsCollapsed && !browseScope && (
           <div className="md:hidden">
             <TaskProjectTabs
               projectTab={projectTab}
@@ -682,6 +779,15 @@ export default function TasksPage() {
         <div className="md:hidden">
           <TaskViewSwitcher value={viewMode} onChange={setViewMode} />
         </div>
+        <TaskBrowseScopePicker
+          className="w-full md:hidden"
+          browseScope={browseScope}
+          projects={catalogProjects}
+          spaces={catalogSpaces}
+          participatingProjects={normalProjects}
+          participatingSpaces={normalSpaces}
+          onBrowseScopeChange={handleBrowseScopeChange}
+        />
       </div>
       <div className="min-h-0 flex-1">
         {storageReady && viewMode === "list" ? (
@@ -719,12 +825,13 @@ export default function TasksPage() {
             draftTask={draftTask}
             openTask={openTask}
             openTaskById={openTaskById}
+            browseScope={browseScope}
           />
         ) : null}
         {storageReady && viewMode === "schedule" ? (
           <TaskScheduleView
             tasks={taskData.tasks}
-            projects={allProjects?.length ? allProjects : projects}
+            projects={catalogProjects}
             selectedProjectId={selectedProjectId}
             appFilterId={appFilterId}
             appTaskIds={appTaskIds}
@@ -741,6 +848,7 @@ export default function TasksPage() {
             loadError={taskData.loadError}
             remoteReadOnly={remoteReadOnly}
             onOpenTask={openTask}
+            browseScope={browseScope}
           />
         ) : null}
       </div>
@@ -763,6 +871,7 @@ export default function TasksPage() {
           onTaskLoaded={handleDetailTaskLoaded}
           onOpenTask={(taskId) => openTaskById(taskId, null)}
           occurrenceContext={selectedOccurrenceContext}
+          browseScope={browseScope}
         />
       )}
     </div>

@@ -29,6 +29,7 @@ Discord Developer Portal で以下の権限を設定します：
 ### Bot Permissions:
 - Send Messages
 - Read Message History
+- Add Reactions
 - Use Application Commands
 - Connect (音声チャンネル用)
 - Speak (音声チャンネル用)
@@ -36,7 +37,18 @@ Discord Developer Portal で以下の権限を設定します：
 
 ### Privileged Gateway Intents:
 - Message Content Intent
-- Server Members Intent
+
+`Server Members Intent` は現在のAoiTalk Discord実装では必須ではありません。
+不要な特権Intentは有効化しないでください。
+
+### Discord Voice / DAVE
+
+Discordは2026年3月から音声・映像通話でDAVE E2EEを必須化しています。
+AoiTalkのVC受信には `discord.py 2.7.x` と、receive-side DAVE対応を含む
+固定版 `discord-ext-voice-recv` が必要です。依存は `pyproject.toml` に固定済みです。
+
+既存venvを使っている場合は依存更新後に、実際のVCで「接続できる」だけでなく
+PCMが破損せずSTTまで到達することを確認してください。
 
 ## 4. Bot をサーバーに招待
 

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeFieldValues,
@@ -19,6 +19,7 @@ import {
 import {
   getKnowledgeNodeChildMetadata,
   getDocsNodeAccess,
+  docsNodeVisibleOrBridge,
   requireDocsNode,
   serializeFieldValue,
   serializeNode,
@@ -38,7 +39,7 @@ function outlineBodyJson(value: unknown) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const source = value as Record<string, unknown>;
   const body = Object.fromEntries(
-    ["format", "block_type", "checked"]
+    ["format", "block_type", "checked", "blank"]
       .filter((key) => key in source)
       .map((key) => [key, source[key]]),
   ) as Record<string, unknown>;
@@ -100,30 +101,7 @@ export async function GET(
   // Keep an invisible legacy blank parent in the lazy-load payload when it
   // has meaningful descendants; the client hoists those descendants instead
   // of making the subtree unreachable.
-  const nodeVisibleOrBridge = sql<boolean>`(
-    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
-    OR EXISTS (
-      WITH RECURSIVE blank_descendants AS (
-        SELECT id, parent_id, title, archived_at, docs_library_id,
-               ARRAY[id]::uuid[] AS visited_path, 0 AS depth
-        FROM knowledge_nodes
-        WHERE parent_id = ${knowledgeNodes.id}
-          AND docs_library_id = ${access.workspace.id}
-        UNION ALL
-        SELECT child.id, child.parent_id, child.title, child.archived_at,
-               child.docs_library_id,
-               ancestor.visited_path || ARRAY[child.id]::uuid[], ancestor.depth + 1
-        FROM knowledge_nodes AS child
-        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
-        WHERE child.docs_library_id = ${access.workspace.id}
-          AND ancestor.depth < 512
-          AND NOT child.id = ANY(ancestor.visited_path)
-      )
-      SELECT 1 FROM blank_descendants
-      WHERE archived_at IS NULL
-        AND regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
-    )
-  )`;
+  const nodeVisibleOrBridge = docsNodeVisibleOrBridge(access.workspace.id);
   const notLegacyEmailBlank = sql<boolean>`NOT (
     ${knowledgeNodes.title} = '（空行）'
     AND EXISTS (
@@ -146,87 +124,138 @@ export async function GET(
       SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
     )
   )`;
-  const nodeCursorCondition = cursor
+  type StreamCursor = { sortOrder: number; itemId: string } | null;
+  const nodeCursorCondition = (after: StreamCursor) => after
     ? or(
-        gt(nodeSort, cursor.sortOrder),
-        and(eq(nodeSort, cursor.sortOrder), gt(knowledgeNodes.id, cursor.itemId)),
+        gt(nodeSort, after.sortOrder),
+        and(eq(nodeSort, after.sortOrder), gt(knowledgeNodes.id, after.itemId)),
       )
     : undefined;
-  const placementCursorCondition = cursor
+  const placementCursorCondition = (after: StreamCursor) => after
     ? or(
-        gt(placementSort, cursor.sortOrder),
-        and(eq(placementSort, cursor.sortOrder), gt(knowledgeNodePlacements.id, cursor.itemId)),
+        gt(placementSort, after.sortOrder),
+        and(eq(placementSort, after.sortOrder), gt(knowledgeNodePlacements.id, after.itemId)),
       )
     : undefined;
+  const fetchDirectRows = (after: StreamCursor) => db
+    .select()
+    .from(knowledgeNodes)
+    .where(and(
+      eq(knowledgeNodes.docsLibraryId, access.workspace.id),
+      eq(knowledgeNodes.parentId, id),
+      isNull(knowledgeNodes.archivedAt),
+      nodeVisibleOrBridge,
+      notLegacyEmailBlank,
+      nodeCursorCondition(after),
+    ))
+    .orderBy(asc(nodeSort), asc(knowledgeNodes.id))
+    .limit(candidateLimit);
+  const fetchPlacementRows = (after: StreamCursor) => db
+    .select({ placement: knowledgeNodePlacements, node: knowledgeNodes })
+    .from(knowledgeNodePlacements)
+    .innerJoin(knowledgeNodes, eq(knowledgeNodePlacements.nodeId, knowledgeNodes.id))
+    .where(and(
+      eq(knowledgeNodePlacements.parentNodeId, id),
+      eq(knowledgeNodes.docsLibraryId, access.workspace.id),
+      // A structural child is already represented by the direct stream.  Do
+      // not emit its placement twin: because the two streams have independent
+      // cursors, allowing both can duplicate one node across page boundaries.
+      or(isNull(knowledgeNodes.parentId), ne(knowledgeNodes.parentId, id)),
+      isNull(knowledgeNodes.archivedAt),
+      nodeVisibleOrBridge,
+      notLegacyEmailBlank,
+      placementCursorCondition(after),
+    ))
+    .orderBy(asc(placementSort), asc(knowledgeNodePlacements.id))
+    .limit(candidateLimit);
 
-  const [directRows, placementRows] = await Promise.all([
-    db
-      .select()
-      .from(knowledgeNodes)
-      .where(and(
-        eq(knowledgeNodes.docsLibraryId, access.workspace.id),
-        eq(knowledgeNodes.parentId, id),
-        isNull(knowledgeNodes.archivedAt),
-        nodeVisibleOrBridge,
-        notLegacyEmailBlank,
-        nodeCursorCondition,
-      ))
-      .orderBy(asc(nodeSort), asc(knowledgeNodes.id))
-      .limit(candidateLimit),
-    db
-      .select({ placement: knowledgeNodePlacements, node: knowledgeNodes })
-      .from(knowledgeNodePlacements)
-      .innerJoin(knowledgeNodes, eq(knowledgeNodePlacements.nodeId, knowledgeNodes.id))
-      .where(and(
-        eq(knowledgeNodePlacements.parentNodeId, id),
-        eq(knowledgeNodes.docsLibraryId, access.workspace.id),
-        isNull(knowledgeNodes.archivedAt),
-        nodeVisibleOrBridge,
-        notLegacyEmailBlank,
-        placementCursorCondition,
-      ))
-      .orderBy(asc(placementSort), asc(knowledgeNodePlacements.id))
-      .limit(candidateLimit),
-  ]);
+  // ACL is intentionally resolved after the broad candidate query because a
+  // shared personal subtree can be visible even when its project_id is not.
+  // Do not let an inaccessible prefix consume the only page: stream both
+  // ordered sources until `limit` visible items (or both sources' ends) are
+  // reached.  The cursor advances over the last *examined* raw item, so the
+  // next request cannot loop over an inaccessible prefix.
+  let directRows = await fetchDirectRows(cursor);
+  let placementRows = await fetchPlacementRows(cursor);
+  let directExhausted = directRows.length < candidateLimit;
+  let placementExhausted = placementRows.length < candidateLimit;
+  let directAfter: StreamCursor = directRows.length > 0
+    ? { sortOrder: directRows.at(-1)?.sortOrder ?? 0, itemId: directRows.at(-1)?.id ?? "" }
+    : cursor;
+  let placementAfter: StreamCursor = placementRows.length > 0
+    ? { sortOrder: placementRows.at(-1)?.placement.sortOrder ?? 0, itemId: placementRows.at(-1)?.placement.id ?? "" }
+    : cursor;
+  const accessByNodeId = new Map<string, Awaited<ReturnType<typeof getDocsNodeAccess>>>();
+  const permissionByNodeId = new Map<string, "owner" | "read" | "write">();
+  const selected: ChildItem[] = [];
+  const selectedNodeIds = new Set<string>();
+  let lastExamined: StreamCursor = null;
 
-  const [directAccessRows, placementAccessRows] = await Promise.all([
-    Promise.all(directRows.map((node) => getDocsNodeAccess(node.id, user))),
-    Promise.all(placementRows.map(({ node }) => getDocsNodeAccess(node.id, user))),
-  ]);
-  const visibleDirectIds = new Set(
-    directAccessRows
-      .filter((item): item is NonNullable<typeof item> => Boolean(item))
-      .map((item) => item.node.id),
-  );
-  const visiblePlacementIds = new Set(
-    placementAccessRows
-      .filter((item): item is NonNullable<typeof item> => Boolean(item))
-      .map((item) => item.node.id),
-  );
-  const permissionByNodeId = new Map(
-    [...directAccessRows, ...placementAccessRows]
-      .filter((item): item is NonNullable<typeof item> => Boolean(item))
-      .map((item) => [item.node.id, item.permission]),
-  );
-  const items: ChildItem[] = [
-    ...directRows.filter((node) => visibleDirectIds.has(node.id)).map((node) => ({
-      itemId: node.id,
-      sortOrder: node.sortOrder ?? 0,
-      node,
-      placement: null,
-    })),
-    ...placementRows.filter(({ node }) => visiblePlacementIds.has(node.id)).map(({ node, placement }) => ({
-      itemId: placement.id,
-      sortOrder: placement.sortOrder ?? 0,
-      node,
-      placement,
-    })),
-  ].sort((a, b) => a.sortOrder - b.sortOrder || a.itemId.localeCompare(b.itemId));
-  const selected = items.slice(0, limit);
-  const hasMore = items.length > limit || directRows.length >= candidateLimit || placementRows.length >= candidateLimit;
-  const last = selected.at(-1);
-  const nextCursor = hasMore && last
-    ? encodeDocsChildrenCursor({ sortOrder: last.sortOrder, itemId: last.itemId })
+  while (selected.length < limit) {
+    if (directRows.length === 0 && !directExhausted) {
+      directRows = await fetchDirectRows(directAfter);
+      directExhausted = directRows.length < candidateLimit;
+      if (directRows.length > 0) {
+        const tail = directRows.at(-1)!;
+        directAfter = { sortOrder: tail.sortOrder ?? 0, itemId: tail.id };
+      }
+    }
+    if (placementRows.length === 0 && !placementExhausted) {
+      placementRows = await fetchPlacementRows(placementAfter);
+      placementExhausted = placementRows.length < candidateLimit;
+      if (placementRows.length > 0) {
+        const tail = placementRows.at(-1)!;
+        placementAfter = { sortOrder: tail.placement.sortOrder ?? 0, itemId: tail.placement.id };
+      }
+    }
+    if (directRows.length === 0 && placementRows.length === 0) break;
+
+    const directHead = directRows[0];
+    const placementHead = placementRows[0];
+    const useDirect = Boolean(
+      directHead
+      && (!placementHead
+        || (directHead.sortOrder ?? 0) < (placementHead.placement.sortOrder ?? 0)
+        || (directHead.sortOrder ?? 0) === (placementHead.placement.sortOrder ?? 0)
+          && directHead.id.localeCompare(placementHead.placement.id) <= 0),
+    );
+    const item: ChildItem = useDirect
+      ? {
+          itemId: directHead.id,
+          sortOrder: directHead.sortOrder ?? 0,
+          node: directHead,
+          placement: null,
+        }
+      : {
+          itemId: placementHead!.placement.id,
+          sortOrder: placementHead!.placement.sortOrder ?? 0,
+          node: placementHead!.node,
+          placement: placementHead!.placement,
+        };
+    if (useDirect) directRows = directRows.slice(1);
+    else placementRows = placementRows.slice(1);
+    lastExamined = { sortOrder: item.sortOrder, itemId: item.itemId };
+
+    let nodeAccess = accessByNodeId.get(item.node.id);
+    if (nodeAccess === undefined) {
+      nodeAccess = await getDocsNodeAccess(item.node.id, user);
+      accessByNodeId.set(item.node.id, nodeAccess);
+    }
+    if (!nodeAccess) continue;
+    // A node can have both its structural parent and a placement reference
+    // under the same requested parent.  Count it once per page; the stream
+    // cursor still advances over the duplicate raw item so the next page does
+    // not repeat it.
+    if (selectedNodeIds.has(item.node.id)) continue;
+    permissionByNodeId.set(item.node.id, nodeAccess.permission);
+    selectedNodeIds.add(item.node.id);
+    selected.push(item);
+  }
+
+  const hasMore = directRows.length > 0 || placementRows.length > 0
+    || !directExhausted || !placementExhausted;
+  const nextCursor = hasMore && lastExamined
+    ? encodeDocsChildrenCursor(lastExamined)
     : null;
   const nodes = Array.from(new Map(selected.map((item) => [item.node.id, item.node])).values());
   const nodeIds = nodes.map((node) => node.id);

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "@/db";
-import { knowledgeFieldValues, knowledgeFields } from "@/db/schema";
+import { knowledgeFieldValues, knowledgeFields, knowledgeNodes, projects } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import {
   applyDocsTaskFieldProxies,
@@ -14,6 +14,7 @@ import {
 } from "@/lib/server/knowledge-docs-utils";
 import {
   lockAndAssertGenericDocsMutationAllowed,
+  ManagedDocsAccessError,
   ManagedDocsMutationError,
 } from "@/lib/server/managed-docs-policy";
 
@@ -26,6 +27,14 @@ class ForeignDocsFieldError extends Error {
 
   constructor() {
     super("別のDocs Libraryのフィールドはこのnodeに設定できません");
+  }
+}
+
+class CanonicalDocsFieldError extends Error {
+  readonly status = 409;
+
+  constructor() {
+    super("案件情報の正本nodeのProject/Page Role fieldは専用Project APIで管理されます");
   }
 }
 
@@ -42,6 +51,13 @@ export async function PUT(
   const access = await requireDocsNode(id, user, "write");
   if (!access) {
     return NextResponse.json({ detail: "nodeが見つからないか権限がありません" }, { status: 404 });
+  }
+  const systemKey = String(access.node.systemKey ?? "").trim();
+  if (systemKey === "project_information_root" || systemKey.startsWith("project_information:")) {
+    return NextResponse.json(
+      { detail: "案件情報の正本nodeのProject/Page Role fieldは専用Project APIで管理されます" },
+      { status: 409 },
+    );
   }
 
   const body = await request.json().catch(() => ({}));
@@ -67,7 +83,40 @@ export async function PUT(
   };
   try {
     result = await db.transaction(async (tx) => {
-      await lockAndAssertGenericDocsMutationAllowed(access.node, tx);
+      if (typeof tx.execute === "function" || access.node.projectId || systemKey) {
+        const pointerSelect = tx.select({ id: projects.id });
+        const pointerFrom = pointerSelect.from(projects);
+        const pointerWhere = pointerFrom.where(eq(projects.knowledgeNodeId, access.node.id));
+        const pointerLimited = typeof pointerWhere.limit === "function"
+          ? pointerWhere.limit(2)
+          : pointerWhere;
+        const pointerRows = typeof pointerLimited.for === "function"
+          ? await pointerLimited.for("update")
+          : await pointerLimited;
+        if (pointerRows.length > 0) {
+          throw new CanonicalDocsFieldError();
+        }
+      }
+      await lockAndAssertGenericDocsMutationAllowed(access.node, tx, user);
+      // The reverse-pointer check above is only a preflight. Recheck the
+      // canonical identity after the managed-policy lock, because a Project
+      // repair may have assigned this node while the first query was running.
+      const postPolicyPointers = await tx
+        .select({ id: projects.id })
+        .from(projects)
+        .where(eq(projects.knowledgeNodeId, access.node.id));
+      const [postPolicyNode] = await tx
+        .select({ systemKey: knowledgeNodes.systemKey })
+        .from(knowledgeNodes)
+        .where(eq(knowledgeNodes.id, access.node.id));
+      const postPolicySystemKey = String(postPolicyNode?.systemKey ?? "").trim();
+      if (
+        postPolicyPointers.length > 0
+        || postPolicySystemKey === "project_information_root"
+        || postPolicySystemKey.startsWith("project_information:")
+      ) {
+        throw new CanonicalDocsFieldError();
+      }
 
       const fields = await tx
         .select()
@@ -127,13 +176,19 @@ export async function PUT(
       return { rows, fields, proxiedFieldIds };
     });
   } catch (error) {
-    if (error instanceof ManagedDocsMutationError || error instanceof ForeignDocsFieldError) {
+    if (
+      error instanceof ManagedDocsMutationError
+      || error instanceof ManagedDocsAccessError
+      || error instanceof ForeignDocsFieldError
+      || error instanceof CanonicalDocsFieldError
+    ) {
       return NextResponse.json({ detail: error.message }, { status: error.status });
     }
+    console.error("Docs field values update failed", { nodeId: id, error });
     return NextResponse.json(
       {
         detail: "タスク連携フィールドの更新に失敗しました",
-        error: error instanceof Error ? error.message : String(error),
+        code: "docs_field_update_failed",
       },
       { status: 502 },
     );

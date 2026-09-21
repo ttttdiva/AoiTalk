@@ -1,7 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useState, type RefObject } from "react";
-import { chatApi, type ContextSnapshot } from "@/lib/chat-api";
+import {
+  chatApi,
+  type ContextCapabilities,
+  type ContextManifest,
+  type ContextManifestInspector,
+  type ContextSnapshot,
+  type ContextSnapshotBinding,
+} from "@/lib/chat-api";
 
 type UseContextSnapshotArgs = {
   activeSessionId: string | null;
@@ -29,6 +36,14 @@ export function useContextSnapshot({
 }: UseContextSnapshotArgs) {
   const [contextSnapshot, setContextSnapshot] =
     useState<ContextSnapshot | null>(null);
+  const [contextManifest, setContextManifest] =
+    useState<ContextManifest | null>(null);
+  const [contextInspector, setContextInspector] =
+    useState<ContextManifestInspector | null>(null);
+  const [contextCapabilities, setContextCapabilities] =
+    useState<ContextCapabilities | null>(null);
+  const [contextBinding, setContextBinding] =
+    useState<ContextSnapshotBinding | null>(null);
   const [contextSnapshotStatus, setContextSnapshotStatus] = useState("idle");
 
   const refreshContextSnapshot = useCallback(
@@ -43,18 +58,74 @@ export function useContextSnapshot({
         })
         .then((result) => {
           if (activeSessionIdRef.current !== sessionId) return;
-          setContextSnapshot(result.snapshot ?? null);
+          // The response carries an explicit server binding.  Prefer the
+          // response's session/message IDs over provider metadata and reject
+          // a late result whose binding no longer matches the active session.
+          const binding = result.binding ?? result.turn_binding ?? null;
+          const responseSessionId =
+            binding?.session_id ?? result.session_id ?? result.snapshot?.session_id;
+          if (responseSessionId && responseSessionId !== sessionId) {
+            setContextSnapshot(null);
+            setContextManifest(null);
+            setContextInspector(null);
+            setContextCapabilities(null);
+            setContextBinding(null);
+            setContextSnapshotStatus("unavailable");
+            return;
+          }
+          if (
+            binding &&
+            binding.active_branch !== true &&
+            (result.inspector || result.authorized_references?.length)
+          ) {
+            setContextSnapshot(null);
+            setContextManifest(null);
+            setContextInspector(null);
+            setContextCapabilities(null);
+            setContextBinding(null);
+            setContextSnapshotStatus("unavailable");
+            return;
+          }
+          const manifest = includeProjectContext
+            ? (result.context_manifest ?? result.snapshot?.context_manifest ?? null)
+            : null;
+          const inspector = includeProjectContext
+            ? (result.inspector ?? result.snapshot?.inspector ?? null)
+            : null;
+          const capabilities =
+            result.capabilities ?? result.snapshot?.capabilities ?? null;
+          const authorizedReferences = includeProjectContext
+            ? (result.authorized_references ?? [])
+            : [];
+          const nextSnapshot = result.snapshot
+            ? {
+                ...result.snapshot,
+                ...(manifest ? { context_manifest: manifest } : { context_manifest: null }),
+                ...(inspector ? { inspector } : { inspector: null }),
+                ...(capabilities ? { capabilities } : { capabilities: null }),
+                authorized_references: authorizedReferences,
+              }
+            : null;
+          setContextSnapshot(nextSnapshot);
+          setContextManifest(manifest);
+          setContextInspector(inspector);
+          setContextCapabilities(capabilities);
+          setContextBinding(binding);
           setContextSnapshotStatus(
-            result.status ?? (result.snapshot ? "available" : "unavailable"),
+            result.status ?? (nextSnapshot ? "available" : "unavailable"),
           );
         })
         .catch((err) => {
           if (activeSessionIdRef.current !== sessionId) return;
           console.warn("コンテキストSnapshotの取得に失敗:", err);
           setContextSnapshot(null);
+          setContextManifest(null);
+          setContextInspector(null);
+          setContextCapabilities(null);
+          setContextBinding(null);
           setContextSnapshotStatus("unavailable");
         }),
-    [activeSessionIdRef],
+    [activeSessionIdRef, includeProjectContext],
   );
 
   // セッション ID の変化に応じた状態リセットを、React 標準の「描画中に前回値と比較」
@@ -66,9 +137,38 @@ export function useContextSnapshot({
   >(undefined);
   if (activeSessionId !== prevActiveSessionId) {
     setPrevActiveSessionId(activeSessionId);
-    if (!activeSessionId) {
-      setContextSnapshot(null);
-      setContextSnapshotStatus("unavailable");
+    // Do not keep the previous session's manifest visible while the new
+    // request is in flight.  This is especially important for forked chats,
+    // where copied history intentionally has no current-turn Manifest.
+    setContextSnapshot(null);
+    setContextManifest(null);
+    setContextInspector(null);
+    setContextCapabilities(null);
+    setContextBinding(null);
+    setContextSnapshotStatus(activeSessionId ? "idle" : "unavailable");
+  }
+
+  const [prevIncludeProjectContext, setPrevIncludeProjectContext] = useState<
+    boolean | undefined
+  >(undefined);
+  if (includeProjectContext !== prevIncludeProjectContext) {
+    setPrevIncludeProjectContext(includeProjectContext);
+    if (!includeProjectContext) {
+      // Project Context can be toggled while a previous response is still
+      // mounted. Remove the old Manifest synchronously so OFF never flashes
+      // stale project/work evidence during the refresh.
+      setContextManifest(null);
+      setContextInspector(null);
+      setContextSnapshot((previous) =>
+        previous
+          ? {
+              ...previous,
+              context_manifest: null,
+              inspector: null,
+              authorized_references: [],
+            }
+          : previous,
+      );
     }
   }
 
@@ -85,5 +185,12 @@ export function useContextSnapshot({
     refreshContextSnapshot,
   ]);
 
-  return { contextSnapshot, contextSnapshotStatus };
+  return {
+    contextSnapshot,
+    contextSnapshotStatus,
+    contextManifest,
+    contextInspector,
+    contextCapabilities,
+    contextBinding,
+  };
 }

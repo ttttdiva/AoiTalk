@@ -13,14 +13,44 @@ from collections.abc import Mapping
 from typing import Any, List, Optional
 
 import httpx
+from types import SimpleNamespace
 
 from ....services.outbound_privacy_service import OutboundPrivacyGateway
 from ....services.turn_context import get_turn_context
+from ....services.search_egress_policy import (
+    SearchEgressPreconditionError,
+    assert_search_egress_approved,
+)
 
 logger = logging.getLogger("x-search-mcp")
 
 XAI_PROVIDER = "xai"
 XAI_REQUEST_TYPE = "search"
+
+
+def _xai_egress_descriptor(model: str, destination: str):
+    """Create the canonical descriptor lazily for the xAI transport."""
+
+    try:
+        from ....services.outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="grok_x_search",
+            transport="httpx.AsyncClient.post",
+            destination=destination,
+            provider="grok",
+            tool="x_search",
+            model=model,
+        )
+    except ImportError:  # pragma: no cover - old stripped embeds
+        return SimpleNamespace(
+            action="grok_x_search",
+            transport="httpx.AsyncClient.post",
+            destination=destination,
+            provider="grok",
+            tool="x_search",
+            model=model,
+        )
 
 
 def normalize_usage(usage: Any, **kwargs: Any) -> dict[str, Any]:
@@ -85,6 +115,24 @@ def _mapping(value: Any) -> Mapping[str, Any] | None:
     if isinstance(raw, Mapping) and raw:
         return raw
     return None
+
+
+def require_protected_x_payload(value: Any) -> dict[str, Any]:
+    """Validate the protected xAI request shape before external transport."""
+
+    if not isinstance(value, Mapping):
+        raise ValueError("privacy protection returned no protected payload")
+    payload = dict(value)
+    items = payload.get("input")
+    if not isinstance(items, list) or not items:
+        raise ValueError("privacy protection returned no protected input")
+    last = items[-1]
+    if not isinstance(last, Mapping):
+        raise ValueError("privacy protection returned invalid protected input")
+    content = last.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("privacy protection returned no protected query")
+    return payload
 
 
 def _field(value: Any, name: str, default: Any = None) -> Any:
@@ -431,6 +479,7 @@ class XSearchAPIClient:
         self.api_base: str = os.getenv("XAI_API_BASE", "https://api.x.ai/v1")
         self.model: str = os.getenv("XAI_GROK_MODEL", "grok-4-0709")
         self._client: Optional[httpx.AsyncClient] = None
+        self._config: Any = None
         # Keep strong references so object-id reuse cannot turn a later
         # response into a false duplicate.  The list is bounded because a
         # long-lived MCP process may serve many requests.
@@ -441,6 +490,7 @@ class XSearchAPIClient:
             from ....config import Config
 
             config = Config()
+            self._config = config
         except Exception as exc:
             raise RuntimeError("Grok検索のプライバシー設定を解決できません") from exc
         try:
@@ -479,6 +529,7 @@ class XSearchAPIClient:
             self._client = httpx.AsyncClient(
                 headers=self.headers,
                 timeout=60.0,
+                follow_redirects=False,
             )
         return self._client
 
@@ -554,47 +605,59 @@ class XSearchAPIClient:
         # context; do not bypass its review bridge with an auto-approve hook.
         try:
             gateway = self._privacy_gateway()
-        except Exception as exc:
-            return f"Grok検索はプライバシー設定を解決できないため停止しました: {exc}"
+        except Exception:
+            return "Grok検索はプライバシー保護の設定を解決できないため停止しました。"
         try:
-            protected = await gateway.protect(
+            assert_search_egress_approved(
+                self._config,
+                "grok",
+                credential=self.api_key,
+                endpoint=self.api_base,
+            )
+        except SearchEgressPreconditionError:
+            return "Grok検索に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+        started_at = time.monotonic()
+        try:
+            client = await self._get_client()
+            execute = getattr(gateway, "execute", None)
+            if not callable(execute):
+                return "Grok検索はプライバシー保護の設定を解決できないため停止しました。"
+
+            async def send(protected_payload):
+                try:
+                    wire_payload = require_protected_x_payload(protected_payload)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "privacy protection returned no protected xAI payload"
+                    ) from exc
+                return await client.post(
+                    url,
+                    json=wire_payload,
+                    timeout=timeout_seconds,
+                    follow_redirects=False,
+                )
+
+            response = await execute(
                 payload,
                 provider="grok",
+                descriptor=_xai_egress_descriptor(self.model, url),
+                sender=send,
                 base_url=self.api_base,
                 source_kind="grok_x_search_mcp",
                 model=self.model,
             )
-        except Exception as exc:  # noqa: BLE001
-            return f"Grok検索はプライバシーポリシーにより停止しました: {exc}"
-        payload = protected.payload
-
-        started_at = time.monotonic()
-        try:
-            client = await self._get_client()
-            response = await client.post(
-                url, json=payload, timeout=timeout_seconds
-            )
-        except httpx.RequestError as exc:
-            return f"Grok APIへの接続に失敗しました: {exc}"
+        except httpx.RequestError:
+            return "Grok検索に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+        except Exception:
+            return "Grok検索はプライバシー保護に失敗しました。"
 
         if response.status_code >= 300:
-            try:
-                error_payload = response.json()
-                err = error_payload.get("error", "")
-                if isinstance(err, dict):
-                    error_message = err.get("message", "") or json.dumps(err, ensure_ascii=False)
-                elif isinstance(err, str) and err:
-                    error_message = err
-                else:
-                    error_message = json.dumps(error_payload, ensure_ascii=False)
-            except Exception:
-                error_message = response.text
-            return f"Grok APIエラー({response.status_code}): {error_message}"
+            return "Grok検索プロバイダーがエラーを返しました。設定と承認済みエグレスを確認してください。"
 
         try:
             response_payload = response.json()
         except ValueError:
-            return f"Grok APIの応答を解析できませんでした: {response.text}"
+            return "Grok検索プロバイダーの応答を解析できませんでした。"
 
         # Record only successful Responses envelopes with provider-reported
         # usage.  No synthetic zero row is created when ``usage`` is absent.

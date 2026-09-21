@@ -406,6 +406,19 @@ function restoreStatus(
     return { ...state, lifecycle: emptyLifecycle("idle", event.sessionId) };
   }
 
+  // A terminal generation epoch is one-way.  A delayed status response can
+  // still report the run as queued/running after the dispatch request already
+  // settled as failed; reopening the lifecycle would resurrect the live
+  // timeline and keep the composer blocked.  A new dispatch_started event
+  // allocates a fresh epoch, while terminal snapshots continue through the
+  // existing deduplication/enrichment path below.
+  if (
+    TERMINAL_PHASES.has(state.lifecycle.phase) &&
+    (status.running || !["completed", "cancelled", "failed"].includes(phase))
+  ) {
+    return state;
+  }
+
   let workingState = state;
   if (state.lifecycle.generationEpoch == null) {
     const generationEpoch = state.nextGenerationEpoch + 1;
@@ -584,6 +597,21 @@ export function chatGenerationReducer(
   }
 
   if (!matchesCurrentGeneration(state.lifecycle, event)) return state;
+
+  // Terminal is absorbing within one generation epoch.  Only
+  // dispatch_started above may begin a new active generation; late active
+  // WebSocket events must not revive a failed/completed/cancelled epoch.
+  // status_restored and assistant_persisted remain allowed so durable
+  // identity/persistence reconciliation can finish without reopening live UI.
+  if (
+    TERMINAL_PHASES.has(state.lifecycle.phase) &&
+    event.type !== "status_restored" &&
+    event.type !== "assistant_persisted" &&
+    !TERMINAL_PHASES.has(event.type as GenerationPhase)
+  ) {
+    return state;
+  }
+
   const marked = markEventSeen(state, event.eventId);
   if (!marked) return state;
   state = marked;

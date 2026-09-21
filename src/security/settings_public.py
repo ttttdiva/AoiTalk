@@ -23,6 +23,7 @@ _SECRET_LEAF_NAMES = frozenset(
 )
 
 _ADMIN_ONLY_SETTING_PREFIXES = (
+    "browser_agent.",
     "tts.yomi_linter.",
     "mage_vl.",
 )
@@ -53,7 +54,7 @@ def is_admin_only_setting_key(key: str) -> bool:
         ".api_key"
     ):
         return True
-    return normalized == "mage_vl.api_key"
+    return normalized in {"mage_vl.api_key", "browser_agent"}
 
 
 def _configured_flag_name(field_name: str) -> str:

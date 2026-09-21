@@ -10,6 +10,7 @@ import signal
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -130,8 +131,34 @@ def _safe_env(input_json: dict[str, Any], extra: dict[str, str] | None = None) -
         "LC_ALL",
     }
     env = {key: value for key, value in os.environ.items() if key in allowed}
+    # Jobs are launched by the same AoiTalk runtime that owns the App.  On
+    # Windows the parent process may be a system Python shim while the
+    # application dependencies (pytest, openpyxl, etc.) live in the active
+    # virtualenv.  Prepend the current interpreter's bin directory rather than
+    # widening the environment to arbitrary host variables; manifest commands
+    # such as ``python -m pytest`` then resolve to the verified runtime.
+    runtime_bins = [Path(sys.executable).resolve().parent]
+    # ``main.py`` may supervise the backend with a system Python while the
+    # repository's declared dependencies live in its virtualenv.  Prefer that
+    # project-local runtime when it exists, then retain the active interpreter
+    # directory as a fallback for packaged deployments.
+    repo_root = Path(__file__).resolve().parents[2]
+    # The source tree convention is <repo>/venv/<bin-dir>.
+    project_venv_bin = repo_root / "venv" / ("Scripts" if os.name == "nt" else "bin")
+    if project_venv_bin.is_dir():
+        runtime_bins.insert(0, project_venv_bin)
+    existing_path = str(env.get("PATH") or "")
+    env["PATH"] = os.pathsep.join(
+        [str(item) for item in runtime_bins] + ([existing_path] if existing_path else [])
+    )
     env["AOITALK_APP_INPUT_JSON"] = json.dumps(input_json or {}, ensure_ascii=False)
     env["AOITALK_APP_RUNNER"] = runner_env_marker()
+    # Keep durable AppJob logs decodable across Windows system/virtualenv
+    # interpreters.  The runner writes UTF-8 and the API exposes the same file
+    # to the WebUI; without these explicit flags a child Python may emit the
+    # console code page (for example CP932), causing log inspection to fail.
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     if extra:
         env.update({str(key): str(value) for key, value in extra.items()})
     return env
@@ -308,6 +335,16 @@ def run_subprocess_job(
             "duration_seconds": 0.0,
             "error": str(exc),
         }
+    child_env = _safe_env(input_json, environment)
+    # Resolve the managed Python executable explicitly.  Windows can ignore a
+    # child environment's PATH when searching a bare ``python`` argv, which
+    # otherwise selects a system interpreter without AoiTalk's dependencies.
+    # The manifest remains portable (``python ...``); only the parsed argv
+    # passed to CreateProcess is rebound to the trusted runtime path.
+    if argv and Path(argv[0]).name.casefold() in {"python", "python.exe"}:
+        managed_python = shutil.which(argv[0], path=child_env.get("PATH"))
+        if managed_python:
+            argv[0] = managed_python
     with log_path.open("w", encoding="utf-8", newline="\n") as log:
         log.write(f"$ {command}\n")
         log.write(f"cwd={cwd}\n")
@@ -325,7 +362,7 @@ def run_subprocess_job(
                 job_id=job_id,
                 argv=argv,
                 cwd=cwd,
-                env=_safe_env(input_json, environment),
+                env=child_env,
                 log_file=log,
                 config=config,
             )

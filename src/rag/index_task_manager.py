@@ -46,6 +46,12 @@ class IndexTaskManager:
         self._tasks: Dict[str, IndexTask] = {}
         self._semaphore = asyncio.Semaphore(1)
         self._db_manager = None
+        # IndexTaskManager is a process-owned background-task owner.  Once
+        # shutdown starts no new work may be published, while existing tasks
+        # are cancelled and awaited before shutdown returns.
+        self._shutdown_started = False
+        self._shutdown_complete = False
+        self._shutdown_lock = asyncio.Lock()
 
     def set_db_manager(self, db_manager):
         """Set database manager for status updates."""
@@ -64,9 +70,19 @@ class IndexTaskManager:
 
         Returns IndexTask if started, None if already running for this collection.
         """
+        if self._shutdown_started:
+            logger.warning("Indexing manager is shutting down; refusing new task")
+            return None
+
         if collection_id in self._tasks:
             existing = self._tasks[collection_id]
-            if existing.status == "running":
+            if (
+                existing.status in {"pending", "running"}
+                or (
+                    existing._task is not None
+                    and not existing._task.done()
+                )
+            ):
                 logger.warning(f"Indexing already running for collection {collection_id}")
                 return None
 
@@ -80,10 +96,55 @@ class IndexTaskManager:
         asyncio_task = asyncio.create_task(
             self._run_indexing(
                 task_info, clear_existing, include_patterns, exclude_patterns
-            )
+            ),
+            name=f"rag-index:{collection_id}",
         )
         task_info._task = asyncio_task
+        # Always retrieve an unexpected task exception.  _run_indexing handles
+        # normal errors itself, but this callback protects the manager if a
+        # future change or a cancellation-path hook raises unexpectedly.
+        asyncio_task.add_done_callback(self._consume_task_exception)
         return task_info
+
+    def _consume_task_exception(self, task: asyncio.Task) -> None:
+        """Retrieve a finished task's exception without re-raising it."""
+        task_info = next(
+            (info for info in self._tasks.values() if info._task is task),
+            None,
+        )
+        try:
+            exception = task.exception()
+        except asyncio.CancelledError:
+            # A cancelled task has no unhandled exception to report.
+            if task_info is not None and task_info.completed_at is None:
+                task_info.status = "cancelled"
+                task_info.completed_at = datetime.utcnow()
+            return
+        except Exception:
+            # Calling exception() is solely for retrieval; _run_indexing logs
+            # and records normal failures before this callback runs.
+            return
+
+        if exception is not None:
+            if task_info is not None and task_info.completed_at is None:
+                task_info.status = "error"
+                task_info.error_message = str(exception)
+                task_info.completed_at = datetime.utcnow()
+            task_name = (
+                task.get_name()
+                if hasattr(task, "get_name")
+                else repr(task)
+            )
+            logger.error(
+                "Unhandled exception in indexing task %s: %s",
+                task_name,
+                exception,
+            )
+        elif task_info is not None and task_info.completed_at is None:
+            # A task that returns before entering _run_indexing's normal
+            # completion path should not remain permanently pending.
+            task_info.status = "completed"
+            task_info.completed_at = datetime.utcnow()
 
     async def _run_indexing(
         self,
@@ -93,12 +154,15 @@ class IndexTaskManager:
         exclude_patterns: Optional[List[str]],
     ):
         """Execute indexing in the background with semaphore control."""
-        async with self._semaphore:
-            task_info.status = "running"
-            task_info.started_at = datetime.utcnow()
-            await self._update_db_status(task_info.collection_id, "indexing")
+        try:
+            # Keep the semaphore wait inside the cancellation/error boundary.
+            # A task cancelled while queued must still transition out of its
+            # initial ``pending`` state.
+            async with self._semaphore:
+                task_info.status = "running"
+                task_info.started_at = datetime.utcnow()
+                await self._update_db_status(task_info.collection_id, "indexing")
 
-            try:
                 from .manager import get_rag_manager_for_collection
                 from .config import SourceConfig
 
@@ -141,19 +205,39 @@ class IndexTaskManager:
                     f"{task_info.files_processed} files, {task_info.total_chunks} chunks"
                 )
 
-            except asyncio.CancelledError:
-                task_info.status = "cancelled"
-                task_info.completed_at = datetime.utcnow()
-                await self._update_db_status(task_info.collection_id, "error",
-                                             error_message="Cancelled")
-            except Exception as e:
-                task_info.status = "error"
-                task_info.error_message = str(e)
-                task_info.completed_at = datetime.utcnow()
+        except asyncio.CancelledError:
+            # Cancellation is an expected lifecycle outcome.  Set status even
+            # when cancellation happened before semaphore acquisition and
+            # consume any legacy status-hook failure without masking it.
+            task_info.status = "cancelled"
+            task_info.completed_at = datetime.utcnow()
+            try:
+                await self._update_db_status(
+                    task_info.collection_id,
+                    "error",
+                    error_message="Cancelled",
+                )
+            except Exception as status_error:
+                logger.debug(
+                    "Unable to update cancelled indexing status for %s: %s",
+                    task_info.collection_id,
+                    status_error,
+                )
+        except Exception as e:
+            task_info.status = "error"
+            task_info.error_message = str(e)
+            task_info.completed_at = datetime.utcnow()
+            try:
                 await self._update_db_status(
                     task_info.collection_id, "error", error_message=str(e)
                 )
-                logger.error(f"Indexing failed for {task_info.collection_name}: {e}")
+            except Exception as status_error:
+                logger.debug(
+                    "Unable to update failed indexing status for %s: %s",
+                    task_info.collection_id,
+                    status_error,
+                )
+            logger.error(f"Indexing failed for {task_info.collection_name}: {e}")
 
     async def _update_db_status(
         self, collection_id: str, status: str,
@@ -177,9 +261,48 @@ class IndexTaskManager:
         """Cancel a running task."""
         task = self._tasks.get(collection_id)
         if task and task._task and not task._task.done():
+            # Mark synchronously as well as in _run_indexing's cancellation
+            # handler.  A task can be cancelled before its coroutine receives
+            # its first timeslice, in which case the handler never runs.
+            task.status = "cancelled"
+            task.completed_at = datetime.utcnow()
             task._task.cancel()
             return True
         return False
+
+    async def shutdown(self) -> None:
+        """Cancel and await every task owned by this manager.
+
+        Completed task records are retained for status introspection, but no
+        further indexing can be started after shutdown begins.
+        """
+        async with self._shutdown_lock:
+            if self._shutdown_complete:
+                return
+
+            self._shutdown_started = True
+            owned_entries = [
+                (task_info, task_info._task)
+                for task_info in self._tasks.values()
+                if task_info._task is not None
+            ]
+            owned_tasks = [task for _, task in owned_entries]
+
+            # Request cancellation before awaiting so all work is stopped as
+            # one shutdown operation.  Do not cancel external tasks: every
+            # task here was created and published by start_indexing().
+            for task_info, task in owned_entries:
+                if task is not None and not task.done():
+                    task_info.status = "cancelled"
+                    task_info.completed_at = datetime.utcnow()
+                    task.cancel()
+
+            if owned_tasks:
+                # return_exceptions keeps one misbehaving task from skipping
+                # the await/retrieval of the remaining tasks.
+                await asyncio.gather(*owned_tasks, return_exceptions=True)
+
+            self._shutdown_complete = True
 
 
 # Global instance

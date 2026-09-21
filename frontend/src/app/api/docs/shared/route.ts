@@ -16,18 +16,25 @@ function sharedNodeVisibleCondition() {
   // the literal （空行） marker; suppress it only when an email ancestor is
   // present so an ordinary user-authored title remains visible.
   return sql<boolean>`
-    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
+    (
+      (
+        ${knowledgeNodes.isExplicitBlank} = true
+        AND ${knowledgeNodes.nodeType} = 'node'
+        AND coalesce(btrim(${knowledgeNodes.systemKey}), '') = ''
+      )
+      OR regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
+    )
     AND NOT (
       ${knowledgeNodes.title} = '（空行）'
       AND EXISTS (
         WITH RECURSIVE email_ancestors AS (
-          SELECT id, parent_id, system_key, body_json, docs_library_id,
+          SELECT id, parent_id, system_key, docs_library_id,
                  ARRAY[id]::uuid[] AS visited_path, 0 AS depth
           FROM knowledge_nodes
           WHERE id = ${knowledgeNodes.id}
             AND docs_library_id = ${knowledgeNodes.docsLibraryId}
           UNION ALL
-          SELECT parent.id, parent.parent_id, parent.system_key, parent.body_json,
+          SELECT parent.id, parent.parent_id, parent.system_key,
                  parent.docs_library_id,
                  child.visited_path || ARRAY[parent.id]::uuid[], child.depth + 1
           FROM knowledge_nodes AS parent
@@ -39,7 +46,6 @@ function sharedNodeVisibleCondition() {
         SELECT 1
         FROM email_ancestors
         WHERE system_key LIKE 'project_mail:%'
-          OR body_json::jsonb ->> 'format' = 'email'
       )
     )`;
 }

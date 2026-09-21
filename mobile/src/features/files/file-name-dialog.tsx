@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { StyleSheet } from "react-native";
-import { Button, Dialog, Text, TextInput } from "react-native-paper";
+import { Button, Dialog, Text } from "react-native-paper";
+import { ThemedTextInput } from "../../components/themed-text-input";
 
 export type FileNameDialogProps = {
   visible: boolean;
@@ -68,13 +69,14 @@ export function FileNameDialog({
             {helperText}
           </Text>
         ) : null}
-        <TextInput
+        <ThemedTextInput
           // visible/initialValue が変わったときだけ native input を再生成する。
           // 入力中の再描画では key が変わらず、入力全体と IME composition を保持する。
           key={`${visible ? "open" : "closed"}:${initialValue}`}
           mode="outlined"
           label={label}
           defaultValue={initialValue}
+          cursorColor="#ffffff"
           onChangeText={handleChangeText}
           testID="file-name-input"
           style={styles.dialogInput}

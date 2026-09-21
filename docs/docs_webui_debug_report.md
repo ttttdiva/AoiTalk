@@ -101,4 +101,4 @@
 
 - AoiTalk起動時のキーワード初期化で `gpt-5-mini` のLLMクライアントが初期化された。証拠は `C:\\nk\\41_AoiTalk\\temp\\docs-debug-main.out.log`、`docs-debug-main2.out.log`、`docs-debug-main3.out.log` の各 `LLMクライアント作成完了 (モデル: gpt-5-mini)` 行。
 - これは今回の禁止モデル方針に反する初期化であり、私の起動前チェック不足。3回ともDocs QA用サーバー起動時で、起動後にChat/LLM操作はしていない。取得ログには `chat/completions` / `responses` の推論呼出し記録はないが、完全な外部通信ゼロを証明するネットワークキャプチャは取得していないため、「初期化のみ確認、API推論呼出しは証拠なし」と表記する。
-- サブエージェントは `gpt-5.6-luna` のみを使用し、`gpt-5-mini` / `gpt-4o-mini` APIは使用していない。起動したAoiTalkプロセスは停止済み。
+- サブエージェントは `gpt-5.6-luna` のみを使用し、`gpt-5-mini` / `gpt-5.5` APIは使用していない。起動したAoiTalkプロセスは停止済み。

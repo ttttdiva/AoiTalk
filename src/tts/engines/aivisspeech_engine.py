@@ -7,9 +7,17 @@ import time
 import os
 import socket
 import psutil
+from collections.abc import Mapping
 from typing import Optional, Dict, Any
 import requests
 import httpx
+
+from ...services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
 
 from ..engine_startup import (
     DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
@@ -27,6 +35,8 @@ class AivisSpeechEngine:
         port: int = 10101,
         use_gpu: bool = False,
         startup_timeout_seconds: float = DEFAULT_ENGINE_STARTUP_TIMEOUT_SECONDS,
+        config: Any | None = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
     ):
         """Initialize AivisSpeech engine
         
@@ -43,8 +53,75 @@ class AivisSpeechEngine:
         self.use_gpu = use_gpu
         self.startup_timeout_seconds = max(1.0, float(startup_timeout_seconds))
         self.base_url = f"http://{host}:{port}"
+        self.config = config
+        self._privacy_gateway = privacy_gateway
         self.process = None
         self.client = None  # Persistent httpx client
+
+    def _gateway(self) -> OutboundPrivacyGateway:
+        """Return the active request-scoped privacy gateway."""
+
+        if self._privacy_gateway is not None:
+            return self._privacy_gateway
+        try:
+            from ...services.turn_context import get_turn_context
+
+            turn = get_turn_context()
+        except Exception:
+            turn = None
+        scope = get_privacy_policy_context()
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(getattr(turn, "user_id", "") or ""),
+            session_id=str(getattr(turn, "session_id", "") or ""),
+            session_context=scope.session_context,
+            project_metadata=scope.project_metadata,
+        )
+
+    def _descriptor(self, *, action: str, path: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="httpx" if self.client is not None else "requests",
+            destination=f"{self.base_url}{path}",
+            provider="aivisspeech",
+            tool="tts.aivisspeech",
+        )
+
+    async def _execute_async(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        path: str,
+        sender,
+    ) -> Any:
+        gateway = self._gateway()
+        return await gateway.execute(
+            payload,
+            provider="aivisspeech",
+            descriptor=self._descriptor(action=action, path=path),
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=action,
+        )
+
+    def _execute_sync(
+        self,
+        payload: Any,
+        *,
+        action: str,
+        path: str,
+        sender,
+    ) -> Any:
+        gateway = self._gateway()
+        return gateway.execute_sync(
+            payload,
+            provider="aivisspeech",
+            descriptor=self._descriptor(action=action, path=path),
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=action,
+        )
         
     def _is_port_in_use(self, port: int) -> bool:
         """Check if port is in use
@@ -303,7 +380,16 @@ class AivisSpeechEngine:
             )
             if started:
                 try:
-                    response = requests.get(f"{self.base_url}/version", timeout=2)
+                    response = self._execute_sync(
+                        {},
+                        action="tts.aivisspeech.version",
+                        path="/version",
+                        sender=lambda _payload: requests.get(
+                            f"{self.base_url}/version",
+                            timeout=2,
+                            allow_redirects=False,
+                        ),
+                    )
                     version_info = response.text.strip().replace('"', '')
                 except requests.exceptions.RequestException:
                     version_info = "unknown"
@@ -387,11 +473,20 @@ class AivisSpeechEngine:
                 base_url=self.base_url,
                 limits=limits,
                 timeout=timeout,
-                headers={'Connection': 'keep-alive'}
+                headers={'Connection': 'keep-alive'},
+                follow_redirects=False,
             )
             
             # Test connection to AivisSpeech API
-            response = await self.client.get("/version")
+            response = await self._execute_async(
+                {},
+                action="tts.aivisspeech.version",
+                path="/version",
+                sender=lambda _payload: self.client.get(
+                    "/version",
+                    follow_redirects=False,
+                ),
+            )
             if response.status_code == 200:
                 print(f"[AivisSpeech] Connected to engine (version: {response.text.strip()})")
                 return True
@@ -425,7 +520,7 @@ class AivisSpeechEngine:
             WAV audio data as bytes, or None if failed
         """
         # Windows-specific debug: immediate print before any async operations
-        print(f"[AivisSpeech] synthesize() called - text: '{text}', speaker_id: {speaker_id}")
+        print(f"[AivisSpeech] synthesize() called - chars={len(str(text or ''))}, speaker_id: {speaker_id}")
         
         # On Windows, use synchronous method to avoid async issues
         if os.name == 'nt':
@@ -442,43 +537,45 @@ class AivisSpeechEngine:
             print("[AivisSpeech] Client not initialized")
             return None
             
-        # Check if engine is still running
+        # Check if engine is still running.  Do not silently restart/retry a
+        # provider request; callers can explicitly reinitialize the engine.
         if self.process and self.process.poll() is not None:
             print(f"[AivisSpeech] Engine process died (exit code: {self.process.returncode})")
-            # Try to reinitialize
-            print("[AivisSpeech] Attempting to restart engine...")
-            if self.start_engine() and await self.initialize():
-                print("[AivisSpeech] Engine restarted successfully")
-            else:
-                print("[AivisSpeech] Failed to restart engine")
-                return None
+            return None
         
-        # Retry logic for connection errors
-        max_retries = 3
-        retry_delay = 1.0
+        # A single gateway transaction is intentional.  Hidden retries could
+        # otherwise create a second provider request outside review/audit.
+        max_retries = 1
         
         for attempt in range(max_retries):
             try:
-                # Test connection first
-                try:
-                    print(f"[AivisSpeech] 接続テスト中... (試行 {attempt + 1}/{max_retries})")
-                    test_response = await self.client.get("/version")
-                    if test_response.status_code != 200:
-                        raise Exception(f"Engine not responding (status: {test_response.status_code})")
-                    print(f"[AivisSpeech] 接続OK")
-                except httpx.RequestError as e:
-                    raise Exception(f"Cannot connect to engine: {e}")
-                
                 # Create audio query
-                print(f"[AivisSpeech] Creating audio query - text: '{text}', speaker_id: {speaker_id}")
+                print(f"[AivisSpeech] Creating audio query - chars={len(str(text or ''))}, speaker_id: {speaker_id}")
                 
                 # Add timeout for Windows
                 query_start = asyncio.get_event_loop().time()
+
+                def send_audio_query(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech audio-query payload is malformed"
+                        )
+                    return self.client.post(
+                        "/audio_query",
+                        params={
+                            "text": str(protected_payload.get("text") or ""),
+                            "speaker": int(protected_payload.get("speaker", speaker_id)),
+                        },
+                        follow_redirects=False,
+                    )
+
                 try:
                     query_response = await asyncio.wait_for(
-                        self.client.post(
-                            "/audio_query",
-                            params={"text": text, "speaker": speaker_id}
+                        self._execute_async(
+                            {"text": text, "speaker": speaker_id},
+                            action="tts.aivisspeech.audio_query",
+                            path="/audio_query",
+                            sender=send_audio_query,
                         ),
                         timeout=10.0
                     )
@@ -508,15 +605,38 @@ class AivisSpeechEngine:
                 audio_query["intonationScale"] = intonation
                 audio_query["volumeScale"] = volume
                 
-                # Synthesize audio
+                # Synthesize audio through the same gateway.  The provider
+                # receives only the final audio-query candidate approved by
+                # the transaction above.
                 synth_start = asyncio.get_event_loop().time()
+
+                def send_synthesis(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech synthesis payload is malformed"
+                        )
+                    outbound_query = protected_payload.get("audio_query")
+                    if not isinstance(outbound_query, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech synthesis audio query is unavailable"
+                        )
+                    return self.client.post(
+                        "/synthesis",
+                        params={
+                            "speaker": int(protected_payload.get("speaker", speaker_id))
+                        },
+                        json=dict(outbound_query),
+                        headers={"Content-Type": "application/json"},
+                        follow_redirects=False,
+                    )
+
                 try:
                     synthesis_response = await asyncio.wait_for(
-                        self.client.post(
-                            "/synthesis",
-                            params={"speaker": speaker_id},
-                            json=audio_query,
-                            headers={"Content-Type": "application/json"}
+                        self._execute_async(
+                            {"speaker": speaker_id, "audio_query": audio_query},
+                            action="tts.aivisspeech.synthesis",
+                            path="/synthesis",
+                            sender=send_synthesis,
                         ),
                         timeout=20.0
                     )
@@ -549,23 +669,8 @@ class AivisSpeechEngine:
                 return audio_data
                 
             except Exception as e:
-                error_msg = str(e)
-                if ("connect" in error_msg.lower() or "server error" in error_msg.lower()) and attempt < max_retries - 1:
-                    print(f"[AivisSpeech] Error (attempt {attempt + 1}/{max_retries}): {error_msg}")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    
-                    # Try to reinitialize client on connection errors
-                    if "connect" in error_msg.lower():
-                        try:
-                            await self.cleanup()
-                            await self.initialize()
-                            print("[AivisSpeech] Client reinitialized")
-                        except:
-                            pass
-                else:
-                    print(f"[AivisSpeech] Synthesis error: {type(e).__name__}: {e}")
-                    return None
+                print(f"[AivisSpeech] Synthesis error: {type(e).__name__}: {e}")
+                return None
                     
         return None
     
@@ -580,34 +685,43 @@ class AivisSpeechEngine:
         
         This method uses requests instead of httpx to avoid async issues on Windows.
         """
-        print(f"[AivisSpeech] synthesize_sync() called - text: '{text}', speaker_id: {speaker_id}")
+        print(f"[AivisSpeech] synthesize_sync() called - chars={len(str(text or ''))}, speaker_id: {speaker_id}")
         
         if self.process and self.process.poll() is not None:
             print(f"[AivisSpeech] Engine process died (exit code: {self.process.returncode})")
             return None
         
-        max_retries = 3
-        retry_delay = 1.0
+        # One explicit transaction; retrying here would bypass a fresh review
+        # decision and make provider request counts opaque.
+        max_retries = 1
         
         for attempt in range(max_retries):
             try:
-                # Test connection first
-                print(f"[AivisSpeech] Testing connection (attempt {attempt + 1}/{max_retries})")
-                # Use longer timeout on Windows
-                timeout = 10 if os.name == 'nt' else 5
-                test_response = requests.get(f"{self.base_url}/version", timeout=timeout)
-                if test_response.status_code != 200:
-                    raise Exception(f"Engine not responding (status: {test_response.status_code})")
-                print(f"[AivisSpeech] Connection OK")
-                
                 # Create audio query
-                print(f"[AivisSpeech] Creating audio query - text: '{text}', speaker_id: {speaker_id}")
+                print(f"[AivisSpeech] Creating audio query - chars={len(str(text or ''))}, speaker_id: {speaker_id}")
                 # Use longer timeout on Windows (30s for audio query)
                 timeout = 30 if os.name == 'nt' else 10
-                query_response = requests.post(
-                    f"{self.base_url}/audio_query",
-                    params={"text": text, "speaker": speaker_id},
-                    timeout=timeout
+
+                def send_audio_query(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech audio-query payload is malformed"
+                        )
+                    return requests.post(
+                        f"{self.base_url}/audio_query",
+                        params={
+                            "text": str(protected_payload.get("text") or ""),
+                            "speaker": int(protected_payload.get("speaker", speaker_id)),
+                        },
+                        timeout=timeout,
+                        allow_redirects=False,
+                    )
+
+                query_response = self._execute_sync(
+                    {"text": text, "speaker": speaker_id},
+                    action="tts.aivisspeech.audio_query",
+                    path="/audio_query",
+                    sender=send_audio_query,
                 )
                 
                 if query_response.status_code != 200:
@@ -629,12 +743,33 @@ class AivisSpeechEngine:
                 print(f"[AivisSpeech] Synthesizing audio...")
                 # Use longer timeout on Windows (60s for synthesis)
                 timeout = 60 if os.name == 'nt' else 20
-                synthesis_response = requests.post(
-                    f"{self.base_url}/synthesis",
-                    params={"speaker": speaker_id},
-                    json=audio_query,
-                    headers={"Content-Type": "application/json"},
-                    timeout=timeout
+
+                def send_synthesis(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech synthesis payload is malformed"
+                        )
+                    outbound_query = protected_payload.get("audio_query")
+                    if not isinstance(outbound_query, Mapping):
+                        raise PrivacyError(
+                            "AivisSpeech synthesis audio query is unavailable"
+                        )
+                    return requests.post(
+                        f"{self.base_url}/synthesis",
+                        params={
+                            "speaker": int(protected_payload.get("speaker", speaker_id))
+                        },
+                        json=dict(outbound_query),
+                        headers={"Content-Type": "application/json"},
+                        timeout=timeout,
+                        allow_redirects=False,
+                    )
+
+                synthesis_response = self._execute_sync(
+                    {"speaker": speaker_id, "audio_query": audio_query},
+                    action="tts.aivisspeech.synthesis",
+                    path="/synthesis",
+                    sender=send_synthesis,
                 )
                 
                 if synthesis_response.status_code != 200:
@@ -652,14 +787,8 @@ class AivisSpeechEngine:
                 return audio_data
                 
             except Exception as e:
-                error_msg = str(e)
-                if ("connect" in error_msg.lower() or "server error" in error_msg.lower()) and attempt < max_retries - 1:
-                    print(f"[AivisSpeech] Error (attempt {attempt + 1}/{max_retries}): {error_msg}")
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    print(f"[AivisSpeech] Synthesis error: {type(e).__name__}: {e}")
-                    return None
+                print(f"[AivisSpeech] Synthesis error: {type(e).__name__}: {e}")
+                return None
                     
         return None
             
@@ -674,7 +803,15 @@ class AivisSpeechEngine:
             return None
             
         try:
-            response = await self.client.get("/speakers")
+            response = await self._execute_async(
+                {},
+                action="tts.aivisspeech.speakers",
+                path="/speakers",
+                sender=lambda _payload: self.client.get(
+                    "/speakers",
+                    follow_redirects=False,
+                ),
+            )
             if response.status_code == 200:
                 speakers = response.json()
                 print(f"[AivisSpeech] Available speakers: {speakers}")

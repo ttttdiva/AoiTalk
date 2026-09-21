@@ -14,6 +14,8 @@ import {
 import {
   filterAvailableProviders,
   isProviderAvailable,
+  filterVisibleProviders,
+  normalizeHiddenProviderIds,
 } from "@/lib/llm-provider-visibility";
 
 // SWR キャッシュキー。チャット画面で一意なので固定文字列を使う。
@@ -22,6 +24,7 @@ const RESPONSE_MODEL_OPTIONS_SWR_KEY = "chat/response-model-options";
 const EMPTY_OPTIONS: ChatResponseModelOption[] = [];
 
 const API_KEY_REQUIRED_PROVIDERS = new Set(["openai", "gemini", "openrouter", "deepseek", "deepinfra", "kimi"]);
+const STRICT_RUNTIME_PROVIDERS = new Set(["openai_compatible_local", "ollama", "sglang"]);
 
 function modelLabel(
   model: LlmCatalogModelOption | undefined,
@@ -44,12 +47,31 @@ export function buildResponseModelOptions(
   void _settings;
   const currentProvider = catalog.current.provider;
   const currentModel = catalog.current.model;
-  const availableProviders = filterAvailableProviders(
-    catalog.providers,
-    catalog.deployment as LlmDeploymentMetadata | null | undefined,
-    (provider) => provider.id,
-    (provider) => provider,
+  const hiddenProviderIds = new Set(
+    normalizeHiddenProviderIds(catalog.provider_visibility),
   );
+  const availableProviders = filterVisibleProviders(
+    filterAvailableProviders(
+      catalog.providers,
+      catalog.deployment as LlmDeploymentMetadata | null | undefined,
+      (provider) => provider.id,
+      (provider) => provider,
+    ),
+    catalog.provider_visibility,
+    [],
+    (provider) => provider.id,
+  );
+  /*
+   * ``models`` remains the settings catalog.  A backend that predates the
+   * split has no ``chat_models`` field, so retain a compatibility fallback;
+   * an explicit empty chat_models list is authoritative and must stay empty.
+   */
+  const chatModelsForProvider = (provider: LlmCatalogProvider) =>
+    Array.isArray(provider.chat_models)
+      ? provider.chat_models
+      : STRICT_RUNTIME_PROVIDERS.has(provider.id.trim().toLowerCase())
+        ? []
+        : provider.models;
   const providers = new Map(
     availableProviders.map((provider) => [provider.id, provider]),
   );
@@ -97,12 +119,15 @@ export function buildResponseModelOptions(
       persistedCurrentProvider,
     )
   ) {
-    const currentCatalogModel = currentCatalogProvider.models.find(
+    const currentCatalogModel = chatModelsForProvider(currentCatalogProvider).find(
       (model) => model.id === currentModel,
     );
-    addOption(currentCatalogProvider, currentModel, currentCatalogModel);
+    if (currentCatalogModel) {
+      addOption(currentCatalogProvider, currentModel, currentCatalogModel);
+    }
   } else if (
     !catalog.deployment &&
+    !hiddenProviderIds.has(currentProvider.trim().toLowerCase()) &&
     isProviderAvailable(currentProvider, undefined, persistedCurrentProvider)
   ) {
     // Older personal responses may omit the provider from the catalog while
@@ -127,16 +152,17 @@ export function buildResponseModelOptions(
       continue;
     }
 
+    const chatModels = chatModelsForProvider(provider);
     const configuredModel = provider.configured_model?.trim();
-    if (configuredModel) {
+    if (configuredModel && chatModels.some((model) => model.id === configuredModel)) {
       addOption(
         provider,
         configuredModel,
-        provider.models.find((model) => model.id === configuredModel),
+        chatModels.find((model) => model.id === configuredModel),
       );
     }
 
-    for (const model of provider.models) {
+    for (const model of chatModels) {
       addOption(provider, model.id, model);
     }
   }
@@ -144,16 +170,29 @@ export function buildResponseModelOptions(
   return result;
 }
 
+export type UseResponseModelOptionsInput = {
+  /** Catalog owned by RuntimeProvider. Null means it is still loading. */
+  catalog?: LlmModelCatalogResponse | null;
+  /** Skip the hook's standalone request and use the shared catalog. */
+  shared?: boolean;
+};
+
 /**
  * 再生成モデル選択肢を LLM カタログから読み込むフック。
  *
- * 取得・キャッシュ・重複排除は SWR に委譲する。マウント時に必ずカタログ取得を
- * 開始し、取得完了までは loading=true とする見え方は従来（旧: useState 初期値 true +
- * effect 内 fetch）と不変。フォーカス/再接続などの自動 revalidation は無効化する。
+ * 既定では取得・キャッシュ・重複排除を SWR に委譲する。RuntimeProvider
+ * の共有カタログを渡された場合は独立した /llm/models リクエストを省き、
+ * その値を直接再利用する。フォーカス/再接続などの自動 revalidation は無効化する。
  */
-export function useResponseModelOptions() {
+export function useResponseModelOptions(
+  input?: UseResponseModelOptionsInput,
+) {
+  // Passing a catalog object opts into the shared-runtime path by default;
+  // callers may explicitly set shared=false when they only want to seed
+  // optional metadata while retaining the standalone fetch.
+  const sharedCatalog = input !== undefined && input.shared !== false;
   const { data: catalog, isLoading } = useSWR<LlmModelCatalogResponse>(
-    RESPONSE_MODEL_OPTIONS_SWR_KEY,
+    sharedCatalog ? null : RESPONSE_MODEL_OPTIONS_SWR_KEY,
     async () => {
       return getLlmModelCatalog();
     },
@@ -168,14 +207,26 @@ export function useResponseModelOptions() {
       onError: (err) => console.warn("再生成モデル一覧の取得に失敗:", err),
     },
   );
+  const resolvedCatalog = sharedCatalog ? input?.catalog ?? null : catalog;
   const responseModelOptions = useMemo(
-    () => (catalog ? buildResponseModelOptions(catalog) : EMPTY_OPTIONS),
-    [catalog],
+    () =>
+      resolvedCatalog
+        ? buildResponseModelOptions(resolvedCatalog)
+        : EMPTY_OPTIONS,
+    [resolvedCatalog],
   );
 
   return {
-    // 取得失敗時は data が undefined のままとなり、従来同様に空配列を返す。
+    // Shared runtime catalog is already loading/owned elsewhere, so expose a
+    // settled false loading flag and let the runtime controls render their own
+    // loading/error state. Standalone callers retain the historical SWR flag.
     responseModelOptions,
-    responseModelOptionsLoading: isLoading,
+    // A shared RuntimeProvider still owns the request, but a null shared
+    // catalog means that request is pending. Preserve the loading signal so
+    // rerun menus do not report a false permanent empty state during a
+    // transient metadata timeout.
+    responseModelOptionsLoading: sharedCatalog
+      ? input?.catalog == null
+      : isLoading,
   };
 }

@@ -198,15 +198,25 @@ export function ReportsTimeline({
             style={{ height: `${TOTAL_HOURS * 48}px` }}
           >
             <div className="relative">
-              {Array.from({ length: TOTAL_HOURS + 1 }, (_, i) => (
-                <div
-                  key={i}
-                  className="absolute right-2 text-[10px] text-muted-foreground -translate-y-1/2"
-                  style={{ top: `${(i / TOTAL_HOURS) * 100}%` }}
-                >
-                  {HOUR_START + i}:00
-                </div>
-              ))}
+              {Array.from({ length: TOTAL_HOURS + 1 }, (_, i) => {
+                const hour = HOUR_START + i;
+                const edgePositionClass =
+                  i === 0
+                    ? "translate-y-0"
+                    : i === TOTAL_HOURS
+                      ? "-translate-y-full"
+                      : "-translate-y-1/2";
+                return (
+                  <div
+                    key={i}
+                    data-hour-label={hour}
+                    className={`absolute right-2 text-[10px] text-muted-foreground ${edgePositionClass}`}
+                    style={{ top: `${(i / TOTAL_HOURS) * 100}%` }}
+                  >
+                    {hour}:00
+                  </div>
+                );
+              })}
             </div>
 
             {weekDays.map((day, dayIndex) => {

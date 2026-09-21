@@ -11,15 +11,33 @@
  */
 
 import crypto from "node:crypto";
-import dns from "node:dns/promises";
-import net from "node:net";
 import { db } from "@/db";
 import { sql } from "drizzle-orm";
 import {
   decryptTextIfNeeded,
   encryptText,
 } from "@/lib/server/field-crypto";
+import {
+  DEFAULT_HYDRUS_API_URL,
+  effectiveHydrusProfile,
+  inspectHydrusEndpoint,
+  isNativeLocalPersonal,
+  type HydrusPolicyOptions,
+  type HydrusEndpointRejectReason,
+} from "@/lib/server/hydrus-policy";
 import type { RepoType } from "./client";
+
+// Re-export the policy entry points from the historical user-store module so
+// server callers/tests do not accidentally grow a second Hydrus URL policy.
+export {
+  DEFAULT_HYDRUS_API_URL,
+  effectiveHydrusProfile,
+  inspectHydrusEndpoint,
+  isLoopbackHost,
+  isNativeLocalPersonal,
+  isPrivateHost,
+  validateHydrusApiUrl,
+} from "@/lib/server/hydrus-policy";
 
 export interface UserHfAccount {
   /** Public opaque id.  It embeds no token and is only meaningful for owner. */
@@ -45,6 +63,9 @@ export interface UserHydrusSettings {
 type StoredHfAccount = UserHfAccount & { token: string; accountKey: string };
 const HF_AAD = "user_hf_credentials.encrypted_payload";
 const HYDRUS_AAD = "user_hydrus_credentials.encrypted_payload";
+const LEGACY_MIGRATION_SOURCE = "legacy_env_v1";
+const LEGACY_MIGRATION_METHOD = "explicit_current_principal_claim";
+const LEGACY_MIGRATION_LOCK_KEY = "aoitalk:hydrus:legacy-env-owner-claim";
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -394,144 +415,297 @@ export async function getUserHydrusSettings(userId: string): Promise<UserHydrusS
   const apiUrl = typeof payload.apiUrl === "string" ? payload.apiUrl.trim() : "";
   const accessKey = typeof payload.accessKey === "string" ? payload.accessKey : "";
   if (!apiUrl || !accessKey) return null;
-  // Never echo a legacy URL containing credentials (or a disallowed private
-  // endpoint) back to the settings UI.  The user must explicitly reconfigure
-  // it through the validated save path.
-  try {
-    const parsed = new URL(apiUrl);
-    const host = parsed.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-    const allowPrivate = /^(1|true|yes)$/i.test(
-      process.env.HYDRUS_ALLOW_PRIVATE_HOSTS ||
-        process.env.AOITALK_HYDRUS_ALLOW_PRIVATE_URLS ||
-        "",
-    );
-    if (
-      (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
-      parsed.username ||
-      parsed.password ||
-      (isPrivateHost(host) && !allowPrivate)
-    ) {
-      return null;
-    }
-    if (!allowPrivate && !isPrivateHost(host)) {
-      try {
-        const addresses = await dns.lookup(host, { all: true, verbatim: true });
-        // An empty answer is not proof of a public destination.  Fail closed
-        // rather than echoing a legacy endpoint that cannot be validated.
-        if (
-          addresses.length === 0 ||
-          addresses.some((entry) => isPrivateHost(entry.address))
-        ) {
-          return null;
-        }
-      } catch {
-        // DNS errors are treated as invalid configuration.  The caller can
-        // explicitly re-save once resolution works; no potentially internal
-        // endpoint is echoed while the destination is unknown.
-        return null;
-      }
-    }
-  } catch {
-    return null;
-  }
+  // Never return a URL that is outside the canonical endpoint policy.  This
+  // protects both the settings API and the FastAPI credential resolver from a
+  // stale/legacy row containing an internal destination.
+  const endpoint = await inspectHydrusEndpoint(apiUrl);
+  if (!endpoint.allowed) return null;
   const settings = toObject(parseJsonValue(row.settings_json));
   const displayName = typeof settings.displayName === "string" ? settings.displayName : undefined;
-  return { apiUrl, accessKey, displayName };
+  return { apiUrl: endpoint.url, accessKey, displayName };
+}
+
+function hydrusUrlValidationError(reason: HydrusEndpointRejectReason): Error {
+  switch (reason) {
+    case "embedded-credentials":
+      return new Error("Hydrus API URLに埋め込み認証情報は指定できません");
+    case "loopback-requires-native":
+      return new Error("Hydrus API URLのloopback接続はWindows Personalのnative local実行でのみ許可されます");
+    case "private-host":
+      return new Error("Hydrus API URLのprivate/localhost接続は管理ポリシーで許可されていません");
+    case "private-resolution":
+      return new Error("Hydrus API URLの解決先がprivateネットワークです");
+    case "dns-failure":
+      return new Error("Hydrus API URLのDNS解決に失敗しました");
+    case "unsupported-protocol":
+    case "invalid-url":
+    default:
+      return new Error("Hydrus API URLが不正です");
+  }
 }
 
 export async function saveUserHydrusSettings(
   userId: string,
   settings: UserHydrusSettings,
 ): Promise<void> {
-  let apiUrl: URL;
-  try {
-    apiUrl = new URL(settings.apiUrl);
-  } catch {
-    throw new Error("Hydrus API URLが不正です");
-  }
-  if (apiUrl.protocol !== "http:" && apiUrl.protocol !== "https:") {
-    throw new Error("Hydrus API URLが不正です");
-  }
-  if (apiUrl.username || apiUrl.password) {
-    throw new Error("Hydrus API URLに埋め込み認証情報は指定できません");
-  }
-  const allowPrivate = /^(1|true|yes)$/i.test(
-    process.env.HYDRUS_ALLOW_PRIVATE_HOSTS ||
-      process.env.AOITALK_HYDRUS_ALLOW_PRIVATE_URLS ||
-      "",
-  );
-  const host = apiUrl.hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  const privateHost = isPrivateHost(host);
-  if (privateHost && !allowPrivate) {
-    throw new Error("Hydrus API URLのprivate/localhost接続は管理ポリシーで許可されていません");
-  }
-  if (!privateHost && !allowPrivate) {
-    try {
-      const addresses = await dns.lookup(host, { all: true, verbatim: true });
-      if (
-        addresses.length === 0 ||
-        addresses.some((entry) => isPrivateHost(entry.address))
-      ) {
-        throw new Error("Hydrus API URLの解決先がprivateネットワークです");
-      }
-    } catch (error) {
-      if (error instanceof Error && error.message.includes("privateネットワーク")) {
-        throw error;
-      }
-      throw new Error("Hydrus API URLのDNS解決に失敗しました");
-    }
-  }
+  const endpoint = await inspectHydrusEndpoint(settings.apiUrl);
+  if (!endpoint.allowed) throw hydrusUrlValidationError(endpoint.reason);
   if (!settings.accessKey.trim()) throw new Error("Hydrus access keyが必要です");
   await db.transaction(async (tx) => {
     const executor = tx as unknown as typeof db;
+    // Serialize explicit saves with the one-time process-global legacy claim.
+    // Without the shared lock, a concurrent manual save by another principal
+    // could commit between the migration's row-count check and its INSERT.
+    await executor.execute(
+      sql`SELECT pg_advisory_xact_lock(hashtextextended(${LEGACY_MIGRATION_LOCK_KEY}, 0))`,
+    );
     await lockUser(executor, userId);
+    const existing = await queryOne(
+      "user_hydrus_credentials",
+      userId,
+      executor,
+      true,
+      true,
+    );
+    const existingSettings = existing
+      ? toObject(parseJsonValue(existing.settings_json))
+      : {};
+    const migration = toObject(existingSettings.migration);
+    const persistedSettings: Record<string, unknown> = {};
+    // Keep the secret-free owner-claim marker across later manual saves.  The
+    // marker is also intentionally retained by the delete tombstone path so
+    // a deleted legacy claim cannot be silently re-imported.
+    if (Object.keys(migration).length > 0) {
+      persistedSettings.migration = migration;
+    }
+    if (settings.displayName) persistedSettings.displayName = settings.displayName;
     await writeRow(
       "user_hydrus_credentials",
       userId,
       encryptText(
         JSON.stringify({
-          apiUrl: apiUrl.toString().replace(/\/$/, ""),
-          accessKey: settings.accessKey,
+          apiUrl: endpoint.url,
+          accessKey: settings.accessKey.trim(),
         }),
         HYDRUS_AAD,
       ),
-      settings.displayName ? { displayName: settings.displayName } : {},
+      persistedSettings,
       executor,
     );
   });
 }
 
-function isPrivateHost(host: string): boolean {
-  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) {
-    return true;
-  }
-  const family = net.isIP(host);
-  if (family === 4) {
-    const octets = host.split(".").map(Number);
-    return (
-      octets[0] === 10 ||
-      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
-      (octets[0] === 192 && octets[1] === 168) ||
-      octets[0] === 127 ||
-      (octets[0] === 169 && octets[1] === 254) ||
-      octets[0] === 0
-    );
-  }
-  if (family === 6) {
-    const normalized = host.toLowerCase();
-    if (normalized.startsWith("::ffff:")) {
-      return isPrivateHost(normalized.slice("::ffff:".length));
-    }
-    return (
-      normalized === "::1" ||
-      normalized === "::" ||
-      normalized.startsWith("fe80:") ||
-      normalized.startsWith("fc") ||
-      normalized.startsWith("fd")
-    );
-  }
-  return false;
+/** Public, non-secret status values returned by the legacy migration action. */
+export type LegacyHydrusMigrationStatus =
+  | "migrated"
+  | "already_migrated"
+  | "legacy_unavailable"
+  | "endpoint_rejected"
+  | "credential_conflict"
+  | "enterprise_disabled"
+  | "profile_not_personal"
+  | "native_local_required"
+  | "invalid_user"
+  | "internal_error";
+
+export interface LegacyHydrusMigrationResult {
+  status: LegacyHydrusMigrationStatus;
+  /** True for both a newly imported row and an idempotent retry. */
+  migrated: boolean;
+  /** Normalized endpoint only; the encrypted access key is never returned. */
+  apiUrl?: string;
 }
+
+function legacyEnvironment(env: NodeJS.ProcessEnv = process.env): {
+  apiUrl: string;
+  accessKey: string;
+  endpointDefaulted: boolean;
+} | null {
+  const accessKey = env.HYDRUS_ACCESS_KEY;
+  if (typeof accessKey !== "string" || !accessKey.trim()) return null;
+  // Hydrus historically defaulted to the local Client port.  Keep that
+  // default for existing installations that only carried HYDRUS_ACCESS_KEY.
+  const configuredUrl = env.HYDRUS_API_URL?.trim() || "";
+  const apiUrl = configuredUrl || DEFAULT_HYDRUS_API_URL;
+  return { apiUrl, accessKey: accessKey.trim(), endpointDefaulted: !configuredUrl };
+}
+
+function enabledValue(row: Record<string, unknown>): boolean {
+  return row.enabled !== false && row.enabled !== "false";
+}
+
+function isLegacyMigrationRow(row: Record<string, unknown>): boolean {
+  const settings = toObject(parseJsonValue(row.settings_json));
+  const marker = toObject(settings.migration);
+  return (
+    marker.source === LEGACY_MIGRATION_SOURCE &&
+    marker.method === LEGACY_MIGRATION_METHOD &&
+    typeof marker.claimedAt === "string" &&
+    marker.claimedAt.length > 0 &&
+    typeof marker.endpointDefaulted === "boolean"
+  );
+}
+
+function countRows(value: unknown): number | null {
+  const result = value as
+    | Array<Record<string, unknown>>
+    | { rows?: Array<Record<string, unknown>> };
+  const row = Array.isArray(result) ? result[0] : result?.rows?.[0];
+  if (!row || typeof row !== "object") return null;
+  const raw = row.count ?? row.row_count ?? row.total;
+  const count = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(count) && count >= 0 ? Math.trunc(count) : null;
+}
+
+/** Count all rows, including disabled tombstones, in the Hydrus table. */
+async function countHydrusCredentialRows(executor: typeof db): Promise<number> {
+  const result = await executor.execute(
+    sql`SELECT COUNT(*) AS count FROM ${sql.identifier("user_hydrus_credentials")}`,
+  );
+  const count = countRows(result);
+  if (count === null) throw new Error("Hydrus credential row count unavailable");
+  return count;
+}
+
+function migrationProfileStatus(
+  options: Pick<HydrusPolicyOptions, "env" | "platform"> = {},
+): LegacyHydrusMigrationStatus | null {
+  const profile = effectiveHydrusProfile(options.env || process.env);
+  if (profile === "enterprise") return "enterprise_disabled";
+  if (profile !== "personal") return "profile_not_personal";
+  if (!isNativeLocalPersonal(options)) return "native_local_required";
+  return null;
+}
+
+/**
+ * Return whether an authenticated principal can see a safe legacy-import
+ * affordance.  The result deliberately contains no reason or secret; a
+ * caller only learns that an import is available for its own account.
+ */
+export async function getLegacyHydrusAvailability(
+  userId: string,
+  options: HydrusPolicyOptions = {},
+): Promise<boolean> {
+  if (!validUserId(userId) || migrationProfileStatus(options)) return false;
+  const legacy = legacyEnvironment(options.env || process.env);
+  if (!legacy) return false;
+  try {
+    // The old environment was process-global.  Any row for any principal,
+    // including a disabled tombstone, means ownership has already been
+    // established or explicitly declined and must block a new claim.
+    if ((await countHydrusCredentialRows(db)) > 0) return false;
+  } catch {
+    return false;
+  }
+  const endpoint = await inspectHydrusEndpoint(legacy.apiUrl, options);
+  // Legacy HYDRUS_* settings were process-global and historically pointed at
+  // the local desktop client.  A one-time ownership claim must never broaden
+  // that contract to an arbitrary public/LAN destination, even when the
+  // administrator has enabled private-host integrations for normal saves.
+  return endpoint.allowed && endpoint.kind === "loopback";
+}
+
+/**
+ * Atomically claim the process-global legacy Hydrus environment for the
+ * authenticated principal.  The caller must have supplied the explicit
+ * confirmation phrase; this function only performs the server-side claim.
+ */
+export async function migrateLegacyHydrusSettings(
+  userId: string,
+  options: HydrusPolicyOptions = {},
+): Promise<LegacyHydrusMigrationResult> {
+  if (!validUserId(userId)) {
+    return { status: "invalid_user", migrated: false };
+  }
+  const profileStatus = migrationProfileStatus(options);
+  if (profileStatus) return { status: profileStatus, migrated: false };
+
+  const env = options.env || process.env;
+  try {
+    return await db.transaction(async (tx) => {
+      const executor = tx as unknown as typeof db;
+      // One global lock is intentional: the legacy key is process-global, so
+      // two users must never race to claim it.  The per-user lock protects
+      // this row from concurrent manual saves in the same transaction scope.
+      await executor.execute(
+        sql`SELECT pg_advisory_xact_lock(hashtextextended(${LEGACY_MIGRATION_LOCK_KEY}, 0))`,
+      );
+      await lockUser(executor, userId);
+      const existing = await queryOne(
+        "user_hydrus_credentials",
+        userId,
+        executor,
+        true,
+        true,
+      );
+      if (existing) {
+        if (enabledValue(existing) && isLegacyMigrationRow(existing)) {
+          const secret = rowSecret(existing, "user_hydrus_credentials");
+          const payload = toObject(parseJsonValue(secret));
+          const apiUrl = typeof payload.apiUrl === "string" ? payload.apiUrl : undefined;
+          return { status: "already_migrated", migrated: true, ...(apiUrl ? { apiUrl } : {}) };
+        }
+        // A disabled row is deliberately a conflict too.  Otherwise deleting
+        // a user's manual integration would make a global secret claimable by
+        // whoever happens to be logged in next.
+        return { status: "credential_conflict", migrated: false };
+      }
+
+      // Ownership is global, not per-user: the legacy environment contains a
+      // single process-wide key.  A row owned by another principal therefore
+      // blocks this claim even though the current principal has no row.
+      if ((await countHydrusCredentialRows(executor)) > 0) {
+        return { status: "credential_conflict", migrated: false };
+      }
+
+      const legacy = legacyEnvironment(env);
+      if (!legacy) return { status: "legacy_unavailable", migrated: false };
+      const endpoint = await inspectHydrusEndpoint(legacy.apiUrl, options);
+      if (!endpoint.allowed || endpoint.kind !== "loopback") {
+        // A native gate failure is normally caught before opening the
+        // transaction, but retain the typed distinction if policy options are
+        // supplied by a test or an embedding server.
+        if (!endpoint.allowed && endpoint.reason === "loopback-requires-native") {
+          return { status: "native_local_required", migrated: false };
+        }
+        return { status: "endpoint_rejected", migrated: false };
+      }
+
+      const claimedAt = new Date().toISOString();
+      const settings = {
+        migration: {
+          source: LEGACY_MIGRATION_SOURCE,
+          method: LEGACY_MIGRATION_METHOD,
+          claimedAt,
+          endpointDefaulted: legacy.endpointDefaulted,
+        },
+      };
+      await writeRow(
+        "user_hydrus_credentials",
+        userId,
+        encryptText(
+          JSON.stringify({
+            apiUrl: endpoint.url,
+            accessKey: legacy.accessKey,
+          }),
+          HYDRUS_AAD,
+        ),
+        settings,
+        executor,
+      );
+      return { status: "migrated", migrated: true, apiUrl: endpoint.url };
+    });
+  } catch {
+    // Do not send SQL/crypto errors (which could contain configuration
+    // material) to the browser.  The route exposes only this safe status.
+    return { status: "internal_error", migrated: false };
+  }
+}
+
+// Descriptive alias for callers that want to emphasize the owner-claim
+// semantics.  Keep one implementation so the locking and marker contract
+// cannot drift between routes.
+export const claimLegacyHydrusSettings = migrateLegacyHydrusSettings;
 
 export async function deleteUserHydrusSettings(userId: string): Promise<void> {
   if (!validUserId(userId)) return;

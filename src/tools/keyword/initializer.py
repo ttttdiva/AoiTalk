@@ -3,10 +3,15 @@
 """
 
 from typing import Optional, Any, Dict
+import logging
 from ...features import Features
+from ...utils.logging_config import FILE_ONLY_LOG_EXTRA
 from .manager import get_keyword_manager
 from .detectors.speech_rate_detector import SpeechRateDetector
 from .detectors.character_switch_detector import CharacterSwitchDetector
+
+
+logger = logging.getLogger(__name__)
 
 
 def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optional[Any] = None) -> None:
@@ -24,7 +29,9 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
     
     # キーワード検出全体が無効な場合は何もしない
     if not keyword_config.get('enabled', True):
-        print("[キーワード初期化] キーワード検出は無効に設定されています")
+        logger.info(
+            "Keyword detection is disabled by configuration",
+        )
         return
     
     # Spotify LLM検出器を登録
@@ -54,18 +61,27 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
                 spotify_detector.confidence_threshold = spotify_config.get('confidence_threshold', 0.7)
             if hasattr(spotify_detector, 'fallback_to_regex'):
                 spotify_detector.fallback_to_regex = spotify_config.get('fallback_to_regex', True)
-            
+
             manager.register_detector(spotify_detector)
-            print(f"[キーワード初期化] Spotify検出器を登録しました (有効: {spotify_enabled})")
+            logger.info(
+                "Spotify keyword detector registered (enabled=%s)",
+                spotify_enabled,
+            )
         else:
             # A process may reinitialize after the Integration toggle changes;
             # remove any previously registered detector so a stale instance
             # cannot issue Spotify LLM/tool calls while disabled.
             manager.unregister_detector("spotify")
-            print("[キーワード初期化] Spotify検出器は無効に設定されています")
-        
-    except Exception as e:
-        print(f"[キーワード初期化] Spotify検出器の登録に失敗: {e}")
+            logger.info(
+                "Spotify keyword detector disabled",
+            )
+
+    except Exception:
+        logger.warning(
+            "Spotify keyword detector setup failed; continuing without it",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     
     # 話速調整検出器を登録
     try:
@@ -85,14 +101,23 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
                 speech_rate_detector.confidence_threshold = speech_rate_config.get('confidence_threshold', 0.7)
             if hasattr(speech_rate_detector, 'fallback_to_regex'):
                 speech_rate_detector.fallback_to_regex = speech_rate_config.get('fallback_to_regex', True)
-            
+
             manager.register_detector(speech_rate_detector)
-            print(f"[キーワード初期化] 話速調整検出器を登録しました (有効: {speech_rate_enabled})")
+            logger.info(
+                "Speech-rate keyword detector registered (enabled=%s)",
+                speech_rate_enabled,
+            )
         else:
-            print("[キーワード初期化] 話速調整検出器は無効に設定されています")
-            
-    except Exception as e:
-        print(f"[キーワード初期化] 話速調整検出器の登録に失敗: {e}")
+            logger.info(
+                "Speech-rate keyword detector disabled",
+            )
+
+    except Exception:
+        logger.warning(
+            "Speech-rate keyword detector setup failed; continuing without it",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     
     # キャラクター切り替え検出器を登録
     try:
@@ -104,21 +129,34 @@ def initialize_keyword_detectors(llm_client: Optional[Any] = None, config: Optio
                 enabled=character_switch_enabled,
                 config=config
             )
-            
+
             manager.register_detector(character_switch_detector)
-            print(f"[キーワード初期化] キャラクター切り替え検出器を登録しました (有効: {character_switch_enabled})")
+            logger.info(
+                "Character-switch keyword detector registered (enabled=%s)",
+                character_switch_enabled,
+            )
         else:
-            print("[キーワード初期化] キャラクター切り替え検出器は無効に設定されています")
-            
-    except Exception as e:
-        print(f"[キーワード初期化] キャラクター切り替え検出器の登録に失敗: {e}")
+            logger.info(
+                "Character-switch keyword detector disabled",
+            )
+
+    except Exception:
+        logger.warning(
+            "Character-switch keyword detector setup failed; continuing without it",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     
     # 将来的に他の検出器を追加する場合はここに記述
     # 例: TTS制御、モード切り替えなど
     
     # 初期化完了ログ
     status = manager.get_status()
-    print(f"[キーワード初期化] 完了 - 検出器数: {status['total_detectors']}, 有効: {status['enabled_detectors']}")
+    logger.info(
+        "Keyword detection initialized (detectors=%s, enabled=%s)",
+        status['total_detectors'],
+        status['enabled_detectors'],
+    )
 
 
 def _get_keyword_config(config: Optional[Any]) -> Dict[str, Any]:
@@ -179,8 +217,12 @@ def _get_keyword_config(config: Optional[Any]) -> Dict[str, Any]:
                 result.update(configured)
                 return result
     
-    except Exception as e:
-        print(f"[キーワード初期化] 設定読み込みエラー: {e}")
+    except Exception:
+        logger.warning(
+            "Keyword detection configuration could not be read; using defaults",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     
     return default_config
 
@@ -231,9 +273,11 @@ def get_llm_client_for_keywords(config: Optional[Any] = None):
             config = Config()
         
         api_key = os.getenv('OPENAI_API_KEY')
-        
+
         if not api_key:
-            print("[キーワード初期化] 警告: OPENAI_API_KEYが設定されていません - LLMベース抽出は無効になります")
+            logger.warning(
+                "OPENAI_API_KEY is not configured; keyword LLM extraction is disabled",
+            )
             return None
         
         # 設定に応じたLLMクライアントを作成
@@ -243,11 +287,18 @@ def get_llm_client_for_keywords(config: Optional[Any] = None):
             config=config
         )
         
-        print(f"[キーワード初期化] LLMクライアント作成完了 (モデル: {llm_model})")
+        logger.info(
+            "Keyword LLM client initialized (model=%s)",
+            llm_model,
+        )
         return llm_client
-        
-    except Exception as e:
-        print(f"[キーワード初期化] LLMクライアント作成エラー: {e} - 正規表現フォールバックのみ利用可能")
+
+    except Exception:
+        logger.warning(
+            "Keyword LLM client initialization failed; using regex fallback",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         return None
 
 
@@ -265,6 +316,10 @@ def setup_keyword_detection(config: Optional[Any] = None) -> None:
         # キーワード検出器を初期化
         initialize_keyword_detectors(llm_client, config)
         
-    except Exception as e:
-        print(f"[キーワード初期化] セットアップエラー: {e}")
+    except Exception:
+        logger.warning(
+            "Keyword detection setup failed; continuing without keyword extraction",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         # エラーが発生してもシステムは継続動作

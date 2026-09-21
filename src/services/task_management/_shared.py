@@ -20,7 +20,13 @@ from ...memory.models import (
     Task,
     User,
 )
-from ...task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
+from ...task_time import (
+    DEFAULT_TASK_TIMEZONE,
+    normalize_task_timezone,
+    timer_db_datetime,
+    timer_duration_seconds,
+    timer_now_db,
+)
 # 既存の内部 import パスとの互換性のため、旧定数名もここから参照できるようにする。
 from ...task_recurrence import (
     DEFAULT_SKIP_MODE,
@@ -124,6 +130,196 @@ class ScheduledOccurrence:
     end_at: datetime
     is_generated: bool
     source_kind: str
+    # ``start_at`` is the value exposed by the legacy helper and is the
+    # canonical RRULE value unless a schedule segment is applied by the
+    # materializer.  Keeping this identity explicitly lets callers preserve
+    # exceptions even when the displayed occurrence has moved.
+    original_start_at: Optional[datetime] = None
+    all_day: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class AppliedRecurrenceSchedule:
+    """Actual occurrence values after applying a schedule segment.
+
+    The object is intentionally iterable so lightweight callers can unpack it
+    as ``start_at, end_at, all_day`` while richer callers can use named
+    attributes.  ``original_start_at`` is always the canonical RRULE start.
+    """
+
+    start_at: datetime
+    end_at: datetime
+    all_day: bool
+    original_start_at: datetime
+
+    @property
+    def actual_start_at(self) -> datetime:
+        return self.start_at
+
+    @property
+    def actual_end_at(self) -> datetime:
+        return self.end_at
+
+    @property
+    def actual_all_day(self) -> bool:
+        return self.all_day
+
+    def __iter__(self):
+        yield self.start_at
+        yield self.end_at
+        yield self.all_day
+
+
+def _segment_value(segment: Any, *names: str, default: Any = None) -> Any:
+    """Read a segment field from either an ORM row or a mapping.
+
+    The frontend/API use snake_case JSON while a few service doubles use
+    camelCase.  Accepting both here keeps the pure recurrence logic easy to
+    exercise without coupling it to SQLAlchemy.
+    """
+
+    for name in names:
+        if isinstance(segment, dict) and name in segment:
+            value = segment[name]
+            if value is not None:
+                return value
+        value = getattr(segment, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _coerce_segment_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    # Task datetimes are persisted as wall-clock naive values.  For callers
+    # that provide an aware ISO timestamp, compare on the same wall clock
+    # representation rather than raising ``TypeError`` for mixed awareness.
+    return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+
+
+def _comparable_datetime(value: datetime) -> datetime:
+    return value.replace(tzinfo=None) if value.tzinfo is not None else value
+
+
+def resolve_recurrence_schedule_segment(
+    segments: Iterable[Any],
+    canonical_start: datetime,
+) -> Optional[Any]:
+    """Return the last segment effective at ``canonical_start``.
+
+    Segment boundaries are canonical RRULE starts, not displayed occurrence
+    starts.  Rows are expected to arrive sorted, but sorting a local list also
+    makes this helper deterministic for API/test doubles that do not preserve
+    database ordering.
+    """
+
+    canonical_value = _coerce_segment_datetime(canonical_start)
+    if canonical_value is None:
+        return None
+    canonical = _comparable_datetime(canonical_value)
+    candidates: list[tuple[datetime, int, Any]] = []
+    for index, segment in enumerate(segments or []):
+        effective_from = _coerce_segment_datetime(
+            _segment_value(segment, "effective_from", "effectiveFrom")
+        )
+        if effective_from is None:
+            continue
+        effective_from = _comparable_datetime(effective_from)
+        if effective_from <= canonical:
+            candidates.append((effective_from, index, segment))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]))
+    return candidates[-1][2]
+
+
+def _segment_offset_seconds(segment: Any, *names: str) -> int:
+    value = _segment_value(segment, *names, default=0)
+    try:
+        # Persisted offsets are integer seconds.  Rounding here prevents a
+        # malformed float from introducing sub-second drift into recurrence
+        # identity comparisons while retaining negative offsets.
+        return int(round(float(value or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def apply_recurrence_schedule_segment(
+    canonical_start: datetime,
+    canonical_end: datetime,
+    base_all_day: bool,
+    segments: Iterable[Any],
+    base_start_at: Optional[datetime] = None,
+    base_end_at: Optional[datetime] = None,
+) -> AppliedRecurrenceSchedule:
+    """Apply the effective segment to one canonical occurrence.
+
+    Offsets are absolute deltas from the original task schedule.  A zero
+    offset segment is therefore meaningful: it explicitly resets an earlier
+    future shift at that boundary.
+    """
+
+    segment = resolve_recurrence_schedule_segment(segments, canonical_start)
+    base_start = base_start_at or canonical_start
+    base_end = base_end_at or canonical_end
+    if segment is None:
+        return AppliedRecurrenceSchedule(
+            start_at=base_start,
+            end_at=base_end,
+            all_day=bool(base_all_day),
+            original_start_at=canonical_start,
+        )
+
+    start_offset = _segment_offset_seconds(
+        segment, "start_offset_seconds", "startOffsetSeconds"
+    )
+    end_offset = _segment_offset_seconds(
+        segment, "end_offset_seconds", "endOffsetSeconds"
+    )
+    raw_all_day = _segment_value(
+        segment, "all_day", "allDay", default=base_all_day
+    )
+    actual_all_day = bool(base_all_day if raw_all_day is None else raw_all_day)
+    return AppliedRecurrenceSchedule(
+        start_at=base_start + timedelta(seconds=start_offset),
+        end_at=base_end + timedelta(seconds=end_offset),
+        all_day=actual_all_day,
+        original_start_at=canonical_start,
+    )
+
+
+def get_recurrence_segment_envelope_seconds(segments: Iterable[Any]) -> int:
+    """Return the max absolute segment offset in seconds."""
+
+    envelope = 0
+    for segment in segments or []:
+        envelope = max(
+            envelope,
+            abs(
+                _segment_offset_seconds(
+                    segment, "start_offset_seconds", "startOffsetSeconds"
+                )
+            ),
+            abs(
+                _segment_offset_seconds(
+                    segment, "end_offset_seconds", "endOffsetSeconds"
+                )
+            ),
+        )
+    return envelope
+
+
+def get_recurrence_segment_envelope(segments: Iterable[Any]) -> timedelta:
+    """Return the segment generation padding as a ``timedelta``."""
+
+    return timedelta(seconds=get_recurrence_segment_envelope_seconds(segments))
 
 
 def normalize_task_status(status: str) -> str:
@@ -339,6 +535,15 @@ def parse_recurrence_override_original_start_at(
     return datetime(year, month, day, hour, minute, second, millisecond * 1000)
 
 
+def format_recurrence_override_source_kind(original_start_at: datetime) -> str:
+    """Encode a canonical start in the compact ``ro:`` exception format."""
+
+    return (
+        f"{RECURRENCE_OVERRIDE_PREFIX}"
+        f"{original_start_at:%Y%m%dT%H%M%S}{original_start_at.microsecond // 1000:03d}"
+    )
+
+
 def build_occurrence_schedule(
     *,
     start_at: Optional[datetime],
@@ -350,6 +555,7 @@ def build_occurrence_schedule(
     skip_weekend: bool = False,
     skip_holiday: bool = False,
     skip_mode: str = DEFAULT_SKIP_MODE,
+    window_padding: timedelta | int | float = timedelta(0),
 ) -> list[ScheduledOccurrence]:
     """Pure helper that expands a task schedule into materialized occurrences."""
     if not start_at or not end_at:
@@ -397,9 +603,18 @@ def build_occurrence_schedule(
         )
 
     now = base_now or datetime.utcnow()
+    if isinstance(window_padding, timedelta):
+        padding = window_padding
+    else:
+        try:
+            padding = timedelta(seconds=float(window_padding or 0))
+        except (TypeError, ValueError) as exc:
+            raise TaskManagementError("window_padding must be a duration") from exc
+    if padding < timedelta(0):
+        raise TaskManagementError("window_padding must be >= 0")
     try:
-        window_start = min(start_at, now - window_duration)
-        window_end = now + timedelta(days=horizon_days)
+        window_start = min(start_at, now - window_duration - padding)
+        window_end = now + timedelta(days=horizon_days) + padding
         rule = rrulestr(recurrence_rrule, dtstart=start_at)
 
         # ``between`` は該当回をすべて list 化するため、秒次かつ無期限のルールで
@@ -431,15 +646,16 @@ def build_occurrence_schedule(
     if start_at not in starts and start_at <= window_end:
         starts.insert(0, start_at)
 
+    canonical_starts = list(starts)
     if skip_weekend or skip_holiday:
         # 開始日はユーザーが明示した日付なのでずらさない。2回目以降だけを対象にし、
         # ずらした結果が同じ日に着地した分は set で 1 件にまとめる
         # （毎日+土日スキップだと土・日・月がいずれも月曜へ寄るため）。
         # omit モードでは None が返るので、その回自体を落とす。
-        adjusted: list[datetime] = []
-        for value in starts:
+        adjusted: list[tuple[datetime, datetime]] = []
+        for value in canonical_starts:
             if value == start_at:
-                adjusted.append(value)
+                adjusted.append((value, value))
                 continue
             shifted = apply_occurrence_skip(
                 value,
@@ -448,11 +664,23 @@ def build_occurrence_schedule(
                 skip_mode=skip_mode,
             )
             if shifted is not None:
-                adjusted.append(shifted)
-        starts = adjusted
+                adjusted.append((value, shifted))
+        canonical_occurrences = adjusted
+    else:
+        canonical_occurrences = [(value, value) for value in canonical_starts]
 
-    unique_starts = sorted(set(starts))
-    if len(unique_starts) > MAX_EXPANDED_OCCURRENCES:
+    # A skip/shift policy may map multiple canonical starts to one displayed
+    # start.  Keep the first canonical identity for a duplicate actual slot;
+    # the old helper returned a set of actual starts, and this retains that
+    # behaviour without losing identity for the common one-to-one case.
+    unique_occurrences: list[tuple[datetime, datetime]] = []
+    seen_actual_starts: set[datetime] = set()
+    for canonical, actual in sorted(canonical_occurrences, key=lambda item: item[1]):
+        if actual in seen_actual_starts:
+            continue
+        seen_actual_starts.add(actual)
+        unique_occurrences.append((canonical, actual))
+    if len(unique_occurrences) > MAX_EXPANDED_OCCURRENCES:
         raise TaskManagementError(
             "recurrence rule expands to more than "
             f"{MAX_EXPANDED_OCCURRENCES} occurrences",
@@ -462,12 +690,14 @@ def build_occurrence_schedule(
     try:
         return [
             ScheduledOccurrence(
-                start_at=occurrence_start,
-                end_at=occurrence_start + duration,
+                start_at=actual_start,
+                end_at=actual_start + duration,
                 is_generated=True,
                 source_kind="recurrence",
+                original_start_at=canonical_start,
+                all_day=bool(all_day),
             )
-            for occurrence_start in unique_starts
+            for canonical_start, actual_start in unique_occurrences
         ]
     except OverflowError as exc:
         raise TaskManagementError(
@@ -476,29 +706,18 @@ def build_occurrence_schedule(
         ) from exc
 
 
-_TIMER_UTC_SKEW_MIN = timedelta(hours=8)
-_TIMER_UTC_SKEW_MAX = timedelta(hours=10)
-
-
 def correct_likely_timer_started_at(
     started_at: Optional[datetime],
     created_at: Optional[datetime],
     source: Optional[str],
 ) -> Optional[datetime]:
-    """timer 起動時に UTC が混入した started_at を created_at で補正する。
+    """Legacy compatibility shim; timer starts are never heuristically rewritten.
 
-    Web BFF（frontend/src/lib/server/db-time.ts の correctLikelyTimerStartedAt）と
-    同じ発見的補正。DB はローカル壁時計時刻で保存する規約のため、
-    started_at と created_at の差が 8〜10 時間ある timer エントリは
-    UTC で書かれた可能性が高く、created_at を開始時刻として扱う。
+    New timer rows cross an explicit timezone boundary at the API and service
+    edges.  Keep the old importable symbol for mixed-version callers, but
+    always return the persisted value unchanged.
     """
-    if (
-        source == "timer"
-        and started_at is not None
-        and created_at is not None
-        and _TIMER_UTC_SKEW_MIN <= (created_at - started_at) <= _TIMER_UTC_SKEW_MAX
-    ):
-        return created_at
+
     return started_at
 
 
@@ -530,17 +749,31 @@ def build_time_report(entries: Iterable[dict[str, Any]]) -> dict[str, Any]:
             }
         return target[key]
 
-    # DB はローカル壁時計時刻で保存しているため、実行中エントリの集計も
-    # ローカル現在時刻で行う（utcnow だと JST 環境で 9 時間ずれる）。
-    now = datetime.now()
+    # Timer rows are naive values in the configured deployment zone, so an
+    # active row must be measured against that same explicit zone rather than
+    # the host OS timezone.
+    now = timer_now_db()
     for entry in entries:
-        started_at = entry.get("started_at")
-        ended_at = entry.get("ended_at")
+        raw_started_at = entry.get("started_at")
+        raw_ended_at = entry.get("ended_at")
+        started_at = (
+            timer_db_datetime(raw_started_at)
+            if isinstance(raw_started_at, datetime)
+            else raw_started_at
+        )
+        ended_at = (
+            timer_db_datetime(raw_ended_at)
+            if isinstance(raw_ended_at, datetime)
+            else raw_ended_at
+        )
         if not isinstance(started_at, datetime):
             continue
 
-        effective_end = ended_at if isinstance(ended_at, datetime) else now
-        duration_seconds = max(0, int((effective_end - started_at).total_seconds()))
+        duration_seconds = timer_duration_seconds(
+            started_at,
+            ended_at if isinstance(ended_at, datetime) else None,
+            now=now,
+        )
         summary["total_seconds"] += duration_seconds
         summary["entry_count"] += 1
         if ended_at is None:

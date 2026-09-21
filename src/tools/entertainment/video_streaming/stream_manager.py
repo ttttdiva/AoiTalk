@@ -17,6 +17,13 @@ import atexit
 import shutil
 from datetime import datetime, timedelta
 
+from ....services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
+
 
 class VideoStreamManager:
     """Manager for video streaming audio extraction and playback"""
@@ -78,6 +85,13 @@ class VideoStreamManager:
                 'socket_timeout': 30,
                 # Limit file size for testing (10MB)
                 'max_filesize': 10 * 1024 * 1024,
+                # The privacy gateway owns transaction/retry semantics.  Do
+                # not let yt-dlp silently retry a provider request after an
+                # approved operation has failed.
+                'retries': 0,
+                'fragment_retries': 0,
+                'extractor_retries': 0,
+                'file_access_retries': 0,
             }
             
     def _progress_hook(self, d):
@@ -89,6 +103,104 @@ class VideoStreamManager:
                 self._download_progress = d['downloaded_bytes'] / d['total_bytes_estimate'] * 100
         elif d['status'] == 'finished':
             self._download_progress = 100
+
+    def _privacy_gateway(self) -> OutboundPrivacyGateway:
+        """Resolve the policy used by yt-dlp's configurable network sink."""
+
+        context = get_privacy_policy_context()
+        try:
+            from ....config import Config
+
+            config = Config()
+        except Exception as exc:
+            raise PrivacyError("Video streaming privacy configuration is unavailable") from exc
+        session = context.session_context or {}
+        return OutboundPrivacyGateway(
+            config,
+            user_id=str(session.get("user_id") or ""),
+            session_id=str(session.get("session_id") or session.get("id") or ""),
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    def execute_yt_dlp(
+        self,
+        target: str,
+        operation,
+        *,
+        action: str,
+        provider: str = "youtube",
+        destination: Optional[str] = None,
+    ) -> Any:
+        """Run one yt-dlp operation behind the common egress transaction.
+
+        yt-dlp performs its own provider requests internally, so this wrapper
+        treats the complete extraction/search operation as one atomic sink and
+        disables its hidden retry knobs.  A reviewer may edit the query or
+        video URL, but the transport remains constrained to the requested
+        YouTube/Niconico scheme and never receives a retargeted arbitrary URL.
+        """
+
+        if not isinstance(target, str):
+            raise PrivacyError("yt-dlp target is malformed")
+        if not isinstance(provider, str):
+            raise PrivacyError("yt-dlp provider is malformed")
+        if not callable(operation):
+            raise PrivacyError("yt-dlp operation is malformed")
+        original_target = target
+        provider_name = provider.strip().lower()
+        if provider_name not in {"youtube", "niconico"}:
+            raise PrivacyError("yt-dlp provider is unsupported")
+        base_destination = destination or (
+            "https://www.nicovideo.jp/" if provider_name == "niconico" else "https://www.youtube.com/"
+        )
+        gateway = self._privacy_gateway()
+
+        def sender(final_payload: Any) -> Any:
+            if not isinstance(final_payload, dict):
+                raise PrivacyError("yt-dlp outbound payload is malformed")
+            final_target = final_payload.get("target")
+            if not isinstance(final_target, str) or not final_target.strip():
+                raise PrivacyError("yt-dlp target is malformed")
+            if original_target.startswith(("ytsearch", "nicosearch")):
+                search_prefix = (
+                    "nicosearch" if original_target.startswith("nicosearch") else "ytsearch"
+                )
+                if not final_target.startswith(f"{search_prefix}:"):
+                    raise PrivacyError("yt-dlp search target binding changed")
+            elif final_target.startswith(("http://", "https://")):
+                from urllib.parse import urlsplit
+
+                host = (urlsplit(final_target).hostname or "").lower().rstrip(".")
+                allowed = (
+                    "youtube.com",
+                    "www.youtube.com",
+                    "youtu.be",
+                    "m.youtube.com",
+                    "nicovideo.jp",
+                    "www.nicovideo.jp",
+                    "nico.ms",
+                )
+                if not any(host == item or host.endswith("." + item) for item in allowed):
+                    raise PrivacyError("yt-dlp destination host is not allowed")
+            else:
+                raise PrivacyError("yt-dlp target scheme is unsupported")
+            return operation(final_target)
+
+        return gateway.execute_sync(
+            {"target": original_target},
+            provider=provider_name,
+            descriptor=EgressDescriptor(
+                action=action,
+                transport="yt_dlp",
+                destination=base_destination,
+                provider=provider_name,
+                tool="entertainment.video_streaming",
+            ),
+            base_url=base_destination,
+            source_kind="video_streaming",
+            sender=sender,
+        )
             
     def extract_audio(self, url: str, platform: str = 'youtube') -> Dict[str, Any]:
         """Extract audio from video URL
@@ -128,10 +240,22 @@ class VideoStreamManager:
                 # Extract audio
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     print(f"[VideoStream] Extracting audio from {platform}: {url}")
+                    provider = "niconico" if platform == "niconico" else "youtube"
+                    destination = (
+                        "https://www.nicovideo.jp/"
+                        if provider == "niconico"
+                        else "https://www.youtube.com/"
+                    )
                     
                     # Extract info first
                     print(f"[VideoStream] Getting video info...")
-                    info = ydl.extract_info(url, download=False)
+                    info = self.execute_yt_dlp(
+                        url,
+                        lambda target: ydl.extract_info(target, download=False),
+                        action=f"{provider}.extract_info",
+                        provider=provider,
+                        destination=destination,
+                    )
                     print(f"[VideoStream] Video info obtained: {info.get('title', 'Unknown')}")
                     
                     self._current_info = {
@@ -144,7 +268,13 @@ class VideoStreamManager:
                     
                     # Download and extract audio
                     print(f"[VideoStream] Starting download and extraction...")
-                    ydl.download([url])
+                    self.execute_yt_dlp(
+                        url,
+                        lambda target: ydl.download([target]),
+                        action=f"{provider}.download",
+                        provider=provider,
+                        destination=destination,
+                    )
                     print(f"[VideoStream] Download completed")
                     
                     # Find the extracted WAV file

@@ -17,6 +17,9 @@ import { getSession } from "@/lib/auth";
 import {
   canReadProjectId,
   canWriteProjectId,
+  hasTaskBrowseScopeParams,
+  resolveReadScope,
+  TaskBrowseScopeError,
   type SessionUser,
 } from "@/lib/server/task-route-utils";
 import { ensureProjectStorageRoot } from "@/lib/server/project-workspace-management";
@@ -38,11 +41,56 @@ const REFERENCE_TYPES = new Set([
 const RELATION_TYPES = new Set(["source", "related"]);
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-function missingReference(displayName?: string | null) {
+function normalizeConversationMessageId(value: unknown) {
+  const normalized = value == null ? "" : String(value).trim();
+  return UUID_RE.test(normalized) ? normalized.toLowerCase() : normalized;
+}
+
+function taskReferenceDedupeKey(
+  referenceType: string,
+  targetId: string | null,
+  targetPath: string | null,
+  targetUrl: string | null,
+  metadata: unknown,
+) {
+  const baseKey = `${targetId ?? ""}|${targetPath ?? ""}|${targetUrl ?? ""}`;
+  if (referenceType !== "conversation_message") return baseKey;
+  const messageId = metadata && typeof metadata === "object"
+    ? normalizeConversationMessageId((metadata as Record<string, unknown>).message_id)
+    : "";
+  return `${baseKey}|${messageId}`;
+}
+
+function legacyMessageReferenceMatches(
+  reference: typeof taskReferences.$inferSelect | undefined,
+  legacyDedupeKey: string,
+  canonicalMessageId: string,
+) {
+  if (!reference || !canonicalMessageId || reference.dedupeKey !== legacyDedupeKey) return false;
+  const metadata = reference.referenceMetadata;
+  const messageId = metadata && typeof metadata === "object"
+    ? normalizeConversationMessageId((metadata as Record<string, unknown>).message_id)
+    : "";
+  return messageId === canonicalMessageId;
+}
+
+function missingReference(
+  displayName?: string | null,
+  redactTarget = false,
+) {
   return {
     display_name: displayName || "参照先が見つかりません",
     subtitle: "参照先が見つかりません",
     exists: false,
+    ...(redactTarget
+      ? {
+          target_id: null,
+          target_path: null,
+          target_url: null,
+          metadata: {},
+          open: { id: null, path: null, url: null },
+        }
+      : {}),
   };
 }
 
@@ -60,22 +108,82 @@ async function loadTask(taskId: string) {
   return task ?? null;
 }
 
-async function requireTaskAccess(taskId: string, user: SessionUser, write = false) {
+async function requireTaskAccess(
+  taskId: string,
+  user: SessionUser,
+  write = false,
+  browseParams?: URLSearchParams,
+) {
   const task = await loadTask(taskId);
-  if (!task) return { task: null, response: NextResponse.json({ detail: "タスクが見つかりません" }, { status: 404 }) };
+  if (!task) {
+    return {
+      task: null,
+      response: NextResponse.json(
+        { detail: "タスクが見つかりません" },
+        { status: 404 },
+      ),
+      browseProjectIds: null,
+    };
+  }
+  let browseProjectIds: string[] | null = null;
+  if (browseParams && hasTaskBrowseScopeParams(browseParams)) {
+    try {
+      const scope = await resolveReadScope(user, browseParams);
+      if (scope.explicit) {
+        browseProjectIds = scope.projectIds;
+        if (!scope.projectIds.includes(task.projectId)) {
+          return {
+            task: null,
+            response: NextResponse.json(
+              { detail: "タスクが見つかりません" },
+              { status: 404 },
+            ),
+            browseProjectIds,
+          };
+        }
+      }
+    } catch (error) {
+      if (error instanceof TaskBrowseScopeError) {
+        return {
+          task: null,
+          response: NextResponse.json(
+            { detail: error.message },
+            { status: error.status },
+          ),
+          browseProjectIds: null,
+        };
+      }
+      throw error;
+    }
+  }
   if (!(await canReadProjectId(user, task.projectId))) {
-    return { task: null, response: NextResponse.json({ detail: "タスクが見つかりません" }, { status: 404 }) };
+    return {
+      task: null,
+      response: NextResponse.json(
+        { detail: "タスクが見つかりません" },
+        { status: 404 },
+      ),
+      browseProjectIds,
+    };
   }
   if (write && !(await canWriteProjectId(user, task.projectId))) {
-    return { task: null, response: NextResponse.json({ detail: "権限がありません" }, { status: 403 }) };
+    return {
+      task: null,
+      response: NextResponse.json(
+        { detail: "権限がありません" },
+        { status: 403 },
+      ),
+      browseProjectIds,
+    };
   }
-  return { task, response: null };
+  return { task, response: null, browseProjectIds };
 }
 
 async function serializeReference(
   row: typeof taskReferences.$inferSelect,
   user: SessionUser,
   canRemove: boolean,
+  allowedProjectIds?: ReadonlySet<string> | null,
 ) {
   const base = {
     id: row.id,
@@ -103,7 +211,17 @@ async function serializeReference(
     const session = targetSessionId
       ? await getLiveConversationSession(targetSessionId, user.id)
       : null;
-    if (!session) return { ...base, ...missingReference(null) };
+    const sessionInScope =
+      !session ||
+      !allowedProjectIds ||
+      !session.projectId ||
+      allowedProjectIds.has(session.projectId);
+    if (!session || !sessionInScope) {
+      return {
+        ...base,
+        ...missingReference(null, allowedProjectIds != null),
+      };
+    }
     const messageId = row.referenceType === "conversation_message"
       ? String((row.referenceMetadata as Record<string, unknown> | null)?.message_id ?? "")
       : "";
@@ -115,7 +233,7 @@ async function serializeReference(
             .where(and(eq(conversationMessages.id, messageId), eq(conversationMessages.sessionId, session.id)))
             .limit(1)
         : [];
-      if (!message) return { ...base, ...missingReference(row.displayName) };
+      if (!message) return { ...base, ...missingReference(row.displayName, allowedProjectIds != null) };
     }
     return {
       ...base,
@@ -141,10 +259,11 @@ async function serializeReference(
       : [];
     const canRead = node
       ? node.node.projectId
-        ? await canReadProject(user, node.node.projectId)
+        ? (!allowedProjectIds || allowedProjectIds.has(node.node.projectId)) &&
+          (await canReadProject(user, node.node.projectId))
         : node.workspaceOwner === user.id || user.role === "admin"
       : false;
-    if (!node || !canRead) return { ...base, ...missingReference(null) };
+    if (!node || !canRead) return { ...base, ...missingReference(null, allowedProjectIds != null) };
     return {
       ...base,
       display_name: node.node.title || row.displayName,
@@ -154,8 +273,10 @@ async function serializeReference(
   }
 
   if (row.referenceType === "workspace_file") {
-    const canRead = await canReadProject(user, row.projectId);
-    if (!canRead || !row.targetPath) return { ...base, ...missingReference(null) };
+    const canRead =
+      (!allowedProjectIds || allowedProjectIds.has(row.projectId)) &&
+      (await canReadProject(user, row.projectId));
+    if (!canRead || !row.targetPath) return { ...base, ...missingReference(null, allowedProjectIds != null) };
     let exists = false;
     try {
       const root = ensureProjectStorageRoot(row.projectId);
@@ -166,7 +287,7 @@ async function serializeReference(
     }
     return {
       ...base,
-      ...(!exists ? missingReference(row.displayName) : {}),
+      ...(!exists ? missingReference(row.displayName, allowedProjectIds != null) : {}),
       subtitle: "workspace",
       open: { id: row.projectId, path: row.targetPath, url: null },
     };
@@ -185,6 +306,7 @@ async function serializeTaskRelation(
   currentTaskId: string,
   user: SessionUser,
   canRemove: boolean,
+  allowedProjectIds?: ReadonlySet<string> | null,
 ) {
   const targetId = relatedTaskId(currentTaskId, row);
   const base = {
@@ -216,6 +338,9 @@ async function serializeTaskRelation(
     .where(and(eq(tasks.id, targetId), isNull(tasks.deletedAt)))
     .limit(1);
   if (!target || !(await canReadProject(user, target.task.projectId))) {
+    return base;
+  }
+  if (allowedProjectIds && !allowedProjectIds.has(target.task.projectId)) {
     return base;
   }
 
@@ -273,15 +398,23 @@ async function serializeAttachment(
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const user = await getSession();
   if (!user) return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
   const { id } = await params;
-  const access = await requireTaskAccess(id, user);
+  const access = await requireTaskAccess(
+    id,
+    user,
+    false,
+    new URL(request.url).searchParams,
+  );
   if (access.response) return access.response;
-  const canRemove = access.task
+  const allowedProjectIds = access.browseProjectIds
+    ? new Set(access.browseProjectIds)
+    : null;
+  const canRemove = access.task && !allowedProjectIds
     ? await canWriteProjectId(user, access.task.projectId)
     : false;
   const [refs, relations, attachments] = await Promise.all([
@@ -294,8 +427,16 @@ export async function GET(
     db.select().from(taskAttachments).where(eq(taskAttachments.taskId, id)).orderBy(desc(taskAttachments.createdAt)),
   ]);
   const result = [
-    ...(await Promise.all(refs.map((row) => serializeReference(row, user, canRemove)))),
-    ...(await Promise.all(relations.map((row) => serializeTaskRelation(row, id, user, canRemove)))),
+    ...(await Promise.all(
+      refs.map((row) =>
+        serializeReference(row, user, canRemove, allowedProjectIds),
+      ),
+    )),
+    ...(await Promise.all(
+      relations.map((row) =>
+        serializeTaskRelation(row, id, user, canRemove, allowedProjectIds),
+      ),
+    )),
     ...(await Promise.all(attachments.map((row) => serializeAttachment(row, canRemove)))),
   ];
   if (access.task?.knowledgeNodeId) {
@@ -312,7 +453,8 @@ export async function GET(
       .limit(1);
     const canRead = node
       ? node.projectId
-        ? await canReadProject(user, node.projectId)
+        ? (!allowedProjectIds || allowedProjectIds.has(node.projectId)) &&
+          (await canReadProject(user, node.projectId))
         : node.workspaceOwner === user.id || user.role === "admin"
       : false;
     result.push({
@@ -321,7 +463,7 @@ export async function GET(
       relation_type: "related",
       display_name: canRead ? node?.title || "Docsノード" : "参照先が見つかりません",
       subtitle: canRead ? "タスクのDocs" : "参照先が見つかりません",
-      target_id: access.task.knowledgeNodeId,
+      target_id: canRead || allowedProjectIds == null ? access.task.knowledgeNodeId : null,
       target_path: null,
       target_url: null,
       metadata: {},
@@ -329,7 +471,11 @@ export async function GET(
       created_at: access.task.createdAt,
       can_remove: canRead && canRemove,
       exists: canRead,
-      open: { id: access.task.knowledgeNodeId, path: canRead ? `/docs/${access.task.knowledgeNodeId}` : null, url: null },
+      open: {
+        id: canRead || allowedProjectIds == null ? access.task.knowledgeNodeId : null,
+        path: canRead ? `/docs/${access.task.knowledgeNodeId}` : null,
+        url: null,
+      },
     });
   }
   return NextResponse.json(result);
@@ -341,6 +487,12 @@ export async function POST(
 ) {
   const user = await getSession();
   if (!user) return NextResponse.json({ detail: "認証が必要です" }, { status: 401 });
+  if (hasTaskBrowseScopeParams(new URL(request.url).searchParams)) {
+    return NextResponse.json(
+      { detail: "Browse scope is read-only" },
+      { status: 400 },
+    );
+  }
   const { id } = await params;
   const access = await requireTaskAccess(id, user, true);
   if (access.response || !access.task) return access.response;
@@ -471,9 +623,29 @@ export async function POST(
   if (referenceType === "workspace_file" && !(await canReadProject(user, access.task.projectId))) {
     return NextResponse.json({ detail: "参照先プロジェクトの権限がありません" }, { status: 403 });
   }
-  const dedupeKey = `${targetId ?? ""}|${targetPath ?? ""}|${targetUrl ?? ""}`;
+  const dedupeKey = taskReferenceDedupeKey(
+    referenceType,
+    targetId,
+    targetPath,
+    targetUrl,
+    body.metadata,
+  );
   const [existing] = await db.select().from(taskReferences).where(and(eq(taskReferences.taskId, id), eq(taskReferences.referenceType, referenceType), eq(taskReferences.relationType, relationType), eq(taskReferences.dedupeKey, dedupeKey))).limit(1);
   if (existing) return NextResponse.json(await serializeReference(existing, user, true));
+  if (referenceType === "conversation_message") {
+    const canonicalMessageId = normalizeConversationMessageId(
+      body.metadata && typeof body.metadata === "object"
+        ? (body.metadata as Record<string, unknown>).message_id
+        : null,
+    );
+    if (canonicalMessageId) {
+      const legacyDedupeKey = `${targetId ?? ""}|${targetPath ?? ""}|${targetUrl ?? ""}`;
+      const [legacyReference] = await db.select().from(taskReferences).where(and(eq(taskReferences.taskId, id), eq(taskReferences.referenceType, referenceType), eq(taskReferences.relationType, relationType), eq(taskReferences.dedupeKey, legacyDedupeKey))).limit(1);
+      if (legacyMessageReferenceMatches(legacyReference, legacyDedupeKey, canonicalMessageId)) {
+        return NextResponse.json(await serializeReference(legacyReference, user, true));
+      }
+    }
+  }
   const [row] = await db.insert(taskReferences).values({
     taskId: id,
     projectId: access.task.projectId,

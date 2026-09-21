@@ -207,13 +207,31 @@ def _message_payload(message: Any, include_metadata: bool = False) -> Dict[str, 
 
 
 def _public_metadata(value: Any) -> Any:
-    """provider 内部の推論内容を落としたメタデータを返す。"""
+    """モデルへ返して安全なメタデータ投影を返す。"""
     try:
-        from src.memory.models.conversations import _public_message_metadata
+        from src.services.privacy_masking_projection import (
+            public_model_message_metadata,
+        )
 
-        return _public_message_metadata(value)
+        return public_model_message_metadata(value)
     except Exception:
-        return value
+        # This is a model-facing projection.  If the sanitizer is unavailable
+        # (for example during a rolling deployment), do not fall back to raw
+        # persisted metadata; an empty projection is fail-closed.
+        return {}
+
+
+def _is_masking_source_message(message: Any) -> bool:
+    """Keep raw ``/masking`` source rows out of cross-session tools."""
+    try:
+        from src.services.privacy_masking_projection import is_privacy_masking_source
+
+        return bool(is_privacy_masking_source(message))
+    except Exception:
+        # The helper is part of the backend package.  If an older/partial
+        # worker cannot import it, fail closed for this projection rather than
+        # returning a raw conversation row to a cross-session tool.
+        return True
 
 
 def _query_terms(query: str) -> List[str]:
@@ -391,9 +409,13 @@ async def read_chat_session(
                 "messages": [],
             }
 
-        messages = list(
-            await repository.get_active_branch_messages(resolved_session_id) or []
-        )
+        messages = [
+            message
+            for message in list(
+                await repository.get_active_branch_messages(resolved_session_id) or []
+            )
+            if not _is_masking_source_message(message)
+        ]
     except Exception as exc:
         return {
             "success": False,
@@ -517,6 +539,8 @@ async def _search_chat_history_text(
         session_title = getattr(session, "title", "") or ""
 
         for message in messages:
+            if _is_masking_source_message(message):
+                continue
             created_at = _to_datetime(getattr(message, "created_at", None))
             if cutoff is not None and created_at is not None and created_at < cutoff:
                 continue

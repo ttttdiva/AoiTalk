@@ -89,6 +89,41 @@ export function shouldFindOccurrenceByStartAt(
   return reuseOccurrenceId && !occurrenceId;
 }
 
+/**
+ * Validate a normal materialized row against the canonical/actual pair sent
+ * by a single-occurrence mutation.  Legacy rows without original_start_at
+ * can still be reused when their stored actual timestamp matches the UI row.
+ */
+export function matchesOccurrenceIdentity({
+  sourceKind,
+  originalStartAt,
+  startAt,
+  canonicalStartAt,
+  actualStartAt,
+}: {
+  sourceKind: string | null | undefined;
+  originalStartAt?: string | Date | null;
+  startAt: string | Date;
+  canonicalStartAt: string | Date;
+  actualStartAt: string | Date;
+}): boolean {
+  if (
+    isRecurrenceSkipSourceKind(sourceKind) ||
+    isRecurrenceOverrideSourceKind(sourceKind)
+  ) {
+    return false;
+  }
+  try {
+    const identity = originalStartAt ?? startAt;
+    const expected = originalStartAt ? canonicalStartAt : actualStartAt;
+    const toDate = (value: string | Date) =>
+      value instanceof Date ? value : parseInputDate(value);
+    return toDate(identity).getTime() === toDate(expected).getTime();
+  } catch {
+    return false;
+  }
+}
+
 export function parseRecurrenceOriginalStartAt(
   sourceKind: string | null | undefined,
 ): string | null {

@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from uuid import UUID
@@ -66,6 +67,10 @@ try:
         set_folder_thumbnail as explorer_set_folder_thumbnail,
         clear_folder_thumbnail as explorer_clear_folder_thumbnail,
     )
+    from ...tools.file_explorer import (
+        is_safe_workspace_path as explorer_is_safe_workspace_path,
+        resolve_workspace_path as explorer_resolve_workspace_path,
+    )
     from ...tools.file_explorer.download_stream import (
         prepare_download_file,
         prepare_download_items,
@@ -92,6 +97,8 @@ except ImportError:
     explorer_search_workspace_entries = None
     explorer_resolve_file_path = None
     explorer_get_root_dir = None
+    explorer_is_safe_workspace_path = None
+    explorer_resolve_workspace_path = None
     prepare_download_file = None
     prepare_download_items = None
     remove_temp_download = None
@@ -208,6 +215,11 @@ try:
 except ImportError:
     ensure_user_storage = None
 
+try:
+    from ...tools.file_explorer.storage_context import calculate_storage_usage
+except ImportError:
+    calculate_storage_usage = None
+
 # Import bookmark repository (server.py と同じフォールバック付き)
 try:
     from ...memory.file_explorer_bookmark_repository import (
@@ -270,15 +282,24 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
         paths: list[str],
         *,
         write: bool = False,
+        allow_project_transfer: bool = False,
+        project_permission: Literal["read", "write", "delete"] | None = None,
     ) -> tuple[list[str], bool]:
         """Authorize generic explorer namespaces before resolving filesystem paths.
 
         Project workspaces have project-specific APIs which perform the quota
         admission/row-lock protocol.  The legacy generic explorer therefore
-        permits project reads only and rejects every project write, including
-        administrators, so an alternate path cannot bypass that protocol.
-        User storage remains available only to its owner for non-admin users.
+        permits project reads only and rejects every project write unless the
+        caller is one of the transfer endpoints below.  Transfer authorization
+        is intentionally explicit so rename/delete/upload and the other
+        generic writers keep the historical guard.  User storage remains
+        available only to its owner for non-admin users.
         """
+
+        if allow_project_transfer and not project_permission:
+            raise RuntimeError("project transfer authorization requires a permission")
+        if write and allow_project_transfer and project_permission != "write":
+            raise RuntimeError("project transfer writes require write permission")
 
         is_admin = await server._is_admin_user(request)
         user_id: UUID | None = None
@@ -302,7 +323,7 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
             explorer_get_root_dir() if explorer_get_root_dir is not None else None
         )
         normalized: list[str] = []
-        project_checks: list[UUID] = []
+        project_checks: list[tuple[UUID, str]] = []
 
         for raw_value in paths:
             raw = str(raw_value or "")
@@ -378,13 +399,17 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                         raise HTTPException(
                             status_code=403, detail="無効なプロジェクトパスです"
                         )
-                    if write:
+                    if write and not allow_project_transfer:
                         raise HTTPException(
                             status_code=403,
                             detail="プロジェクトファイルはプロジェクトAPIから操作してください",
                         )
-                    if not is_admin:
-                        project_checks.append(UUID(match.group(1)))
+                    if user_id is not None and (
+                        not is_admin or project_permission is not None
+                    ):
+                        project_checks.append(
+                            (UUID(match.group(1)), project_permission or "read")
+                        )
             elif folded and folded[0] == "_users":
                 if len(parts) < 2:
                     # _users も管理者の上位移動で通過する読み取り専用の
@@ -416,12 +441,12 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
 
             session = await server._db_manager.get_session()
             try:
-                for project_id in dict.fromkeys(project_checks):
+                for project_id, permission in dict.fromkeys(project_checks):
                     allowed = await ProjectRepository.has_permission(
                         session,
                         project_id=project_id,
                         user_id=user_id,
-                        permission="read",
+                        permission=permission,
                     )
                     if not allowed:
                         raise HTTPException(status_code=403, detail="Permission denied")
@@ -429,6 +454,386 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 await session.close()
 
         return normalized, is_admin
+
+    def _explorer_transfer_namespace(
+        path: str,
+    ) -> tuple[str | None, UUID | None, bool]:
+        """Return the protected namespace owning an explorer transfer path."""
+
+        parts = [part for part in str(path or "").replace("\\", "/").split("/") if part]
+        folded = [part.casefold() for part in parts]
+        if not folded or folded[0] not in {"_projects", "_users"}:
+            return None, None, False
+        namespace_kind = "project" if folded[0] == "_projects" else "user"
+        if len(parts) == 1:
+            return f"{namespace_kind}_namespace", None, True
+        segment = (
+            _PROJECT_SEGMENT if folded[0] == "_projects" else _USER_SEGMENT
+        ).fullmatch(parts[1])
+        if segment is None:
+            return None, None, False
+        return namespace_kind, UUID(segment.group(1)), len(parts) == 2
+
+    async def _explorer_transfer_user_id(request: Request) -> UUID | None:
+        """Resolve the authenticated principal for transfer ACL rechecks."""
+
+        if getattr(server, "auth_enabled", None) is False:
+            # Personal development mode deliberately has no DB principal.  It
+            # retains the historical admin-only workspace behavior; deployed
+            # authenticated profiles always take the ACL path below.
+            return None
+        user_info = await server._get_user_info_from_request(request)
+        if not user_info or not user_info.get("id"):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        try:
+            return UUID(str(user_info["id"]))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+
+    def _transfer_project_root(storage_relative: str) -> Path:
+        """Resolve and create one canonical project root without following links."""
+
+        if explorer_get_root_dir is None or explorer_is_safe_workspace_path is None:
+            raise HTTPException(status_code=503, detail="File explorer is not available")
+        workspace_root = Path(explorer_get_root_dir()).resolve()
+        relative_path = Path(storage_relative)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise HTTPException(status_code=400, detail="Invalid project storage path")
+        project_root = workspace_root / relative_path
+        if not explorer_is_safe_workspace_path(workspace_root, project_root):
+            raise HTTPException(
+                status_code=400,
+                detail="Project storage path must not cross a symlink",
+            )
+        project_root.mkdir(parents=True, exist_ok=True)
+        if not explorer_is_safe_workspace_path(workspace_root, project_root):
+            raise HTTPException(
+                status_code=400,
+                detail="Project storage path changed outside the workspace root",
+            )
+        return project_root.resolve()
+
+    async def _resolve_explorer_transfer_path(path: str, *, is_admin: bool) -> Path:
+        if explorer_resolve_workspace_path is None:
+            raise HTTPException(status_code=503, detail="File explorer is not available")
+        resolved, valid = await asyncio.to_thread(
+            explorer_resolve_workspace_path,
+            path,
+            is_admin=is_admin,
+        )
+        if not valid:
+            raise HTTPException(status_code=400, detail="無効なパスです")
+        return Path(resolved)
+
+    def _explorer_transfer_item_size(path: Path) -> int:
+        if not path.exists():
+            raise HTTPException(status_code=400, detail="移動元が見つかりません")
+        if path.is_dir():
+            if calculate_storage_usage is None:
+                raise HTTPException(
+                    status_code=503, detail="Storage quota support is not available"
+                )
+            return int(calculate_storage_usage(path, strict=True)["total_bytes"])
+        if path.is_file():
+            return int(path.stat().st_size)
+        raise HTTPException(status_code=400, detail="移動元は通常のファイルまたはフォルダである必要があります")
+
+    def _remove_explorer_transfer_artifact(path: Path) -> None:
+        """Remove only a path created by a successful copy operation."""
+
+        try:
+            if path.is_symlink():
+                path.unlink(missing_ok=True)
+            elif path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            return
+
+    def _rollback_explorer_transfer(
+        operation: Literal["move", "copy"],
+        source_path: Path,
+        created_path: Path,
+        *,
+        mutated: bool,
+    ) -> None:
+        if not mutated:
+            return
+        try:
+            if operation == "move":
+                if source_path.exists():
+                    logger.error(
+                        "Cannot roll back explorer move because source exists: %s",
+                        source_path,
+                    )
+                    return
+                if created_path.exists() or created_path.is_symlink():
+                    shutil.move(str(created_path), str(source_path.parent))
+            else:
+                _remove_explorer_transfer_artifact(created_path)
+        except Exception:
+            logger.exception(
+                "Failed to roll back explorer %s: source=%s created=%s",
+                operation,
+                source_path,
+                created_path,
+            )
+
+    async def _run_explorer_transfer(
+        request: Request,
+        *,
+        operation: Literal["move", "copy"],
+        source: str,
+        destination: str,
+    ) -> dict:
+        """Run a User↔Project transfer under the existing Project protocol."""
+
+        is_move = operation == "move"
+        if is_move:
+            [authorized_source], is_admin = await authorize_explorer_paths(
+                request,
+                [source],
+                write=True,
+                allow_project_transfer=True,
+                project_permission="write",
+            )
+            [authorized_destination], _ = await authorize_explorer_paths(
+                request,
+                [destination],
+                write=True,
+                allow_project_transfer=True,
+                project_permission="write",
+            )
+        else:
+            [authorized_source], is_admin = await authorize_explorer_paths(
+                request,
+                [source],
+                project_permission="read",
+            )
+            [authorized_destination], _ = await authorize_explorer_paths(
+                request,
+                [destination],
+                write=True,
+                allow_project_transfer=True,
+                project_permission="write",
+            )
+
+        source_kind, source_namespace_id, source_is_root = _explorer_transfer_namespace(
+            authorized_source
+        )
+        destination_kind, destination_namespace_id, _ = _explorer_transfer_namespace(
+            authorized_destination
+        )
+        source_project_id = (
+            source_namespace_id if source_kind == "project" else None
+        )
+        destination_project_id = (
+            destination_namespace_id if destination_kind == "project" else None
+        )
+        if source_kind in {"project", "user", "project_namespace", "user_namespace"} and source_is_root:
+            raise HTTPException(
+                status_code=400,
+                detail="Project or user storage root cannot be transferred",
+            )
+        if source_project_id is not None and destination_project_id is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Cross-project explorer transfers are not supported",
+            )
+
+        user_id = await _explorer_transfer_user_id(request)
+        project_permissions: dict[UUID, set[str]] = {}
+        if source_project_id is not None:
+            source_permissions = project_permissions.setdefault(source_project_id, set())
+            source_permissions.add("write" if is_move else "read")
+            if is_move:
+                source_permissions.add("delete")
+        if destination_project_id is not None:
+            project_permissions.setdefault(destination_project_id, set()).add("write")
+
+        session = None
+        project_rows: dict[UUID, object] = {}
+        project_roots: dict[UUID, Path] = {}
+        committed = False
+        operation_mutated = False
+        created_path: Path | None = None
+        source_absolute: Path | None = None
+
+        try:
+            if project_permissions:
+                if getattr(server, "_db_manager", None) is None:
+                    raise HTTPException(status_code=503, detail="Database is not available")
+                from ...memory.project_repository import ProjectRepository
+
+                session = await server._db_manager.get_session()
+                # The current task supports User↔one-Project transfers.  A
+                # sorted loop keeps the lock order deterministic if this is
+                # extended later, while cross-project pairs are rejected above.
+                for project_id in sorted(project_permissions, key=str):
+                    project = await ProjectRepository.get_by_id_for_update(
+                        session, project_id
+                    )
+                    if project is None or getattr(project, "deleted_at", None) is not None:
+                        raise HTTPException(status_code=404, detail="Project not found")
+                    project_rows[project_id] = project
+
+                if user_id is not None:
+                    for project_id in sorted(project_permissions, key=str):
+                        for permission in ("read", "write", "delete"):
+                            if permission not in project_permissions[project_id]:
+                                continue
+                            allowed = await ProjectRepository.has_permission(
+                                session,
+                                project_id=project_id,
+                                user_id=user_id,
+                                permission=permission,
+                            )
+                            if not allowed:
+                                raise HTTPException(
+                                    status_code=403, detail="Permission denied"
+                                )
+                for project_id in project_permissions:
+                    storage_relative = await ProjectRepository.get_storage_path(project_id)
+                    project_roots[project_id] = await asyncio.to_thread(
+                        _transfer_project_root, storage_relative
+                    )
+
+            source_absolute = await _resolve_explorer_transfer_path(
+                authorized_source,
+                is_admin=is_admin,
+            )
+            destination_absolute = await _resolve_explorer_transfer_path(
+                authorized_destination,
+                is_admin=is_admin,
+            )
+
+            source_bytes: int | None = None
+            if destination_project_id is not None and (
+                not is_move or source_project_id != destination_project_id
+            ):
+                source_bytes = await asyncio.to_thread(
+                    _explorer_transfer_item_size,
+                    source_absolute,
+                )
+                destination_project = project_rows[destination_project_id]
+                before_usage = await asyncio.to_thread(
+                    calculate_storage_usage,
+                    project_roots[destination_project_id],
+                    strict=True,
+                )
+                try:
+                    quota_mb = (
+                        1000
+                        if getattr(destination_project, "storage_quota_mb", None) is None
+                        else int(destination_project.storage_quota_mb)
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise HTTPException(
+                        status_code=500, detail="Project storage quota is invalid"
+                    ) from exc
+                quota_bytes = max(0, quota_mb) * 1024 * 1024
+                if int(before_usage["total_bytes"]) + source_bytes > quota_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Project storage quota exceeded",
+                    )
+
+            if is_move:
+                result = await run_in_threadpool(
+                    explorer_move_item,
+                    authorized_source,
+                    authorized_destination,
+                    is_admin=is_admin,
+                )
+            else:
+                result = await run_in_threadpool(
+                    explorer_copy_item,
+                    authorized_source,
+                    authorized_destination,
+                    is_admin=is_admin,
+                )
+            if not result.get("success"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=result.get(
+                        "error",
+                        "Failed to move" if is_move else "Failed to copy",
+                    ),
+                )
+
+            created_name = str(result.get("new_name") or source_absolute.name)
+            created_path = destination_absolute / created_name
+            operation_mutated = not (
+                (is_move and created_path == source_absolute)
+                or (not is_move and result.get("created") is False)
+            )
+
+            if project_permissions:
+                for project_id, project in project_rows.items():
+                    final_usage = await asyncio.to_thread(
+                        calculate_storage_usage,
+                        project_roots[project_id],
+                        strict=True,
+                    )
+                    final_bytes = int(final_usage["total_bytes"])
+                    quota_check_required = destination_project_id == project_id and (
+                        not is_move or source_project_id != destination_project_id
+                    )
+                    if quota_check_required:
+                        try:
+                            quota_mb = (
+                                1000
+                                if getattr(project, "storage_quota_mb", None) is None
+                                else int(project.storage_quota_mb)
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise HTTPException(
+                                status_code=500, detail="Project storage quota is invalid"
+                            ) from exc
+                        if final_bytes > max(0, quota_mb) * 1024 * 1024:
+                            raise HTTPException(
+                                status_code=413,
+                                detail="Project storage quota exceeded",
+                            )
+                    project.storage_used_mb = final_bytes / (1024 * 1024)
+                await session.commit()
+                committed = True
+            return result
+        except HTTPException:
+            if source_absolute is not None and created_path is not None and not committed:
+                await asyncio.to_thread(
+                    _rollback_explorer_transfer,
+                    operation,
+                    source_absolute,
+                    created_path,
+                    mutated=operation_mutated,
+                )
+            if session is not None and not committed:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("Failed to roll back explorer transfer session")
+            raise
+        except Exception as exc:
+            if source_absolute is not None and created_path is not None and not committed:
+                await asyncio.to_thread(
+                    _rollback_explorer_transfer,
+                    operation,
+                    source_absolute,
+                    created_path,
+                    mutated=operation_mutated,
+                )
+            if session is not None and not committed:
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception("Failed to roll back explorer transfer session")
+            logger.error("Failed to %s explorer item: %s", operation, exc)
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        finally:
+            if session is not None:
+                await session.close()
 
     @app.get("/api/filer/config")
     async def get_absolute_filer_path_config(
@@ -1055,26 +1460,15 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 status_code=503, detail="File explorer is not available"
             )
 
-        try:
-            [src], is_admin = await authorize_explorer_paths(
-                request, [payload.src], write=True
+        result = await await_task_completion_before_cancellation(
+            _run_explorer_transfer(
+                request,
+                operation="move",
+                source=payload.src,
+                destination=payload.dest,
             )
-            [dest], _ = await authorize_explorer_paths(
-                request, [payload.dest], write=True
-            )
-            result = explorer_move_item(
-                src, dest, is_admin=is_admin
-            )
-            if not result.get("success"):
-                raise HTTPException(
-                    status_code=400, detail=result.get("error", "Failed to move")
-                )
-            return JSONResponse(result)
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to move: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        )
+        return JSONResponse(result)
 
     @app.post("/api/explorer/copy")
     async def explorer_copy(
@@ -1088,24 +1482,15 @@ def register_file_explorer_routes(app: FastAPI, server: "WebChatServer") -> None
                 status_code=503, detail="File explorer is not available"
             )
 
-        try:
-            [src], is_admin = await authorize_explorer_paths(request, [payload.src])
-            [dest], _ = await authorize_explorer_paths(
-                request, [payload.dest], write=True
+        result = await await_task_completion_before_cancellation(
+            _run_explorer_transfer(
+                request,
+                operation="copy",
+                source=payload.src,
+                destination=payload.dest,
             )
-            result = explorer_copy_item(
-                src, dest, is_admin=is_admin
-            )
-            if not result.get("success"):
-                raise HTTPException(
-                    status_code=400, detail=result.get("error", "Failed to copy")
-                )
-            return JSONResponse(result)
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Failed to copy: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+        )
+        return JSONResponse(result)
 
     @app.post("/api/explorer/archive")
     async def explorer_archive(

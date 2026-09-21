@@ -7,7 +7,11 @@ import {
   type ValuePreviewFn,
 } from "@/components/tasks/slash-command-input";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
-import { parseLocalDateTime } from "@/lib/date-time";
+import {
+  formatLocalDate,
+  hasExplicitTimeComponent,
+  parseLocalDateTime,
+} from "@/lib/date-time";
 import type { Project, Tag, Task } from "@/lib/task-api";
 
 export function formatDateTimeLocal(d: Date): string {
@@ -226,14 +230,17 @@ export function parseFlexibleDate(raw: string): string | null {
 }
 
 function hasExplicitTime(raw: string): boolean {
-  return /(^|\s)\d{1,2}:\d{2}$/.test(raw.trim());
+  const trimmed = raw.trim();
+  return (
+    hasExplicitTimeComponent(trimmed) ||
+    /(^|\s)\d{1,2}:\d{2}$/.test(trimmed)
+  );
 }
 
-export function hasNonMidnightTime(value: string | null | undefined): boolean {
-  if (!value) return false;
-  const d = parseTaskDateValue(value);
-  if (!d) return false;
-  return d.getHours() !== 0 || d.getMinutes() !== 0;
+function canonicalizeSlashDate(value: string, dateOnly: boolean): string {
+  if (!dateOnly) return value;
+  const date = parseTaskDateValue(value);
+  return date ? formatLocalDate(date) : value;
 }
 
 function buildSlashCommandRegex(command: string, global = false): RegExp {
@@ -384,12 +391,14 @@ export function parseSlashCommands(
       const rawVal = match[2].trim();
       const parsed = parseFlexibleDate(rawVal);
       if (parsed) {
+        const dateOnly = !hasExplicitTime(rawVal);
+        const canonical = canonicalizeSlashDate(parsed, dateOnly);
         if (command === "/start") {
-          patches.startAt = parsed;
-          patches.startAtDateOnly = !hasExplicitTime(rawVal);
+          patches.startAt = canonical;
+          patches.startAtDateOnly = dateOnly;
         } else {
-          patches.endAt = parsed;
-          patches.endAtDateOnly = !hasExplicitTime(rawVal);
+          patches.endAt = canonical;
+          patches.endAtDateOnly = dateOnly;
         }
       }
       if (parsed) {
@@ -576,12 +585,11 @@ export function applyStartTimeToEndAt(
   endAtDateOnly: boolean,
   startAt: string | null | undefined,
 ): string {
-  if (!endAtDateOnly || !startAt || !startAt.includes("T")) return endAt;
+  if (!endAtDateOnly || !hasExplicitTimeComponent(startAt)) return endAt;
   const startDate = parseTaskDateValue(startAt);
   if (!startDate) return endAt;
   const startH = startDate.getHours();
   const startM = startDate.getMinutes();
-  if (startH === 0 && startM === 0) return endAt;
   const dueDate = parseTaskDateValue(endAt);
   if (!dueDate) return endAt;
   dueDate.setHours(startH + 1, startM, 0, 0);
@@ -821,6 +829,8 @@ export function buildTaskSlashCommandFormPatch({
   const nextEndAt = patches.endAt
     ? (resolvedEndAt ?? patches.endAt)
     : undefined;
+  const hasDatePatch =
+    patches.startAt !== undefined || patches.endAt !== undefined;
 
   return {
     title,
@@ -828,11 +838,10 @@ export function buildTaskSlashCommandFormPatch({
     priority: patches.priority,
     startAt: patches.startAt,
     endAt: nextEndAt,
-    allDay:
-      patches.endAtDateOnly || patches.startAtDateOnly
-        ? !hasNonMidnightTime(resolvedStartAt) &&
-          !hasNonMidnightTime(resolvedEndAt)
-        : undefined,
+    allDay: hasDatePatch
+      ? !hasExplicitTimeComponent(resolvedStartAt) &&
+        !hasExplicitTimeComponent(resolvedEndAt)
+      : undefined,
     targetProjectId: patches.moveToProject,
     tagNames: patches.tagNames,
   };

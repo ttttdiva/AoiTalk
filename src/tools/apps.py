@@ -115,22 +115,111 @@ class _RuntimeAppContext(dict):
         self._initial_context = dict(initial or {})
         super().__init__(self._initial_context)
 
+    @staticmethod
+    def _turn_context_projection() -> dict[str, Any]:
+        """Project only trusted identity/scope fields from ``TurnContext``.
+
+        Bootstrap tools are intentionally usable when there is no selected App
+        (and, for a normal turn, no runtime Project projection).  The provider
+        registry may nevertheless be retained across turns, so using the
+        constructor mapping as a fallback in that situation would authorize a
+        stale App/Project principal.  ``TurnContext`` is populated by the
+        request boundary after authentication and is therefore the only safe
+        source for this no-runtime-context case.  Do not copy arbitrary fields
+        from the model-facing payload here.
+        """
+
+        turn = get_turn_context()
+        projected: dict[str, Any] = {}
+        user_id = getattr(turn, "user_id", None)
+        if user_id:
+            projected["user_id"] = str(user_id)
+        # ``project_id`` is the trusted UI-selected Project identity.  It is
+        # deliberately retained even when ``include_project_context`` is OFF:
+        # that flag controls prompt visibility, while ACL/write checks still
+        # need the selected Project scope.
+        project_id = getattr(turn, "project_id", None)
+        if project_id:
+            projected["id"] = str(project_id)
+        return projected
+
     def _current(self) -> dict[str, Any]:
         current = get_runtime_project_context()
         if isinstance(current, dict):
-            return current
-        if runtime_project_context_is_bound():
-            return {}
-        # A bound TurnContext with no runtime project is an explicit
-        # project/app-off turn (or an unresolved authorization scope).  Do not
-        # fall back to the constructor object in that case.  Only legacy
-        # direct invocations outside any turn may use the initial context.
+            # Runtime Project/App context is server-resolved and remains the
+            # authority for selected App/Project.  Fill a missing principal
+            # from the authenticated TurnContext, but never overwrite an
+            # explicitly resolved value or merge the stale constructor map.
+            projected = dict(current)
+            turn = get_turn_context()
+            turn_user_id = str(getattr(turn, "user_id", None) or "").strip()
+            context_user_id = str(
+                projected.get("user_id")
+                or projected.get("authenticated_user_id")
+                or ""
+            ).strip()
+            if (
+                turn_user_id
+                and context_user_id
+                and turn_user_id.casefold() != context_user_id.casefold()
+            ):
+                raise PermissionError("App runtime user identity mismatch")
+
+            # ``id`` is the selected Project identity for the App runtime
+            # context.  Legacy child contexts may use ``project_id`` or a
+            # nested ``project`` mapping instead.  Compare whichever trusted
+            # value is present so a retained registry cannot combine one
+            # turn's Project with another turn's TurnContext principal.
+            turn_project_id = str(getattr(turn, "project_id", None) or "").strip()
+            context_project_value = projected.get("project_id")
+            # App runtime contexts use the outer ``id`` for the selected
+            # Project.  A few legacy callers put only an App id at the top
+            # level; those contexts have no trusted Project to compare unless
+            # an explicit ``project_id``/nested Project is present.
+            if context_project_value is None and not (
+                projected.get("app_id")
+                or projected.get("active_app_id")
+                or projected.get("app_context")
+            ):
+                context_project_value = projected.get("id")
+            elif context_project_value is None and isinstance(
+                projected.get("app_context"), dict
+            ):
+                context_project_value = projected.get("id")
+            if context_project_value is None and isinstance(
+                projected.get("project"), dict
+            ):
+                context_project_value = projected["project"].get("id")
+            context_project_id = str(context_project_value or "").strip()
+            if (
+                turn_project_id
+                and context_project_id
+                and turn_project_id.casefold() != context_project_id.casefold()
+            ):
+                raise PermissionError("App runtime Project identity mismatch")
+
+            turn_projection = self._turn_context_projection()
+            if not projected.get("user_id") and turn_projection.get("user_id"):
+                projected["user_id"] = turn_projection["user_id"]
+            if not projected.get("id") and turn_projection.get("id"):
+                projected["id"] = turn_projection["id"]
+            return projected
+
+        # ``None`` can be an explicitly bound, request-local Project/App-off
+        # context.  Bootstrap still needs the authenticated principal, while
+        # development tools must fail closed because no App is selected.  In
+        # either explicit-bound or ordinary turns use only trusted TurnContext
+        # identity; never fall back to a stale constructor context.
         turn = get_turn_context()
         if any(
             getattr(turn, field, None) is not None
             for field in ("user_id", "session_id", "project_id", "message_id", "client_message_id")
         ) or getattr(turn, "include_project_context", None) is not None:
+            return self._turn_context_projection()
+        if runtime_project_context_is_bound():
             return {}
+        # Legacy direct invocations outside any request binding retain the
+        # constructor context for compatibility (and existing unit tests).
         return self._initial_context
 
     def get(self, key: Any, default: Any = None) -> Any:
@@ -446,8 +535,19 @@ def build_app_tool_definitions(
     *,
     workspace_root: str | None = None,
     deployment_config: dict[str, Any] | None = None,
+    include_bootstrap: bool = True,
+    include_development: bool = True,
 ) -> list[ToolDefinition]:
-    """Build App tools for one server-resolved runtime context."""
+    """Build App tools for one server-resolved runtime context.
+
+    ``create_app`` and ``list_apps`` are context-free bootstrap/provisioning
+    tools.  The remaining App tools operate on the selected App and are kept in
+    the contextual development pack.  The historical all-tools behaviour is
+    retained by default; callers that construct the root registry should use
+    :func:`build_app_bootstrap_tool_definitions` and
+    :func:`build_app_development_tool_definitions` to register the two
+    surfaces independently.
+    """
     # Keep a lazy request-local principal instead of freezing the constructor
     # context inside every App Tool closure.
     runtime_context = _RuntimeAppContext(context)
@@ -1514,7 +1614,7 @@ def build_app_tool_definitions(
             return link.to_dict()
 
     common_app_id = ToolParam("app_id", "string", "App UUID。省略時は選択中App", required=False)
-    return [
+    definitions = [
         _tool("create_app", "永続的なAppを作成し、App workspaceとREADME/Manifestを初期化する", create_app, [ToolParam("name", "string"), ToolParam("slug", "string", required=False, default=""), ToolParam("description", "string", required=False, default="")], risk="medium", side_effect="database", supports_parallel=False),
         _tool("list_apps", "権限のあるApp一覧を取得する", list_apps, []),
         _tool("get_app", "AppのメタデータとTargetを取得する", get_app, [common_app_id]),
@@ -1545,5 +1645,59 @@ def build_app_tool_definitions(
         _tool("link_app_to_task", "TaskへAppとrelation typeを登録する", link_app_to_task, [ToolParam("task_id", "string"), ToolParam("relation_type", "string", enum=["develops", "fixes", "tests", "releases", "uses", "related"], required=False, default="related"), ToolParam("target_id", "string", required=False, default=""), common_app_id], risk="medium", side_effect="database", supports_parallel=False),
     ]
 
+    bootstrap_names = {"create_app", "list_apps"}
+    if not include_bootstrap:
+        definitions = [item for item in definitions if item.name not in bootstrap_names]
+    if not include_development:
+        definitions = [item for item in definitions if item.name in bootstrap_names]
+    return definitions
 
-__all__ = ["AppWriteTransaction", "abort_forked_app", "build_app_tool_definitions"]
+
+def build_app_bootstrap_tool_definitions(
+    context: dict[str, Any] | None,
+    *,
+    workspace_root: str | None = None,
+    deployment_config: dict[str, Any] | None = None,
+) -> list[ToolDefinition]:
+    """Build only context-free App provisioning/discovery tools.
+
+    These definitions are safe to register for normal, Project-only, and
+    autonomous turns when the Apps feature is enabled.  Invocation still
+    requires an authenticated principal resolved from the request-local
+    ``TurnContext`` (or an explicitly supplied server context for legacy direct
+    callers); no App context is required.
+    """
+
+    return build_app_tool_definitions(
+        context,
+        workspace_root=workspace_root,
+        deployment_config=deployment_config,
+        include_bootstrap=True,
+        include_development=False,
+    )
+
+
+def build_app_development_tool_definitions(
+    context: dict[str, Any] | None,
+    *,
+    workspace_root: str | None = None,
+    deployment_config: dict[str, Any] | None = None,
+) -> list[ToolDefinition]:
+    """Build only App Development tools bound to the selected App context."""
+
+    return build_app_tool_definitions(
+        context,
+        workspace_root=workspace_root,
+        deployment_config=deployment_config,
+        include_bootstrap=False,
+        include_development=True,
+    )
+
+
+__all__ = [
+    "AppWriteTransaction",
+    "abort_forked_app",
+    "build_app_tool_definitions",
+    "build_app_bootstrap_tool_definitions",
+    "build_app_development_tool_definitions",
+]

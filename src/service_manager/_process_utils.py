@@ -14,12 +14,16 @@ import socket
 import subprocess
 import sys
 import time
+import logging
 from pathlib import Path
+
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 _IS_WINDOWS = sys.platform == "win32"
 
 _child_processes: list[subprocess.Popen] = []
 _openai_compatible_local_processes: list[subprocess.Popen] = []
+logger = logging.getLogger(__name__)
 
 
 def _track_child_process(
@@ -147,7 +151,12 @@ def _kill_existing_on_port(port: int) -> None:
             )
 
         for pid in sorted(pids, key=int):
-            print(f"Stopped existing process on port {port} (PID {pid})")
+            logger.info(
+                "Stopped existing process on port %s (PID %s)",
+                port,
+                pid,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
         return
 
     kill_errors: list[str] = []

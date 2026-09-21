@@ -15,9 +15,23 @@ from fastapi import APIRouter, HTTPException, Depends, Request, Query
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 import httpx
 
-from .client import get_hydrus_client
+from .client import (
+    HYDRUS_ERROR_MESSAGES,
+    HydrusClientError,
+    HydrusUnreachableError,
+    get_hydrus_client,
+    hydrus_error_detail,
+    hydrus_error_for_status,
+)
 from .cache import get_thumbnail_cache
-from .credentials import load_hydrus_credentials, validate_hydrus_api_url
+from .credentials import (
+    HydrusCredentialError,
+    HydrusNotConfiguredError,
+    load_hydrus_credentials,
+    resolve_hydrus_credentials,
+    validate_hydrus_api_url_strict,
+)
+from .policy import HydrusEndpointPolicyError, HydrusEndpointResolutionError
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +40,46 @@ DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 200
 MAX_METADATA_IDS = 256
 PRIVATE_HEADERS = {"Cache-Control": "private, no-store"}
+
+
+def _safe_detail(code: str) -> dict[str, str]:
+    """Return a static, secret-free Hydrus error detail."""
+
+    return {
+        "category": "hydrus",
+        "code": code,
+        "message": HYDRUS_ERROR_MESSAGES.get(code, HYDRUS_ERROR_MESSAGES["hydrus_upstream_error"]),
+    }
+
+
+def _http_error_for_hydrus(error: BaseException) -> HTTPException:
+    if isinstance(error, HydrusClientError):
+        return HTTPException(
+            status_code=error.status_code,
+            detail=hydrus_error_detail(error),
+        )
+    code = getattr(error, "code", "hydrus_upstream_error")
+    status_code = int(getattr(error, "status_code", 502))
+    if code not in HYDRUS_ERROR_MESSAGES:
+        code = "hydrus_upstream_error"
+    if code == "hydrus_endpoint_policy_rejected":
+        status_code = 422
+    elif code == "hydrus_endpoint_resolution_failed":
+        status_code = 502
+    elif code == "hydrus_not_configured" or code.startswith("hydrus_legacy_owner_"):
+        status_code = 409
+    elif code == "hydrus_credential_unreadable":
+        status_code = 500
+    elif code == "hydrus_credential_store_unavailable":
+        status_code = 503
+    return HTTPException(status_code=status_code, detail=_safe_detail(code))
+
+
+def _log_hydrus_failure(operation: str, error: BaseException) -> None:
+    code = getattr(error, "code", "hydrus_upstream_error")
+    # Never stringify ``error``: upstream/network exception text may contain a
+    # URL, proxy credentials, or an access key.
+    logger.warning("Hydrus %s failed (code=%s)", operation, code)
 
 
 async def _await_maybe(value: Any) -> Any:
@@ -63,16 +117,27 @@ def create_hydrus_router(
     async def user_client(request: Request):
         user_id = await current_user_id(request)
         loader = get_hydrus_credentials or load_hydrus_credentials
-        credentials = await _await_maybe(loader(user_id))
+        # The built-in resolver retains typed storage/crypto diagnostics.  A
+        # test/integration-supplied loader keeps the historical optional
+        # mapping contract and is validated at this boundary as well.
+        try:
+            credentials = (
+                await resolve_hydrus_credentials(user_id)
+                if get_hydrus_credentials is None
+                else await _await_maybe(loader(user_id))
+            )
+        except (HydrusCredentialError, HydrusEndpointPolicyError, HydrusEndpointResolutionError) as exc:
+            raise _http_error_for_hydrus(exc) from None
         if not isinstance(credentials, Mapping):
-            raise HTTPException(status_code=503, detail="Hydrus接続が設定されていません")
+            raise _http_error_for_hydrus(HydrusNotConfiguredError())
         api_url = credentials.get("api_url") or credentials.get("apiUrl")
         access_key = credentials.get("access_key") or credentials.get("accessKey")
-        if not isinstance(api_url, str) or not isinstance(access_key, str) or not api_url or not access_key:
-            raise HTTPException(status_code=503, detail="Hydrus接続が設定されていません")
-        safe_api_url = await validate_hydrus_api_url(api_url)
-        if safe_api_url is None:
-            raise HTTPException(status_code=503, detail="Hydrus API URLが許可されていません")
+        if not isinstance(api_url, str) or not isinstance(access_key, str) or not api_url.strip() or not access_key.strip():
+            raise _http_error_for_hydrus(HydrusNotConfiguredError())
+        try:
+            safe_api_url = await validate_hydrus_api_url_strict(api_url)
+        except (HydrusEndpointPolicyError, HydrusEndpointResolutionError) as exc:
+            raise _http_error_for_hydrus(exc) from None
         # Scope includes the authenticated principal and an integration
         # fingerprint.  If a user replaces their Hydrus endpoint/key, stale
         # thumbnails from the previous integration cannot collide on file_id.
@@ -100,11 +165,18 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True, **data}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrus接続エラー: {e}")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("health", exc)
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={"ok": False, **hydrus_error_detail(exc)},
+                headers=PRIVATE_HEADERS,
+            )
+        except Exception:
+            _log_hydrus_failure("health", HydrusClientError())
             return JSONResponse(
                 status_code=502,
-                content={"ok": False, "error": "Hydrus Clientに接続できません"},
+                content={"ok": False, **_safe_detail("hydrus_upstream_error")},
                 headers=PRIVATE_HEADERS,
             )
 
@@ -117,9 +189,12 @@ def create_hydrus_router(
             return JSONResponse(content=data, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusサービス取得エラー: {e}")
-            raise HTTPException(status_code=502, detail="Hydrus APIエラー")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("services", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("services", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/search")
     async def search_files(
@@ -160,9 +235,12 @@ def create_hydrus_router(
             }, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrus検索エラー: {e}")
-            raise HTTPException(status_code=502, detail="Hydrus検索に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("search", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("search", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/metadata")
     async def get_metadata(
@@ -194,9 +272,12 @@ def create_hydrus_router(
             return JSONResponse(content={"metadata": metadata}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusメタデータ取得エラー: {e}")
-            raise HTTPException(status_code=502, detail="メタデータ取得に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("metadata", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("metadata", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/tags/search")
     async def search_tags(
@@ -212,9 +293,12 @@ def create_hydrus_router(
             return JSONResponse(content=data, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusタグ検索エラー: {e}")
-            raise HTTPException(status_code=502, detail="タグ検索に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("tag search", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("tag search", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/thumbnail/{file_id}")
     async def get_thumbnail(
@@ -244,9 +328,12 @@ def create_hydrus_router(
                 )
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusサムネイル取得エラー (file_id={file_id}): {e}")
-            raise HTTPException(status_code=502, detail="サムネイル取得に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("thumbnail", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("thumbnail", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/file/{file_id}")
     async def get_file(
@@ -264,10 +351,11 @@ def create_hydrus_router(
             resp = await client.get_file_stream(file_id)
 
             if resp.status_code != 200:
+                error = hydrus_error_for_status(resp.status_code)
                 await resp.aclose()
                 await client.close()
                 client = None
-                raise HTTPException(status_code=resp.status_code, detail="ファイル取得失敗")
+                raise _http_error_for_hydrus(error) from None
 
             content_type = resp.headers.get("content-type", "application/octet-stream")
             content_length = resp.headers.get("content-length")
@@ -299,11 +387,16 @@ def create_hydrus_router(
             if client is not None:
                 await client.close()
             raise
-        except Exception as e:
+        except HydrusClientError as exc:
             if client is not None:
                 await client.close()
-            logger.error(f"Hydrusファイル取得エラー (file_id={file_id}): {e}")
-            raise HTTPException(status_code=502, detail="ファイル取得に失敗しました")
+            _log_hydrus_failure("file", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            if client is not None:
+                await client.close()
+            _log_hydrus_failure("file", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.get("/cache/stats")
     async def cache_stats(request: Request, _=Depends(require_auth)):
@@ -339,9 +432,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusタグ編集エラー: {e}")
-            raise HTTPException(status_code=502, detail="タグ編集に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("tag edit", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("tag edit", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.post("/files/archive")
     async def archive_files(
@@ -360,9 +456,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True, "count": len(file_ids)}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusアーカイブエラー: {e}")
-            raise HTTPException(status_code=502, detail="アーカイブに失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("archive", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("archive", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.post("/files/delete")
     async def delete_files(
@@ -382,9 +481,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True, "count": len(file_ids)}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrus削除エラー: {e}")
-            raise HTTPException(status_code=502, detail="削除に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("delete", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("delete", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.post("/files/undelete")
     async def undelete_files(
@@ -403,9 +505,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True, "count": len(file_ids)}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrus削除取り消しエラー: {e}")
-            raise HTTPException(status_code=502, detail="削除の取り消しに失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("undelete", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("undelete", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.post("/ratings/set")
     async def set_rating(
@@ -433,9 +538,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusレーティング設定エラー: {e}")
-            raise HTTPException(status_code=502, detail="レーティング設定に失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("rating", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("rating", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     @router.post("/files/inbox")
     async def unarchive_files(
@@ -454,9 +562,12 @@ def create_hydrus_router(
             return JSONResponse(content={"ok": True, "count": len(file_ids)}, headers=PRIVATE_HEADERS)
         except HTTPException:
             raise
-        except Exception as e:
-            logger.error(f"Hydrusインボックス戻しエラー: {e}")
-            raise HTTPException(status_code=502, detail="���ンボックスに戻す操作���失敗しました")
+        except HydrusClientError as exc:
+            _log_hydrus_failure("inbox", exc)
+            raise _http_error_for_hydrus(exc) from None
+        except Exception as exc:
+            _log_hydrus_failure("inbox", exc)
+            raise _http_error_for_hydrus(exc) from None
 
     return router
 
@@ -551,16 +662,24 @@ def create_hydrus_compat_router(
     async def forward_hydrus_request(request: Request, path: str) -> StreamingResponse:
         user_id = await compat_user_id(request)
         loader = get_hydrus_credentials or load_hydrus_credentials
-        credentials = await _await_maybe(loader(user_id))
+        try:
+            credentials = (
+                await resolve_hydrus_credentials(user_id)
+                if get_hydrus_credentials is None
+                else await _await_maybe(loader(user_id))
+            )
+        except (HydrusCredentialError, HydrusEndpointPolicyError, HydrusEndpointResolutionError) as exc:
+            raise _http_error_for_hydrus(exc) from None
         if not isinstance(credentials, Mapping):
-            raise HTTPException(status_code=503, detail="Hydrus接続が設定されていません")
+            raise _http_error_for_hydrus(HydrusNotConfiguredError())
         hydrus_url = credentials.get("api_url") or credentials.get("apiUrl")
         access_key = credentials.get("access_key") or credentials.get("accessKey")
-        if not isinstance(hydrus_url, str) or not isinstance(access_key, str):
-            raise HTTPException(status_code=503, detail="Hydrus接続が設定されていません")
-        hydrus_url = await validate_hydrus_api_url(hydrus_url)
-        if hydrus_url is None:
-            raise HTTPException(status_code=503, detail="Hydrus API URLが許可されていません")
+        if not isinstance(hydrus_url, str) or not isinstance(access_key, str) or not hydrus_url.strip() or not access_key.strip():
+            raise _http_error_for_hydrus(HydrusNotConfiguredError())
+        try:
+            hydrus_url = await validate_hydrus_api_url_strict(hydrus_url)
+        except (HydrusEndpointPolicyError, HydrusEndpointResolutionError) as exc:
+            raise _http_error_for_hydrus(exc) from None
         target_url = f"{hydrus_url}{path}"
         body = await request.body()
         headers = {
@@ -583,9 +702,15 @@ def create_hydrus_compat_router(
                 content=body,
             )
             upstream = await client.send(outbound, stream=True)
-        except Exception:
+        except httpx.RequestError:
             await client.aclose()
-            raise
+            error = HydrusUnreachableError()
+            _log_hydrus_failure("compat proxy", error)
+            raise _http_error_for_hydrus(error) from None
+        except Exception as exc:
+            await client.aclose()
+            _log_hydrus_failure("compat proxy", exc)
+            raise _http_error_for_hydrus(exc) from None
 
         response_headers = {
             key: value

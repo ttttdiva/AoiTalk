@@ -54,7 +54,12 @@ export async function POST(request: NextRequest) {
         "User-Agent": "AoiTalk Docs Link Preview",
         Accept: "text/html,application/xhtml+xml",
       },
-      redirect: "follow",
+      // A user-supplied URL is an SSRF boundary.  Never let the framework
+      // follow a redirect to a host that was not checked by
+      // assertPublicTarget (or leak the request into a private network).
+      // Redirect responses fail closed and are rendered as the normal
+      // best-effort fallback below.
+      redirect: "error",
     });
     const html = await response.text();
     const title =

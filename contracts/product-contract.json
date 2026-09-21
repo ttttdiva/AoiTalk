@@ -804,6 +804,18 @@
           "given": "a conversation is cached locally",
           "when": "the user sends a message offline and reconnects",
           "then": "the message is replayed once and project ACL is rechecked"
+        },
+        {
+          "id": "chat.direct.local_context",
+          "given": "the AoiTalk server is unavailable and a valid Direct LLM connection is configured",
+          "when": "the user sends with the bundled standard character or an account-and-server-scoped cached character, including after restart",
+          "then": "the requested persona and locally available tasks in the selected project or space reach the LLM without a profile API dependency; unacquired, unsynced, empty and unreadable data are distinguished"
+        },
+        {
+          "id": "chat.direct.delivery",
+          "given": "a Direct reply fails or completes while the AoiTalk server is unavailable",
+          "when": "the user retries or server connectivity returns",
+          "then": "failed drafts and history remain with a retry reason, and completed Direct messages are never dispatched for server generation"
         }
       ]
     },
@@ -1191,6 +1203,12 @@
           "given": "a project is revoked or read=false",
           "when": "the next list or sync completes",
           "then": "the project and its dependent task/chat/file selectors disappear from every mobile surface"
+        },
+        {
+          "id": "projects.scope_selection",
+          "given": "many projects, long names, same-name Inbox projects and repeated project IDs are available",
+          "when": "a mobile scope or project selector is opened and its list refreshes",
+          "then": "all valid IDs remain selectable in a bounded scrollable searchable list, duplicate IDs appear once, and the current space/project or local/unassigned scope is identifiable without deleting data"
         }
       ]
     },

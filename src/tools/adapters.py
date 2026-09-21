@@ -21,7 +21,18 @@ def _clean_schema_for_gemini(schema: Dict[str, Any]) -> Dict[str, Any]:
 
     cleaned: Dict[str, Any] = {}
     for key, value in schema.items():
-        if key in ("title", "$schema", "additionalProperties", "default"):
+        if key in (
+            "title",
+            "$schema",
+            "additionalProperties",
+            "default",
+            # The deprecated google.generativeai Schema proto rejects the
+            # standard JSON Schema array-cardinality keywords.  Keep them in
+            # ToolDefinition/OpenAI contracts and remove them only from this
+            # Gemini wire projection.
+            "minItems",
+            "maxItems",
+        ):
             continue
         if key == "properties" and isinstance(value, dict):
             cleaned[key] = {

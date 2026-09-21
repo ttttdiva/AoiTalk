@@ -14,6 +14,7 @@ from ._shared import (
     LegacyEventPayload,
     ReorderTasksPayload,
     TaskRouterContext,
+    _parse_browse_scope,
 )
 from ...uuid_http import parse_uuid_or_400
 
@@ -80,10 +81,20 @@ def register_tag_reorder_routes(router: APIRouter, ctx: TaskRouterContext) -> No
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            browse_kwargs = (
+                {
+                    "browse_project_id": browse_project_id,
+                    "browse_space_id": browse_space_id,
+                }
+                if browse_project_id is not None or browse_space_id is not None
+                else {}
+            )
             return await service.list_tags(
                 session,
                 project_id=parse_uuid_or_400(project_id, "project_id"),
                 user_id=user_id,
+                **browse_kwargs,
             )
         except TaskManagementError as exc:
             raise _translate_service_error(exc)

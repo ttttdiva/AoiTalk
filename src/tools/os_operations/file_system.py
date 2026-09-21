@@ -16,7 +16,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, List, Optional
+from typing import Callable, Generator, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -232,7 +232,8 @@ class FileSystem:
         path: str,
         extensions: Optional[List[str]] = None,
         search_content: bool = False,
-        max_results: int = 50
+        max_results: int = 50,
+        exclude_path: Optional[Callable[[Path], bool]] = None,
     ) -> str:
         """
         Search for files by name or content.
@@ -255,9 +256,13 @@ class FileSystem:
         results: List[str] = []
         
         if search_content:
-            results = self._search_content(search_path, query, extensions, max_results)
+            results = self._search_content(
+                search_path, query, extensions, max_results, exclude_path
+            )
         else:
-            results = self._search_names(search_path, query, extensions, max_results)
+            results = self._search_names(
+                search_path, query, extensions, max_results, exclude_path
+            )
             
         if not results:
             return f"No files found matching '{query}' in {path}"
@@ -276,7 +281,8 @@ class FileSystem:
         path: Path,
         pattern: str,
         extensions: Optional[List[str]],
-        max_results: int
+        max_results: int,
+        exclude_path: Optional[Callable[[Path], bool]] = None,
     ) -> List[str]:
         """Search files by name pattern."""
         results = []
@@ -289,13 +295,21 @@ class FileSystem:
             
         for root, dirs, files in os.walk(path):
             # Skip hidden and common uninteresting directories
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in self.SKIP_DIRS]
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in self.SKIP_DIRS
+                and not (exclude_path and exclude_path(Path(root) / d))
+            ]
             
             for filename in files:
                 if len(results) >= max_results:
                     return results
                     
                 filepath = Path(root) / filename
+                if exclude_path and exclude_path(filepath):
+                    continue
 
                 try:
                     _run_scoped_read_path(str(filepath))
@@ -319,7 +333,8 @@ class FileSystem:
         path: Path,
         query: str,
         extensions: Optional[List[str]],
-        max_results: int
+        max_results: int,
+        exclude_path: Optional[Callable[[Path], bool]] = None,
     ) -> List[str]:
         """Search files by content."""
         results = []
@@ -332,13 +347,21 @@ class FileSystem:
             
         for root, dirs, files in os.walk(path):
             # Skip hidden and common directories
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in self.SKIP_DIRS]
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith(".")
+                and d not in self.SKIP_DIRS
+                and not (exclude_path and exclude_path(Path(root) / d))
+            ]
             
             for filename in files:
                 if len(results) >= max_results:
                     return results
                     
                 filepath = Path(root) / filename
+                if exclude_path and exclude_path(filepath):
+                    continue
 
                 try:
                     _run_scoped_read_path(str(filepath))

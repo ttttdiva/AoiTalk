@@ -26,6 +26,8 @@ import { RuntimeProvider } from "@/contexts/runtime-context";
 import { ConfirmProvider } from "@/hooks/use-confirm";
 import { SwrGlobalProvider } from "@/components/providers/swr-global-provider";
 import { getSession } from "@/lib/auth";
+import { PetProvider } from "@/components/pets/pet-provider";
+import { PetOverlay } from "@/components/pets/pet-overlay";
 
 export default async function AppLayout({
   children,
@@ -43,6 +45,7 @@ export default async function AppLayout({
           <ProjectProvider>
             <ChatSessionProvider>
               <RuntimeProvider>
+                <PetProvider userId={userId}>
                 <AudioPlayerProvider>
                   <SnippetsProvider>
                     <TooltipProvider>
@@ -67,6 +70,7 @@ export default async function AppLayout({
                             <GlobalMemoPad />
                             <HomeTodayOverlay />
                             <AudioPlayerBar />
+                            <PetOverlay />
                             <TaskCompletionUndoProvider />
                           </DocsClipIngestProvider>
                         </DocsCommandProvider>
@@ -74,6 +78,7 @@ export default async function AppLayout({
                     </TooltipProvider>
                   </SnippetsProvider>
                 </AudioPlayerProvider>
+                </PetProvider>
               </RuntimeProvider>
             </ChatSessionProvider>
           </ProjectProvider>

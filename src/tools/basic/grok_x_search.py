@@ -6,11 +6,13 @@ from datetime import datetime
 from typing import List, Optional
 
 import requests
+from types import SimpleNamespace
 
 from ..external_llm_permission import check_permission_sync
 from ..external.x_search_mcp.api_client import (
     normalize_usage,
     normalize_xai_response_usage,
+    require_protected_x_payload,
     persist_xai_usage_sync as _persist_xai_usage_sync,
 )
 from ...services.outbound_privacy_service import (
@@ -18,6 +20,12 @@ from ...services.outbound_privacy_service import (
     get_privacy_policy_context,
 )
 from ...services.turn_context import get_turn_context
+from ...services.search_egress_policy import (
+    SearchEgressPreconditionError,
+    assert_public_search_egress_approved,
+    assert_search_egress_approved,
+    is_enterprise_profile,
+)
 
 from ..core import tool
 from .x_search import (
@@ -54,14 +62,42 @@ XAI_SYSTEM_PROMPT = (
     "最終行に投稿へのURLまたはハンドルを提示してください。"
 )
 
+_GROK_PRIVACY_FAILURE = "Grok検索はプライバシー保護に失敗したため停止しました。"
+_GROK_EGRESS_FAILURE = "Grok検索に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+_GROK_PROVIDER_FAILURE = "Grok検索に失敗しました。設定と承認済みエグレスを確認してください。"
+
 _RECORDED_USAGE_RESPONSES: list[object] = []
 
 
-def _grok_privacy_gateway() -> OutboundPrivacyGateway:
+def _grok_egress_descriptor(model: str, destination: str):
     try:
-        from ...config import Config
+        from ...services.outbound_privacy_service import EgressDescriptor
 
-        config = Config()
+        return EgressDescriptor(
+            action="grok_x_search",
+            transport="requests.post",
+            destination=destination,
+            provider="grok",
+            tool="grok_x_search",
+            model=model,
+        )
+    except ImportError:  # pragma: no cover - old stripped embeds
+        return SimpleNamespace(
+            action="grok_x_search",
+            transport="requests.post",
+            destination=destination,
+            provider="grok",
+            tool="grok_x_search",
+            model=model,
+        )
+
+
+def _grok_privacy_gateway(config=None) -> OutboundPrivacyGateway:
+    try:
+        if config is None:
+            from ...config import Config
+
+            config = Config()
     except Exception as exc:
         raise RuntimeError("Grok検索のプライバシー設定を解決できません") from exc
     try:
@@ -258,6 +294,27 @@ def grok_x_search(
     if not query or not query.strip():
         return "検索クエリを指定してください。"
 
+    runtime_config = None
+    yahoo_allowed = True
+    if is_enterprise_profile():
+        try:
+            from ...config import Config
+
+            runtime_config = Config()
+            assert_public_search_egress_approved(
+                runtime_config,
+                engine="yahoo_realtime",
+                endpoint="https://search.yahoo.co.jp/realtime/search",
+            )
+        except SearchEgressPreconditionError:
+            # An operator may approve hosted Grok without approving the
+            # keyless public Yahoo shortcut.  Skip Yahoo in that case and let
+            # the separate hosted Grok gate below decide whether fallback is
+            # permitted.
+            yahoo_allowed = False
+        except Exception:
+            yahoo_allowed = False
+
     if max_results < 1 or max_results > 25:
         return "max_resultsは1〜25の範囲で指定してください。"
 
@@ -285,10 +342,14 @@ def grok_x_search(
     # satisfies the requested count; otherwise retain it as context while
     # optionally asking Grok for a supplement.  This call intentionally occurs
     # before checking XAI_API_KEY so a Yahoo-only result never requires xAI.
-    yahoo_result = _try_yahoo_x_search(
-        query.strip(),
-        max_results=max_results,
-        timeout_seconds=timeout_seconds,
+    yahoo_result = (
+        _try_yahoo_x_search(
+            query.strip(),
+            max_results=max_results,
+            timeout_seconds=timeout_seconds,
+        )
+        if yahoo_allowed
+        else None
     )
     yahoo_text = (
         format_yahoo_x_results(query, yahoo_result, max_results=max_results)
@@ -305,6 +366,16 @@ def grok_x_search(
         if yahoo_text:
             return yahoo_text
         return "Grok X検索を使うにはXAI_API_KEY (またはGROK_API_KEY) を設定してください。"
+    if is_enterprise_profile():
+        try:
+            assert_search_egress_approved(
+                runtime_config,
+                "grok",
+                credential=api_key,
+                endpoint=XAI_API_BASE,
+            )
+        except SearchEgressPreconditionError:
+            return _GROK_EGRESS_FAILURE
 
     tool_entry = {
         'type': 'x_search',
@@ -333,34 +404,11 @@ def grok_x_search(
         'max_output_tokens': max_output_tokens,
     }
 
-    # X search is an external egress boundary.  Keep aliases in the query
-    # until this boundary and apply the shared gateway immediately before the
-    # HTTP request; local_only therefore fails closed without contacting xAI.
-    # Never install an auto-approve callback here.  The gateway inherits the
-    # effective request/session policy through its context and must invoke the
-    # configured review bridge (or fail closed) for protected high-risk work.
-    try:
-        gateway = _grok_privacy_gateway()
-    except Exception as exc:
-        return f"Grok検索はプライバシー設定を解決できないため停止しました: {exc}"
-    try:
-        protected = gateway.protect_sync(
-            payload,
-            provider="grok",
-            base_url=XAI_API_BASE,
-            source_kind="grok_x_search",
-            model=XAI_DEFAULT_MODEL,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return f"Grok検索はプライバシーポリシーにより停止しました: {exc}"
-    payload = protected.payload
-
-    # Permission UI receives only the gateway output.  Raw search terms must
-    # never be exposed to the tool-confirmation surface before redaction.
-    try:
-        permission_query = payload["input"][-1].get("content", "")
-    except (KeyError, IndexError, AttributeError, TypeError):
-        permission_query = ""
+    # The ordinary permission check is separate from the privacy transaction
+    # and intentionally runs first.  A cancellation therefore cannot start a
+    # sidecar/review callback or provider transport.  The gateway receives the
+    # original payload only inside the sender boundary below.
+    permission_query = query.strip()
     approved = check_permission_sync(
         tool_name="grok_x_search",
         tool_args={"query": permission_query, "max_results": max_results},
@@ -375,30 +423,53 @@ def grok_x_search(
         'Content-Type': 'application/json'
     }
 
+    try:
+        gateway = _grok_privacy_gateway(runtime_config)
+    except Exception:
+        return _GROK_PRIVACY_FAILURE
+
     started_at = time.monotonic()
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=timeout_seconds)
-    except requests.RequestException as exc:
-        return f"Grok APIへの接続に失敗しました: {exc}"
+        execute_sync = getattr(gateway, "execute_sync", None)
+        if not callable(execute_sync):
+            return _GROK_PRIVACY_FAILURE
+
+        def send(protected_payload):
+            try:
+                wire_payload = require_protected_x_payload(protected_payload)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    "privacy protection returned no protected xAI payload"
+                ) from exc
+            return requests.post(
+                url,
+                headers=headers,
+                json=wire_payload,
+                timeout=timeout_seconds,
+                allow_redirects=False,
+            )
+
+        response = execute_sync(
+            payload,
+            provider="grok",
+            descriptor=_grok_egress_descriptor(XAI_DEFAULT_MODEL, url),
+            sender=send,
+            base_url=XAI_API_BASE,
+            source_kind="grok_x_search",
+            model=XAI_DEFAULT_MODEL,
+        )
+    except requests.RequestException:
+        return _GROK_EGRESS_FAILURE
+    except Exception:
+        return _GROK_PRIVACY_FAILURE
 
     if response.status_code >= 300:
-        try:
-            error_payload = response.json()
-            err = error_payload.get('error', '')
-            if isinstance(err, dict):
-                error_message = err.get('message', '') or json.dumps(err, ensure_ascii=False)
-            elif isinstance(err, str) and err:
-                error_message = err
-            else:
-                error_message = json.dumps(error_payload, ensure_ascii=False)
-        except Exception:
-            error_message = response.text
-        return f"Grok APIエラー({response.status_code}): {error_message}"
+        return _GROK_PROVIDER_FAILURE
 
     try:
         response_payload = response.json()
     except ValueError:
-        return f"Grok APIの応答を解析できませんでした: {response.text}"
+        return _GROK_PROVIDER_FAILURE
 
     # xAI Responses returns usage only on successful provider responses.  Keep
     # the direct tool on the same normalization/storage path as native LLM

@@ -53,10 +53,9 @@ def _load_sentence_transformer():
 class BgeM3Embedding:
     """Embedding model wrapper using sentence-transformers.
     
-    Supports any sentence-transformers compatible model including:
-    - BAAI/bge-m3
-    - intfloat/multilingual-e5-large
-    - sentence-transformers/all-MiniLM-L6-v2
+    Supports any sentence-transformers-compatible model.  Conversation memory
+    uses the configured RAG model (``BAAI/bge-m3`` by default); callers should
+    not select a separate legacy memory embedding implementation.
     """
     
     def __init__(self, config: EmbeddingConfig):

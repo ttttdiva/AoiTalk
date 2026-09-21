@@ -88,7 +88,7 @@ export default function AppDetailScreen() {
   const appId = getParam(params.appId);
   const projectId = getParam(params.projectId) || undefined;
   const { selectedProjectId } = useProject();
-  const online = useNetworkStore((state) => state.online);
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const effectiveProjectId = projectId || selectedProjectId || undefined;
   const [data, setData] = useState<AppDetailData>({
     app: null,

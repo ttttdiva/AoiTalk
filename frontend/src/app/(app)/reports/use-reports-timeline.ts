@@ -3,11 +3,12 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { taskApi, type Task, type TimeEntry } from "@/lib/task-api";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
-import { formatLocalDateTime } from "@/lib/date-time";
 import {
   HOUR_START,
   HOUR_END,
   TOTAL_HOURS,
+  getEntryHourRange,
+  toExplicitInstant,
   type ResizeState,
   type MoveState,
   type CtxMenuState,
@@ -365,8 +366,8 @@ export function useReportsTimeline({
 
       await taskApi.createTimeEntry({
         task_id: taskId,
-        started_at: formatLocalDateTime(startDate),
-        ended_at: formatLocalDateTime(endDate),
+        started_at: toExplicitInstant(startDate),
+        ended_at: toExplicitInstant(endDate),
       });
 
       setDragForm(null);
@@ -408,11 +409,10 @@ export function useReportsTimeline({
       if (e.button !== 0 || e.isPrimary === false) return;
       if (!entry.started_at || !entry.ended_at) return;
       if (remoteReadOnly || isEntryReadOnly(entry)) return;
+      const range = getEntryHourRange(entry, new Date(entry.ended_at));
+      if (!range) return;
+      const { startHour, endHour } = range;
       capturePointer(e, activeResizePointerRef);
-      const start = new Date(entry.started_at);
-      const end = new Date(entry.ended_at);
-      const startHour = start.getHours() + start.getMinutes() / 60;
-      const endHour = end.getHours() + end.getMinutes() / 60;
       isResizingRef.current = true;
       setResizeState({
         entryId: entry.id,
@@ -486,9 +486,7 @@ export function useReportsTimeline({
         return;
       }
 
-      const baseDate = new Date(
-        state.edge === "top" ? entry.started_at : entry.ended_at,
-      );
+      const baseDate = new Date(entry.started_at);
       baseDate.setHours(0, 0, 0, 0);
 
       const applyHour = (d: Date, h: number) => {
@@ -502,11 +500,11 @@ export function useReportsTimeline({
       if (state.edge === "top") {
         const d = new Date(baseDate);
         applyHour(d, newStartHour);
-        payload.started_at = formatLocalDateTime(d);
+        payload.started_at = toExplicitInstant(d);
       } else {
         const d = new Date(baseDate);
         applyHour(d, newEndHour);
-        payload.ended_at = formatLocalDateTime(d);
+        payload.ended_at = toExplicitInstant(d);
       }
 
       try {
@@ -545,15 +543,14 @@ export function useReportsTimeline({
       if ((e.target as HTMLElement).closest("[data-resize-handle]")) return;
       if (!entry.started_at || !entry.ended_at) return;
       if (remoteReadOnly || isEntryReadOnly(entry)) return;
+      const range = getEntryHourRange(entry, new Date(entry.ended_at));
+      if (!range) return;
+      const { startHour, endHour } = range;
+      const durationHours = endHour - startHour;
       e.stopPropagation();
       e.preventDefault();
       e.currentTarget.focus({ preventScroll: true });
       capturePointer(e, activeMovePointerRef);
-      const start = new Date(entry.started_at);
-      const end = new Date(entry.ended_at);
-      const startHour = start.getHours() + start.getMinutes() / 60;
-      const endHour = end.getHours() + end.getMinutes() / 60;
-      const durationHours = endHour - startHour;
       const col = dayColRefs.current[dayIndex];
       const cursorHour = col ? calcHourFromMouseY(e.clientY, col) : startHour;
       isMovingRef.current = true;
@@ -663,8 +660,8 @@ export function useReportsTimeline({
 
       try {
         await taskApi.updateTimeEntry(entry.id, {
-          started_at: formatLocalDateTime(newStart),
-          ended_at: formatLocalDateTime(newEnd),
+          started_at: toExplicitInstant(newStart),
+          ended_at: toExplicitInstant(newEnd),
         });
         fetchReport();
       } catch (err) {
@@ -732,8 +729,8 @@ export function useReportsTimeline({
     try {
       await taskApi.createTimeEntry({
         task_id: entry.task_id,
-        started_at: entry.started_at,
-        ended_at: entry.ended_at,
+        started_at: toExplicitInstant(entry.started_at),
+        ended_at: toExplicitInstant(entry.ended_at),
         note: entry.note || undefined,
       });
       fetchReport();

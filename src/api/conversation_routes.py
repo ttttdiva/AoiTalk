@@ -5,13 +5,14 @@ Provides REST API endpoints for managing conversation sessions and messages.
 """
 
 import logging
-from typing import Literal, Optional
+import re
+from typing import Any, Literal, Mapping, Optional
 from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, Depends, Query, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from ..config_errors import (
     CharacterLookupError,
@@ -21,8 +22,12 @@ from ..config_errors import (
     character_lookup_http_detail,
     character_lookup_http_status,
 )
-from ..llm.context_snapshot import enrich_persisted_context_snapshot
+from ..llm.context_snapshot import (
+    enrich_persisted_context_snapshot,
+    validate_context_manifest_metadata,
+)
 from ..services.conversation_title_service import ensure_conversation_title
+from ..services.session_llm_runtime import release_session_agent_team_registry
 from .http_cache import etag_json_response, make_weak_etag_from_payload
 
 logger = logging.getLogger(__name__)
@@ -153,6 +158,22 @@ class AddMessageRequest(BaseModel):
     client_message_id: Optional[str] = Field(default=None, max_length=512)
 
 
+class ImportLocalAssistantMessageRequest(BaseModel):
+    """One assistant row promoted from an owned native local transcript.
+
+    This contract is intentionally separate from :class:`AddMessageRequest`:
+    normal client message writes remain user-only.  Rejecting unknown fields
+    here prevents callers from smuggling prompt-control or system/tool
+    metadata through the history-import path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["assistant"]
+    content: str
+    client_message_id: str = Field(min_length=1, max_length=512)
+
+
 class EditMessageRequest(BaseModel):
     """Request model for editing a message (creates a new branch)"""
 
@@ -230,6 +251,492 @@ def _is_story_workflow_session(session) -> bool:
     return character_name.startswith("story_") or title.startswith("[執筆]")
 
 
+# ContextManifest is an optional observation attached to one assistant
+# message.  Keep this route's response projection deliberately explicit: a
+# full Manifest is still returned under ``context_manifest`` for trusted API
+# consumers, while the UI consumes ``inspector`` below and never renders raw
+# JSON.  These limits are intentionally smaller than the persistence limits.
+_INSPECTOR_MAX_ITEMS = 128
+_INSPECTOR_MAX_TEXT = 160
+_SAFE_INSPECTOR_TOKEN_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/@+\- ]{0,159}$"
+)
+_CAPABILITY_DENIAL_MARKERS = frozenset(
+    {
+        "denied",
+        "deny",
+        "blocked",
+        "not allowed",
+        "unauthorized",
+        "forbidden",
+        "permission denied",
+        "capability blocked",
+        "tool policy blocked",
+    }
+)
+_SNAPSHOT_PRIVATE_KEYS = frozenset(
+    {
+        "prompt",
+        "prompt_body",
+        "messages",
+        "content",
+        "arguments",
+        "args",
+        "result",
+        "output",
+        "model_output",
+        "preview",
+        "reasoning",
+        "reasoning_content",
+    }
+)
+
+
+def _safe_inspector_token(value: Any, *, limit: int = _INSPECTOR_MAX_TEXT) -> str | None:
+    """Return a compact display token without accepting arbitrary prompt text."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).replace("\x00", " ").replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split()).strip()
+    if not text:
+        return None
+    text = text[:limit].rstrip()
+    return text if _SAFE_INSPECTOR_TOKEN_RE.fullmatch(text) else None
+
+
+def _safe_inspector_hash(value: Any) -> str | None:
+    text = str(value or "").strip()
+    return text if re.fullmatch(r"sha256:[0-9a-f]{64}", text) else None
+
+
+def _strip_snapshot_private_fields(value: Any) -> Any:
+    """Drop prompt/result-shaped fields from legacy snapshot metadata.
+
+    ``enrich_persisted_context_snapshot`` preserves unknown legacy keys for
+    compatibility.  The Inspector boundary is stricter: malformed/provider
+    metadata must not turn a diagnostic snapshot into a prompt or result
+    exfiltration channel.  Scalar/list shape is retained for old callers.
+    """
+
+    if isinstance(value, list):
+        return [_strip_snapshot_private_fields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        str(key): _strip_snapshot_private_fields(item)
+        for key, item in value.items()
+        if str(key).strip().casefold() not in _SNAPSHOT_PRIVATE_KEYS
+    }
+
+
+def _manifest_inspector_categories(snapshot: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Project snapshot components into status/count metadata only."""
+
+    main = snapshot.get("main") if isinstance(snapshot.get("main"), dict) else snapshot
+    raw = main.get("components") or main.get("categories") or []
+    if not isinstance(raw, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in raw[:_INSPECTOR_MAX_ITEMS]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "active").strip().casefold()
+        if status not in {"active", "deferred", "failed"}:
+            continue
+        category = _safe_inspector_token(item.get("category"))
+        if not category:
+            continue
+        projected: dict[str, Any] = {
+            "category": category,
+            "status": status,
+        }
+        for key in (
+            "measurement",
+            "source",
+            "selection_reason",
+        ):
+            value = _safe_inspector_token(item.get(key))
+            if value:
+                projected[key] = value
+        for key in (
+            "tokens",
+            "percentage",
+            "retrieved_chars",
+            "selected_chars",
+            "size_chars",
+        ):
+            value = item.get(key)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            if value < 0:
+                continue
+            projected[key] = int(value) if isinstance(value, int) else round(float(value), 3)
+        result.append(projected)
+    return result
+
+
+def _manifest_inspector_projection(
+    manifest: Mapping[str, Any],
+    snapshot: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the non-JSON-dump structure consumed by WorkIntelligenceInspector."""
+
+    def copy_rows(
+        key: str,
+        fields: tuple[str, ...],
+        *,
+        max_items: int = _INSPECTOR_MAX_ITEMS,
+    ) -> list[dict[str, Any]]:
+        raw_rows = manifest.get(key)
+        if not isinstance(raw_rows, list):
+            return []
+        rows: list[dict[str, Any]] = []
+        for raw in raw_rows[:max_items]:
+            if not isinstance(raw, dict):
+                continue
+            row: dict[str, Any] = {}
+            for field in fields:
+                value = raw.get(field)
+                if field.endswith("hash") or field in {
+                    "ref_hash",
+                    "locator_hash",
+                    "decision_ref_hash",
+                    "resource_ref_hash",
+                    "supersedes_ref_hash",
+                    "request_hash",
+                    "person_ref_hash",
+                    "subject_ref_hash",
+                    "target_ref_hash",
+                }:
+                    safe = _safe_inspector_hash(value) if value is not None else None
+                    if safe:
+                        row[field] = safe
+                    continue
+                if isinstance(value, bool):
+                    row[field] = value
+                    continue
+                if isinstance(value, (int, float)):
+                    if value >= 0:
+                        row[field] = int(value) if isinstance(value, int) else round(float(value), 3)
+                    continue
+                safe = _safe_inspector_token(value)
+                if safe:
+                    row[field] = safe
+                elif value is None:
+                    row[field] = None
+            if row:
+                rows.append(row)
+        return rows
+
+    subject = manifest.get("subject")
+    safe_subject: dict[str, Any] = {}
+    if isinstance(subject, dict):
+        for key in (
+            "include_project_context",
+            "strict_project_scope",
+            "automatic_context_suppressed",
+            "verified_project_attachment",
+        ):
+            if type(subject.get(key)) is bool or subject.get(key) is None:
+                safe_subject[key] = subject.get(key)
+        scopes = subject.get("scopes")
+        if isinstance(scopes, list):
+            safe_subject["scopes"] = copy_rows_from_values(
+                scopes,
+                ("kind", "ref_hash", "relation", "source", "version", "freshness", "supersedes_ref_hash"),
+                max_items=3,
+            )
+
+    inspector: dict[str, Any] = {
+        "schema_version": _safe_inspector_token(manifest.get("schema_version")),
+        "producer_version": _safe_inspector_token(manifest.get("producer_version")),
+        "sanitizer_version": _safe_inspector_token(manifest.get("sanitizer_version")),
+        "mode": _safe_inspector_token(manifest.get("mode")),
+        "subject": safe_subject,
+        "resources": copy_rows(
+            "resources",
+            ("kind", "ref_hash", "relation", "source", "version", "freshness", "supersedes_ref_hash"),
+        ),
+        "evidence": copy_rows(
+            "evidence",
+            ("kind", "locator_hash", "source_type", "version"),
+        ),
+        "policy_decisions": copy_rows(
+            "policy_decisions",
+            ("authority", "scope", "decision", "resource_ref_hash", "decision_ref_hash"),
+            max_items=64,
+        ),
+        "layers": copy_rows(
+            "layers",
+            ("category", "source", "status", "inclusion_reason", "retrieved_chars", "selected_chars", "truncated", "transform"),
+            max_items=32,
+        ),
+        "requests": copy_rows(
+            "requests",
+            (
+                "request_index",
+                "request_kind",
+                "observed_provider",
+                "observed_model",
+                "context_window_tokens",
+                "response_tokens_reserved",
+                "input_tokens",
+                "remaining_tokens",
+                "measurement",
+                "request_hash",
+            ),
+            max_items=32,
+        ),
+        "omission_reason_counts": {},
+        "reproducibility_hashes": {},
+        "manifest_hash": _safe_inspector_hash(manifest.get("manifest_hash")),
+    }
+
+    component_categories = manifest.get("requests")
+    if isinstance(snapshot, Mapping):
+        inspector["categories"] = _manifest_inspector_categories(snapshot)
+
+    omission_counts = manifest.get("omission_reason_counts")
+    if isinstance(omission_counts, dict):
+        inspector["omission_reason_counts"] = {
+            token: int(count)
+            for key, count in omission_counts.items()
+            if (token := _safe_inspector_token(key))
+            and isinstance(count, int)
+            and not isinstance(count, bool)
+            and count > 0
+        }
+    hashes = manifest.get("reproducibility_hashes")
+    if isinstance(hashes, dict):
+        inspector["reproducibility_hashes"] = {
+            key: digest
+            for key in ("turn", "context", "requests")
+            if (digest := _safe_inspector_hash(hashes.get(key)))
+        }
+    budget = manifest.get("bundle_char_budget")
+    if isinstance(budget, int) and not isinstance(budget, bool) and budget >= 0:
+        inspector["bundle_char_budget"] = budget
+
+    # ``wi-core-1`` is an additive sidecar.  Keep all references hashed and
+    # omit item titles/people names, which are intentionally not part of the
+    # historical Inspector contract.
+    raw_work = manifest.get("work_intelligence")
+    if isinstance(raw_work, dict):
+        work: dict[str, Any] = {
+            "schema_version": _safe_inspector_token(raw_work.get("schema_version")),
+            "producer_version": _safe_inspector_token(raw_work.get("producer_version")),
+            "items": [],
+            "people": [],
+            "evidence": [],
+            "relations": [],
+            "freshness": {},
+            "omissions": {},
+            "layers": [],
+        }
+        for raw in (raw_work.get("items") if isinstance(raw_work.get("items"), list) else [])[:64]:
+            if not isinstance(raw, dict):
+                continue
+            item = {
+                key: value
+                for key in (
+                    "kind", "ref_hash", "status", "priority", "score", "version",
+                    "freshness", "uncertain", "advisory_conflict", "evidence_ref_hashes",
+                )
+                if (value := _safe_manifest_inspector_value(key, raw.get(key))) is not None
+            }
+            if item.get("ref_hash"):
+                work["items"].append(item)
+        for raw in (raw_work.get("people") if isinstance(raw_work.get("people"), list) else [])[:32]:
+            if not isinstance(raw, dict):
+                continue
+            ref_hash = _safe_inspector_hash(raw.get("person_ref_hash"))
+            if ref_hash:
+                work["people"].append({
+                    "person_ref_hash": ref_hash,
+                    "evidence_count": max(0, int(raw.get("evidence_count") or 0)),
+                    "score": round(float(raw.get("score") or 0), 3),
+                    "uncertain": raw.get("uncertain") is True,
+                })
+        for key, fields, max_items in (
+            ("evidence", ("kind", "locator_hash", "source_type", "version", "freshness", "uncertain"), 128),
+            ("relations", ("relation_type", "subject_ref_hash", "target_kind", "target_ref_hash", "evidence_ref_hashes", "confidence", "uncertain"), 128),
+            ("layers", ("category", "source", "status", "selected_chars", "item_count", "evidence_count"), 8),
+        ):
+            raw_rows = raw_work.get(key)
+            if not isinstance(raw_rows, list):
+                continue
+            for raw in raw_rows[:max_items]:
+                if not isinstance(raw, dict):
+                    continue
+                projected = {
+                    field: value
+                    for field in fields
+                    if (value := _safe_manifest_inspector_value(field, raw.get(field))) is not None
+                }
+                if projected:
+                    work[key].append(projected)
+        for key, value in (raw_work.get("freshness") or {}).items() if isinstance(raw_work.get("freshness"), dict) else ():
+            token = _safe_inspector_token(key)
+            version = _safe_manifest_inspector_value("version", value)
+            if token and version is not None:
+                work["freshness"][token] = version
+        for key, value in (raw_work.get("omissions") or {}).items() if isinstance(raw_work.get("omissions"), dict) else ():
+            token = _safe_inspector_token(key)
+            if token and isinstance(value, int) and not isinstance(value, bool) and value > 0:
+                work["omissions"][token] = value
+        inspector["work_intelligence"] = work
+    return inspector
+
+
+def _safe_manifest_inspector_value(key: str, value: Any) -> Any:
+    """Defensive scalar projection for a validated Manifest sidecar."""
+
+    if value is None:
+        return None
+    if key.endswith("hash") or key in {
+        "ref_hash", "locator_hash", "decision_ref_hash", "resource_ref_hash",
+        "supersedes_ref_hash", "request_hash", "person_ref_hash", "subject_ref_hash",
+        "target_ref_hash",
+    }:
+        return _safe_inspector_hash(value)
+    if key == "evidence_ref_hashes":
+        if not isinstance(value, list):
+            return None
+        return [digest for item in value[:16] if (digest := _safe_inspector_hash(item))]
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return int(value) if isinstance(value, int) else round(float(value), 3)
+    return _safe_inspector_token(value)
+
+
+def copy_rows_from_values(
+    values: list[Any],
+    fields: tuple[str, ...],
+    *,
+    max_items: int,
+) -> list[dict[str, Any]]:
+    """Project Manifest resource-like rows without exposing unknown fields."""
+
+    rows: list[dict[str, Any]] = []
+    for raw in values[:max_items]:
+        if not isinstance(raw, dict):
+            continue
+        row = {
+            field: value
+            for field in fields
+            if (value := _safe_manifest_inspector_value(field, raw.get(field))) is not None
+        }
+        if row:
+            rows.append(row)
+    return rows
+
+
+def _capability_record_value(record: Any, *keys: str) -> Any:
+    if isinstance(record, Mapping):
+        for key in keys:
+            if key in record and record[key] is not None:
+                return record[key]
+    for key in keys:
+        try:
+            value = getattr(record, key)
+        except Exception:
+            continue
+        if value is not None:
+            return value
+    return None
+
+
+def _capability_failure_is_denied(reason: Any) -> bool:
+    normalized = str(reason or "").strip().casefold()
+    return any(marker in normalized for marker in _CAPABILITY_DENIAL_MARKERS)
+
+
+def _capability_reason(record: Any, success: bool) -> str:
+    metadata = _capability_record_value(record, "metadata", "result_metadata", "meta")
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    raw_reason = _capability_record_value(record, "reason", "failure", "error", "error_message")
+    raw_reason = raw_reason or metadata.get("reason") or metadata.get("status")
+    normalized = str(raw_reason or "").strip().casefold()
+    if success:
+        return "completed"
+    if "cancel" in normalized:
+        return "cancelled"
+    if "timeout" in normalized:
+        return "timed_out"
+    return "failed"
+
+
+async def _bound_agent_run_capabilities(
+    *,
+    session_id: str,
+    agent_run_id: str | None,
+) -> dict[str, Any]:
+    """Read only tool names from the current session's durable AgentRun."""
+
+    empty: dict[str, Any] = {"executed": [], "executed_names": []}
+    normalized_run_id = str(agent_run_id or "").strip()
+    if not normalized_run_id:
+        return empty
+    try:
+        from ..services.agent_run_service import AgentRunService
+
+        run = await AgentRunService().get_run(
+            normalized_run_id,
+            include_tool_calls=True,
+            include_events=False,
+        )
+    except Exception:
+        return empty
+    if not isinstance(run, Mapping):
+        return empty
+    if str(run.get("session_id") or "").strip() != str(session_id).strip():
+        # A stale/mismatched run id is not an authority for this turn.
+        return empty
+
+    entries: list[dict[str, str]] = []
+    raw_calls = run.get("tool_calls")
+    if not isinstance(raw_calls, list):
+        raw_calls = []
+    for record in raw_calls[:64]:
+        name = _safe_inspector_token(
+            _capability_record_value(record, "tool_name", "tool", "name", "capability")
+        )
+        success_value = _capability_record_value(record, "success", "successful")
+        success = success_value is True or str(success_value or "").strip().casefold() in {
+            "1", "true", "yes", "ok", "success", "succeeded"
+        }
+        raw_reason = _capability_record_value(record, "reason", "failure", "error", "error_message")
+        metadata = _capability_record_value(record, "metadata", "result_metadata", "meta")
+        if not raw_reason and isinstance(metadata, Mapping):
+            raw_reason = metadata.get("reason") or metadata.get("status")
+        denial_probes = (
+            raw_reason,
+            _capability_record_value(record, "result", "output"),
+            metadata.get("reason") if isinstance(metadata, Mapping) else None,
+            metadata.get("error") if isinstance(metadata, Mapping) else None,
+        )
+        if any(_capability_failure_is_denied(value) for value in denial_probes):
+            # Do not disclose denied capability names, ids, or counts.
+            continue
+        if not name:
+            continue
+        entries.append({"name": name, "reason": _capability_reason(record, success)})
+    deduped: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in entries:
+        key = (entry["name"], entry["reason"])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(entry)
+    empty["executed"] = deduped
+    empty["executed_names"] = [entry["name"] for entry in deduped]
+    return empty
+
+
 def _conversation_search_session_result(session, query: str) -> dict[str, object]:
     title = str(getattr(session, "title", "") or "")
     character_name = str(getattr(session, "character_name", "") or "")
@@ -301,7 +808,11 @@ def create_conversation_router(
 
     # Import repository
     try:
-        from ..memory.conversation_repository import ConversationRepository
+        from ..memory.conversation_repository import (
+            ConversationMessageIdempotencyConflict,
+            ConversationRepository,
+            ConversationWriteAuthorizationError,
+        )
 
         REPO_AVAILABLE = True
     except ImportError:
@@ -1098,8 +1609,12 @@ def create_conversation_router(
             await _require_session_project_permission(session, user_info)
             messages = await repo.get_recent_messages(session_id, count=100)
             latest = None
+            latest_manifest = None
+            latest_inspector = None
+            latest_agent_run_id: str | None = None
+            latest_message_id: str | None = None
             for message in reversed(messages):
-                if message.role != "assistant" or not getattr(message, "is_active_branch", True):
+                if message.role != "assistant" or getattr(message, "is_active_branch", True) is False:
                     continue
                 metadata = (
                     message.message_metadata
@@ -1111,13 +1626,98 @@ def create_conversation_router(
                     latest = enrich_persisted_context_snapshot(candidate)
                     if latest is None:
                         continue
-                    latest.setdefault("session_id", session_id)
-                    latest.setdefault("message_id", str(message.id))
+                    latest = _strip_snapshot_private_fields(latest)
+                    # IDs are authoritative route bindings, not values read
+                    # from provider metadata.  Override hostile/mismatched
+                    # values rather than using setdefault.
+                    latest_message_id = str(message.id)
+                    latest["session_id"] = str(session_id)
+                    latest["message_id"] = latest_message_id
+                    raw_agent_run_id = metadata.get("agent_run_id") or candidate.get("agent_run_id")
+                    latest_agent_run_id = (
+                        _safe_inspector_token(raw_agent_run_id, limit=128)
+                        if raw_agent_run_id is not None
+                        else None
+                    )
+
+                    # A fork copies history with ``fork_source_message_id``
+                    # and intentionally strips turn metadata.  Treat the
+                    # marker as a hard boundary even for mixed-version rows
+                    # that accidentally retained a stale Manifest.
+                    raw_manifest = (
+                        None
+                        if metadata.get("fork_source_message_id")
+                        else metadata.get("context_manifest")
+                    )
+                    validated_manifest = validate_context_manifest_metadata(raw_manifest)
+                    # A Manifest produced while Project Context was OFF must
+                    # not be resurrected by a later turn/worker.  The
+                    # producer's subject flag is the only trusted indicator
+                    # available in a persisted row, so fail closed here.
+                    if isinstance(validated_manifest, dict):
+                        subject = validated_manifest.get("subject")
+                        if isinstance(subject, dict) and subject.get("include_project_context") is False:
+                            validated_manifest = None
+                    if validated_manifest is not None:
+                        latest_manifest = validated_manifest
+                        latest_inspector = _manifest_inspector_projection(
+                            validated_manifest,
+                            latest,
+                        )
                     break
+
+            capabilities = await _bound_agent_run_capabilities(
+                session_id=str(session_id),
+                agent_run_id=latest_agent_run_id,
+            )
+            authorized_references: list[dict[str, Any]] = []
+            if latest_manifest is not None and getattr(session, "project_id", None):
+                # Persisted hashes are correlation hints only. Re-resolve
+                # labels/hrefs through the current Project/Docs ACL path;
+                # revoked or deleted rows simply disappear.
+                try:
+                    from ..services.work_intelligence import (
+                        resolve_work_intelligence_references,
+                    )
+
+                    actor_user_id = str(user_info.get("id") or "").strip()
+                    project_id = str(getattr(session, "project_id", "") or "").strip()
+                    if actor_user_id and project_id:
+                        resolved = await resolve_work_intelligence_references(
+                            latest_manifest,
+                            actor_user_id=actor_user_id,
+                            project_id=project_id,
+                            session_id=str(session_id),
+                        )
+                        if isinstance(resolved, list):
+                            authorized_references = [
+                                item for item in resolved[:8] if isinstance(item, dict)
+                            ]
+                except Exception:
+                    authorized_references = []
+            # Keep the top-level response additive for existing clients while
+            # exposing the same bound IDs in a compact, explicit turn marker.
+            if latest is not None and latest_agent_run_id:
+                latest["agent_run_id"] = latest_agent_run_id
+            binding = {
+                "session_id": str(session_id),
+                "message_id": latest_message_id,
+                "agent_run_id": latest_agent_run_id,
+                "active_branch": bool(latest is not None),
+            }
             return JSONResponse({
                 "success": True,
                 "status": "available" if latest else "unavailable",
                 "snapshot": latest,
+                "context_manifest": latest_manifest,
+                "inspector": latest_inspector,
+                "capabilities": capabilities,
+                "binding": binding,
+                "turn_binding": binding,
+                "session_id": str(session_id),
+                "message_id": latest_message_id,
+                "agent_run_id": latest_agent_run_id,
+                "authorized_references": authorized_references,
             })
         except HTTPException:
             raise
@@ -1265,30 +1865,168 @@ def create_conversation_router(
                     else None
                 ),
                 sender_type="user" if payload.role == "user" else None,
-                sender_id=user_id if payload.role == "user" else None,
+                # A client_message_id is scoped to the authenticated actor for
+                # both user and assistant writes.  Without this provenance an
+                # assistant retry could replay a legacy/null row on behalf of
+                # another participant in the same shared conversation.
+                sender_id=(
+                    user_id
+                    if payload.role == "user" or payload.client_message_id
+                    else None
+                ),
                 sender_display_name=(
                     str(user_info.get("display_name") or user_info.get("username") or "")
                     if payload.role == "user"
                     else None
                 ),
+                actor_user_id=user_id,
+                actor_role=str(user_info.get("role") or ""),
             )
 
-            generated_title = await ensure_conversation_title(
-                repo=repo,
-                session_id=session_id,
-                llm_generator=get_llm_for_title_generation,
-            )
+            replayed = bool(getattr(message, "_idempotency_replayed", False))
+            generated_title = None
+            if not replayed:
+                generated_title = await ensure_conversation_title(
+                    repo=repo,
+                    session_id=session_id,
+                    llm_generator=get_llm_for_title_generation,
+                )
 
-            response = {"success": True, "message": message.to_dict()}
+            response = {
+                "success": True,
+                "replayed": replayed,
+                "message": message.to_dict(),
+            }
             if generated_title:
                 response["title"] = generated_title.title
                 response["title_source"] = generated_title.source
             return JSONResponse(response)
         except HTTPException:
             raise
+        except ConversationMessageIdempotencyConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_conflict",
+                    "message": "同じclient_message_idの内容が一致しません",
+                    "retryable": False,
+                },
+            ) from exc
+        except ConversationWriteAuthorizationError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "forbidden",
+                    "message": "会話への書き込み権限がありません",
+                    "retryable": False,
+                },
+            ) from exc
         except Exception as e:
             logger.error(f"Failed to add message: {e}")
-            raise HTTPException(status_code=500, detail=str(e))
+            # Provider/DB/crypto details stay in server logs.  The native
+            # FastAPI writer shares the BFF's structured persistence contract
+            # so mobile callers can distinguish a save failure without
+            # receiving SQL, hostnames, or secret-bearing exception text.
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "message_persistence_failed",
+                    "message": "メッセージを保存できませんでした",
+                    "retryable": True,
+                },
+            ) from e
+
+    @router.post("/{session_id}/local-import/messages")
+    async def import_local_assistant_message(
+        session_id: str,
+        payload: ImportLocalAssistantMessageRequest,
+        _: None = Depends(require_auth),
+        request: Request = None,
+    ):
+        """Promote one assistant row from an owned native local transcript.
+
+        Normal ``/{session_id}/messages`` remains user-only.  This dedicated
+        endpoint is intentionally narrower: only the session owner may import
+        history, project-backed sessions still require project write access,
+        and a mandatory client id makes retries repository-idempotent.
+        """
+        if not REPO_AVAILABLE:
+            raise HTTPException(status_code=503, detail="Database not available")
+
+        try:
+            user_info = await _get_current_conversation_user(request)
+            user_id = str(user_info.get("id") or "default_user")
+
+            repo = ConversationRepository()
+            session = await repo.get_session_by_id(session_id)
+            if not session:
+                raise HTTPException(status_code=404, detail="Session not found")
+
+            # History promotion is owner-only even when the actor is a global
+            # admin or a project/conversation participant.  This prevents an
+            # authorized collaborator from injecting assistant transcript rows
+            # into another user's local-session migration.
+            if str(getattr(session, "user_id", "")) != user_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Conversation ownership required for local history import",
+                )
+
+            await _require_project_permission(
+                getattr(session, "project_id", None),
+                user_info,
+                permission="write",
+            )
+
+            message = await repo.add_message(
+                session_id=session_id,
+                role="assistant",
+                content=payload.content,
+                metadata={"client_message_id": payload.client_message_id},
+                sender_type=None,
+                sender_id=user_id,
+                sender_display_name=None,
+                actor_user_id=user_id,
+                actor_role=str(user_info.get("role") or ""),
+            )
+            replayed = bool(getattr(message, "_idempotency_replayed", False))
+            return JSONResponse(
+                {
+                    "success": True,
+                    "replayed": replayed,
+                    "message": message.to_dict(),
+                }
+            )
+        except HTTPException:
+            raise
+        except ConversationMessageIdempotencyConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "idempotency_conflict",
+                    "message": "同じclient_message_idの内容が一致しません",
+                    "retryable": False,
+                },
+            ) from exc
+        except ConversationWriteAuthorizationError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "code": "forbidden",
+                    "message": "会話への書き込み権限がありません",
+                    "retryable": False,
+                },
+            ) from exc
+        except Exception as e:
+            logger.error(f"Failed to import local assistant message: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "code": "message_persistence_failed",
+                    "message": "メッセージを保存できませんでした",
+                    "retryable": True,
+                },
+            ) from e
 
     @router.post("/{session_id}/generate-title")
     async def generate_session_title(
@@ -1575,9 +2313,6 @@ def create_conversation_router(
             # Handle async function
             if hasattr(user_info, "__await__"):
                 user_info = await user_info
-            # memory_managerと同じuser_id（default_user）を使用
-            user_id = "default_user"
-
             repo = ConversationRepository()
             session = await repo.get_session_by_id(session_id)
 
@@ -1596,6 +2331,15 @@ def create_conversation_router(
             )
 
             deleted = await repo.delete_session(session_id)
+
+            # The process-local manual Team projection follows the durable
+            # session row.  Release it only after the repository confirms the
+            # delete; failures must leave the projection intact for retries.
+            if deleted:
+                release_session_agent_team_registry(
+                    str(session.user_id) if session.user_id is not None else None,
+                    session_id,
+                )
 
             return JSONResponse({"success": deleted})
         except HTTPException:

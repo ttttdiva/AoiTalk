@@ -381,6 +381,7 @@ class AppService:
                 parent_id=app_root.id,
                 root_page_id=app_root.id,
                 system_key=system_key,
+                is_explicit_blank=False,
                 title=app.name,
                 description=app.description or "",
                 body_text=readme,
@@ -410,6 +411,7 @@ class AppService:
             node.root_page_id = app_root.id
             node.project_id = None
             node.app_id = app.id
+            node.is_explicit_blank = False
             node.display_props = {
                 **(node.display_props if isinstance(node.display_props, dict) else {}),
                 "app_id": str(app.id),

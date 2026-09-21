@@ -15,10 +15,13 @@ Provides function tools that can be called by the LLM:
 """
 
 import fnmatch
+import functools
 import logging
+import ntpath
 import os
 import re
 import stat
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -38,14 +41,222 @@ from .file_editor import (
 from .file_system import get_file_system, FileSystemError
 
 try:
-    from ...security.agent_run_scope import RunScopeViolation, get_current_run_scope
+    from ...security.agent_run_scope import (
+        AgentRunScope,
+        RunScopeViolation,
+        get_current_run_scope,
+        run_scope_context,
+    )
 except ImportError:  # pragma: no cover - defensive for stripped builds
+    AgentRunScope = None  # type: ignore[assignment,misc]
     RunScopeViolation = PermissionError  # type: ignore[assignment]
 
     def get_current_run_scope():  # type: ignore[no-redef]
         return None
 
+    @contextmanager
+    def run_scope_context(_scope):  # type: ignore[no-redef]
+        yield _scope
+
+try:
+    from ...security.harness_execution_scope import (
+        HarnessExecutionScope,
+        get_current_harness_execution_scope,
+        harness_execution_scope_context,
+    )
+except ImportError:  # pragma: no cover - defensive for stripped builds
+    HarnessExecutionScope = None  # type: ignore[assignment,misc]
+
+    def get_current_harness_execution_scope():  # type: ignore[no-redef]
+        return None
+
+    @contextmanager
+    def harness_execution_scope_context(_scope):  # type: ignore[no-redef]
+        yield _scope
+
 logger = logging.getLogger(__name__)
+
+
+def _enterprise_scope_error(exc: BaseException, *, operation: str) -> Dict[str, Any]:
+    """Return a stable fail-closed result for one Enterprise operation."""
+
+    logger.warning("Enterprise %s scope setup denied: %s", operation, exc)
+    return {
+        "success": False,
+        "error": (
+            "Enterpriseではこの操作に必要な信頼済み実行スコープを"
+            f"構築できないため拒否しました: {exc}"
+        ),
+    }
+
+
+def _enterprise_scope_config() -> Any:
+    """Load the server-owned config used by the Enterprise scope factory."""
+
+    from ...config import Config
+
+    return Config()
+
+
+def _validate_enterprise_command_backend() -> None:
+    """Require the configured file-scoped backend before command calls."""
+
+    from ...security.wsl_bwrap_backend import get_wsl_bwrap_backend
+
+    backend = get_wsl_bwrap_backend()
+    if not getattr(backend, "file_scoped", False):
+        raise RuntimeError("configured command backend is not file-scoped")
+    available = getattr(backend, "is_available", None)
+    if not callable(available) or not available():
+        raise RuntimeError("file-scoped WSL2/bubblewrap backend is unavailable")
+
+
+def _enterprise_sensitive_filter_active() -> bool:
+    """Whether the explicit sandbox/coding path should mask secret-like names.
+
+    Enterprise deployment by itself is not a coding-agent execution scope.  In
+    the ordinary employee lane, filename heuristics must not turn into a
+    blanket authorization denial.  A bound upper or lower capability still
+    opts the call into the conservative sandbox policy.
+    """
+
+    if not _enterprise_mode():
+        return False
+    try:
+        return (
+            get_current_harness_execution_scope() is not None
+            or get_current_run_scope() is not None
+        )
+    except Exception:
+        # Scope lookup is part of a security boundary.  If the trusted context
+        # cannot be inspected, retain the conservative scoped policy rather
+        # than exposing a secret-like path accidentally.
+        logger.exception("Failed to inspect Enterprise execution scope")
+        return True
+
+
+@contextmanager
+def _enterprise_execution_scope(*, require_backend: bool = False):
+    """Validate and bind already-issued Enterprise execution capabilities.
+
+    Enterprise deployment does not itself establish a coding/repository
+    sandbox.  Ordinary employee calls therefore remain unbound.  A parent
+    harness may explicitly bind a server-issued ``HarnessExecutionScope`` and
+    its matching ``AgentRunScope``; only those capabilities are validated and
+    (when needed) adapted for the decorated tool.  No scope is manufactured
+    from the current turn or model/tool arguments here.
+    """
+
+    if not _enterprise_mode():
+        yield None
+        return
+
+    upper_scope = get_current_harness_execution_scope()
+    bound_scope = get_current_run_scope()
+
+    # Ordinary Enterprise filesystem calls stay on the capability/ACL lane.
+    # Command execution applies its shared-identity fail-closed check after
+    # the existing permission confirmation contract; ``require_backend`` only
+    # controls validation when an explicit coding scope is already active.
+    if upper_scope is None and bound_scope is None:
+        yield None
+        return
+
+    adapter_scope = bound_scope
+    try:
+        if upper_scope is not None and HarnessExecutionScope is not None and not isinstance(
+            upper_scope, HarnessExecutionScope
+        ):
+            raise TypeError("invalid trusted HarnessExecutionScope")
+        if bound_scope is not None and AgentRunScope is not None and not isinstance(
+            bound_scope, AgentRunScope
+        ):
+            raise TypeError("invalid trusted AgentRunScope")
+
+        if upper_scope is not None and bound_scope is None:
+            # The upper capability is already server-issued and immutable.  Its
+            # repository adapter is safe to bind for this call; no new
+            # authority or roots are inferred.
+            adapter_scope = upper_scope.to_agent_run_scope()
+        elif upper_scope is None and bound_scope is not None:
+            # A repository-only lower scope has no authenticated principal,
+            # finite limits, secret policy, or forced COW publication contract.
+            # It is sufficient for legacy Personal helpers, but Enterprise
+            # execution still requires the matching server-issued upper scope.
+            raise RuntimeError(
+                "Enterprise AgentRunScope requires a matching server-issued "
+                "HarnessExecutionScope"
+            )
+
+        # When both layers are already bound, they must describe exactly the
+        # same immutable run.  A lower scope from another run must never be
+        # accepted merely because an upper scope exists in the ambient context.
+        if upper_scope is not None and bound_scope is not None:
+            expected = upper_scope.to_agent_run_scope()
+            try:
+                from .background_jobs import compute_scope_fingerprint
+
+                matching = (
+                    str(getattr(bound_scope, "run_id", ""))
+                    == str(getattr(expected, "run_id", ""))
+                    and str(getattr(bound_scope, "repo_identity", ""))
+                    == str(getattr(expected, "repo_identity", ""))
+                    and compute_scope_fingerprint(bound_scope)
+                    == compute_scope_fingerprint(expected)
+                )
+            except Exception:
+                matching = False
+            if not matching:
+                raise RuntimeError("HarnessExecutionScope and AgentRunScope do not match")
+
+        if require_backend:
+            _validate_enterprise_command_backend()
+    except Exception as exc:
+        yield _enterprise_scope_error(exc, operation="execution")
+        return
+
+    # For newly built scopes bind both layers for the complete call so path
+    # resolution, permission checks, and backend/registry calls all observe
+    # one immutable capability fingerprint.  Enter the contexts before the
+    # single yield so an enter failure is converted to a local denial, while
+    # exceptions raised by the wrapped tool itself still propagate normally.
+    stack = ExitStack()
+    try:
+        if upper_scope is not None and upper_scope is not get_current_harness_execution_scope():
+            stack.enter_context(harness_execution_scope_context(upper_scope))
+        if adapter_scope is not bound_scope:
+            stack.enter_context(run_scope_context(adapter_scope))
+    except Exception as exc:
+        stack.close()
+        yield _enterprise_scope_error(exc, operation="execution")
+        return
+    try:
+        yield None
+    finally:
+        stack.close()
+
+
+def _enterprise_scoped(*, require_backend: bool = False):
+    """Decorator binding Enterprise authority around one LLM-facing tool."""
+
+    def decorate(function):
+        @functools.wraps(function)
+        def wrapped(*args, **kwargs):
+            with _enterprise_execution_scope(require_backend=require_backend) as denied:
+                if denied is not None:
+                    return denied
+                return function(*args, **kwargs)
+
+        return wrapped
+
+    return decorate
+
+
+def _active_harness_resource_limits() -> Any:
+    """Return limits from the bound upper scope, if any."""
+
+    scope = get_current_harness_execution_scope()
+    return getattr(scope, "resource_limits", None) if scope is not None else None
 
 # --- Path Protection Utilities ---
 
@@ -244,81 +455,611 @@ def _enterprise_mode() -> bool:
         return True
 
 
-def _enterprise_project_write_error(path: str, operation: str) -> Optional[Dict[str, Any]]:
-    """Reject generic file-editor writes into project storage in Enterprise.
+_ENTERPRISE_MANAGED_WORKSPACE_NAMESPACES = frozenset(
+    {
+        "_projects",
+        "_docs",
+        "_apps",
+        "_app_artifacts",
+        "_app_instances",
+    }
+)
 
-    Project API writers are the only paths that hold the project row lock and
-    update the quota counter.  The generic LLM file editor has no transaction
-    context, so allowing it to write `_projects` would bypass both controls.
+
+def _normalise_windows_device_alias(path: str) -> tuple[str, bool]:
+    """Return a filesystem path with Windows device aliases normalised.
+
+    ``Path.resolve`` does not consistently collapse Windows extended/device
+    prefixes.  Treat drive/UNC aliases as their ordinary path while refusing
+    opaque device namespaces (``GLOBALROOT``, ``pipe``, volume GUIDs, etc.).
+    The second return value records that a device alias was supplied.
+    """
+
+    raw = str(path or "")
+    if not raw:
+        return raw, False
+
+    # Device paths are documented with backslashes, but accepting forward
+    # slashes here prevents a mixed-separator alias from bypassing the check.
+    windows_form = raw.replace("/", "\\")
+    for prefix in ("\\\\?\\", "\\\\.\\"):
+        if not windows_form.casefold().startswith(prefix):
+            continue
+        rest = windows_form[len(prefix):]
+        folded = rest.casefold()
+        if folded.startswith("unc\\"):
+            tail = rest[4:]
+            if not tail or tail.startswith("\\"):
+                raise ValueError("invalid Windows UNC device alias")
+            return "\\\\" + tail, True
+        if (
+            len(rest) >= 3
+            and rest[0].isalpha()
+            and rest[1] == ":"
+            and rest[2] == "\\"
+        ):
+            return rest, True
+        # Do not attempt to map arbitrary devices into a filesystem path.
+        raise ValueError("unsupported Windows device namespace")
+    return raw, False
+
+
+def _path_key(path: Path) -> str:
+    """Return a case/segment-normalised key suitable for containment checks."""
+
+    return os.path.normcase(os.path.normpath(os.fspath(path)))
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    """Containment check that does not confuse sibling prefixes (``foo2``)."""
+
+    try:
+        return os.path.commonpath((_path_key(path), _path_key(root))) == _path_key(root)
+    except (OSError, ValueError):
+        # Different drives/UNC shares and malformed paths are never inside one
+        # another for this authorization boundary.
+        return False
+
+
+def _existing_path_components(
+    path: Path,
+) -> list[tuple[Path, Optional[bool]]]:
+    """Inspect existing lexical components without following links.
+
+    The optional flag is ``None`` when metadata could not be inspected.  A
+    caller enforcing an authorization boundary must treat that state as a
+    denial rather than guessing from a resolved path.
+    """
+
+    anchor = Path(path.anchor) if path.anchor else Path.cwd()
+    try:
+        parts = path.relative_to(anchor).parts if path.anchor else path.parts
+    except ValueError:
+        anchor = Path.cwd()
+        parts = path.parts
+
+    current = anchor
+    result: list[tuple[Path, Optional[bool]]] = []
+    for part in parts:
+        if not part or part == ".":
+            continue
+        current = current / part
+        try:
+            metadata = os.lstat(current)
+        except FileNotFoundError:
+            # A missing final component is valid for create/write operations;
+            # no later component can exist once its parent is absent.
+            break
+        except (OSError, PermissionError, NotADirectoryError):
+            result.append((current, None))
+            break
+        attributes = getattr(metadata, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+        linked = stat.S_ISLNK(metadata.st_mode) or bool(
+            attributes & reparse_flag
+        )
+        result.append((current, linked))
+    return result
+
+
+def _canonical_path_identity(
+    path: str,
+    *,
+    base: Optional[Path] = None,
+) -> tuple[Path, Path, list[tuple[Path, Optional[bool]]], bool]:
+    """Canonicalise one path while retaining its lexical identity.
+
+    Both the lexical path and the ``realpath`` are returned so callers can
+    reject links that escape a trusted root in either direction.  ``base`` is
+    used only for relative paths; ordinary tool callers normally pass an
+    already-resolved absolute path.
+    """
+
+    normalised, device_alias = _normalise_windows_device_alias(path)
+    if "\x00" in normalised:
+        raise ValueError("path contains NUL")
+
+    # ``ntpath`` catches Windows absolute/device input even when a stripped
+    # build is exercised on a POSIX host.  Such a path cannot be safely mapped
+    # to that host's filesystem and is therefore handled as invalid below.
+    if not os.path.isabs(normalised):
+        if ntpath.isabs(normalised) and os.name != "nt":
+            raise ValueError("Windows absolute path on non-Windows host")
+        normalised = os.path.join(os.fspath(base or Path.cwd()), normalised)
+
+    lexical = Path(os.path.normpath(os.path.abspath(normalised)))
+    try:
+        resolved = Path(os.path.realpath(os.fspath(lexical)))
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("path cannot be canonicalized") from exc
+    components = _existing_path_components(lexical)
+    return lexical, resolved, components, device_alias
+
+
+def _native_employee_capability() -> Any | None:
+    """Return the currently bound, validated native employee capability.
+
+    Native execution is an explicit alternate lane for ordinary Enterprise
+    requests.  The capability is issued/bound by the request dispatcher and
+    proves that this process is running for one authenticated endpoint/user;
+    it is never reconstructed from model arguments.  Keep the imports lazy so
+    tool discovery does not create a security-service <-> tools cycle.
+
+    A missing/invalid capability is represented as ``None``.  Callers that
+    need a user-facing error deliberately use the existing Enterprise
+    fail-closed helpers instead of leaking validation details.
+    """
+
+    if not _enterprise_mode():
+        return None
+    try:
+        from ...security.native_employee_execution import (
+            get_current_native_employee_execution_capability,
+            validate_native_employee_execution_capability,
+        )
+    except (ImportError, AttributeError):
+        return None
+    try:
+        capability = get_current_native_employee_execution_capability()
+    except Exception:
+        logger.exception("Failed to inspect native employee execution capability")
+        return None
+    if capability is None:
+        return None
+
+    # If the native execution service exposes a live-dispatch validator, use
+    # it in addition to the value-only security validator.  This is where
+    # endpoint configuration, current process SID/token and request/session
+    # binding are checked.  Keep this optional for Personal/stripped builds;
+    # Enterprise with a present but uncheckable capability fails closed below.
+    try:
+        from ...services import native_employee_execution_service as service
+
+        # Prefer the full service validator (config + endpoint/SID mapping).
+        # The explicit ``current`` form requires a Config argument; test or
+        # stripped adapters may expose the shorter capability-only form.
+        live_validator = getattr(
+            service,
+            "validate_current_native_employee_execution_capability",
+            None,
+        )
+        if callable(live_validator):
+            try:
+                live_validated = live_validator(capability, _enterprise_scope_config())
+            except TypeError:
+                live_validated = live_validator(capability)
+            if live_validated is False:
+                return None
+            if live_validated is not None:
+                capability = live_validated
+    except (ImportError, AttributeError):
+        pass
+    except Exception:
+        logger.warning(
+            "Native employee live capability validation failed",
+            exc_info=True,
+        )
+        return None
+
+    # Revalidate the opaque handle and bind it to the authenticated request
+    # context.  ``validate_*`` intentionally owns token/expiry checks; this
+    # additional principal comparison prevents a capability for another user
+    # from being used when a caller's ContextVar was switched or omitted.
+    try:
+        validated = validate_native_employee_execution_capability(capability)
+    except Exception:
+        logger.warning("Native employee execution capability validation failed", exc_info=True)
+        return None
+    if validated is False:
+        return None
+    capability = capability if validated is None else validated
+
+    context = get_current_user_context()
+    active_user = context.get("user_id")
+    capability_user = getattr(capability, "authenticated_user_id", None)
+    if capability_user is None:
+        capability_user = getattr(capability, "principal_id", None)
+    if capability_user is None:
+        capability_user = getattr(capability, "user_id", None)
+    if not active_user or capability_user is None:
+        return None
+    if str(capability_user).casefold() != str(active_user).casefold():
+        logger.warning(
+            "Native employee capability principal mismatch: capability=%s active=%s",
+            capability_user,
+            active_user,
+        )
+        return None
+    return capability
+
+
+def _enterprise_explicit_scope_active() -> bool:
+    """Whether coding/harness authority is bound for the current call."""
+
+    try:
+        return bool(
+            get_current_harness_execution_scope() is not None
+            or get_current_run_scope() is not None
+        )
+    except Exception:
+        # If scope inspection fails, callers must not select the less
+        # restrictive native lane.
+        return True
+
+
+def _native_employee_capability_error(operation: str) -> Dict[str, Any]:
+    """Stable denial returned when ordinary Enterprise lacks native authority."""
+
+    return {
+        "success": False,
+        "error": (
+            "Enterpriseの通常Agentはユーザーにバインドされた"
+            f"ネイティブ実行能力がないため{operation}を拒否しました。"
+            "共有サーバーIDによる外部パス操作は許可されません。"
+        ),
+    }
+
+
+def _enterprise_native_mutation_error(
+    operation: str,
+    *,
+    allow_native_employee: bool,
+) -> Optional[Dict[str, Any]]:
+    """Gate generic mutation operations in the native employee lane.
+
+    ``create_file`` and ``edit_file`` are the deliberately narrow native
+    filesystem opt-ins.  Delete/append/insert/undo remain fail-closed because
+    they either destroy state or bypass the editor's journal/rollback contract.
+    Coding/harness scopes are unaffected and continue through AgentRunScope.
+    """
+
+    if (
+        not _enterprise_mode()
+        or _enterprise_explicit_scope_active()
+        or _native_employee_capability() is None
+        or allow_native_employee
+    ):
+        return None
+    return {
+        "success": False,
+        "error": (
+            "Enterpriseのネイティブ従業員レーンでは"
+            f"{operation}を許可していません。"
+            "削除・追記・挿入・取り消しは管理された編集APIを使用してください。"
+        ),
+    }
+
+
+def _aoi_workspace_identity() -> tuple[Path, Path] | None:
+    """Return lexical/resolved AoiTalk workspace roots, or ``None`` on error."""
+
+    try:
+        workspace = Path(_get_user_files_root())
+        lexical, resolved, _components, _alias = _canonical_path_identity(str(workspace))
+        return lexical, resolved
+    except Exception:
+        logger.warning("AoiTalk workspace identity could not be canonicalized", exc_info=True)
+        return None
+
+
+def _path_is_aoi_workspace(path: str) -> bool:
+    """Whether *path* lexically or canonically belongs to AoiTalk workspace."""
+
+    roots = _aoi_workspace_identity()
+    if roots is None:
+        # An inability to establish the workspace boundary is not an excuse to
+        # let a capability-backed file operation bypass the managed-data gate.
+        return True
+    workspace_lexical, workspace_resolved = roots
+    try:
+        lexical, resolved, _components, _alias = _canonical_path_identity(
+            str(path), base=workspace_lexical
+        )
+    except Exception:
+        return True
+    return _path_is_within(lexical, workspace_lexical) or _path_is_within(
+        resolved, workspace_resolved
+    )
+
+
+def _native_employee_external_path_allowed(path: str, operation: str) -> bool:
+    """Authorize one external path for the native employee lane.
+
+    The native capability is the OS-identity proof for paths outside AoiTalk's
+    own workspace.  Canonicalization still runs first to reject malformed/device
+    aliases and uninspectable link/reparse components.  A path that is inside
+    the AoiTalk workspace remains subject to the existing ACL/managed guards.
+    """
+
+    if _native_employee_capability() is None:
+        return False
+    roots = _aoi_workspace_identity()
+    if roots is None:
+        return False
+    workspace_lexical, workspace_resolved = roots
+    try:
+        lexical, resolved, components, _device_alias = _canonical_path_identity(
+            str(path), base=workspace_lexical
+        )
+    except Exception:
+        return False
+
+    lexical_inside = _path_is_within(lexical, workspace_lexical)
+    resolved_inside = _path_is_within(resolved, workspace_resolved)
+    # A link/reparse escape originating inside the application workspace is
+    # never an ordinary native path.  Keep the old canonical workspace guard
+    # even when an endpoint capability is present.
+    if lexical_inside and not resolved_inside:
+        return False
+    for _component, linked in components:
+        if linked is None:
+            return False
+    if lexical_inside or resolved_inside:
+        # Managed/personal roots are still checked by the normal AoiTalk ACL
+        # and generic-writer protection below.
+        return False
+    return True
+
+
+def _native_employee_mutation_resolution_error(
+    path: str,
+    operation: str,
+    *,
+    allow_native_employee: bool,
+) -> Optional[Dict[str, Any]]:
+    """Apply the explicit native opt-in while resolving mutation targets."""
+
+    if (
+        not allow_native_employee
+        or not _enterprise_mode()
+        or _enterprise_explicit_scope_active()
+        or _path_is_aoi_workspace(path)
+    ):
+        return None
+    allowed_error = _check_absolute_path_allowed(path)
+    if allowed_error:
+        return {"success": False, "error": allowed_error}
+    if not _native_employee_external_path_allowed(path, operation):
+        return _native_employee_capability_error(operation)
+    return None
+
+
+def _enterprise_unscoped_path_error(
+    path: str,
+    operation: str,
+    *,
+    allow_native_employee: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Reject unscoped Enterprise access outside AoiTalk's own workspace.
+
+    The Enterprise process normally uses a shared service identity.  A
+    server-issued native employee capability is the explicit alternate lane
+    for ordinary external paths; without it (or without the caller's explicit
+    opt-in), admin flags and model-provided absolute paths must not turn that
+    identity into an employee-wide browser.
+    Explicit Harness/Agent scopes are handled by their own canonical
+    capability checks and intentionally bypass this compatibility gate.
+    """
+
+    if not _enterprise_mode():
+        return None
+
+    try:
+        if (
+            get_current_harness_execution_scope() is not None
+            or get_current_run_scope() is not None
+        ):
+            return None
+    except Exception:
+        # A scope lookup failure cannot establish native identity authority.
+        pass
+
+    denial = _native_employee_capability_error(operation)
+    try:
+        workspace = Path(_get_user_files_root())
+        workspace_lexical, workspace_resolved, _, _ = _canonical_path_identity(
+            str(workspace)
+        )
+        lexical, resolved, components, _device_alias = _canonical_path_identity(
+            str(path),
+            base=workspace_lexical,
+        )
+
+        lexical_inside = _path_is_within(lexical, workspace_lexical)
+        resolved_inside = _path_is_within(resolved, workspace_resolved)
+
+        # An explicitly-issued native capability authorizes an external path,
+        # but not an alias that starts inside AoiTalk and escapes its root.  A
+        # canonical target inside AoiTalk stays on the existing ACL lane.
+        if not lexical_inside and not resolved_inside:
+            if allow_native_employee and _native_employee_external_path_allowed(
+                path,
+                operation,
+            ):
+                return None
+            return denial
+        if lexical_inside and not resolved_inside:
+            return denial
+
+        # A link/reparse component is allowed only when it remains wholly
+        # within the workspace.  This preserves harmless user-local aliases
+        # while preventing a transient escape followed by ``..`` from being
+        # hidden by the final realpath.
+        for component, linked in components:
+            if linked is None:
+                return denial
+            if not linked:
+                continue
+            component_resolved = Path(
+                os.path.realpath(os.fspath(component))
+            )
+            if not _path_is_within(component, workspace_lexical):
+                return denial
+            if not _path_is_within(component_resolved, workspace_resolved):
+                return denial
+    except Exception:
+        # Canonical identity is an authorization prerequisite, not a best
+        # effort hint.  Keep the boundary fail-closed on metadata failures.
+        return denial
+    return None
+
+
+def _enterprise_project_write_error(path: str, operation: str) -> Optional[Dict[str, Any]]:
+    """Reject generic file-editor writes into managed storage in Enterprise.
+
+    Project/Docs API writers are the only paths that hold the required row
+    locks, ACL context, and quota/journal accounting.  The generic LLM file
+    editor has no transaction context, so allowing it to write managed
+    namespaces would bypass those controls.
     """
     if not _enterprise_mode():
         return None
     try:
-        root = _get_user_files_root().resolve(strict=False)
-        candidate = Path(os.path.abspath(str(path or "")))
-        project_root = root / "_projects"
-
-        def is_link_or_reparse(component: Path) -> bool:
-            try:
-                metadata = os.lstat(component)
-            except FileNotFoundError:
-                return False
-            attributes = getattr(metadata, "st_file_attributes", 0)
-            reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
-            return stat.S_ISLNK(metadata.st_mode) or bool(attributes & reparse_flag)
+        root = Path(_get_user_files_root()).resolve(strict=False)
+        candidate, resolved_candidate, components, _device_alias = (
+            _canonical_path_identity(str(path or ""), base=root)
+        )
 
         # A lexical path can escape through a symlink/reparse point in a
         # personal namespace (for example _users/.../link -> _projects/...).
         # Inspect every existing component before any editor or shutil call.
-        current = Path(candidate.anchor) if candidate.anchor else Path()
-        for component in candidate.parts[1:] if candidate.anchor else candidate.parts:
-            current = current / component
-            if is_link_or_reparse(current):
+        for _component, linked in components:
+            if linked is None or linked:
                 return {
                     "success": False,
                     "error": (
                         "Enterpriseではシンボリックリンク/再解析ポイントを経由する"
                         f"{operation}を無効化しています。"
+                        " (symlink/junction/reparse point)"
                     ),
                 }
 
-        resolved_candidate = candidate.resolve(strict=False)
-        project_root_resolved = project_root.resolve(strict=False)
-        for checked in (candidate, resolved_candidate):
-            try:
-                checked.relative_to(project_root_resolved)
+        managed_roots = {
+            namespace: root / namespace
+            for namespace in _ENTERPRISE_MANAGED_WORKSPACE_NAMESPACES
+        }
+        matched_namespace: Optional[str] = None
+        for namespace, managed_root in managed_roots.items():
+            managed_root_resolved = Path(
+                os.path.realpath(os.fspath(managed_root))
+            )
+            if _path_is_within(candidate, managed_root_resolved) or _path_is_within(
+                resolved_candidate, managed_root_resolved
+            ):
+                matched_namespace = namespace
                 break
-            except ValueError:
-                continue
-        else:
+            if matched_namespace is not None:
+                break
+        if matched_namespace is None:
             return None
-    except ValueError:
-        return None
     except Exception:
         return {
             "success": False,
-            "error": "Enterpriseではプロジェクト保存領域のパスを安全に確認できません。",
+            "error": "Enterpriseでは管理対象保存領域のパスを安全に確認できません。",
         }
+    namespace_labels = {
+        "_projects": "プロジェクト",
+        "_docs": "Docs",
+        "_apps": "App",
+        "_app_artifacts": "App artifact",
+        "_app_instances": "App instance",
+    }
+    namespace_label = namespace_labels.get(matched_namespace or "", "管理対象")
     return {
         "success": False,
         "error": (
-            "Enterpriseではプロジェクト保存領域への汎用agent書き込みを"
-            "無効化しています。プロジェクトのファイルAPIを使用してください。"
+            f"Enterpriseでは{namespace_label}保存領域への汎用agent書き込みを"
+            f"無効化しています。{namespace_label}のファイルAPIを使用してください。"
         ),
     }
 
 
 def _enterprise_command_error() -> Optional[Dict[str, Any]]:
-    """Generic shell commands cannot be quota/ACL scoped safely."""
+    """Compatibility shim; Enterprise commands are scoped per invocation."""
+    return None
+
+
+def _enterprise_unscoped_command_error(
+) -> Optional[Dict[str, Any]]:
+    """Reject host-process commands without an explicit coding scope.
+
+    The Enterprise server process may run under one shared service identity.
+    A model-facing command cannot treat that identity (or a native employee
+    capability that describes it) as the authenticated employee, because a
+    same-token shell has no AoiTalk Project/Docs mediation.  Native command
+    execution is therefore a v1 non-goal: only an explicitly issued and
+    validated HarnessExecutionScope/AgentRunScope may select the bounded WSL2
+    backend.  Capability-backed employee access remains available through the
+    mediated filesystem tools below.
+    """
+
     if not _enterprise_mode():
+        return None
+    try:
+        explicit_scope = (
+            get_current_harness_execution_scope() is not None
+            or get_current_run_scope() is not None
+        )
+    except Exception:
+        explicit_scope = False
+    if explicit_scope:
         return None
     return {
         "success": False,
         "error": (
-            "Enterpriseでは汎用コマンド実行を無効化しています。"
-            "プロジェクト操作は専用APIまたは管理機能を使用してください。"
+            "Enterpriseの通常Agentコマンドは、ユーザーにバインドされた"
+            "ネイティブ実行ID/実行能力がなく、AoiTalkの管理境界を"
+            "保証できないため拒否しました。共有サーバーID/同一サービスIDの"
+            "ネイティブshellは許可されません。"
+            "明示的なAgentRunScope/HarnessExecutionScopeを使用してください。"
         ),
     }
+
+
+def _enterprise_sensitive_path_error(path: str) -> Optional[Dict[str, Any]]:
+    if not _enterprise_sensitive_filter_active():
+        return None
+    for part in Path(str(path or "")).parts:
+        name = part.casefold()
+        if (
+            name in {
+                "credentials", "credential", "secrets", "secret",
+                ".ssh", "id_rsa", "id_ed25519",
+            }
+            or name == ".env"
+            or name.startswith(".env.")
+            or name.endswith(
+                (".key", ".pem", ".p12", ".pfx", ".secret", ".secrets")
+            )
+        ):
+            return {
+                "success": False,
+                "error": (
+                    "Enterprise harnessではcredential/secret pathを直接操作できません。"
+                    "明示的なsecret capability/brokerを使用してください。"
+                ),
+            }
+    return None
 
 
 def _resolve_path_for_user(path: str) -> str:
@@ -387,6 +1128,8 @@ def _is_explicit_workspace_namespace(path: str) -> bool:
 def _resolve_mutation_target(
     path: str,
     operation: str = "write",
+    *,
+    allow_native_employee: bool = False,
 ) -> tuple[Optional[str], Optional[Dict[str, Any]]]:
     """Resolve generic mutations without shadowing explicit workspace paths.
 
@@ -394,6 +1137,10 @@ def _resolve_mutation_target(
     ``_projects``/``_users``/``_apps`` namespaces use the canonical workspace
     resolver (including traversal/symlink checks). Ordinary relative paths
     retain the historical current-user personal-workspace base.
+
+    ``allow_native_employee`` is an explicit opt-in for the narrow
+    create/edit tools.  It is intentionally false for delete/append/insert/
+    undo so a native capability cannot widen those mutation lanes.
     """
 
     raw = str(path or "")
@@ -409,12 +1156,21 @@ def _resolve_mutation_target(
                 resolved = scope.assert_delete_allowed(raw)
             else:
                 resolved = scope.assert_mutation_allowed(raw, operation)
-            return str(resolved), None
+            sensitive = _enterprise_sensitive_path_error(str(resolved))
+            return (None, sensitive) if sensitive else (str(resolved), None)
         except RunScopeViolation as exc:
             return None, {"success": False, "error": str(exc)}
 
     if raw and os.path.isabs(raw):
-        return raw, None
+        sensitive = _enterprise_sensitive_path_error(raw)
+        if sensitive:
+            return None, sensitive
+        native_error = _native_employee_mutation_resolution_error(
+            raw,
+            operation,
+            allow_native_employee=allow_native_employee,
+        )
+        return (None, native_error) if native_error else (raw, None)
     if _is_explicit_workspace_namespace(raw):
         target, valid = _workspace_service().resolve_workspace_path(raw)
         if not valid:
@@ -422,8 +1178,18 @@ def _resolve_mutation_target(
                 "success": False,
                 "error": f"ワークスペース外のパスは指定できません: {raw}",
             }
-        return str(target), None
-    return _resolve_path_for_user(raw), None
+        sensitive = _enterprise_sensitive_path_error(str(target))
+        return (None, sensitive) if sensitive else (str(target), None)
+    resolved = _resolve_path_for_user(raw)
+    sensitive = _enterprise_sensitive_path_error(resolved)
+    if sensitive:
+        return None, sensitive
+    native_error = _native_employee_mutation_resolution_error(
+        resolved,
+        operation,
+        allow_native_employee=allow_native_employee,
+    )
+    return (None, native_error) if native_error else (resolved, None)
 
 
 def _workspace_service():
@@ -447,7 +1213,11 @@ def _check_absolute_path_allowed(path: str) -> Optional[str]:
     return path_outside_allowed_error(path)
 
 
-def _resolve_read_target(path: str) -> tuple[Optional[str], bool, Optional[str]]:
+def _resolve_read_target(
+    path: str,
+    *,
+    allow_native_employee: bool = False,
+) -> tuple[Optional[str], bool, Optional[str]]:
     """read_file / list_directory / search_files 共通のパス解決。
 
     絶対パスは統合前の各ツールと同じく
@@ -460,6 +1230,10 @@ def _resolve_read_target(path: str) -> tuple[Optional[str], bool, Optional[str]]
     AOITALK_ALLOWED_PATHS の判定を適用する。FileEditor 経由（行範囲指定）でも
     同じ判定が走るため、行範囲の有無で結果が変わらない。
 
+    ``allow_native_employee`` is an explicit opt-in used only by the
+    ordinary read tools and RepoMap.  It is not a capability grant by itself;
+    the currently bound native employee handle must still validate.
+
     Returns:
         (解決済み絶対パス, 絶対パス指定だったか, エラーメッセージ)
     """
@@ -471,7 +1245,15 @@ def _resolve_read_target(path: str) -> tuple[Optional[str], bool, Optional[str]]
     scope = get_current_run_scope()
     if scope is not None:
         try:
-            return str(scope.assert_read_allowed(raw)), bool(raw and os.path.isabs(raw)), None
+            resolved = str(scope.assert_read_allowed(raw))
+            sensitive = _enterprise_sensitive_path_error(resolved)
+            if sensitive:
+                return (
+                    None,
+                    bool(raw and os.path.isabs(raw)),
+                    str(sensitive["error"]),
+                )
+            return resolved, bool(raw and os.path.isabs(raw)), None
         except RunScopeViolation as exc:
             return None, bool(raw and os.path.isabs(raw)), str(exc)
 
@@ -479,9 +1261,16 @@ def _resolve_read_target(path: str) -> tuple[Optional[str], bool, Optional[str]]
         denied = _check_absolute_path_allowed(raw)
         if denied:
             return None, True, denied
-        permission_error = _check_user_permission(raw, "読み取り")
+        permission_error = _check_user_permission(
+            raw,
+            "読み取り",
+            allow_native_employee=allow_native_employee,
+        )
         if permission_error:
             return None, True, str(permission_error["error"])
+        sensitive = _enterprise_sensitive_path_error(raw)
+        if sensitive:
+            return None, True, str(sensitive["error"])
         return raw, True, None
 
     service = _workspace_service()
@@ -508,9 +1297,16 @@ def _resolve_read_target(path: str) -> tuple[Optional[str], bool, Optional[str]]
     denied = _check_absolute_path_allowed(resolved)
     if denied:
         return None, False, denied
-    permission_error = _check_user_permission(resolved, "読み取り")
+    permission_error = _check_user_permission(
+        resolved,
+        "読み取り",
+        allow_native_employee=allow_native_employee,
+    )
     if permission_error:
         return None, False, str(permission_error["error"])
+    sensitive = _enterprise_sensitive_path_error(resolved)
+    if sensitive:
+        return None, False, str(sensitive["error"])
     return resolved, False, None
 
 
@@ -624,7 +1420,12 @@ def _is_path_in_user_workspace(path: str, user_id: Optional[str], project_ids: L
         return False
 
 
-def _check_user_permission(path: str, operation: str) -> Optional[Dict[str, Any]]:
+def _check_user_permission(
+    path: str,
+    operation: str,
+    *,
+    allow_native_employee: bool = False,
+) -> Optional[Dict[str, Any]]:
     """
     Check if current user has permission to perform operation on path.
     
@@ -646,6 +1447,19 @@ def _check_user_permission(path: str, operation: str) -> Optional[Dict[str, Any]
     # constrained this path for the run.
     if get_current_run_scope() is not None:
         return None
+
+    # Enterprise's host process currently runs under a shared service
+    # identity.  Before the administrator bypass, require the lexical and
+    # canonical path to remain inside AoiTalk's workspace unless an explicit
+    # Harness/Agent capability is already bound.  This keeps admin flags from
+    # turning an absolute external path into a cross-employee data oracle.
+    identity_error = _enterprise_unscoped_path_error(
+        path,
+        operation,
+        allow_native_employee=allow_native_employee,
+    )
+    if identity_error:
+        return identity_error
     
     # Admin users: use existing protected_paths logic
     if context["is_admin"]:
@@ -673,6 +1487,20 @@ def _check_user_permission(path: str, operation: str) -> Optional[Dict[str, Any]
         }
     
     if not _is_path_in_user_workspace(path, user_id, project_ids):
+        # Outside AoiTalk's workspace, a valid native employee capability
+        # delegates authorization to the actual Windows token/ACL.  Never use
+        # this bypass for paths that resolve into AoiTalk-managed data: those
+        # remain on the user/project ACL above and generic writers are blocked
+        # separately by _enterprise_project_write_error.
+        if (
+            allow_native_employee
+            and _enterprise_mode()
+            and _native_employee_external_path_allowed(
+                path,
+                operation,
+            )
+        ):
+            return None
         return {
             "success": False,
             "error": f"操作拒否: パス '{path}' へのアクセス権限がありません。\n"
@@ -889,6 +1717,7 @@ def _check_command_protection(command: str, working_directory: Optional[str]) ->
 
 
 @tool
+@_enterprise_scoped(require_backend=True)
 def execute_command(
     command: str,
     working_directory: Optional[str] = None,
@@ -938,10 +1767,6 @@ def execute_command(
     """
     print(f"[Tool] execute_command が呼び出されました: {command[:50]}...")
 
-    enterprise_error = _enterprise_command_error()
-    if enterprise_error:
-        return enterprise_error
-
     working_directory = _resolve_working_directory(working_directory)
     command_config = _get_command_config()
 
@@ -961,6 +1786,17 @@ def execute_command(
     )
     if permission_error:
         return permission_error
+
+    # Keep the existing confirmation/permission contract first.  Ordinary
+    # Enterprise commands are always fail-closed: a native employee capability
+    # is intentionally not a shell authority because a same-token process
+    # cannot guarantee AoiTalk Project/Docs mediation.  Explicit
+    # AgentRunScope/HarnessExecutionScope calls continue through the bounded
+    # WSL2/bubblewrap backend.  This also keeps background lifecycle APIs
+    # denied before touching the process-global registry.
+    enterprise_identity_error = _enterprise_unscoped_command_error()
+    if enterprise_identity_error:
+        return enterprise_identity_error
 
     if shell is None:
         shell = command_config.get("shell", "auto")
@@ -998,9 +1834,32 @@ def execute_command(
         timeout = int(_COMMAND_CONFIG_DEFAULTS["timeout_seconds"])
 
     max_output_bytes = int(command_config.get("max_output_bytes", 32768))
+    # The model may request arbitrarily large foreground limits.  In an
+    # Enterprise run the immutable upper scope is authoritative and the
+    # request can only narrow (never widen) those limits.
+    limits = _active_harness_resource_limits()
+    if limits is not None:
+        try:
+            timeout = min(float(timeout), float(limits.timeout_seconds))
+            if timeout <= 0:
+                raise ValueError("timeout_seconds must be positive")
+            max_output_bytes = max(
+                1,
+                min(int(max_output_bytes), int(limits.max_output_bytes)),
+            )
+        except (TypeError, ValueError, AttributeError):
+            return _enterprise_scope_error(
+                RuntimeError("invalid Enterprise resource limits"),
+                operation="command",
+            )
 
     executor = get_command_executor()
-    result = executor.execute(command, cwd=working_directory, timeout=timeout, shell=shell)
+    result = executor.execute(
+        command,
+        cwd=working_directory,
+        timeout=timeout,
+        shell=shell,
+    )
 
     formatted = format_command_output(
         stdout=result.stdout,
@@ -1034,6 +1893,7 @@ def execute_command(
 
 
 @tool
+@_enterprise_scoped()
 def read_command_output(
     job_id: str,
     max_output_bytes: int = 8192
@@ -1056,10 +1916,29 @@ def read_command_output(
     """
     print(f"[Tool] read_command_output が呼び出されました: {job_id}")
 
+    # An unscoped Enterprise turn must not use the process-global registry:
+    # ownerless jobs could expose another employee's command output.  Scoped
+    # coding/harness turns retain the registry's existing owner filter.
+    enterprise_identity_error = _enterprise_unscoped_command_error()
+    if enterprise_identity_error:
+        return enterprise_identity_error
+
     try:
         max_output_bytes = int(max_output_bytes)
     except (TypeError, ValueError):
         max_output_bytes = 8192
+    limits = _active_harness_resource_limits()
+    if limits is not None:
+        try:
+            max_output_bytes = max(
+                1,
+                min(max_output_bytes, int(limits.max_output_bytes)),
+            )
+        except (TypeError, ValueError, AttributeError):
+            return _enterprise_scope_error(
+                RuntimeError("invalid Enterprise resource limits"),
+                operation="background output",
+            )
 
     try:
         registry = get_background_job_registry()
@@ -1075,6 +1954,7 @@ def read_command_output(
 
 
 @tool
+@_enterprise_scoped()
 def write_command_input(
     job_id: str,
     text: str
@@ -1105,6 +1985,10 @@ def write_command_input(
     if permission_error:
         return permission_error
 
+    enterprise_identity_error = _enterprise_unscoped_command_error()
+    if enterprise_identity_error:
+        return enterprise_identity_error
+
     try:
         registry = get_background_job_registry()
         result = registry.write_stdin(job_id, text)
@@ -1119,6 +2003,7 @@ def write_command_input(
 
 
 @tool
+@_enterprise_scoped()
 def stop_command(job_id: str) -> Dict[str, Any]:
     """バックグラウンドジョブを停止する
 
@@ -1143,6 +2028,12 @@ def stop_command(job_id: str) -> Dict[str, Any]:
     if permission_error:
         return permission_error
 
+    # Keep stop's existing confirmation first; only a confirmed action then
+    # reaches this Enterprise identity boundary and the registry.
+    enterprise_identity_error = _enterprise_unscoped_command_error()
+    if enterprise_identity_error:
+        return enterprise_identity_error
+
     try:
         registry = get_background_job_registry()
         result = registry.stop(job_id)
@@ -1157,6 +2048,7 @@ def stop_command(job_id: str) -> Dict[str, Any]:
 
 
 @tool
+@_enterprise_scoped()
 def list_commands() -> Dict[str, Any]:
     """バックグラウンドジョブの一覧を取得する
 
@@ -1169,6 +2061,10 @@ def list_commands() -> Dict[str, Any]:
         >>> list_commands()
     """
     print("[Tool] list_commands が呼び出されました")
+
+    enterprise_identity_error = _enterprise_unscoped_command_error()
+    if enterprise_identity_error:
+        return enterprise_identity_error
 
     try:
         registry = get_background_job_registry()
@@ -1223,6 +2119,7 @@ def assert_no_active_scoped_jobs(scope: Any | None = None) -> Dict[str, Any]:
 
 
 @tool
+@_enterprise_scoped()
 def read_file(
     path: str,
     start_line: Optional[int] = None,
@@ -1258,7 +2155,10 @@ def read_file(
     """
     print(f"[Tool] read_file が呼び出されました: {path}")
 
-    resolved, is_absolute, error = _resolve_read_target(path)
+    resolved, is_absolute, error = _resolve_read_target(
+        path,
+        allow_native_employee=True,
+    )
     if error or not resolved:
         return {"success": False, "error": error or "パスを解決できませんでした"}
 
@@ -1361,6 +2261,7 @@ def read_file(
 
 
 @tool
+@_enterprise_scoped()
 def create_file(
     path: str,
     content: str
@@ -1380,7 +2281,11 @@ def create_file(
     """
     print(f"[Tool] create_file が呼び出されました: {path}")
     
-    path, resolution_error = _resolve_mutation_target(path, "create")
+    path, resolution_error = _resolve_mutation_target(
+        path,
+        "create",
+        allow_native_employee=True,
+    )
     if resolution_error or not path:
         return resolution_error or {"success": False, "error": "パスを解決できませんでした"}
 
@@ -1389,7 +2294,11 @@ def create_file(
         return enterprise_error
     
     # Check user permission (for non-admin users)
-    user_perm_error = _check_user_permission(path, "作成")
+    user_perm_error = _check_user_permission(
+        path,
+        "作成",
+        allow_native_employee=True,
+    )
     if user_perm_error:
         return user_perm_error
     
@@ -1427,6 +2336,7 @@ def create_file(
 
 
 @tool
+@_enterprise_scoped()
 def delete_file(path: str) -> Dict[str, Any]:
     """ファイルまたはディレクトリを削除する
     
@@ -1473,6 +2383,13 @@ def delete_file(path: str) -> Dict[str, Any]:
     )
     if permission_error:
         return permission_error
+
+    native_lane_error = _enterprise_native_mutation_error(
+        "削除",
+        allow_native_employee=False,
+    )
+    if native_lane_error:
+        return native_lane_error
     
     try:
         scope = get_current_run_scope()
@@ -1515,6 +2432,7 @@ def delete_file(path: str) -> Dict[str, Any]:
 
 
 @tool
+@_enterprise_scoped()
 def append_to_file(path: str, content: str) -> Dict[str, Any]:
     """ファイルの末尾に内容を追記する
     
@@ -1557,6 +2475,13 @@ def append_to_file(path: str, content: str) -> Dict[str, Any]:
     )
     if permission_error:
         return permission_error
+
+    native_lane_error = _enterprise_native_mutation_error(
+        "追記",
+        allow_native_employee=False,
+    )
+    if native_lane_error:
+        return native_lane_error
     
     try:
         if not os.path.exists(path):
@@ -1586,6 +2511,7 @@ def append_to_file(path: str, content: str) -> Dict[str, Any]:
 
 
 @tool
+@_enterprise_scoped()
 def edit_file(
     path: str,
     old_str: str,
@@ -1610,7 +2536,11 @@ def edit_file(
     """
     print(f"[Tool] edit_file が呼び出されました: {path}")
     
-    path, resolution_error = _resolve_mutation_target(path, "edit")
+    path, resolution_error = _resolve_mutation_target(
+        path,
+        "edit",
+        allow_native_employee=True,
+    )
     if resolution_error or not path:
         return resolution_error or {"success": False, "error": "パスを解決できませんでした"}
 
@@ -1619,7 +2549,11 @@ def edit_file(
         return enterprise_error
     
     # Check user permission (for non-admin users)
-    user_perm_error = _check_user_permission(path, "編集")
+    user_perm_error = _check_user_permission(
+        path,
+        "編集",
+        allow_native_employee=True,
+    )
     if user_perm_error:
         return user_perm_error
     
@@ -1657,6 +2591,7 @@ def edit_file(
 
 
 @tool
+@_enterprise_scoped()
 def insert_to_file(
     path: str,
     line_number: int,
@@ -1703,6 +2638,13 @@ def insert_to_file(
     )
     if permission_error:
         return permission_error
+
+    native_lane_error = _enterprise_native_mutation_error(
+        "挿入",
+        allow_native_employee=False,
+    )
+    if native_lane_error:
+        return native_lane_error
     
     try:
         editor = get_file_editor()
@@ -1725,6 +2667,7 @@ def insert_to_file(
 
 
 @tool
+@_enterprise_scoped()
 def undo_edit(path: str) -> Dict[str, Any]:
     """ファイルの直前の編集を取り消す
     
@@ -1768,6 +2711,13 @@ def undo_edit(path: str) -> Dict[str, Any]:
     )
     if permission_error:
         return permission_error
+
+    native_lane_error = _enterprise_native_mutation_error(
+        "取り消し",
+        allow_native_employee=False,
+    )
+    if native_lane_error:
+        return native_lane_error
     
     try:
         editor = get_file_editor()
@@ -1790,6 +2740,7 @@ def undo_edit(path: str) -> Dict[str, Any]:
 
 
 @tool
+@_enterprise_scoped()
 def list_directory(
     path: str = "",
     max_depth: int = 1,
@@ -1820,7 +2771,10 @@ def list_directory(
     """
     print(f"[Tool] list_directory が呼び出されました: {path}")
 
-    resolved, _is_absolute, error = _resolve_read_target(path)
+    resolved, _is_absolute, error = _resolve_read_target(
+        path,
+        allow_native_employee=True,
+    )
     if error or resolved is None:
         return {"success": False, "error": error or "パスを解決できませんでした"}
 
@@ -1837,6 +2791,18 @@ def list_directory(
         logger.error(f"Error in list_directory: {e}", exc_info=True)
         return {"success": False, "error": f"予期しないエラー: {str(e)}"}
 
+    if result.get("success") and _enterprise_sensitive_filter_active():
+        result["entries"] = [
+            entry
+            for entry in result.get("entries", [])
+            if not _enterprise_sensitive_path_error(str(entry.get("path", "")))
+        ]
+        # Child counts from the generic explorer include entries that were
+        # intentionally redacted.  Do not expose that metadata side channel.
+        for entry in result["entries"]:
+            if entry.get("kind") == "directory":
+                entry["item_count"] = None
+        result["total_returned"] = len(result["entries"])
     if result.get("success") and pattern:
         matcher = str(pattern).lower()
         result["entries"] = [
@@ -1850,6 +2816,7 @@ def list_directory(
 
 
 @tool
+@_enterprise_scoped()
 def search_files(
     query: str,
     path: str = "",
@@ -1888,7 +2855,10 @@ def search_files(
     print(f"[Tool] search_files が呼び出されました: {query} in {path}")
 
     extensions = _normalize_extensions(extensions)
-    resolved, _is_absolute, error = _resolve_read_target(path)
+    resolved, _is_absolute, error = _resolve_read_target(
+        path,
+        allow_native_employee=True,
+    )
     if error or resolved is None:
         return {"success": False, "error": error or "パスを解決できませんでした"}
 
@@ -1901,6 +2871,13 @@ def search_files(
                 extensions=extensions,
                 search_content=True,
                 max_results=int(max_results or 50),
+                exclude_path=(
+                    lambda candidate: bool(
+                        _enterprise_sensitive_path_error(str(candidate))
+                    )
+                )
+                if _enterprise_sensitive_filter_active()
+                else None,
             )
         except FileSystemError as e:
             return {"success": False, "error": str(e)}
@@ -1911,7 +2888,7 @@ def search_files(
 
     try:
         service = _workspace_service()
-        return service.search_workspace_entries(
+        result = service.search_workspace_entries(
             query=query,
             path=resolved,
             include_dirs=include_dirs,
@@ -1920,6 +2897,17 @@ def search_files(
             extensions=extensions,
             is_admin=True,
         )
+        if result.get("success") and _enterprise_sensitive_filter_active():
+            result["results"] = [
+                entry
+                for entry in result.get("results", [])
+                if not _enterprise_sensitive_path_error(str(entry.get("path", "")))
+            ]
+            for entry in result["results"]:
+                if entry.get("kind") == "directory":
+                    entry["item_count"] = None
+            result["total_returned"] = len(result["results"])
+        return result
     except Exception as e:
         logger.error(f"Error in search_files: {e}", exc_info=True)
         return {"success": False, "error": f"予期しないエラー: {str(e)}"}

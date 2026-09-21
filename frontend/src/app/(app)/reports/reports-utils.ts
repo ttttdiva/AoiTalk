@@ -14,6 +14,20 @@ export function formatHours(seconds: number): string {
   return h.toFixed(1) + "h";
 }
 
+/**
+ * Serialize a report timer timestamp as an instant for the timer API.
+ *
+ * Report editors intentionally collect browser-local wall-clock values.  The
+ * API boundary must carry the corresponding instant so the server can convert
+ * it to the deployment-zone naive DB representation without a browser-TZ
+ * drift on the next reload.
+ */
+export function toExplicitInstant(value: Date | string): string {
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) throw new Error("Invalid timestamp");
+  return parsed.toISOString();
+}
+
 export type PeriodPreset = "this_week" | "this_month" | "custom";
 export type ScopeMode = "project" | "space" | "all";
 export type ReportsViewMode = "summary" | "timeline";
@@ -59,8 +73,8 @@ export function getMonthRange(): { start: Date; end: Date } {
 }
 
 export const DAY_LABELS = ["月", "火", "水", "木", "金", "土", "日"];
-export const HOUR_START = 7;
-export const HOUR_END = 22;
+export const HOUR_START = 0;
+export const HOUR_END = 24;
 export const TOTAL_HOURS = HOUR_END - HOUR_START;
 
 export const DEFAULT_ENTRY_COLOR = "#94a3b8";
@@ -94,6 +108,39 @@ export function toLocalHM(date: Date): string {
   return `${String(date.getHours()).padStart(2, "0")}:${String(
     date.getMinutes(),
   ).padStart(2, "0")}`;
+}
+
+export function getLocalClockHour(date: Date): number {
+  return (
+    date.getHours() +
+    date.getMinutes() / 60 +
+    date.getSeconds() / 3600
+  );
+}
+
+export function getLocalCalendarDayDelta(from: Date, to: Date): number {
+  const fromDay = new Date(
+    from.getFullYear(),
+    from.getMonth(),
+    from.getDate(),
+    0,
+    0,
+    0,
+    0,
+  );
+  const toDay = new Date(
+    to.getFullYear(),
+    to.getMonth(),
+    to.getDate(),
+    0,
+    0,
+    0,
+    0,
+  );
+
+  return Math.round(
+    (toDay.getTime() - fromDay.getTime()) / (24 * 60 * 60 * 1000),
+  );
 }
 
 export function toLocalYMD(date: Date): string {
@@ -203,9 +250,13 @@ export function getEntryHourRange(
   if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) {
     return null;
   }
+  const startHour = getLocalClockHour(start);
+  const dayDelta = Math.max(0, getLocalCalendarDayDelta(start, end));
+  const endHour = dayDelta * 24 + getLocalClockHour(end);
+
   return {
-    startHour: start.getHours() + start.getMinutes() / 60,
-    endHour: end.getHours() + end.getMinutes() / 60,
+    startHour,
+    endHour: Math.max(startHour, endHour),
   };
 }
 
@@ -302,16 +353,16 @@ export function getTaskScheduleSegmentForDay(task: Task, day: Date) {
   const segmentStart = start > dayStart ? start : dayStart;
   const segmentEnd = end < dayEnd ? end : dayEnd;
 
-  return {
-    startHour:
-      segmentStart.getHours() +
-      segmentStart.getMinutes() / 60 +
-      segmentStart.getSeconds() / 3600,
-    endHour:
-      segmentEnd.getHours() +
-      segmentEnd.getMinutes() / 60 +
-      segmentEnd.getSeconds() / 3600,
-  };
+  const startHour =
+    segmentStart.getTime() === dayStart.getTime()
+      ? HOUR_START
+      : getLocalClockHour(segmentStart);
+  const endHour =
+    segmentEnd.getTime() === dayEnd.getTime()
+      ? HOUR_END
+      : getLocalClockHour(segmentEnd);
+
+  return { startHour, endHour };
 }
 
 export function formatTaskScheduleLabel(task: Task): string {

@@ -44,6 +44,7 @@ const DDL: string[] = [
      storage_quota_mb INTEGER,
      storage_used_mb REAL,
      project_metadata TEXT,
+     is_participating INTEGER,
      created_at TEXT,
      updated_at TEXT,
      deleted_at TEXT
@@ -85,6 +86,7 @@ const DDL: string[] = [
      task_id TEXT NOT NULL,
      start_at TEXT NOT NULL,
      end_at TEXT,
+     original_start_at TEXT,
      status TEXT NOT NULL DEFAULT 'todo',
      all_day INTEGER,
      reminder_offsets TEXT,
@@ -984,22 +986,36 @@ const DDL: string[] = [
    );`,
   `CREATE INDEX IF NOT EXISTS idx_task_detail_cache_cached_at ON task_detail_cache(cached_at);`,
 
-  // ---------- pending_clip_ingests（サーバー未到達時のクリップ取り込み保留キュー） ----------
-  // auth_scope は enqueue 時点の認証スコープ（`auth:<user_id>` / 'anonymous'）。
-  // 別ユーザーの保留を再送しないための絞り込みに使う。
+  // ---------- pending_clip_ingests（durable ClipIngest operation journal） ----------
+  // Existing rows remain legacy when operation_key is NULL. New rows persist
+  // their exact operation/request/context before any remote or local effects.
   `CREATE TABLE IF NOT EXISTS pending_clip_ingests (
      id TEXT PRIMARY KEY,
      source TEXT NOT NULL,
      status TEXT NOT NULL DEFAULT 'queued',
      auth_scope TEXT,
+     server_fingerprint TEXT,
+     operation_key TEXT,
+     request_json TEXT,
+     context_json TEXT,
+     delivery TEXT,
+     remote_job_id TEXT,
+     ack_json TEXT,
+     result_json TEXT,
+     error_json TEXT,
      retry_count INTEGER NOT NULL DEFAULT 0,
      last_error TEXT,
      created_at TEXT,
-     updated_at TEXT
+     updated_at TEXT,
+     terminal_at TEXT
    );`,
   `CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_status ON pending_clip_ingests(status);`,
   `CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_auth_scope ON pending_clip_ingests(auth_scope);`,
   `CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_created_at ON pending_clip_ingests(created_at);`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_scope_status ON pending_clip_ingests(auth_scope, status);`,
+  `CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_scope_server_status
+     ON pending_clip_ingests(auth_scope, server_fingerprint, status);`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_clip_ingests_operation_key ON pending_clip_ingests(operation_key);`,
 
   // ---------- clip_ingest_target_cache（取り込み先設定のオフラインキャッシュ） ----------
   // cache_key は認証スコープそのもの。別ユーザーの取り込み先を読まないため。
@@ -1009,6 +1025,10 @@ const DDL: string[] = [
      cached_at TEXT
    );`,
 ];
+
+const isIndexDdl = (statement: string): boolean =>
+  /^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b/i.test(statement);
+const BASE_SCHEMA_DDL = DDL.filter((statement) => !isIndexDdl(statement));
 
 let _applied = false;
 let _asyncEnsurePromise: Promise<void> | null = null;
@@ -1021,6 +1041,10 @@ const DOCS_SCOPE_MEMBERSHIP_BACKFILL_MARKER =
   "migration:docs_scope_membership_backfill_v0.1.111";
 const DOCS_OUTBOX_SCOPE_BACKFILL_MARKER =
   "migration:docs_outbox_scope_backfill_v0.1.112";
+const CLIP_INGEST_OPERATION_JOURNAL_V01143_MARKER =
+  "migration:clip_ingest_operation_journal_v0.1.143";
+const CLIP_INGEST_SERVER_FINGERPRINT_V01144_MARKER =
+  "migration:clip_ingest_server_fingerprint_v0.1.144";
 // The maintenance below used to run on every process start.  Keep a durable
 // marker so large local caches are not rewritten on every launch.  The marker
 // is written in the same transaction as the maintenance, so a failed/partial
@@ -1056,6 +1080,10 @@ type AsyncSqliteExecutor = {
 };
 
 const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
+  // Unknown old remote rows are not assumed to be joined. The next project
+  // list/sync fills this per-account projection without deleting user data.
+  ["projects", "is_participating", "ALTER TABLE projects ADD COLUMN is_participating INTEGER;"],
+  ["task_occurrences", "original_start_at", "ALTER TABLE task_occurrences ADD COLUMN original_start_at TEXT;"],
   ["tasks", "notifications_enabled", "ALTER TABLE tasks ADD COLUMN notifications_enabled INTEGER NOT NULL DEFAULT 1;"],
   ["tasks", "estimated_hours", "ALTER TABLE tasks ADD COLUMN estimated_hours REAL;"],
   ["tasks", "parent_task_id", "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;"],
@@ -1088,6 +1116,16 @@ const COLUMN_MIGRATIONS: Array<[string, string, string]> = [
   ["docs_sync_runs", "server_time", "ALTER TABLE docs_sync_runs ADD COLUMN server_time TEXT;"],
   ["docs_sync_staging", "scope_key", "ALTER TABLE docs_sync_staging ADD COLUMN scope_key TEXT NOT NULL DEFAULT 'personal';"],
   ["docs_sync_staging", "project_id", "ALTER TABLE docs_sync_staging ADD COLUMN project_id TEXT;"],
+  ["pending_clip_ingests", "server_fingerprint", "ALTER TABLE pending_clip_ingests ADD COLUMN server_fingerprint TEXT;"],
+  ["pending_clip_ingests", "operation_key", "ALTER TABLE pending_clip_ingests ADD COLUMN operation_key TEXT;"],
+  ["pending_clip_ingests", "request_json", "ALTER TABLE pending_clip_ingests ADD COLUMN request_json TEXT;"],
+  ["pending_clip_ingests", "context_json", "ALTER TABLE pending_clip_ingests ADD COLUMN context_json TEXT;"],
+  ["pending_clip_ingests", "delivery", "ALTER TABLE pending_clip_ingests ADD COLUMN delivery TEXT;"],
+  ["pending_clip_ingests", "remote_job_id", "ALTER TABLE pending_clip_ingests ADD COLUMN remote_job_id TEXT;"],
+  ["pending_clip_ingests", "ack_json", "ALTER TABLE pending_clip_ingests ADD COLUMN ack_json TEXT;"],
+  ["pending_clip_ingests", "result_json", "ALTER TABLE pending_clip_ingests ADD COLUMN result_json TEXT;"],
+  ["pending_clip_ingests", "error_json", "ALTER TABLE pending_clip_ingests ADD COLUMN error_json TEXT;"],
+  ["pending_clip_ingests", "terminal_at", "ALTER TABLE pending_clip_ingests ADD COLUMN terminal_at TEXT;"],
 ];
 
 const INDEX_MIGRATIONS = [
@@ -1095,7 +1133,45 @@ const INDEX_MIGRATIONS = [
   "CREATE INDEX IF NOT EXISTS idx_outbox_docs_scope ON outbox(auth_scope, docs_scope_key);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_runs_auth_scope ON docs_sync_runs(auth_scope, scope_key, scope_id, project_id, state);",
   "CREATE INDEX IF NOT EXISTS idx_docs_sync_staging_auth_scope ON docs_sync_staging(auth_scope, scope_key, scope_id, project_id);",
+  "CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_scope_status ON pending_clip_ingests(auth_scope, status);",
+  "CREATE INDEX IF NOT EXISTS idx_pending_clip_ingests_scope_server_status ON pending_clip_ingests(auth_scope, server_fingerprint, status);",
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_pending_clip_ingests_operation_key ON pending_clip_ingests(operation_key);",
 ];
+const SCHEMA_INDEX_DDL = Array.from(
+  new Set([...DDL.filter(isIndexDdl), ...INDEX_MIGRATIONS]),
+);
+
+function applySchemaBootstrapSync(): void {
+  const db = getSqlite();
+  for (const stmt of BASE_SCHEMA_DDL) {
+    db.execSync(stmt);
+  }
+  for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
+    ensureColumn(tableName, columnName, ddl);
+  }
+  for (const stmt of SCHEMA_INDEX_DDL) {
+    db.execSync(stmt);
+  }
+}
+
+async function applySchemaBootstrapAsync(
+  tx: AsyncSqliteExecutor,
+): Promise<void> {
+  for (const stmt of BASE_SCHEMA_DDL) {
+    await tx.execAsync(stmt);
+  }
+  for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
+    const columns = await tx.getAllAsync<{ name?: string }>(
+      `PRAGMA table_info(${tableName});`,
+    );
+    if (!columns.some((column) => column.name === columnName)) {
+      await tx.execAsync(ddl);
+    }
+  }
+  for (const stmt of SCHEMA_INDEX_DDL) {
+    await tx.execAsync(stmt);
+  }
+}
 
 /**
  * Attach legacy live Docs rows to the authenticated scope projection that was
@@ -1462,6 +1538,32 @@ async function backfillDocsOutboxScopeKeysAsync(tx: AsyncSqliteExecutor): Promis
 
 
 async function runSchemaMaintenanceAsync(tx: AsyncSqliteExecutor): Promise<void> {
+  // v0.1.144 pins new durable operations to their configured API server. Do
+  // not assign the current server to older rows: their original endpoint is
+  // unknown, so NULL remains recovery-only until explicit user action.
+  const serverFingerprintMarker = await tx.getFirstAsync(
+    `SELECT id FROM app_migrations WHERE id = '${CLIP_INGEST_SERVER_FINGERPRINT_V01144_MARKER}' LIMIT 1;`,
+  );
+  if (!serverFingerprintMarker) {
+    await tx.execAsync(`
+      INSERT OR IGNORE INTO app_migrations(id, applied_at)
+      VALUES ('${CLIP_INGEST_SERVER_FINGERPRINT_V01144_MARKER}', CURRENT_TIMESTAMP);
+    `);
+  }
+
+  // v0.1.143 only adds durable operation-journal columns/indexes.  Do not
+  // backfill operation ownership or status: legacy rows remain
+  // operation_key=NULL and require explicit user recovery.
+  const journalMarker = await tx.getFirstAsync(
+    `SELECT id FROM app_migrations WHERE id = '${CLIP_INGEST_OPERATION_JOURNAL_V01143_MARKER}' LIMIT 1;`,
+  );
+  if (!journalMarker) {
+    await tx.execAsync(`
+      INSERT OR IGNORE INTO app_migrations(id, applied_at)
+      VALUES ('${CLIP_INGEST_OPERATION_JOURNAL_V01143_MARKER}', CURRENT_TIMESTAMP);
+    `);
+  }
+
   const marker = await tx.getFirstAsync(
     `SELECT id FROM app_migrations WHERE id = '${SCHEMA_MAINTENANCE_V01142_MARKER}' LIMIT 1;`,
   ) as { id?: unknown } | null;
@@ -1605,15 +1707,7 @@ export function ensureSchema(): void {
   if (_applied || _asyncEnsurePromise) return;
   const db = getSqlite();
   db.withTransactionSync(() => {
-    for (const stmt of DDL) {
-      db.execSync(stmt);
-    }
-    for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
-      ensureColumn(tableName, columnName, ddl);
-    }
-    for (const stmt of INDEX_MIGRATIONS) {
-      db.execSync(stmt);
-    }
+    applySchemaBootstrapSync();
   });
   // Synchronous callers retain the historical schema bootstrap contract, but
   // intentionally leave large-table maintenance to ensureSchemaAsync().
@@ -1636,20 +1730,7 @@ export function ensureSchemaAsync(): Promise<void> {
       // before this async upgrade starts.  In that case only maintenance is
       // missing; otherwise apply the full DDL/column/index bootstrap here.
       if (!_applied) {
-        for (const stmt of DDL) {
-          await tx.execAsync(stmt);
-        }
-        for (const [tableName, columnName, ddl] of COLUMN_MIGRATIONS) {
-          const columns = await tx.getAllAsync<{ name?: string }>(
-            `PRAGMA table_info(${tableName});`,
-          );
-          if (!columns.some((column) => column.name === columnName)) {
-            await tx.execAsync(ddl);
-          }
-        }
-        for (const stmt of INDEX_MIGRATIONS) {
-          await tx.execAsync(stmt);
-        }
+        await applySchemaBootstrapAsync(tx);
       }
       await runSchemaMaintenanceAsync(tx);
     }))

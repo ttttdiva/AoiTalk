@@ -24,9 +24,39 @@ class WorkItemTracker(Protocol):
 class BuiltInTaskTrackerAdapter:
     """Treat AoiTalk tasks as harness work items."""
 
+    # The adapter now also satisfies the common runtime WorkSource seam.  The
+    # historical ``fetch_candidates``/``fetch_by_ids`` methods remain for the
+    # process-local compatibility facade; durable discovery delegates to the
+    # canonical TaskWorkSource so assignment/project authority is not inferred
+    # from Task metadata.
+    source_type = "task"
+
     def __init__(self, get_db_manager: Any, settings: AgentHarnessSettings):
         self._get_db_manager = get_db_manager
         self._settings = settings
+
+    async def discover(self, session: Any, *, now=None):
+        """Discover durable Task work through the common WorkSource."""
+
+        from ..services.task_work_source import TaskWorkSource
+
+        source = TaskWorkSource(
+            # The durable source requires explicit Agent assignment/grant;
+            # retaining its harness-enabled compatibility mode also accepts
+            # legacy ``agent_harness_enabled`` task metadata.  The legacy
+            # tracker itself still applies ``include_all_active_tasks`` to
+            # process-local candidates below.
+            include_harness_enabled=True,
+            domain="internal",
+        )
+        return await source.discover(session, now=now)
+
+    async def refresh(self, session: Any, claim: Any) -> bool:
+        """Revalidate Task assignment/project grant before settlement."""
+
+        from ..services.task_work_source import TaskWorkSource
+
+        return await TaskWorkSource(domain="internal").refresh(session, claim)
 
     async def fetch_candidates(self) -> list[WorkItem]:
         db_manager = self._get_db_manager()

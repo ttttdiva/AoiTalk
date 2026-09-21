@@ -68,13 +68,19 @@ def register(mcp: FastMCP, get_audio_player, get_stream_manager):
         Args:
             query: 検索キーワード
         """
-        import yt_dlp
-
-        ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
-
         try:
+            import yt_dlp
+
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': True}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                search_results = ydl.extract_info(f"nicosearch:{query}", download=False)
+                manager = get_stream_manager()
+                search_results = manager.execute_yt_dlp(
+                    f"nicosearch:{query}",
+                    lambda target: ydl.extract_info(target, download=False),
+                    action="niconico.search",
+                    provider="niconico",
+                    destination="https://www.nicovideo.jp/",
+                )
                 if not search_results or 'entries' not in search_results or not search_results['entries']:
                     return f"「{query}」に関するニコニコ動画が見つかりませんでした。"
 

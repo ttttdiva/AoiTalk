@@ -7,6 +7,7 @@ import copy
 import inspect
 import time
 import platform
+import logging
 from typing import Any, Dict, Optional
 from ..base import BaseAssistant
 from ..voice_handler import VoiceHandler
@@ -30,8 +31,16 @@ from ...services.agent_run_service import (
     reset_current_agent_run_id,
     set_current_agent_run_id,
 )
-from ...services.turn_context import reset_turn_context, set_turn_context
+from ...services.turn_context import (
+    override_turn_context,
+    reset_turn_context,
+    set_turn_context,
+)
 from src.tools.keyword.character_manager import get_character_manager
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceChatMode(BaseAssistant):
@@ -59,7 +68,7 @@ class VoiceChatMode(BaseAssistant):
         self._pending_engine_switch = None
         self._chat_turn_lock = asyncio.Lock()
         self._chat_turn_persistence: Optional[ChatTurnPersistence] = None
-        self._response_model_clients: dict[tuple[str, str], Any] = {}
+        self._response_model_clients: dict[tuple[str, ...], Any] = {}
 
         # Register TTS character switch callback
         self._register_tts_character_switch_callback()
@@ -122,22 +131,30 @@ class VoiceChatMode(BaseAssistant):
             return base_llm_client
 
         provider, model = identity
-        if base_llm_client and self._active_client_matches_response_model(
+        effort = response_model.get("reasoning_effort") if response_model else None
+        # An explicit turn effort must not reuse/mutate the shared active client.
+        cache_key = (*identity, str(effort)) if effort is not None else identity
+        if effort is None and base_llm_client and self._active_client_matches_response_model(
             base_llm_client,
             provider,
             model,
         ):
             return base_llm_client
 
-        cached = self._response_model_clients.get(identity)
+        cached = self._response_model_clients.get(cache_key)
         if cached is not None:
             return cached
 
         from ...llm.manager import create_llm_client
 
-        client = create_llm_client(
-            self._clone_config_for_response_model(provider, model)
-        )
+        config = self._clone_config_for_response_model(provider, model)
+        if effort is not None:
+            from ...llm.response_model_effort import apply_response_model_effort
+
+            effort = apply_response_model_effort(config, provider, model, effort)
+        client = create_llm_client(config)
+        if effort is not None and hasattr(client, "set_llm_mode"):
+            client.set_llm_mode(effort)
         personality = self.character_config.get("personality", {})
         system_prompt = personality.get(
             "details",
@@ -145,7 +162,7 @@ class VoiceChatMode(BaseAssistant):
         )
         if hasattr(client, "set_system_prompt"):
             client.set_system_prompt(system_prompt)
-        self._response_model_clients[identity] = client
+        self._response_model_clients[cache_key] = client
         return client
 
     def _get_chat_turn_persistence(self, llm_client=None) -> ChatTurnPersistence:
@@ -337,7 +354,7 @@ class VoiceChatMode(BaseAssistant):
         voice_config = self.character_config.get('voice', {})
         preferred_engine = voice_config.get('engine', 'voicevox')
         
-        print(f"TTSエンジン: {preferred_engine}")
+        logger.info("TTSエンジン: %s", preferred_engine, extra=FILE_ONLY_LOG_EXTRA)
         
         # Initialize TTS engine
         engine_initialized = await self._initialize_tts_engine(preferred_engine, self.character_config)
@@ -394,8 +411,11 @@ class VoiceChatMode(BaseAssistant):
         if not server_url:
             return
 
-        print("🌐 Webチャットインターフェースを開始しました")
-        print(f"📍 ブラウザで以下のURLにアクセスしてください: {server_url}")
+        logger.info(
+            "Webチャットインターフェースを開始しました: %s",
+            server_url,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
 
         # Show device info
         print("\n利用可能な音声デバイス:")
@@ -613,6 +633,7 @@ class VoiceChatMode(BaseAssistant):
         session_id=None,
         project_id=None,
         generation_profile=None,
+        planning_policy=None,
         include_project_context=False,
         edit_message_id=None,
         response_model=None,
@@ -629,8 +650,13 @@ class VoiceChatMode(BaseAssistant):
         sender_display_name=None,
         response_started_at_monotonic=None,
         command_capabilities=None,
+        tools_required=None,
         media_recognition_metadata=None,
         docs_reference_ids=None,
+        task_id=None,
+        explicit_references=None,
+        cloud_advisor_origin=None,
+        cloud_advisor_assessment=None,
         verified_project_attachment=False,
     ):
         """Process user message from web interface
@@ -641,6 +667,64 @@ class VoiceChatMode(BaseAssistant):
             image_data: Optional image data dict with 'data', 'mimeType', 'name' keys
             session_id: Optional conversation session ID from frontend
         """
+        # The server normally intercepts this literal command before queuing a
+        # mode callback.  Keep a defense-in-depth guard for stale/legacy
+        # callbacks so voice mode cannot send raw masking input to a provider.
+        masking_input = (
+            persist_content if isinstance(persist_content, str) else message
+        )
+        masking_command = None
+        try:
+            from ...services.masking_service import parse_masking_command
+
+            masking_command = parse_masking_command(masking_input)
+        except Exception:
+            masking_command = None
+        if masking_command is None:
+            # Defense in depth for stale/partial workers: the exact literal
+            # token must not fall through to a voice provider when the
+            # canonical parser is unavailable.
+            parts = (
+                masking_input.strip().split(None, 1)
+                if isinstance(masking_input, str)
+                else []
+            )
+            if parts and parts[0].casefold() == "/masking":
+                print(
+                    "[VoiceChatMode] Masking parser unavailable; refusing provider dispatch"
+                )
+                return
+        if masking_command is not None:
+            masking_handler = getattr(
+                getattr(self, "web_interface", None),
+                "_execute_builtin_masking_turn",
+                None,
+            )
+            if callable(masking_handler):
+                await masking_handler(
+                    {
+                        "message": (
+                            persist_content
+                            if isinstance(persist_content, str)
+                            else message
+                        ),
+                        "session_id": session_id,
+                        "project_id": project_id,
+                        "_sender_user_id": sender_user_id,
+                        "_sender_display_name": sender_display_name,
+                        "client_message_id": client_message_id,
+                        "attachments": attachments or [],
+                        "skip_user_persistence": skip_user_persistence,
+                        "persisted_user_message_id": persisted_user_message_id,
+                        "edit_message_id": edit_message_id,
+                    },
+                    masking_command,
+                )
+            else:
+                print(
+                    "[VoiceChatMode] Masking helper unavailable; refusing provider dispatch"
+                )
+            return
         if persist_content is None:
             persist_content = message
         agent_run_context_token = (
@@ -657,7 +741,15 @@ class VoiceChatMode(BaseAssistant):
             # Trust only the structured value resolved at the authenticated
             # request boundary; prompt attachment paths are not evidence.
             verified_project_attachment=bool(verified_project_attachment),
+            # Task scope and explicit resource references are resolved by the
+            # authenticated server boundary.  Keep them on the immutable
+            # generation TurnContext; never reconstruct them from prompt IDs.
+            task_id=task_id,
+            explicit_references=explicit_references,
+            cloud_advisor_origin=cloud_advisor_origin,
+            cloud_advisor_assessment=cloud_advisor_assessment,
         )
+        persisted_message_context_token = None
         try:
             llm_client = (
                 self.response_handler.llm_client
@@ -689,6 +781,28 @@ class VoiceChatMode(BaseAssistant):
                         sender_id=sender_user_id,
                         sender_display_name=sender_display_name,
                     )
+                    if user_message is not None and getattr(user_message, "id", None):
+                        # Rebind only after the server-persisted row exists;
+                        # client UUIDs are never valid chat evidence.
+                        persisted_message_context_token = override_turn_context(
+                            message_id=str(user_message.id)
+                        )
+                    if user_message and agent_run_id and sender_user_id:
+                        from ...services.learning_capture_router import (
+                            capture_direct_websocket_learning_best_effort,
+                        )
+
+                        await capture_direct_websocket_learning_best_effort(
+                            actor_id=str(sender_user_id),
+                            raw_text=str(persist_content or ""),
+                            session_id=str(session_id),
+                            project_id=(
+                                str(project_id) if project_id else None
+                            ),
+                            message_id=str(user_message.id),
+                            agent_run_id=str(agent_run_id),
+                            client_message_id=client_message_id,
+                        )
                     await self._broadcast_conversation_persisted(
                         session_id=session_id,
                         role="user",
@@ -1244,6 +1358,8 @@ class VoiceChatMode(BaseAssistant):
             except Exception as web_error:
                 print(f"❌ Webインターフェースエラー送信失敗: {web_error}")
         finally:
+            if persisted_message_context_token is not None:
+                reset_turn_context(persisted_message_context_token)
             reset_turn_context(turn_context_token)
             if agent_run_context_token is not None:
                 reset_current_agent_run_id(agent_run_context_token)

@@ -4,6 +4,7 @@ import logging
 import math
 import os
 import secrets
+import inspect
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional
@@ -52,6 +53,77 @@ LOGIN_BACKOFF_WINDOW = timedelta(minutes=10)
 LOGIN_BACKOFF_THRESHOLD = 5
 LOGIN_BACKOFF_MAX_SECONDS = 60
 LOGIN_THROTTLED_FAILURE_REASON = "rate_limited"
+
+
+def _safe_user_payload(user: Any, *, fallback_username: str = "") -> dict[str, Any]:
+    """Serialize only non-sensitive authentication metadata.
+
+    ``User.to_dict`` is intentionally not trusted at this boundary: older
+    deployments included additional persistence fields and a future model
+    extension must never accidentally expose password hashes, DNs, or AD
+    objectGUID values in a login response.
+    """
+    username = str(getattr(user, "username", None) or fallback_username)
+    raw_source = (
+        getattr(user, "auth_source", None)
+        or getattr(user, "credential_source", None)
+        or "local"
+    )
+    source = str(getattr(raw_source, "value", raw_source)).strip().lower()
+    if source in {"ad", "active-directory", "active directory"}:
+        source = "active_directory"
+    if source not in {"local", "active_directory"}:
+        source = "local"
+    return {
+        "id": str(getattr(user, "id", "")) if getattr(user, "id", None) else None,
+        "username": username,
+        "role": str(getattr(user, "role", "user") or "user"),
+        "display_name": getattr(user, "display_name", None),
+        "password_reset_required": bool(
+            getattr(user, "is_password_reset_required", False)
+        ),
+        "auth_source": source,
+    }
+
+
+def _authentication_error_code(exc: BaseException) -> str:
+    code = getattr(exc, "code", None)
+    value = getattr(code, "value", code)
+    return str(value or "authentication_backend_unavailable")
+
+
+def _authentication_error_status(code: str) -> int:
+    if code in {"invalid_credentials", "account_disabled"}:
+        return 401
+    if code in {"credential_source_required", "unsupported_credential_source"}:
+        return 400
+    if code == "ad_provisioning_conflict":
+        return 409
+    # Provider configuration, reachability, TLS, identity lookup, and backend
+    # failures are deliberately unavailable rather than 401: this avoids
+    # pretending a directory outage is an invalid password and makes AD
+    # fail-closed visible to operators without leaking provider details.
+    return 503
+
+
+def _authentication_error_detail(code: str) -> str:
+    if code in {"invalid_credentials", "account_disabled"}:
+        return "Invalid credentials"
+    if code in {"credential_source_required", "unsupported_credential_source"}:
+        return "Invalid login input"
+    if code == "ad_provisioning_conflict":
+        return "Authentication account provisioning conflict"
+    return "Authentication provider is unavailable"
+
+
+def _is_ad_user(user: Any) -> bool:
+    raw_source = (
+        getattr(user, "auth_source", None)
+        or getattr(user, "credential_source", None)
+        or "local"
+    )
+    source = str(getattr(raw_source, "value", raw_source)).strip().lower()
+    return source in {"ad", "active_directory", "active-directory", "active directory"}
 
 
 def _normalized_login_username(username: str) -> str:
@@ -227,11 +299,38 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
         ) as (retry_after, session):
             await enforce_login_backoff(payload, request, retry_after, session)
 
-            user = await server._verify_credentials_async(
-                payload.username,
-                payload.password,
-                session=session,
-            )
+            try:
+                verify_kwargs = {"session": session}
+                # Omit the kwarg for legacy test doubles and old deployments
+                # when the caller did not select a source.  The canonical
+                # service still receives ``None`` through its method default
+                # and rejects omission when AD is enabled.
+                if payload.credential_source is not None:
+                    verify_kwargs["credential_source"] = payload.credential_source
+                user = await server._verify_credentials_async(
+                    payload.username,
+                    payload.password,
+                    **verify_kwargs,
+                )
+            except Exception as exc:
+                # PasswordAuthenticationService exposes only stable error
+                # codes; map those to safe responses and preserve a single
+                # throttling/audit event for the attempted principal.
+                code = _authentication_error_code(exc)
+                await record_auth_event(
+                    username=payload.username,
+                    action="login",
+                    request=request,
+                    success=False,
+                    failure_reason=code,
+                    session=session,
+                )
+                if session is not None:
+                    await session.commit()
+                raise HTTPException(
+                    status_code=_authentication_error_status(code),
+                    detail=_authentication_error_detail(code),
+                ) from exc
             if not user:
                 await record_auth_event(
                     username=payload.username,
@@ -303,12 +402,131 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
             return Response(status_code=403, headers={"Cache-Control": "no-store"})
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
+    @app.post("/internal/auth/password-login", include_in_schema=False)
+    async def internal_password_login(payload: LoginPayload, request: Request):
+        """Authenticate a Next.js BFF request through the canonical service.
+
+        This is a server-to-server adapter, not a public login surface.  It
+        intentionally performs no throttle lookup, audit write, cookie/JWT
+        issuance, or local fallback.  The BFF owns its browser-session/audit
+        adapter while this endpoint owns credential verification and AD JIT
+        persistence.  Two independent headers prevent an accidental browser
+        call from being treated as an internal request.
+        """
+        expected_key = str(os.getenv("INTERNAL_API_KEY", "") or "").strip()
+        supplied_keys = request.headers.getlist("x-internal-auth")
+        supplied_adapter = request.headers.getlist("x-aoitalk-auth-adapter")
+        if (
+            not expected_key
+            or len(supplied_keys) != 1
+            or len(supplied_adapter) != 1
+            or supplied_adapter[0].strip() != "password-v1"
+            or not secrets.compare_digest(supplied_keys[0], expected_key)
+        ):
+            return JSONResponse(
+                {"authenticated": False, "code": "internal_auth_required"},
+                status_code=403,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not server.auth_enabled:
+            return JSONResponse(
+                {"authenticated": True, "auth_source": "local"},
+                headers={"Cache-Control": "no-store"},
+            )
+        if not USER_REPOSITORY_AVAILABLE or server._db_manager is None:
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "code": "authentication_backend_unavailable",
+                },
+                status_code=503,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        try:
+            verify_kwargs = {}
+            if payload.credential_source is not None:
+                verify_kwargs["credential_source"] = payload.credential_source
+            user = await server._verify_credentials_async(
+                payload.username,
+                payload.password,
+                **verify_kwargs,
+            )
+        except Exception as exc:
+            code = _authentication_error_code(exc)
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "code": code,
+                    "detail": _authentication_error_detail(code),
+                },
+                status_code=_authentication_error_status(code),
+                headers={"Cache-Control": "no-store"},
+            )
+
+        if not user:
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "code": "invalid_credentials",
+                    "detail": "Invalid credentials",
+                },
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        if not bool(getattr(user, "is_active", True)):
+            return JSONResponse(
+                {
+                    "authenticated": False,
+                    "code": "account_disabled",
+                    "detail": "Invalid credentials",
+                },
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+
+        safe_user = _safe_user_payload(user, fallback_username=payload.username)
+        return JSONResponse(
+            {
+                "authenticated": True,
+                "user": safe_user,
+                "auth_source": safe_user["auth_source"],
+                "session_version": int(getattr(user, "session_version", 1) or 1),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
+
     @app.get("/api/auth/status")
     async def auth_status(request: Request):
         """Check whether the request is authenticated"""
-        return JSONResponse(
-            {"authenticated": server._is_request_authenticated(request)}
-        )
+        authenticated = bool(server._is_request_authenticated(request))
+        result: dict[str, Any] = {"authenticated": authenticated}
+        # Expose source metadata only after resolving the already-authenticated
+        # principal.  The whitelist avoids leaking provider identifiers or
+        # persistence fields and keeps unauthenticated responses unchanged.
+        if authenticated:
+            resolver = getattr(server, "_get_user_info_from_request", None)
+            if callable(resolver):
+                try:
+                    info = resolver(request)
+                    if inspect.isawaitable(info):
+                        info = await info
+                    if isinstance(info, dict):
+                        raw_source = info.get("auth_source") or "local"
+                        source = str(
+                            getattr(raw_source, "value", raw_source)
+                        ).strip().lower()
+                        result["auth_source"] = (
+                            "active_directory"
+                            if source in {"ad", "active_directory", "active-directory"}
+                            else "local"
+                        )
+                except Exception:
+                    # Status remains a boolean compatibility endpoint; a
+                    # metadata lookup failure must not turn a valid session
+                    # into an accidental 500.
+                    logger.debug("Auth source metadata lookup failed", exc_info=True)
+        return JSONResponse(result)
 
     @app.post("/api/auth/login")
     async def login(payload: LoginPayload, request: Request):
@@ -318,35 +536,24 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
 
         user = await authenticate_login(payload, request)
 
+        safe_user = _safe_user_payload(user, fallback_username=payload.username)
+        canonical_username = safe_user["username"]
+
         # Store login time for session duration calculation
-        server._login_sessions[payload.username] = datetime.utcnow()
+        server._login_sessions[canonical_username] = datetime.utcnow()
 
         session_id = server._sign_session(
-            payload.username,
+            canonical_username,
             session_version=int(getattr(user, "session_version", 1) or 1),
+            user_id=getattr(user, "id", None),
         )
 
         # Build response with user info
         response_data = {
             "authenticated": True,
-            "user": {
-                "username": payload.username,
-                "role": (
-                    getattr(user, "role", "user")
-                    if hasattr(user, "role")
-                    else "user"
-                ),
-                "display_name": (
-                    getattr(user, "display_name", None)
-                    if hasattr(user, "display_name")
-                    else None
-                ),
-                "password_reset_required": (
-                    getattr(user, "is_password_reset_required", False)
-                    if hasattr(user, "is_password_reset_required")
-                    else False
-                ),
-            },
+            "user": safe_user,
+            "auth_source": safe_user["auth_source"],
+            "session_version": int(getattr(user, "session_version", 1) or 1),
         }
 
         response = JSONResponse(response_data)
@@ -362,14 +569,17 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
 
         user = await authenticate_login(payload, request)
 
+        safe_user = _safe_user_payload(user, fallback_username=payload.username)
+        canonical_username = safe_user["username"]
+
         # ログイン記録
-        server._login_sessions[payload.username] = datetime.utcnow()
+        server._login_sessions[canonical_username] = datetime.utcnow()
         # JWT トークン生成
         if AUTH_SERVICE_AVAILABLE:
             auth_service = get_auth_service()
             result = auth_service.create_auth_result(
                 user_id=str(user.id) if hasattr(user, "id") else payload.username,
-                username=payload.username,
+                username=canonical_username,
                 role=(
                     getattr(user, "role", "user")
                     if hasattr(user, "role")
@@ -380,7 +590,16 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
                 ),
                 session_version=int(getattr(user, "session_version", 1) or 1),
             )
-            return JSONResponse(result.dict())
+            result_data = result.model_dump() if hasattr(result, "model_dump") else result.dict()
+            result_data.update(
+                {
+                    "auth_source": safe_user["auth_source"],
+                    "session_version": int(
+                        getattr(user, "session_version", 1) or 1
+                    ),
+                }
+            )
+            return JSONResponse(result_data)
         else:
             raise HTTPException(status_code=500, detail="Auth service unavailable")
 
@@ -687,6 +906,7 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
         # clients and direct FastAPI callers.
         try:
             user = None
+            username = None
             auth_header = request.headers.get("Authorization", "")
             # Next.js BFF requests carry a verified internal key and the
             # canonical user id.  Resolve that id through the repository just
@@ -726,8 +946,21 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
                     session_data = serializer.loads(
                         session_id, max_age=server.session_ttl_seconds
                     )
-                    username = session_data.get("u")
-                    if username:
+                    # New sessions carry the stable local users.id.  Prefer it
+                    # over the legacy username claim so an AD rename cannot
+                    # resolve a different account during a password operation.
+                    session_user_id = session_data.get("i")
+                    if session_user_id:
+                        db_session = await server._db_manager.get_session()
+                        try:
+                            user = await UserRepository.get_by_id(
+                                db_session, UUID(str(session_user_id))
+                            )
+                        finally:
+                            await db_session.close()
+                    else:
+                        username = session_data.get("u")
+                    if user is None and username:
                         db_session = await server._db_manager.get_session()
                         try:
                             user = await UserRepository.get_by_username(
@@ -738,6 +971,13 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             if user is None or not user.is_active:
                 raise HTTPException(status_code=401, detail="Not authenticated")
+            if _is_ad_user(user):
+                # AD is the credential authority; local password mutation would
+                # create a shadow credential and violate the source boundary.
+                raise HTTPException(
+                    status_code=403,
+                    detail="Active Directory accounts must change their password in Active Directory",
+                )
         except Exception as e:
             if isinstance(e, HTTPException):
                 raise
@@ -818,6 +1058,7 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
                         session_version=int(
                             getattr(updated_user, "session_version", 1) or 1
                         ),
+                        user_id=getattr(updated_user, "id", None),
                     ),
                     httponly=True,
                     samesite="lax",
@@ -872,6 +1113,16 @@ def register_auth_routes(app: FastAPI, server: "WebChatServer") -> None:
             session = await server._db_manager.get_session()
             try:
                 async with session.begin():
+                    lookup = getattr(UserRepository, "get_by_id", None)
+                    if callable(lookup):
+                        lookup_user = lookup(session, user_id)
+                        if inspect.isawaitable(lookup_user):
+                            lookup_user = await lookup_user
+                        if lookup_user is not None and _is_ad_user(lookup_user):
+                            raise HTTPException(
+                                status_code=403,
+                                detail="Active Directory accounts must change their password in Active Directory",
+                            )
                     user = await UserRepository.complete_password_reset(
                         session,
                         user_id,

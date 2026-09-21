@@ -10,6 +10,7 @@ import {
   MessageSquare,
   Settings,
   Swords,
+  Workflow,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { DOCS_NAV_LABEL, DOCS_ROUTE } from "@/lib/docs-model";
@@ -73,19 +74,29 @@ export const APP_VIEW_TABS = [
     available: true,
   },
   {
-    id: "reports",
-    title: "レポート",
-    href: "/reports",
-    icon: BarChart3,
-    shortcut: "6",
-    available: true,
-  },
-  {
     id: "projects",
     title: "プロジェクト",
     href: "/projects",
     icon: FolderOpen,
+    shortcut: "6",
+    available: true,
+  },
+  {
+    id: "reports",
+    title: "レポート",
+    href: "/reports",
+    icon: BarChart3,
     shortcut: "7",
+    available: true,
+  },
+  {
+    id: "operations",
+    title: "Operations",
+    href: "/operations",
+    icon: Workflow,
+    // Operations is a workflow surface rather than a numbered shortcut;
+    // keeping this empty preserves the existing Alt+digit contract.
+    shortcut: "",
     available: true,
   },
   {

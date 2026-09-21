@@ -24,6 +24,7 @@ from ..memory.models.free_team import (
 )
 from .agent_team_service import config_get
 from .free_team_defaults import free_team_profile_template
+from ..llm.deployment_resolver import is_retired_model
 
 
 ROUTING_PROFILE_PROVIDER = "routing-profile"
@@ -356,6 +357,8 @@ def _candidate_matches(
     required_capabilities: set[str],
     now: datetime,
 ) -> bool:
+    if is_retired_model(candidate.model):
+        return False
     if not candidate.enabled or not credential.enabled:
         return False
     if credential.status not in {"ready", "active"}:

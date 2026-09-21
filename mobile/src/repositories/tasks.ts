@@ -3,10 +3,12 @@
  *
  * M1 policy:
  *   - Reads (`list`, `get`): local-first. Return SQLite cache immediately,
- *     kick off a remote refresh when online. On cold cache + online, wait
+ *     kick off a remote refresh when an AoiTalk network path exists. On cold
+ *     cache + server path, wait
  *     for the remote call so the UI isn't empty.
  *   - Writes (`create`, `update`, `delete`): at M1 writes still go straight
- *     to the server when online; local cache is updated on success. If
+ *     to the server when a server path exists; local cache is updated on
+ *     success. If
  *     offline, the write is rejected with an `OfflineWriteError` (caller
  *     shows a toast). M2 replaces this with outbox-backed optimistic writes.
  *
@@ -15,20 +17,23 @@
 
 import { eq, isNull, isNotNull, and, desc } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import {
   isApiConnectionError,
   isApiHttpError,
   isApiTimeoutError,
+  probeApiReachability,
 } from "../lib/api-client";
 import {
   taskApi,
   TaskCompletionCancelledError,
 } from "../lib/task-api";
 import { normalizeTaskStatus } from "../lib/task-status";
+import { isParticipatingProject } from "../lib/project-list-visibility";
 import { nowServerNaiveIso } from "../lib/task-datetime";
 import { rescheduleLocalTaskNotificationsFromCache } from "../lib/local-notifications";
-import { useNetworkStore } from "../stores/network";
+import { canAttemptAoiTalkServer } from "../stores/network";
 import type {
   Task as ApiTask,
   TaskAssignee,
@@ -314,8 +319,25 @@ export class OfflineWriteError extends Error {
 }
 
 async function canUseServer(): Promise<boolean> {
-  const network = useNetworkStore.getState();
-  return network.online && network.serverReachable && Boolean(await getToken());
+  return canAttemptAoiTalkServer() && Boolean(await getToken());
+}
+
+const TASK_MUTATION_PREFLIGHT_TIMEOUT_MS = 2_000;
+
+/**
+ * A mutation may use the server only after a short read-only health probe.
+ *
+ * This prevents a stale `serverReachable=true` state from sending a write into
+ * an endpoint that is currently black-holed. The probe itself is outside the
+ * SQLite foreground coordinator and performs no server mutation.
+ *
+ * Once the actual mutation has been sent, its existing timeout semantics stay
+ * unchanged because a timed-out POST/PATCH/DELETE can have an ambiguous server
+ * outcome and must not be blindly replayed.
+ */
+async function canUseServerForTaskMutation(hasToken: boolean): Promise<boolean> {
+  if (!canAttemptAoiTalkServer() || !hasToken) return false;
+  return probeApiReachability(TASK_MUTATION_PREFLIGHT_TIMEOUT_MS);
 }
 
 /**
@@ -334,6 +356,53 @@ function objectPayload(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {};
+}
+
+/**
+ * Return the task metadata supplied by a caller while keeping the legacy
+ * `metadata` input alias working.  The FastAPI task contract calls this field
+ * `task_metadata`; `metadata` is the response/display name used by Mobile.
+ * When both are present the canonical field wins so a stale compatibility
+ * value cannot overwrite an explicit patch.
+ */
+function taskMetadataInput(data: Record<string, unknown>): unknown {
+  if (
+    Object.prototype.hasOwnProperty.call(data, "task_metadata") &&
+    data.task_metadata !== undefined
+  ) {
+    return data.task_metadata;
+  }
+  return data.metadata;
+}
+
+/**
+ * Translate a Mobile task mutation into the canonical FastAPI wire shape.
+ * `metadata` must not be sent: Pydantic ignores that legacy key and the
+ * user's metadata would otherwise be silently discarded on create/update.
+ */
+function canonicalTaskMutationPayload(
+  data: Record<string, unknown>,
+): Record<string, unknown> {
+  const payload = { ...data };
+  const hasTaskMetadata = Object.prototype.hasOwnProperty.call(
+    data,
+    "task_metadata",
+  );
+  const hasLegacyMetadata = Object.prototype.hasOwnProperty.call(
+    data,
+    "metadata",
+  );
+  if (hasTaskMetadata && data.task_metadata !== undefined) {
+    payload.task_metadata = data.task_metadata;
+  } else if (hasLegacyMetadata) {
+    payload.task_metadata = data.metadata;
+  } else if (hasTaskMetadata) {
+    // Preserve an explicitly supplied undefined value for callers that use
+    // field-presence to represent a no-op patch; JSON.stringify will omit it.
+    payload.task_metadata = data.task_metadata;
+  }
+  delete payload.metadata;
+  return payload;
 }
 
 function authScopeForToken(token: string | null): string | null | undefined {
@@ -369,7 +438,9 @@ function buildTaskCreatePayload(
     title: String(data.title ?? ""),
     description: (data.description as string | null) ?? null,
     status: normalizeTaskStatus(data.status ?? "open"),
-    priority: String(data.priority ?? "normal"),
+    // FastAPI defaults to medium (and accepts normal as a legacy alias), so
+    // never enqueue the old UI-only fallback when priority is omitted.
+    priority: String(data.priority ?? "medium"),
     start_at: (data.start_at as string | null) ?? null,
     end_at: (data.end_at as string | null) ?? null,
     all_day: Boolean(data.all_day),
@@ -391,7 +462,7 @@ function buildTaskCreatePayload(
       typeof data.recurrence_timezone === "string"
         ? data.recurrence_timezone
         : "Asia/Tokyo",
-    metadata: objectPayload(data.metadata),
+    task_metadata: objectPayload(taskMetadataInput(data)),
     sort_order:
       typeof data.sort_order === "number" ? data.sort_order : null,
     source: String(data.source ?? "mobile"),
@@ -416,7 +487,7 @@ function toApiShape(
     title: row.title,
     description: row.description ?? null,
     status: normalizeTaskStatus(row.status),
-    priority: row.priority ?? "normal",
+    priority: row.priority ?? "medium",
     start_at: row.startAt ?? null,
     end_at: row.endAt ?? null,
     all_day: Boolean(row.allDay),
@@ -596,15 +667,22 @@ export function missingRemoteTaskIds(
     .map((task) => task.id);
 }
 
-async function reconcileCanonicalTasks(
-  list: ApiTask[],
-  scope: { projectId?: string | null; spaceId?: string | null } = {},
-): Promise<void> {
+type TaskListScope = { projectId?: string | null; spaceId?: string | null };
+
+class TaskListScopeChangedError extends Error {
+  constructor() {
+    super("認証状態が変更されたためタスク一覧の適用を中止しました");
+    this.name = "TaskListScopeChangedError";
+  }
+}
+
+async function readCanonicalTaskRows(scope: TaskListScope) {
   const db = getDb();
   const base = db
     .select({
       id: schema.tasks.id,
       projectId: schema.tasks.projectId,
+      updatedAt: schema.tasks.updatedAt,
       ownerId: schema.projects.ownerId,
       spaceId: schema.projects.spaceId,
     })
@@ -627,18 +705,56 @@ async function reconcileCanonicalTasks(
   const existing = rows.filter(
     (row) => scope.projectId || scope.spaceId || row.ownerId != null,
   );
-  const scopeProjectIds = scope.spaceId
-    ? existing.map((row) => row.projectId)
-    : undefined;
-  const staleIds = missingRemoteTaskIds(existing, list, {
-    projectId: scope.projectId,
-    projectIds: scopeProjectIds,
+  return existing;
+}
+
+async function pendingTaskIds(authScope: string | null | undefined): Promise<Set<string>> {
+  // Include failed/blocked operations too: they still own unsent user data.
+  const rows = await getDb().select({
+    entityId: schema.outbox.entityId,
+    authScope: schema.outbox.authScope,
+  }).from(schema.outbox).where(eq(schema.outbox.tableName, "tasks"));
+  return new Set(rows.filter((row) => row.authScope == null || row.authScope === authScope)
+    .map((row) => row.entityId));
+}
+
+async function captureTaskListSnapshot(scope: TaskListScope) {
+  const authScope = authScopeForToken(await getToken());
+  const pending = await pendingTaskIds(authScope);
+  const rows = await readCanonicalTaskRows(scope);
+  return { authScope, pending, rows: new Map(rows.map((row) => [row.id, row])) };
+}
+
+type TaskListSnapshot = Awaited<ReturnType<typeof captureTaskListSnapshot>>;
+
+async function applyCanonicalTaskList(
+  list: ApiTask[],
+  scope: TaskListScope,
+  snapshot: TaskListSnapshot,
+): Promise<void> {
+  await runForegroundSqliteWrite(async () => {
+    if (authScopeForToken(await getToken()) !== snapshot.authScope) {
+      throw new TaskListScopeChangedError();
+    }
+    await applyRemoteTasks(list);
+    const pending = await pendingTaskIds(snapshot.authScope);
+    const rows = await readCanonicalTaskRows(scope);
+    // An old list is not evidence that a task created/edited/sent while the
+    // request was in flight was deleted. Only reconcile stable preflight rows.
+    const existing = rows.filter((row) => {
+      const before = snapshot.rows.get(row.id);
+      return before && before.projectId === row.projectId
+        && before.updatedAt === row.updatedAt
+        && !snapshot.pending.has(row.id) && !pending.has(row.id);
+    });
+    const staleIds = missingRemoteTaskIds(existing, list, {
+      projectId: scope.projectId,
+      projectIds: scope.spaceId ? existing.map((row) => row.projectId) : undefined,
+    });
+    if (!staleIds.length) return;
+    const deletedAt = nowServerNaiveIso();
+    await applyTaskTombstones(staleIds.map((id) => ({ id, deleted_at: deletedAt })));
   });
-  if (!staleIds.length) return;
-  const deletedAt = nowServerNaiveIso();
-  await applyTaskTombstones(
-    staleIds.map((id) => ({ id, deleted_at: deletedAt })),
-  );
 }
 
 export async function applyTaskTombstones(
@@ -770,8 +886,7 @@ function buildLocalTask(
 ): ApiTask {
   // サーバーと同じTZ指定なしUTC表記にする（表記が混ざると並び順が揺れる）。
   const now = nowServerNaiveIso();
-  const metadata =
-    (data.metadata as Record<string, unknown> | undefined) ?? {};
+  const metadata = objectPayload(taskMetadataInput(data));
   const taskMetadata = metadataWithAutoClose(
     metadata,
     data.auto_close_on_due,
@@ -789,7 +904,7 @@ function buildLocalTask(
     title: String(data.title ?? ""),
     description: (data.description as string | null) ?? null,
     status: nextStatus,
-    priority: String(data.priority ?? "normal"),
+    priority: String(data.priority ?? "medium"),
     start_at: (data.start_at as string | null) ?? null,
     end_at: (data.end_at as string | null) ?? null,
     all_day: Boolean(data.all_day),
@@ -879,16 +994,17 @@ function localUpdatePatch(
       typeof data.sort_order === "number" ? data.sort_order : null;
   }
   if ("metadata" in data) {
-    const nextMetadata =
-      data.metadata &&
-      typeof data.metadata === "object" &&
-      !Array.isArray(data.metadata)
-        ? (data.metadata as Record<string, unknown>)
-        : {};
+    const nextMetadata = objectPayload(taskMetadataInput(data));
     patch.taskMetadata =
       "auto_close_on_due" in data
         ? metadataWithAutoClose(nextMetadata, data.auto_close_on_due)
-        : (data.metadata as unknown);
+        : nextMetadata;
+  } else if (Object.prototype.hasOwnProperty.call(data, "task_metadata")) {
+    const nextMetadata = objectPayload(taskMetadataInput(data));
+    patch.taskMetadata =
+      "auto_close_on_due" in data
+        ? metadataWithAutoClose(nextMetadata, data.auto_close_on_due)
+        : nextMetadata;
   }
   return patch;
 }
@@ -1108,12 +1224,16 @@ export function mergeTaskUpdateAggregates(
 export const tasksRepo = {
   /** List from local cache only. */
   async listLocal(projectId?: string | null): Promise<ApiTask[]> {
+    const authScope = authScopeForToken(await getToken());
     const db = getDb();
     const base = db
       .select({
         task: schema.tasks,
         projectName: schema.projects.name,
         projectMetadata: schema.projects.projectMetadata,
+        projectOwnerId: schema.projects.ownerId,
+        projectSlug: schema.projects.slug,
+        projectIsParticipating: schema.projects.isParticipating,
       })
       .from(schema.tasks)
       .leftJoin(
@@ -1145,6 +1265,11 @@ export const tasksRepo = {
           )
           .orderBy(desc(schema.tasks.updatedAt));
     return rows
+      .filter((row) => isParticipatingProject({
+        owner_id: row.projectOwnerId,
+        slug: row.projectSlug ?? "",
+        is_participating: row.projectIsParticipating,
+      }, authScope))
       .map((row) =>
         toApiShape(
           row.task,
@@ -1207,6 +1332,7 @@ export const tasksRepo = {
           // 供給元によって並びが変わると、リロードのたびに表示順が入れ替わる。
           return this.listLocal(projectId);
         } catch (error) {
+          if (error instanceof TaskListScopeChangedError) throw error;
           if (local.length === 0) {
             throw error;
           }
@@ -1255,17 +1381,19 @@ export const tasksRepo = {
         )
       ) {
         try {
+          const reconciliationScope = { spaceId: scope.space_id };
+          const snapshot = await captureTaskListSnapshot(reconciliationScope);
           const list = await taskApi.listTasksByScope({
             ...(scope.space_id ? { space_id: scope.space_id } : {}),
           });
-          await applyRemoteTasks(list);
-          await reconcileCanonicalTasks(list, { spaceId: scope.space_id });
+          await applyCanonicalTaskList(list, reconciliationScope, snapshot);
           lastFullFetchAt.set(key, Date.now());
           // list（サーバー応答順）ではなくローカルの正規化済み順を返す。
           return scope.space_id
             ? this.listLocalBySpace(scope.space_id)
             : this.listLocal(null);
         } catch (error) {
+          if (error instanceof TaskListScopeChangedError) throw error;
           if (local.length === 0) {
             throw error;
           }
@@ -1278,11 +1406,12 @@ export const tasksRepo = {
 
   /** Fetch from server and upsert into SQLite. */
   async refresh(projectId?: string | null): Promise<ApiTask[]> {
+    const scope = { projectId };
+    const snapshot = await captureTaskListSnapshot(scope);
     const list = projectId
       ? await taskApi.listTasks(projectId)
       : await taskApi.listAllTasks();
-    await applyRemoteTasks(list);
-    await reconcileCanonicalTasks(list, { projectId });
+    await applyCanonicalTaskList(list, scope, snapshot);
     return list;
   },
 
@@ -1339,15 +1468,19 @@ export const tasksRepo = {
     const sortOrder =
       typeof data.sort_order === "number"
         ? data.sort_order
-        : await nextTopSortOrder();
+        : await runForegroundSqliteWrite(() => nextTopSortOrder());
     const createData: Record<string, unknown> = {
       ...data,
       sort_order: sortOrder,
     };
-    if (await canUseServer()) {
+    if (await canUseServerForTaskMutation(hasToken)) {
       try {
-        const created = await taskApi.createTask(createData);
-        await applyRemoteTasks([created]);
+        const created = await taskApi.createTask(
+          canonicalTaskMutationPayload(createData),
+        );
+        await runForegroundSqliteWrite(() =>
+          applyRemoteTasks([created]),
+        );
         return created;
       } catch (error) {
         if (!shouldQueueTaskMutation(error)) throw error;
@@ -1356,24 +1489,30 @@ export const tasksRepo = {
       }
     }
 
-    const existingMetadata = objectPayload(createData.metadata);
+    const existingMetadata = objectPayload(taskMetadataInput(createData));
+    const localMetadata = {
+      ...existingMetadata,
+      mobile_sync_status: hasToken ? "pending" : "local_only",
+    };
     const local = buildLocalTask({
       ...createData,
-      metadata: {
-        ...existingMetadata,
-        mobile_sync_status: hasToken ? "pending" : "local_only",
-      },
+      // Keep both aliases in the local input while older callers still use
+      // `metadata`; the canonical alias wins in taskMetadataInput().
+      metadata: localMetadata,
+      task_metadata: localMetadata,
     });
-    await applyRemoteTasks([local]);
-    if (hasToken) {
-      await enqueueOutbox({
-        table: "tasks",
-        action: "create",
-        entityId: local.id,
-        ...authScopeOption(authScope),
-        payload: buildTaskCreatePayload(createData),
-      });
-    }
+    await runForegroundSqliteWrite(async () => {
+      await applyRemoteTasks([local]);
+      if (hasToken) {
+        await enqueueOutbox({
+          table: "tasks",
+          action: "create",
+          entityId: local.id,
+          ...authScopeOption(authScope),
+          payload: buildTaskCreatePayload(createData),
+        });
+      }
+    });
     return local;
   },
 
@@ -1385,11 +1524,16 @@ export const tasksRepo = {
     const hasToken = Boolean(token);
     const authScope = authScopeForToken(token);
     let shouldQueue = false;
-    if (await canUseServer()) {
+    if (await canUseServerForTaskMutation(hasToken)) {
       try {
-        const updated = await taskApi.updateTask(taskId, data);
-        await applyRemoteTasks([updated]);
-        writeTaskSnapshot(updated);
+        const updated = await taskApi.updateTask(
+          taskId,
+          canonicalTaskMutationPayload(data),
+        );
+        await runForegroundSqliteWrite(async () => {
+          await applyRemoteTasks([updated]);
+          writeTaskSnapshot(updated);
+        });
         return updated;
       } catch (error) {
         if (
@@ -1405,66 +1549,73 @@ export const tasksRepo = {
       shouldQueue = hasToken;
     }
 
-    const db = getDb();
-    const before = (
-      await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
-    )[0];
-    const tombstoneLedger = await loadTaskTombstoneLedger();
-    if (before?.deletedAt != null || tombstoneLedger.entries.has(taskId)) {
-      throw new Error("削除済みタスクは更新できません。復元操作が必要です");
-    }
-    const requestedProjectId =
-      typeof data.project_id === "string" ? data.project_id : null;
-    const projectWillChange =
-      requestedProjectId !== null &&
-      before?.projectId !== undefined &&
-      requestedProjectId !== String(before.projectId);
-    if (projectWillChange && before) {
-      const children = await db
-        .select({ id: schema.tasks.id })
-        .from(schema.tasks)
-        .where(
-          and(
-            eq(schema.tasks.parentTaskId, taskId),
-            isNull(schema.tasks.deletedAt),
-          ),
-        );
-      if (children.length > 0) {
-        throw new Error(
-          "子タスクがある親タスクは別のプロジェクトへ移動できません",
-        );
+    const merged = await runForegroundSqliteWrite(async () => {
+      const db = getDb();
+      const before = (
+        await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
+      )[0];
+      const tombstoneLedger = await loadTaskTombstoneLedger();
+      if (before?.deletedAt != null || tombstoneLedger.entries.has(taskId)) {
+        throw new Error("削除済みタスクは更新できません。復元操作が必要です");
       }
-    }
-    const localPatch = localUpdatePatch(data, before?.taskMetadata);
-    if (projectWillChange && !("parent_task_id" in data)) {
-      // Keep offline optimistic state aligned with the server move invariant:
-      // a task moved without an explicit destination parent becomes top-level.
-      localPatch.parentTaskId = null;
-    }
-    await db
-      .update(schema.tasks)
-      .set(localPatch)
-      .where(eq(schema.tasks.id, taskId));
-    if (shouldQueue) {
-      await enqueueOutbox({
-        table: "tasks",
-        action: "update",
-        entityId: taskId,
-        ...authScopeOption(authScope),
-        payload: data,
-        baseUpdatedAt: before?.updatedAt ?? null,
-      });
-    }
+      const requestedProjectId =
+        typeof data.project_id === "string" ? data.project_id : null;
+      const projectWillChange =
+        requestedProjectId !== null &&
+        before?.projectId !== undefined &&
+        requestedProjectId !== String(before.projectId);
+      if (projectWillChange && before) {
+        const children = await db
+          .select({ id: schema.tasks.id })
+          .from(schema.tasks)
+          .where(
+            and(
+              eq(schema.tasks.parentTaskId, taskId),
+              isNull(schema.tasks.deletedAt),
+            ),
+          );
+        if (children.length > 0) {
+          throw new Error(
+            "子タスクがある親タスクは別のプロジェクトへ移動できません",
+          );
+        }
+      }
+      const localPatch = localUpdatePatch(data, before?.taskMetadata);
+      if (projectWillChange && !("parent_task_id" in data)) {
+        // Keep offline optimistic state aligned with the server move invariant:
+        // a task moved without an explicit destination parent becomes top-level.
+        localPatch.parentTaskId = null;
+      }
+      await db
+        .update(schema.tasks)
+        .set(localPatch)
+        .where(eq(schema.tasks.id, taskId));
+      if (shouldQueue) {
+        await enqueueOutbox({
+          table: "tasks",
+          action: "update",
+          entityId: taskId,
+          ...authScopeOption(authScope),
+          payload: canonicalTaskMutationPayload(data),
+          baseUpdatedAt: before?.updatedAt ?? null,
+        });
+      }
+      const after = (
+        await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
+      )[0];
+      const local = after
+        ? toApiShape(after)
+        : buildLocalTask({ ...data, title: data.title ?? "" }, taskId);
+      const previousSnapshot = readTaskSnapshot(taskId)?.task;
+      const mergedLocal = mergeTaskUpdateAggregates(
+        local,
+        previousSnapshot,
+        data,
+      );
+      writeTaskSnapshot(mergedLocal);
+      return mergedLocal;
+    });
     void rescheduleLocalTaskNotificationsFromCache();
-    const after = (
-      await db.select().from(schema.tasks).where(eq(schema.tasks.id, taskId))
-    )[0];
-    const local = after
-      ? toApiShape(after)
-      : buildLocalTask({ ...data, title: data.title ?? "" }, taskId);
-    const previousSnapshot = readTaskSnapshot(taskId)?.task;
-    const merged = mergeTaskUpdateAggregates(local, previousSnapshot, data);
-    writeTaskSnapshot(merged);
     return merged;
   },
 
@@ -1476,7 +1627,7 @@ export const tasksRepo = {
     const token = await getToken();
     const hasToken = Boolean(token);
     const authScope = authScopeForToken(token);
-    if (await canUseServer()) {
+    if (await canUseServerForTaskMutation(hasToken)) {
       try {
         const response = await taskApi.restoreTask(taskId, deletionBatchId);
         await applyTaskRestore(response);
@@ -1540,7 +1691,7 @@ export const tasksRepo = {
     const hasToken = Boolean(token);
     const authScope = authScopeForToken(token);
     let shouldQueue = false;
-    if (await canUseServer()) {
+    if (await canUseServerForTaskMutation(hasToken)) {
       try {
         if (projectId) {
           await taskApi.reorderTasks(projectId, uniqueTaskIds);
@@ -1593,7 +1744,7 @@ export const tasksRepo = {
     const hasToken = Boolean(token);
     const authScope = authScopeForToken(token);
     let shouldQueue = false;
-    if (await canUseServer()) {
+    if (await canUseServerForTaskMutation(hasToken)) {
       try {
         await taskApi.deleteTask(taskId);
         // Keep the local tombstone in sync with the successful remote delete.

@@ -1,6 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { PetSettingsEntry } from "@/components/pets/pet-settings";
 import { ChevronRight } from "lucide-react";
 import {
   getVisibleSettingsCategories,
@@ -30,6 +31,7 @@ export function SettingsOverview({
   return (
     <section id="overview" className="scroll-mt-4 space-y-5" data-settings-overview>
       {quickSettings}
+      <PetSettingsEntry />
 
       <div className="space-y-2" aria-label="設定カテゴリ一覧">
         <div className="flex items-center justify-between border-b border-border dark:border-[#333335] pb-2">

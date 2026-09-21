@@ -1,16 +1,31 @@
 import type { NextConfig } from "next";
 
+const productionLifecycle =
+  process.env.npm_lifecycle_event === "build:production" ||
+  process.env.npm_lifecycle_event === "start";
+const resolvedDistDir =
+  process.env.NEXT_DIST_DIR ||
+  (productionLifecycle
+    ? ".next"
+    : process.env.NODE_ENV === "development"
+      ? ".next-dev"
+      : process.env.npm_lifecycle_event === "build"
+        ? ".next-verify"
+        : ".next");
+
 const nextConfig: NextConfig = {
   // 開発・通常検証が稼働中の本番成果物を上書きしないよう出力先を分離する。
   // next dev は .next-dev、npm run build は .next-verify を使用する。
   // npm run build:production と next start だけが本番の .next を使用する。
-  distDir:
-    process.env.NEXT_DIST_DIR ||
-    (process.env.NODE_ENV === "development"
-      ? ".next-dev"
-      : process.env.npm_lifecycle_event === "build"
-        ? ".next-verify"
-        : ".next"),
+  distDir: resolvedDistDir,
+  typescript: {
+    // Production builds use a dedicated config so TypeScript follows only the
+    // stable production shim, never the concurrently rewritten next-env.d.ts.
+    tsconfigPath:
+      resolvedDistDir === ".next"
+        ? "tsconfig.production.json"
+        : "tsconfig.json",
+  },
   experimental: {
     proxyClientMaxBodySize: "100mb",
   },

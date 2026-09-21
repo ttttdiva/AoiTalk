@@ -189,6 +189,8 @@ def build_task_tools() -> list:
         async def _create():
             db = get_database_manager()
             session = await db.get_session()
+            atomic_prepared = None
+            approved_execution = None
             try:
                 user_id, resolved_project_id = await _resolve_actor_and_project(
                     session,
@@ -204,24 +206,78 @@ def build_task_tools() -> list:
                     )
                 )
                 service = TaskManagementService()
-                task = await service.create_task(
-                    session,
-                    user_id=user_id,
-                    project_id=resolved_project_id,
-                    parent_task_id=UUID(parent_task_id) if parent_task_id else None,
-                    title=title,
-                    description=description or None,
-                    priority=priority or "medium",
-                    start_at=normalized_start_at,
-                    end_at=normalized_end_at,
-                    all_day=normalized_all_day,
-                    auto_close_on_due=auto_close_on_due,
-                    assignee_ids=_parse_ids(assignee_ids),
-                    recurrence_rrule=recurrence_rrule or None,
-                    recurrence_timezone=recurrence_timezone
+                # Approved-plan mutations reserve the durable receipt before
+                # touching the Task tables.  Ordinary direct tool calls retain
+                # the historical service-owned commit path below.
+                if agent_run_id:
+                    try:
+                        from ...services.planning_runtime import (
+                            get_active_approved_action_execution,
+                        )
+                    except ImportError:
+                        get_active_approved_action_execution = None
+                    if get_active_approved_action_execution is not None:
+                        approved_execution = get_active_approved_action_execution(
+                            "create_task"
+                        )
+                        if approved_execution is None:
+                            # A live approved cursor must never silently fall
+                            # back to the ordinary mutation lane when its
+                            # TurnContext binding is missing or mismatched.
+                            from ...services.planning_runtime import (
+                                get_approved_action_directive,
+                            )
+
+                            if get_approved_action_directive() is not None:
+                                raise ValueError(
+                                    "approved action binding unavailable"
+                                )
+                if approved_execution is not None:
+                    from ...services.agent_run_service import AgentRunService
+
+                    approved_call_id = str(
+                        approved_execution.get("call_id") or ""
+                    ).strip()
+                    approved_arguments = dict(
+                        approved_execution.get("arguments") or {}
+                    )
+                    atomic_prepared = await AgentRunService().prepare_approved_mutation_receipt(
+                        session,
+                        run_id=agent_run_id or "",
+                        tool_name="create_task",
+                        tool_call_id=approved_call_id,
+                        arguments=approved_arguments,
+                        metadata=approved_execution,
+                    )
+                    if not atomic_prepared.owned:
+                        from ...services.agent_run_service import (
+                            approved_mutation_receipt_result,
+                        )
+
+                        return approved_mutation_receipt_result(
+                            atomic_prepared.receipt
+                        )
+
+                task_kwargs = {
+                    "user_id": user_id,
+                    "project_id": resolved_project_id,
+                    "parent_task_id": UUID(parent_task_id) if parent_task_id else None,
+                    "title": title,
+                    "description": description or None,
+                    "priority": priority or "medium",
+                    "start_at": normalized_start_at,
+                    "end_at": normalized_end_at,
+                    "all_day": normalized_all_day,
+                    "auto_close_on_due": auto_close_on_due,
+                    "assignee_ids": _parse_ids(assignee_ids),
+                    "recurrence_rrule": recurrence_rrule or None,
+                    "recurrence_timezone": recurrence_timezone
                     or DEFAULT_TASK_TIMEZONE,
-                    agent_run_id=agent_run_id,
-                )
+                    "agent_run_id": agent_run_id,
+                }
+                if atomic_prepared is not None:
+                    task_kwargs["commit"] = False
+                task = await service.create_task(session, **task_kwargs)
                 if agent_run_id:
                     from sqlalchemy import select
                     from sqlalchemy.exc import IntegrityError
@@ -261,20 +317,46 @@ def build_task_tools() -> list:
                                 relation_type=relation_type,
                                 created_by=user_id,
                             ))
-                            try:
-                                await session.commit()
-                            except IntegrityError:
-                                # A retry may have inserted the same formal
-                                # TaskAppLink already.  The Task itself was
-                                # committed by TaskManagementService, so
-                                # rollback only the link transaction and
-                                # return the durable winner.
-                                await session.rollback()
-                                if await session.scalar(link_query) is None:
-                                    raise
+                            if atomic_prepared is None:
+                                try:
+                                    await session.commit()
+                                except IntegrityError:
+                                    # A retry may have inserted the same formal
+                                    # TaskAppLink already.  The Task itself was
+                                    # committed by TaskManagementService, so
+                                    # rollback only the link transaction and
+                                    # return the durable winner.
+                                    await session.rollback()
+                                    if await session.scalar(link_query) is None:
+                                        raise
                         task["app_id"] = str(run.app_id)
                         task["app_target_id"] = str(run.app_target_id) if run.app_target_id else None
                         task["app_relation_type"] = relation_type
+                if atomic_prepared is not None:
+                    from ...services.agent_run_service import AgentRunService
+
+                    result_text = _json(task)
+                    await AgentRunService().finalize_approved_mutation_receipt(
+                        session,
+                        atomic_prepared,
+                        arguments=dict(approved_execution.get("arguments") or {}),
+                        result=result_text,
+                        success=True,
+                        mutation_confirmed=True,
+                        metadata=approved_execution,
+                    )
+                    try:
+                        from ...llm.generation_cancellation import (
+                            raise_if_generation_mutation_blocked,
+                        )
+                    except ImportError:
+                        pass
+                    else:
+                        raise_if_generation_mutation_blocked()
+                    await session.commit()
+                    broadcast = getattr(service, "_broadcast", None)
+                    if broadcast is not None:
+                        await broadcast("task_created", task)
                 return task
             finally:
                 await session.close()

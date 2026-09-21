@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { isStaleNonRecurringTaskSchedule } from "./task-schedule";
 import { and, desc, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
@@ -30,6 +31,9 @@ import {
   isLegacyPythonInAppReminderDedupeKey,
   isTaskNotificationSuppressed,
 } from "@/lib/task-notification-policy";
+import {
+  isProjectStewardNotification,
+} from "@/lib/server/project-steward-notification-access";
 
 const WEB_PRESENCE_ACTIVE_MS = 75_000;
 
@@ -72,20 +76,6 @@ function isDateOnlySchedule(
   return isMidnight(startAt ?? endAt);
 }
 
-export function isStaleNonRecurringTaskSchedule(input: {
-  occurrenceId: string | null | undefined;
-  occurrenceSourceKind: string | null | undefined;
-  recurrenceRuleTaskId: string | null | undefined;
-}): boolean {
-  // ``task_schedule`` rows are legacy mirrors for non-recurring tasks. The
-  // task row is their canonical anchor; retaining the mirror would expose an
-  // old date after a task edit and can replay a stale reminder.
-  return (
-    !!input.occurrenceId &&
-    input.occurrenceSourceKind === "task_schedule" &&
-    !input.recurrenceRuleTaskId
-  );
-}
 
 async function touchWebNotificationPresence(
   userId: string,
@@ -418,6 +408,12 @@ export async function GET(request: NextRequest) {
   const result = rows
     .filter((row) => {
       const n = row.delivery;
+      // Project Steward is operational background work, not a user-facing
+      // notification.  Suppress every legacy row regardless of owner/project
+      // state; ordinary task notifications retain their existing filtering.
+      if (isProjectStewardNotification(n)) {
+        return false;
+      }
       if (n.notificationType === "overdue") return false;
       if (n.notificationType !== "reminder") return true;
       if (isLegacyPythonInAppReminderDedupeKey(n.dedupeKey)) return false;

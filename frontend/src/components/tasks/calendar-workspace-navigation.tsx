@@ -5,6 +5,9 @@ import { CalendarDays, ChevronLeft, ChevronRight, Check, FileText } from "lucide
 
 import { Checkbox } from "@/components/ui/checkbox";
 import { cn } from "@/lib/utils";
+import type { Project, Space } from "@/lib/task-api";
+import type { TaskBrowseScope } from "@/lib/task-browse-scope";
+import { TaskBrowseScopePicker } from "@/components/tasks/task-browse-scope-picker";
 
 export type CalendarWorkspaceScope = "project" | "space" | "all";
 
@@ -63,6 +66,12 @@ export function CalendarWorkspaceNavigation({
   onShowDocsLayerChange,
   onHideRecurringChange,
   onShowClosedChange,
+  browseScope,
+  browseProjects,
+  browseSpaces,
+  participatingProjects,
+  participatingSpaces,
+  onBrowseScopeChange,
 }: {
   scope: CalendarWorkspaceScope;
   scopeLabel: string;
@@ -78,6 +87,12 @@ export function CalendarWorkspaceNavigation({
   onShowDocsLayerChange: (checked: boolean) => void;
   onHideRecurringChange: (checked: boolean) => void;
   onShowClosedChange: (checked: boolean) => void;
+  browseScope: TaskBrowseScope | null;
+  browseProjects?: Project[];
+  browseSpaces?: Space[];
+  participatingProjects?: Project[];
+  participatingSpaces?: Space[];
+  onBrowseScopeChange: (scope: TaskBrowseScope | null) => void;
 }) {
   const anchor = useMemo(() => parseDate(currentDate), [currentDate]);
   const days = useMemo(() => buildMiniCalendarDays(anchor), [anchor]);
@@ -194,6 +209,7 @@ export function CalendarWorkspaceNavigation({
           <label className="ao-calendar-filter-option">
             <Checkbox
               checked={showDocsLayer}
+              disabled={Boolean(browseScope)}
               onCheckedChange={(checked) => onShowDocsLayerChange(checked === true)}
             />
             <FileText className="size-3.5 text-sky-300/80" aria-hidden="true" />
@@ -218,14 +234,30 @@ export function CalendarWorkspaceNavigation({
         </div>
       </section>
 
+      <section className="ao-calendar-nav-section" aria-labelledby="calendar-browse-heading">
+        <h2 id="calendar-browse-heading" className="sr-only">
+          Explicit browse scope
+        </h2>
+        <TaskBrowseScopePicker
+          browseScope={browseScope}
+          projects={browseProjects}
+          spaces={browseSpaces}
+          participatingProjects={participatingProjects}
+          participatingSpaces={participatingSpaces}
+          onBrowseScopeChange={onBrowseScopeChange}
+        />
+      </section>
+
       {readOnly && (
         <div role="status" className="ao-calendar-readonly-note">
-          Remote data (read-only)
+          {browseScope ? "明示参照データ（読み取り専用）" : "Remote data (read-only)"}
         </div>
       )}
 
       <p className="ao-calendar-nav-hint">
-        Click a date cell or time slot to create a task in this scope.
+        {browseScope
+          ? "明示参照中は予定を読み取り専用で表示します。"
+          : "Click a date cell or time slot to create a task in this scope."}
       </p>
 
     </nav>

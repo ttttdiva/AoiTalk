@@ -19,6 +19,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -28,6 +29,57 @@ from .base import Base
 
 def _dt(value: datetime | None) -> str | None:
     return value.isoformat() if value else None
+
+
+_SAFE_EXECUTION_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "agent_id",
+        "agent_revision_id",
+        "agent_revision_version",
+        "team_id",
+        "execution_profile_id",
+        "subagent_id",
+        "capabilities",
+        "project_id",
+        "task_id",
+        "persona_id",
+        "workspace_access",
+        "network_access",
+        "run_scope_hash",
+        "authority_hash",
+        "source",
+    }
+)
+
+
+def _safe_execution_manifest(value: Any) -> dict[str, Any] | None:
+    """Return a tiny metadata-only manifest projection for API/audit reads."""
+
+    if not isinstance(value, dict):
+        return None
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        name = str(key)
+        if name not in _SAFE_EXECUTION_MANIFEST_KEYS:
+            continue
+        if isinstance(item, str):
+            if len(item) > 512 or "/" in item or "\\" in item:
+                continue
+            result[name] = item
+        elif isinstance(item, (int, bool)) or item is None:
+            result[name] = item
+        elif isinstance(item, (list, tuple)):
+            if len(item) > 128 or any(not isinstance(entry, (str, int, bool)) for entry in item):
+                continue
+            if any(
+                isinstance(entry, str)
+                and any(marker in entry.casefold() for marker in ("secret", "token", "password", "credential", "api_key", "cookie"))
+                for entry in item
+            ):
+                continue
+            result[name] = list(item)[:128]
+    return result or None
 
 
 class AgentRun(Base):
@@ -74,6 +126,51 @@ class AgentRun(Base):
     )
     # Target は (app_id, app_target_id) の複合 FK で App に閉じ込める。
     app_target_id = Column(UUID(as_uuid=True), nullable=True, index=True)
+    # Typed autonomous identity links.  These are nullable so historical
+    # human/conversation runs retain their existing shape and ``user_id``
+    # semantics.  A WorkItem has one aggregate row and many immutable runs
+    # (one per retry attempt).
+    agent_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agents.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    agent_revision_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_revisions.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    task_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("tasks.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    work_item_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_work_items.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # A WorkItem retry is a new AgentRun, while a duplicate dispatch of the
+    # same claim must converge to one row.  This bounded attempt number is
+    # paired with a partial unique index below; legacy conversational runs
+    # keep it NULL and are unaffected.
+    work_item_attempt = Column(Integer, nullable=True, index=True)
+    acting_subagent_id = Column(String(100), nullable=True, index=True)
+    previous_attempt_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    resolved_execution_manifest = Column(
+        JSON,
+        nullable=True,
+    )
+    execution_manifest_hash = Column(String(64), nullable=True, index=True)
     base_revision = Column(String(80), nullable=True, index=True)
     result_revision = Column(String(80), nullable=True, index=True)
     user_id = Column(String(200), nullable=True, index=True)
@@ -102,6 +199,16 @@ class AgentRun(Base):
     ended_at = Column(DateTime, nullable=True)
     last_event_at = Column(DateTime, nullable=True)
 
+    @property
+    def execution_manifest(self):
+        """Compatibility alias for the bounded resolved manifest snapshot."""
+
+        return self.resolved_execution_manifest
+
+    @execution_manifest.setter
+    def execution_manifest(self, value):
+        self.resolved_execution_manifest = value
+
     events = relationship(
         "AgentRunEvent",
         back_populates="run",
@@ -120,6 +227,7 @@ class AgentRun(Base):
         foreign_keys=[parent_run_id],
         backref="children",
     )
+    work_item = relationship("AgentWorkItem", foreign_keys=[work_item_id])
 
     __table_args__ = (
         Index(
@@ -133,6 +241,37 @@ class AgentRun(Base):
             "project_id",
             "status",
             "created_at",
+        ),
+        Index(
+            "ix_agent_runs_agent_revision_created",
+            "agent_id",
+            "agent_revision_id",
+            "created_at",
+        ),
+        Index(
+            "ix_agent_runs_work_item_created",
+            "work_item_id",
+            "created_at",
+        ),
+        Index(
+            "uq_agent_runs_work_item_attempt",
+            "work_item_id",
+            "work_item_attempt",
+            unique=True,
+            postgresql_where=text("work_item_id IS NOT NULL AND work_item_attempt IS NOT NULL"),
+            sqlite_where=text("work_item_id IS NOT NULL AND work_item_attempt IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "execution_manifest_hash IS NULL OR length(execution_manifest_hash) = 64",
+            name="ck_agent_runs_execution_manifest_hash",
+        ),
+        CheckConstraint(
+            "resolved_execution_manifest IS NULL OR execution_manifest_hash IS NOT NULL",
+            name="ck_agent_runs_manifest_requires_hash",
+        ),
+        CheckConstraint(
+            "agent_revision_id IS NULL OR agent_id IS NOT NULL",
+            name="ck_agent_runs_revision_requires_agent",
         ),
         UniqueConstraint(
             "session_id",
@@ -175,6 +314,26 @@ class AgentRun(Base):
             "project_id": str(self.project_id) if self.project_id else None,
             "app_id": str(self.app_id) if self.app_id else None,
             "app_target_id": str(self.app_target_id) if self.app_target_id else None,
+            "agent_id": str(self.agent_id) if self.agent_id else None,
+            "agent_revision_id": (
+                str(self.agent_revision_id) if self.agent_revision_id else None
+            ),
+            "task_id": str(self.task_id) if self.task_id else None,
+            "work_item_id": str(self.work_item_id) if self.work_item_id else None,
+            "work_item_attempt": int(self.work_item_attempt) if self.work_item_attempt is not None else None,
+            "acting_subagent_id": self.acting_subagent_id,
+            "previous_attempt_run_id": (
+                str(self.previous_attempt_run_id)
+                if self.previous_attempt_run_id
+                else None
+            ),
+            "resolved_execution_manifest": _safe_execution_manifest(
+                self.resolved_execution_manifest
+            ),
+            "execution_manifest": _safe_execution_manifest(
+                self.resolved_execution_manifest
+            ),
+            "execution_manifest_hash": self.execution_manifest_hash,
             "base_revision": self.base_revision,
             "result_revision": self.result_revision,
             "user_id": self.user_id,

@@ -469,7 +469,7 @@ def build_wbs_tools() -> list:
     ) -> str:
         """Summarize project progress toward goals using Docs, internal WBS.dbtable, and built-in tasks. Empty WBS.dbtable is not a blocker."""
         from ...memory.database import get_database_manager
-        from ...memory.models import KnowledgeNode, ProjectContextPack
+        from ...memory.models import KnowledgeNode
         from ...services.task_management_service import TaskManagementService
 
         async def _summarize():
@@ -503,11 +503,6 @@ def build_wbs_tools() -> list:
                     .order_by(KnowledgeNode.updated_at.desc())
                     .limit(50)
                 )
-                context_pack = await session.scalar(
-                    select(ProjectContextPack).where(
-                        ProjectContextPack.project_id == resolved_project_id
-                    )
-                )
                 docs_nodes = list(docs_result.scalars().all())
                 goal_docs = [
                     _compact_project_doc(node)
@@ -518,31 +513,26 @@ def build_wbs_tools() -> list:
                     _compact_project_doc(node)
                     for node in docs_nodes[:limit]
                 ]
-                context_goals = (
-                    context_pack.goals
-                    if context_pack is not None and isinstance(context_pack.goals, list)
-                    else []
-                )
-                current_status = (
-                    context_pack.current_status
-                    if context_pack is not None
-                    and isinstance(context_pack.current_status, dict)
-                    else {}
-                )
+                context_goals = [
+                    str(item.get("body_text") or item.get("title") or "").strip()
+                    for item in goal_docs
+                    if str(
+                        item.get("body_text") or item.get("title") or ""
+                    ).strip()
+                ][:limit]
+                current_status: dict[str, Any] = {}
                 wbs_summary = _summarize_wbs_for_progress(internal["rows"], limit)
                 task_summary = _summarize_tasks_for_progress(tasks, limit)
                 evidence_sources = {
-                    "project_context_goals": bool(context_goals),
                     "project_goal_docs": bool(goal_docs),
                     "project_docs": bool(docs_evidence),
                     "internal_wbs": bool(internal["rows"]),
                     "tasks": bool(tasks),
-                    "current_status": bool(current_status),
                 }
                 has_progress_evidence = any(evidence_sources.values())
                 return {
                     "source": "project_progress_summary",
-                    "progress_basis": "goals_deliverables_milestones_wbs_and_tasks",
+                    "progress_basis": "project_docs_wbs_and_tasks",
                     "project_id": str(resolved_project_id),
                     "project_name": context.get("name"),
                     "can_assess_progress": has_progress_evidence,
@@ -567,8 +557,8 @@ def build_wbs_tools() -> list:
                     "insufficient_evidence_reason": None
                     if has_progress_evidence
                     else (
-                        "No project goals, facts, current status, internal WBS rows, "
-                        "or built-in tasks are stored yet."
+                        "No project Docs, internal WBS rows, or built-in tasks "
+                        "are stored yet."
                     ),
                 }
             finally:
@@ -739,6 +729,10 @@ def build_wbs_tools() -> list:
         """Import external WBS Excel rows into the internal WBS.dbtable. Set sync_tasks=true only when explicitly asked to mirror imported rows into normal tasks."""
         from ...memory.database import get_database_manager
         from ...memory.models import Task
+        from ...services.knowledge_capture_candidate_service import (
+            enqueue_for_completed_task,
+        )
+        from ...services.task_management._shared import normalize_task_status
         from ...services.task_management_service import TaskManagementService
         from ...services.wbs_excel_service import read_wbs_rows
 
@@ -880,9 +874,15 @@ def build_wbs_tools() -> list:
                         updated.append(row.title)
                         if dry_run:
                             continue
+                        previous_status = normalize_task_status(existing_task.status)
+                        next_status = normalize_task_status(row.status)
+                        became_closed = (
+                            previous_status not in {"closed", "cancelled"}
+                            and next_status == "closed"
+                        )
                         existing_task.title = row.title
                         existing_task.description = row.description
-                        existing_task.status = row.status
+                        existing_task.status = next_status
                         existing_task.priority = row.priority
                         existing_task.start_at = start_at
                         existing_task.end_at = end_at
@@ -895,10 +895,36 @@ def build_wbs_tools() -> list:
                                 **_task_metadata(row)["wbs"],
                             },
                         }
-                        existing_task.completed_at = (
-                            datetime.utcnow() if row.status == "closed" else None
-                        )
+                        if became_closed or (
+                            next_status == "closed" and existing_task.completed_at is None
+                        ):
+                            existing_task.completed_at = datetime.utcnow()
+                        elif next_status != "closed":
+                            existing_task.completed_at = None
                         existing_task.updated_at = datetime.utcnow()
+                        activity = None
+                        if previous_status != next_status:
+                            activity = await service._record_activity(
+                                session,
+                                task_id=existing_task.id,
+                                activity_type="task_updated",
+                                user_id=user_id,
+                                payload={
+                                    "status": next_status,
+                                    "previous_status": previous_status,
+                                    "source": "wbs_sync",
+                                },
+                            )
+                        if became_closed:
+                            activity_id = getattr(activity, "id", None)
+                            if not isinstance(activity_id, UUID):
+                                activity_id = None
+                            await enqueue_for_completed_task(
+                                session,
+                                existing_task,
+                                trigger_user_id=user_id,
+                                task_activity_id=activity_id,
+                            )
                         continue
 
                     created.append(row.title)
@@ -918,6 +944,7 @@ def build_wbs_tools() -> list:
                         assignee_ids=[user_id],
                         source="wbs",
                         task_metadata=_task_metadata(row),
+                        commit=False,
                     )
                 if not dry_run:
                     await session.commit()

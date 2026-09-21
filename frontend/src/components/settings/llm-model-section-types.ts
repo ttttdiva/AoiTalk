@@ -21,7 +21,7 @@ export interface LlmModelOption {
   };
   runtime?: string;
   /** Canonical model-specific runtime contract returned by the backend. */
-  runtime_profile?: LlamaCppRuntimeProfile | null;
+  runtime_profile?: ManagedLocalRuntimeProfile | null;
   /** Shallow MTP projection retained by newer catalog payloads. */
   mtp?: LlamaCppMtpProfile;
   context_length?: number;
@@ -35,6 +35,46 @@ export interface LlmModelOption {
   routing_profile_id?: string;
 }
 
+export interface FreeTokenRuntimeProfile {
+  id?: string;
+  label?: string;
+  description?: string;
+  runtime?: string;
+  source_repository?: string;
+  source_url?: string;
+  model_format?: string;
+  minimum_freetoken_version?: string;
+  capabilities?: {
+    reasoning?: boolean;
+    tools?: boolean;
+    media?: {
+      image?: boolean;
+      audio?: boolean;
+    };
+  };
+}
+
+export type ManagedLocalRuntimeProfile =
+  | LlamaCppRuntimeProfile
+  | FreeTokenRuntimeProfile;
+
+export interface LlamaCppAuxiliaryArtifact {
+  id?: string;
+  kind?: string;
+  filename?: string;
+  required?: boolean;
+  size_bytes?: number;
+  sha256?: string;
+  status?: string;
+  installed?: boolean;
+}
+
+export interface LlamaCppSamplingDefaults {
+  temperature?: number;
+  top_p?: number;
+  top_k?: number;
+}
+
 /**
  * Model metadata consumed by the generic llama.cpp settings panel.
  *
@@ -46,14 +86,25 @@ export interface LlmModelOption {
 export interface LlamaCppRuntimeProfile {
   profile_id?: string;
   runtime?: string;
+  runtime_distribution?: string;
   served_alias?: string;
   alias_locked?: boolean;
   source_repository?: string;
   source_url?: string;
+  source_revision?: string;
   gguf_filename?: string;
+  gguf_filenames?: string[];
+  gguf_shard_count?: number | string;
+  gguf_repository_subdir?: string;
+  default_gpu_layers?: number | string;
+  required_llama_cpp_commit?: string;
   quantization?: string;
   native_context_size?: number | string;
   default_context_size?: number | string;
+  auxiliary_artifacts?: LlamaCppAuxiliaryArtifact[];
+  mmproj_filename?: string;
+  mmproj_required?: boolean;
+  sampling_defaults?: LlamaCppSamplingDefaults;
   minimum_llama_cpp_build?: number | string;
   reasoning_tools_minimum_llama_cpp_build?: number | string;
   required_args?: string[];
@@ -97,6 +148,13 @@ export interface LlamaCppMtpProfile {
   /** Legacy/provider projection aliases for the same companion path rule. */
   user_configurable?: boolean;
   required?: boolean;
+  /** Optional MTP-only runtime gates; these are descriptive/read-only. */
+  minimum_llama_cpp_build?: number | string;
+  required_llama_cpp_commit?: string;
+  embedded_variant?: {
+    primary_filename: string;
+    filenames: string[];
+  };
   compatibility?: string;
   reason?: string;
   ui_notice?: string;
@@ -135,41 +193,174 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
       : undefined;
   const scalar = (item: unknown): string | number | undefined =>
     typeof item === "number" || typeof item === "string" ? item : undefined;
+  const metadataScalar = (item: unknown): string | number | undefined => {
+    if (typeof item === "number") return Number.isFinite(item) ? item : undefined;
+    if (typeof item !== "string") return undefined;
+    const normalized = item.trim();
+    return normalized || undefined;
+  };
+  const metadataText = (item: unknown): string | undefined =>
+    typeof item === "string" && item.trim() ? item.trim() : undefined;
+  const metadataBoolean = (item: unknown): boolean | undefined => {
+    if (typeof item === "boolean") return item;
+    if (typeof item === "number" && (item === 0 || item === 1)) return item === 1;
+    if (typeof item !== "string") return undefined;
+    const normalized = item.trim().toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return undefined;
+  };
+  const metadataBuild = (item: unknown): number | string | undefined => {
+    if (typeof item === "number") {
+      return Number.isInteger(item) && item > 0 ? item : undefined;
+    }
+    if (typeof item !== "string") return undefined;
+    const normalized = item.trim();
+    return /^\d+$/.test(normalized) && Number(normalized) > 0
+      ? normalized
+      : undefined;
+  };
+  const metadataCommit = (item: unknown): string | undefined => {
+    if (typeof item !== "string") return undefined;
+    const normalized = item.trim().toLowerCase();
+    return /^[0-9a-f]{7,40}$/.test(normalized) ? normalized : undefined;
+  };
+  const safeMetadataFilename = (item: unknown): string | undefined => {
+    if (typeof item !== "string") return undefined;
+    const filename = item.trim();
+    if (
+      !filename
+      || filename === "."
+      || filename === ".."
+      || filename.includes("/")
+      || filename.includes("\\")
+      || filename.includes("\0")
+      || filename.includes(":")
+      || /[\*?\[\]]/.test(filename)
+      || filename.startsWith("/")
+      || /^[A-Za-z]:/.test(filename)
+    ) return undefined;
+    return filename;
+  };
+  const safeMetadataFilenames = (item: unknown): string[] | undefined => {
+    const values = typeof item === "string" ? [item] : item;
+    if (!Array.isArray(values) || values.length === 0) return undefined;
+    const filenames: string[] = [];
+    const seen = new Set<string>();
+    for (const candidate of values) {
+      const filename = safeMetadataFilename(candidate);
+      if (!filename) return undefined;
+      const key = filename.toLowerCase();
+      if (seen.has(key)) return undefined;
+      seen.add(key);
+      filenames.push(filename);
+    }
+    return filenames;
+  };
+  const filenameList = (item: unknown): string[] | undefined => {
+    if (!Array.isArray(item)) return undefined;
+    const filenames = item
+      .filter((filename): filename is string => typeof filename === "string")
+      .map((filename) => filename.trim())
+      .filter(Boolean);
+    return filenames.length > 0 ? filenames : undefined;
+  };
   const rawMtp = recordValue(raw.mtp);
+  const rawEmbeddedVariant = recordValue(rawMtp?.embedded_variant);
+  const rawMtpMode = typeof rawMtp?.mode === "string"
+    ? rawMtp.mode.trim().toLowerCase()
+    : "";
+  const embeddedPrimary = safeMetadataFilename(rawEmbeddedVariant?.primary_filename);
+  const embeddedFilenames = safeMetadataFilenames(rawEmbeddedVariant?.filenames);
+  const embeddedVariant = rawMtpMode === "embedded"
+    && embeddedPrimary
+    && embeddedFilenames
+    && embeddedFilenames[0] === embeddedPrimary
+    ? {
+      primary_filename: embeddedPrimary,
+      filenames: embeddedFilenames,
+    }
+    : undefined;
+  const nestedMtpMinimum = rawMtp
+    ? metadataBuild(rawMtp.minimum_llama_cpp_build)
+    : undefined;
+  const nestedMtpCommit = rawMtp
+    ? metadataCommit(rawMtp.required_llama_cpp_commit)
+    : undefined;
+  const artifactFilename = rawMtp
+    ? safeMetadataFilename(rawMtp.artifact_filename ?? rawMtp.companion_filename)
+    : undefined;
+  const companionFilenames = rawMtp
+    ? safeMetadataFilenames(rawMtp.companion_filenames)
+    : undefined;
   const mtp = rawMtp
     ? {
-      ...(rawMtp as LlamaCppMtpProfile),
-      supported: rawMtp.supported === undefined
-        ? undefined
-        : Boolean(rawMtp.supported),
-      default_enabled: rawMtp.default_enabled === undefined
-        ? undefined
-        : Boolean(rawMtp.default_enabled),
+      supported: metadataBoolean(rawMtp.supported),
+      default_enabled: metadataBoolean(rawMtp.default_enabled),
       mode: rawMtp.mode === undefined ? undefined : String(rawMtp.mode),
-      artifact_filename: rawMtp.artifact_filename === undefined
-        ? undefined
-        : String(rawMtp.artifact_filename),
-      companion_filenames: Array.isArray(rawMtp.companion_filenames)
-        ? rawMtp.companion_filenames.map((item) => String(item))
-        : undefined,
+      artifact_filename: artifactFilename,
+      companion_filenames: companionFilenames,
       artifact_user_configurable: rawMtp.artifact_user_configurable === undefined
-        ? (rawMtp.user_configurable === undefined ? undefined : Boolean(rawMtp.user_configurable))
-        : Boolean(rawMtp.artifact_user_configurable),
+        ? metadataBoolean(rawMtp.user_configurable)
+        : metadataBoolean(rawMtp.artifact_user_configurable),
       artifact_required: rawMtp.artifact_required === undefined
-        ? (rawMtp.required === undefined ? undefined : Boolean(rawMtp.required))
-        : Boolean(rawMtp.artifact_required),
-      user_configurable: rawMtp.user_configurable === undefined
-        ? undefined
-        : Boolean(rawMtp.user_configurable),
-      required: rawMtp.required === undefined ? undefined : Boolean(rawMtp.required),
+        ? metadataBoolean(rawMtp.required)
+        : metadataBoolean(rawMtp.artifact_required),
+      user_configurable: metadataBoolean(rawMtp.user_configurable),
+      required: metadataBoolean(rawMtp.required),
+      minimum_llama_cpp_build: nestedMtpMinimum,
+      required_llama_cpp_commit: nestedMtpCommit,
+      embedded_variant: embeddedVariant,
       compatibility: rawMtp.compatibility === undefined ? undefined : String(rawMtp.compatibility),
       reason: rawMtp.reason === undefined ? undefined : String(rawMtp.reason),
       ui_notice: rawMtp.ui_notice === undefined ? undefined : String(rawMtp.ui_notice),
     } satisfies LlamaCppMtpProfile
     : undefined;
+  const numericMetadata = (value: unknown): number | undefined => {
+    const parsed = metadataScalar(value);
+    if (typeof parsed === "number" && Number.isFinite(parsed)) return parsed;
+    if (typeof parsed === "string" && parsed.trim() !== "") {
+      const numeric = Number(parsed);
+      return Number.isFinite(numeric) ? numeric : undefined;
+    }
+    return undefined;
+  };
+  const auxiliaryArtifacts = Array.isArray(raw.auxiliary_artifacts)
+    ? raw.auxiliary_artifacts.flatMap((item: unknown) => {
+      if (!item || typeof item !== "object") return [];
+      const value = item as Record<string, unknown>;
+      const filename = safeMetadataFilename(value.filename);
+      const id = String(value.id ?? "").trim().toLowerCase();
+      const kind = String(value.kind ?? "").trim().toLowerCase();
+      if (!filename || !/^[a-z0-9][a-z0-9_-]*$/.test(id) || !/^[a-z0-9][a-z0-9_-]*$/.test(kind)) {
+        return [];
+      }
+      const size = numericMetadata(value.size_bytes);
+      const sha = String(value.sha256 ?? "").trim().toLowerCase();
+      if (sha && !/^[0-9a-f]{64}$/.test(sha)) return [];
+      return [{
+        id,
+        kind,
+        filename,
+        required: metadataBoolean(value.required),
+        ...(size !== undefined ? { size_bytes: size } : {}),
+        ...(sha ? { sha256: sha } : {}),
+        ...(value.status !== undefined ? { status: String(value.status) } : {}),
+        ...(value.installed !== undefined ? { installed: Boolean(value.installed) } : {}),
+      } satisfies LlamaCppAuxiliaryArtifact];
+    })
+    : undefined;
+  const samplingDefaults = raw.sampling_defaults && typeof raw.sampling_defaults === "object"
+    ? {
+      temperature: numericMetadata((raw.sampling_defaults as Record<string, unknown>).temperature),
+      top_p: numericMetadata((raw.sampling_defaults as Record<string, unknown>).top_p),
+      top_k: numericMetadata((raw.sampling_defaults as Record<string, unknown>).top_k),
+    } satisfies LlamaCppSamplingDefaults
+    : undefined;
   const profile: LlamaCppRuntimeProfile = {
     ...(raw as LlamaCppRuntimeProfile),
     runtime: raw.runtime === undefined ? undefined : String(raw.runtime),
+    runtime_distribution: metadataText(raw.runtime_distribution),
     profile_id: raw.profile_id === undefined && raw.id === undefined
       ? undefined
       : String(raw.profile_id ?? raw.id),
@@ -181,14 +372,24 @@ export function llamaCppRuntimeProfileFromValue(value: unknown): LlamaCppRuntime
     source_url: raw.source_url === undefined
       ? (raw.huggingface_repository === undefined ? undefined : String(raw.huggingface_repository))
       : String(raw.source_url),
+    source_revision: metadataText(raw.source_revision),
     gguf_filename: raw.gguf_filename === undefined
       ? (raw.filename ?? raw.model_filename ?? raw.official_filename) === undefined
         ? undefined
         : String(raw.filename ?? raw.model_filename ?? raw.official_filename)
       : String(raw.gguf_filename),
+    gguf_filenames: filenameList(raw.gguf_filenames),
+    gguf_shard_count: metadataScalar(raw.gguf_shard_count),
+    gguf_repository_subdir: metadataText(raw.gguf_repository_subdir),
+    default_gpu_layers: metadataScalar(raw.default_gpu_layers),
+    required_llama_cpp_commit: metadataText(raw.required_llama_cpp_commit),
     quantization: raw.quantization === undefined ? undefined : String(raw.quantization),
     native_context_size: scalar(raw.native_context_size ?? raw.native_context_length),
     default_context_size: scalar(raw.default_context_size),
+    auxiliary_artifacts: auxiliaryArtifacts,
+    mmproj_filename: auxiliaryArtifacts?.find((item) => item.kind === "mmproj")?.filename,
+    mmproj_required: auxiliaryArtifacts?.some((item) => item.kind === "mmproj" && item.required),
+    sampling_defaults: samplingDefaults,
     minimum_llama_cpp_build: scalar(raw.minimum_llama_cpp_build),
     reasoning_tools_minimum_llama_cpp_build: scalar(raw.reasoning_tools_minimum_llama_cpp_build),
     required_args: requiredArgs,
@@ -317,6 +518,13 @@ export interface LlmProviderCatalog {
   unavailable?: boolean;
   availability_reason?: string | null;
   models: LlmModelOption[];
+  /** Runtime-served models for chat; settings still use ``models``. */
+  chat_models?: LlmModelOption[];
+  available_models?: LlmModelOption[];
+  availability?: {
+    state?: string;
+    error?: string | null;
+  };
   configured_model?: string;
   supports_custom_model: boolean;
   capabilities?: {
@@ -336,8 +544,11 @@ export interface LlmProviderCatalog {
     reasoning_effort_default?: string;
     reasoning_effort_supports_disable?: boolean;
     reasoning_effort_wire?: { transport?: string; path?: string };
+    runtime?: string;
+    server_profile?: string;
     /** Generic llama.cpp/llama-server settings for the local provider. */
     llama_cpp?: LlamaCppRuntimeSettings;
+    freetoken?: FreeTokenRuntimeSettings;
     /** Read-only alias retained by older catalog payloads. */
     runtime_settings?: LlamaCppRuntimeSettings;
     /** Provider-level runtime profile for legacy/current catalog payloads. */
@@ -352,6 +563,7 @@ export interface LlmProviderCatalog {
     mtp_reason?: string | null;
     mtp_artifact_path?: string | null;
     mtp_resolved_model_path?: string | null;
+    mtp_variant_model_path?: string | null;
     mtp_mode?: string | null;
   };
   source: string;
@@ -359,6 +571,57 @@ export interface LlmProviderCatalog {
   cached_at?: string | null;
   error?: string | null;
   selection_kind?: "static" | "routing_profile";
+}
+
+export type ManagedLocalRuntime = "llama_cpp" | "freetoken";
+
+function normalizedManagedLocalRuntime(value: unknown): ManagedLocalRuntime | null {
+  const runtime = String(value ?? "").trim().toLowerCase().replace(".", "_");
+  return runtime === "llama_cpp" || runtime === "freetoken" ? runtime : null;
+}
+
+export function managedLocalRuntimeForSelection(
+  provider: LlmProviderCatalog | null | undefined,
+  option: LlmModelOption | null | undefined,
+  modelId: string,
+): ManagedLocalRuntime | null {
+  const targetModel = modelId.trim().toLowerCase();
+  if (
+    provider?.id !== "openai_compatible_local"
+    || !targetModel
+    || targetModel === "local-model"
+  ) {
+    return null;
+  }
+
+  const optionRuntime = normalizedManagedLocalRuntime(
+    option?.runtime
+      ?? option?.runtime_profile?.runtime
+      ?? option?.details?.runtime,
+  );
+  if (optionRuntime) return optionRuntime;
+
+  if (provider.configured_model?.trim().toLowerCase() !== targetModel) return null;
+  return normalizedManagedLocalRuntime(
+    provider.settings?.runtime_profile?.runtime
+      ?? provider.settings?.runtime
+      ?? provider.settings?.server_profile
+      ?? provider.settings?.llama_cpp?.runtime
+      ?? provider.settings?.runtime_settings?.runtime,
+  );
+}
+
+export interface FreeTokenRuntimeSettings {
+  runtime?: string;
+  server_profile?: string;
+  base_url?: string;
+  host?: string;
+  port?: number | string;
+  auto_start?: boolean | string | number;
+  extra_args?: Array<string | number> | string;
+  readiness_timeout?: number | string;
+  readiness_timeout_seconds?: number | string;
+  runtime_profile?: FreeTokenRuntimeProfile | null;
 }
 
 /**
@@ -369,6 +632,7 @@ export interface LlmProviderCatalog {
 export interface LlamaCppRuntimeSettings {
   runtime?: string;
   server_profile?: string;
+  profile_id?: string;
   runtime_state?: "ready" | "manual" | "missing_model_path" | "model_path_not_found" | "executable_not_found" | "external" | "unmanaged" | string;
   runtime_error?: string | null;
   model_path_source?: "configured" | "environment" | "discovered" | "missing" | string;
@@ -378,6 +642,11 @@ export interface LlamaCppRuntimeSettings {
   base_url?: string;
   executable?: string;
   model_path?: string;
+  /** Effective managed model directory reported by the backend catalog. */
+  model_root?: string;
+  model_root_default?: string;
+  model_root_override?: string;
+  model_root_source?: string;
   model_alias?: string;
   host?: string;
   port?: number | string;
@@ -393,6 +662,12 @@ export interface LlamaCppRuntimeSettings {
   reasoning_effort_supports_disable?: boolean;
   reasoning_effort_wire?: { transport?: string; path?: string } | null;
   model_filename?: string;
+  gguf_filename?: string;
+  gguf_filenames?: string[];
+  gguf_shard_count?: number | string;
+  gguf_repository_subdir?: string;
+  default_gpu_layers?: number | string;
+  required_llama_cpp_commit?: string;
   minimum_llama_cpp_build?: number | string;
   runtime_profile?: LlamaCppRuntimeProfile | null;
   mtp?: LlamaCppMtpProfile | null;
@@ -406,6 +681,7 @@ export interface LlamaCppRuntimeSettings {
   mtp_reason?: string | null;
   mtp_artifact_path?: string | null;
   mtp_resolved_model_path?: string | null;
+  mtp_variant_model_path?: string | null;
   mtp_mode?: string | null;
 }
 
@@ -414,6 +690,8 @@ export interface LlamaCppRuntimeSettings {
 export type LlamaCppSettingsDraft = {
   executable: string;
   model_path: string;
+  /** Persisted user override for the managed model directory. */
+  model_root?: string;
   model_alias: string;
   host: string;
   port: string;
@@ -429,6 +707,7 @@ export type LlamaCppSettingsDraft = {
 export const DEFAULT_LLAMA_CPP_SETTINGS_DRAFT: LlamaCppSettingsDraft = {
   executable: "",
   model_path: "",
+  model_root: "",
   model_alias: "",
   host: "127.0.0.1",
   port: "8080",
@@ -508,10 +787,12 @@ export function llamaCppDraftFromSettings(
       model_path: undefined,
       model_alias: undefined,
       context_size: undefined,
+      gpu_layers: undefined,
       extra_args: undefined,
       runtime_profile: undefined,
       mtp_enabled: undefined,
       mtp_artifact_path: undefined,
+      mtp_variant_model_path: undefined,
     }
     : source;
   const timeout = effectiveSource.readiness_timeout_seconds ?? effectiveSource.readiness_timeout;
@@ -538,6 +819,7 @@ export function llamaCppDraftFromSettings(
     // The profile filename is guidance/placeholder metadata, not a path in
     // the user's filesystem.  Never persist it as an automatic model path.
     model_path: String(effectiveSource.model_path ?? DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.model_path),
+    model_root: String(effectiveSource.model_root ?? DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.model_root ?? ""),
     model_alias: modelAlias,
     host: String(effectiveSource.host ?? DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.host),
     port: formNumber(effectiveSource.port, DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.port),
@@ -545,7 +827,10 @@ export function llamaCppDraftFromSettings(
       effectiveSource.context_size ?? profileContext,
       DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.context_size,
     ),
-    gpu_layers: formNumber(effectiveSource.gpu_layers, DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.gpu_layers),
+    gpu_layers: formNumber(
+      effectiveSource.gpu_layers ?? selectedProfile?.default_gpu_layers,
+      DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.gpu_layers,
+    ),
     extra_args: extraArgs,
     auto_start: effectiveSource.auto_start === undefined
       ? DEFAULT_LLAMA_CPP_SETTINGS_DRAFT.auto_start
@@ -570,11 +855,13 @@ export function llamaCppDraftFromSettings(
 export type LlamaCppSettingsPayload = {
   executable: string;
   model_path: string;
+  /** Optional persisted user override for managed model storage. */
+  model_root?: string;
   model_alias: string;
   host: string;
   port: number;
   context_size: number;
-  gpu_layers: number;
+  gpu_layers: number | "auto";
   extra_args: string[];
   auto_start: boolean;
   /** Canonical backend key; the catalog also returns *_seconds for display. */
@@ -667,6 +954,12 @@ function parseInteger(value: string, label: string, allowNegative = false): numb
   return parsed;
 }
 
+function parseGpuLayers(value: string): number | "auto" {
+  const normalized = value.trim();
+  if (normalized.toLowerCase() === "auto") return "auto";
+  return parseInteger(normalized, "GPU layers", true);
+}
+
 function parsePositiveInteger(value: string, label: string): number {
   const parsed = parseInteger(value, label);
   if (parsed <= 0) throw new Error(`${label} は1以上で指定してください`);
@@ -684,7 +977,7 @@ export function llamaCppPayloadFromDraft(
   const port = parsePositiveInteger(draft.port, "llama.cpp port");
   if (port > 65535) throw new Error("llama.cpp port は65535以下で指定してください");
   const contextSize = parsePositiveInteger(draft.context_size, "context size");
-  const gpuLayers = parseInteger(draft.gpu_layers, "GPU layers", true);
+  const gpuLayers = parseGpuLayers(draft.gpu_layers);
   const timeoutText = draft.readiness_timeout_seconds.trim();
   if (!/^(?:\d+\.?\d*|\.\d+)$/.test(timeoutText)) {
     throw new Error("readiness timeout は正数で指定してください");
@@ -713,11 +1006,25 @@ export function llamaCppPayloadFromDraft(
     auto_start: draft.auto_start,
     readiness_timeout: timeout,
   };
+  if (draft.model_root !== undefined) payload.model_root = draft.model_root.trim();
   // Keep legacy callers/source snapshots byte-for-byte compatible when they
   // do not carry the new optional draft fields.  The controlled UI draft
   // always has mtp_enabled, so an explicit OFF round-trips as false.
   if (draft.mtp_enabled !== undefined) payload.mtp_enabled = draft.mtp_enabled;
   return payload;
+}
+
+/** Dedicated model-root state returned by the backend resolver endpoint. */
+export interface LlamaCppModelRootState {
+  /** Effective root used by discovery/download/status/runtime preparation. */
+  model_root: string;
+  /** Repository-local/default root, independent of environment overrides. */
+  model_root_default: string;
+  /** Explicit persisted user override; empty when the default is active. */
+  model_root_override: string;
+  /** Resolver provenance (for example `default`, `environment`, or `override`). */
+  model_root_source: string;
+  success?: boolean;
 }
 
 export interface LlmModelCatalogResponse {
@@ -726,6 +1033,9 @@ export interface LlmModelCatalogResponse {
     model: string;
   };
   providers: LlmProviderCatalog[];
+  provider_visibility?: {
+    hidden_provider_ids?: unknown;
+  };
   deployment?: LlmDeploymentMetadata | null;
 }
 
@@ -733,8 +1043,69 @@ export interface LlmEngineResponse {
   success?: boolean;
   provider: string;
   model: string;
+  llama_cpp?: LlamaCppModelRootState;
   deployment?: LlmDeploymentMetadata | null;
   message?: string;
+}
+
+export interface LocalRuntimeStatus {
+  task_id: string | null;
+  model: string;
+  runtime: ManagedLocalRuntime | string | null;
+  runtime_distribution?: string | null;
+  phase: string;
+  status: string;
+  completed: number;
+  total: number;
+  percent: number;
+  done: boolean;
+  error: string | null;
+  runtime_installed: boolean;
+  model_installed: boolean;
+  prepared: boolean;
+  started_at: string | null;
+  updated_at: string | null;
+  prepare_supported: boolean;
+  runtime_install: {
+    runtime: ManagedLocalRuntime | string | null;
+    distribution?: string | null;
+    installed: boolean;
+    status: string;
+    installer_required: boolean;
+    version?: string | null;
+    build?: number | null;
+    install_source?: string | null;
+    release?: string | null;
+    asset?: string | null;
+  };
+  model_artifact: {
+    installed: boolean;
+    status: string;
+    managed: boolean;
+    percent?: number;
+    primary_filename?: string | null;
+    auxiliary_artifacts?: LlamaCppAuxiliaryArtifact[];
+  };
+  server: {
+    status: string;
+    ready: boolean | null;
+  };
+  actions: {
+    prepare: boolean;
+    poll: boolean;
+    retry: boolean;
+    installer_required: boolean;
+  };
+  reason: string | null;
+  runtime_version?: string | null;
+  runtime_build?: number | null;
+  runtime_install_source?: string | null;
+  runtime_release?: string | null;
+  runtime_asset?: string | null;
+}
+
+export interface LocalRuntimeTask extends LocalRuntimeStatus {
+  task_id: string | null;
 }
 
 export type SpeechRecognitionSettings = {
@@ -760,7 +1131,61 @@ export interface SettingsPayload {
     mage_vl?: MageVLSettings;
     speech_recognition?: SpeechRecognitionSettings;
     external_model_privacy?: ExternalModelPrivacySettings;
+    cloud_advisor?: CloudAdvisorSettings;
   };
+  schema?: Record<string, {
+    type?: string;
+    values?: unknown[];
+  }>;
+}
+
+/**
+ * Parent-owned Cloud Advisor settings.  Provider/model values are deliberately
+ * separate from the primary LLM route and do not contain credentials or
+ * request/response payloads.
+ */
+export interface CloudAdvisorSettings {
+  mode?: "disabled" | "manual" | "automatic";
+  provider?: string;
+  model?: string;
+  reasoning_effort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | string;
+}
+
+export interface CloudAdvisorProviderOption {
+  id: string;
+  label: string;
+}
+
+/**
+ * Resolve the Cloud Advisor provider choices advertised by the backend
+ * settings schema.  The fallback contains only the providers implemented by
+ * the foundational API coordinator; Web ChatGPT appears only when the
+ * backend explicitly advertises that provider (or has it persisted already).
+ */
+export function cloudAdvisorProviderOptions(
+  settings?: CloudAdvisorSettings | null,
+  schema?: { values?: unknown[] } | null,
+): CloudAdvisorProviderOption[] {
+  const labels: Record<string, string> = {
+    openai: "OpenAI",
+    deepinfra: "DeepInfra",
+    "chatgpt-web": "Web ChatGPT",
+    chatgpt_web: "Web ChatGPT",
+  };
+  const schemaValues = Array.isArray(schema?.values)
+    ? schema.values
+      .map((item) => String(item ?? "").trim().toLowerCase())
+      .filter(Boolean)
+    : [];
+  const candidates = schemaValues.length > 0
+    ? schemaValues
+    : ["openai", "deepinfra"];
+  const current = String(settings?.provider ?? "").trim().toLowerCase();
+  if (current) candidates.push(current);
+  const seen = new Set<string>();
+  return candidates
+    .filter((id) => Boolean(labels[id]) && !seen.has(id) && seen.add(id))
+    .map((id) => ({ id, label: labels[id] }));
 }
 
 export interface ExternalModelPrivacySettings {
@@ -787,6 +1212,7 @@ export interface ModelRoutingSettings {
       api_key?: string;
     };
     clip_ingest?: ModelRouteSettings & { base_url?: string; api_key?: string };
+    project_automation?: ModelRouteSettings & { base_url?: string; api_key?: string };
     video?: ModelRouteSettings & { base_url?: string; api_key?: string };
   };
   media?: {
@@ -1374,5 +1800,31 @@ export function buildClassDraft(
     effortPolicy: (route?.effort_policy as EffortPolicy) || "same",
     engine: route?.engine,
     inherit: route?.inherit ?? false,
+  };
+}
+
+export function buildProjectAutomationDraft(
+  route: (ModelRouteSettings & { base_url?: string; api_key?: string }) | undefined,
+  providers: LlmProviderCatalog[] | undefined,
+): ModelClassDraft {
+  const routeMode = String(route?.mode || "").trim().toLowerCase();
+  const inherit = routeMode === "dedicated"
+    ? false
+    : routeMode === "inherit"
+      ? true
+      : route?.inherit ?? !(route?.provider || route?.model);
+
+  // Project Automation owns `mode` as inherit/dedicated. ModelClassDraft.mode
+  // is the existing frontend effort field, so never project the routing mode
+  // into it.
+  const draft = buildClassDraft(
+    route ? { ...route, mode: route.reasoning_effort || "" } : route,
+    providers,
+  );
+
+  return {
+    ...draft,
+    mode: route?.reasoning_effort || "",
+    inherit,
   };
 }

@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "AoiTalk Browser",
+  "version": "1.0.0",
+  "description": "AoiTalkから普段のMicrosoft Edgeのタブを操作します。",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAnUbhvCFMqfdUGZw4cqR8U+4yYZQLPKvFh4zx+hkRbVFJSakO2iBOLlizAdKYFgsFXGRpfZLpFQoLUAiTtnlIHAMFJFm80ds1ARR8RzktFj1CWU+poPHiVYAMKpcJMe3iwgZWK67NM93HwSROjFRuE09KDWWZDBcPHbdx2vNN1n2l/zUxkhi6Bj+Hdc5YWslLRulDgZfS4aLs8fQvA0LMCeLDEhUn0etySSG5dyX957xT1Ahaf/uBbcaOCZb4BkrY6rBr0M/y4Zd46OF9y/9spP+ZME7JazquM8fbiwIbMF9Z2ROE0dlH09+ZYhz1NuJKEqg+8ZTKRkFV5NTSIKu3BwIDAQAB",
+  "permissions": [
+    "nativeMessaging",
+    "scripting",
+    "tabs",
+    "storage",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://*/*",
+    "https://*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "AoiTalk Browser",
+    "default_popup": "popup.html"
+  }
+}

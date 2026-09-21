@@ -23,6 +23,7 @@ import type {
   DocsSupertag,
   ReferencesState,
 } from "./types";
+import { docsCanonicalNodeTitle } from "./types";
 import {
   docsFieldType,
   fieldValueToDraft,
@@ -62,6 +63,7 @@ export function PageTitleEditor({
   onOpenTag = () => {},
   onNavigateDown = () => {},
   onContextMenu,
+  canonicalTitle,
   readOnly = false,
 }: {
   node: DocsNode;
@@ -74,6 +76,8 @@ export function PageTitleEditor({
   onOpenTag?: (tag: DocsSupertag) => void;
   onNavigateDown?: () => void;
   onContextMenu?: (event: ReactMouseEvent<HTMLInputElement>) => void;
+  /** Server-normalized identity title for Project canonical roots. */
+  canonicalTitle?: string | null;
   readOnly?: boolean;
 }) {
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -83,23 +87,32 @@ export function PageTitleEditor({
   // `node.title` prop.  The workspace updates that prop on every keystroke;
   // clearing the input must not turn the canonical page into a blank row.
   const canonicalTitleRef = useRef(node.title);
+  const renderedCanonicalTitleRef = useRef<string | null>(null);
 
   useEffect(() => {
     const input = inputRef.current;
     if (!input) return;
     const nodeChanged = renderedNodeIdRef.current !== node.id;
+    const serverCanonical = canonicalTitle ?? docsCanonicalNodeTitle(node);
+    const canonicalChanged = serverCanonical !== null
+      && serverCanonical !== renderedCanonicalTitleRef.current;
     if (nodeChanged) {
-      canonicalTitleRef.current = node.title;
+      canonicalTitleRef.current = serverCanonical ?? node.title;
+    } else if (serverCanonical && hasMeaningfulBlockTitle(serverCanonical)) {
+      canonicalTitleRef.current = serverCanonical;
     } else if (hasMeaningfulBlockTitle(node.title)) {
       canonicalTitleRef.current = node.title;
     }
-    if (nodeChanged || document.activeElement !== input) input.value = node.title;
+    // A server-normalized canonical title must win even while the input is
+    // focused; otherwise the stale draft can be committed again on blur.
+    if (nodeChanged || canonicalChanged || document.activeElement !== input) input.value = serverCanonical ?? node.title;
+    renderedCanonicalTitleRef.current = serverCanonical;
     renderedNodeIdRef.current = node.id;
     if (requestFocus) {
       input.focus();
       input.select();
     }
-  }, [node.id, node.title, requestFocus]);
+  }, [canonicalTitle, node, node.id, node.title, requestFocus]);
 
   const restoreCanonicalTitle = (input: HTMLInputElement) => {
     const canonical = hasMeaningfulBlockTitle(canonicalTitleRef.current)
@@ -334,6 +347,10 @@ export function FieldRows({
                 nodes={nodes}
                 projects={projects}
                 currentNodeId={node.id}
+                // Long fields are document content, not compact table cells.
+                // Keep single-line controls for genuinely short scalar fields
+                // while allowing multiline values to grow vertically.
+                longTextLayout={docsFieldType(field) === "long_text" ? "document" : "compact"}
                 disabled={readOnly}
                 onChange={(next) => setDrafts((current) => ({ ...current, [key]: next }))}
                 onCommit={(next) => {

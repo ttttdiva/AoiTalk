@@ -5,6 +5,7 @@ import {
   CheckSquare,
   ExternalLink,
   Hash,
+  LockKeyhole,
   MoveRight,
   Plus,
   Tag,
@@ -17,6 +18,7 @@ import {
   MenuMnemonicSurface,
 } from "@/components/ui/menu-mnemonic";
 import { cn } from "@/lib/utils";
+import { toast } from "sonner";
 
 export type DocsNodeContextMenuPosition = {
   x: number;
@@ -36,6 +38,15 @@ export type DocsNodeContextMenuProps = {
   onTaskifyNode: (node: DocsNode) => void | Promise<unknown>;
   onApplyTag: (node: DocsNode, tag: DocsSupertag) => void | Promise<unknown>;
   onOpenNode: (node: DocsNode) => void | Promise<unknown>;
+  onCleanupNode?: (node: DocsNode) => void | Promise<unknown>;
+  /** Lifecycle-aware affordances. Undefined preserves the ordinary menu. */
+  canArchive?: boolean;
+  canDuplicate?: boolean;
+  canMove?: boolean;
+  canTaskify?: boolean;
+  canTag?: boolean;
+  canCleanup?: boolean;
+  protectedMessage?: string | null;
 };
 
 /**
@@ -55,6 +66,14 @@ export function DocsNodeContextMenu({
   onTaskifyNode,
   onApplyTag,
   onOpenNode,
+  onCleanupNode,
+  canArchive = true,
+  canDuplicate = true,
+  canMove = true,
+  canTaskify = true,
+  canTag = true,
+  canCleanup = false,
+  protectedMessage = null,
 }: DocsNodeContextMenuProps) {
   const surfaceRef = useRef<HTMLDivElement | null>(null);
 
@@ -81,7 +100,13 @@ export function DocsNodeContextMenu({
 
   const run = (action: () => void | Promise<unknown>) => {
     onClose();
-    void action();
+    try {
+      void Promise.resolve(action()).catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : "Docs操作に失敗しました");
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Docs操作に失敗しました");
+    }
   };
   const style: CSSProperties | undefined = position
     ? { left: position.x, top: position.y }
@@ -105,20 +130,33 @@ export function DocsNodeContextMenu({
       onContextMenu={(event) => event.preventDefault()}
     >
       <MenuButton icon={Hash} label="ノードIDをコピー" mnemonic="C" onClick={() => run(() => onCopyNodeId(node))} />
-      <MenuButton icon={Plus} label="複製" mnemonic="U" onClick={() => run(() => onDuplicateNode(node))} />
-      <MenuButton icon={Trash2} label="削除" mnemonic="D" onClick={() => run(() => onArchiveNode(node))} />
-      <MenuButton icon={MoveRight} label="別ページへ移動" mnemonic="M" onClick={() => run(() => onMoveNode(node))} />
-      <MenuButton icon={CheckSquare} label="タスク化" mnemonic="T" onClick={() => run(() => onTaskifyNode(node))} />
-      <MenuButton
-        icon={Tag}
-        label="先頭タグを付与"
-        mnemonic="G"
-        onClick={() => {
-          const tag = tags[0];
-          if (tag) run(() => onApplyTag(node, tag));
-          else onClose();
-        }}
-      />
+      {canDuplicate ? <MenuButton icon={Plus} label="複製" mnemonic="U" onClick={() => run(() => onDuplicateNode(node))} /> : null}
+      {protectedMessage ? (
+        <div
+          role="status"
+          className="my-1 flex items-start gap-2 rounded px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground"
+          data-docs-protected-node
+        >
+          <LockKeyhole className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+          <span>{protectedMessage}</span>
+        </div>
+      ) : null}
+      {canArchive ? <MenuButton icon={Trash2} label="削除" mnemonic="D" onClick={() => run(() => onArchiveNode(node))} /> : null}
+      {canCleanup && onCleanupNode ? <MenuButton icon={Trash2} label="staleをクリーンアップ" mnemonic="K" onClick={() => run(() => onCleanupNode(node))} /> : null}
+      {canMove ? <MenuButton icon={MoveRight} label="別ページへ移動" mnemonic="M" onClick={() => run(() => onMoveNode(node))} /> : null}
+      {canTaskify ? <MenuButton icon={CheckSquare} label="タスク化" mnemonic="T" onClick={() => run(() => onTaskifyNode(node))} /> : null}
+      {canTag ? (
+        <MenuButton
+          icon={Tag}
+          label="先頭タグを付与"
+          mnemonic="G"
+          onClick={() => {
+            const tag = tags[0];
+            if (tag) run(() => onApplyTag(node, tag));
+            else onClose();
+          }}
+        />
+      ) : null}
       <MenuButton icon={ExternalLink} label="右パネルで開く" mnemonic="O" onClick={() => run(() => onOpenNode(node))} />
     </MenuMnemonicSurface>
   );

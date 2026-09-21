@@ -77,8 +77,7 @@ function normalizeLlmMode(result: {
 /**
  * LLM モードの取得・切り替えを担うフック。
  *
- * 取得・キャッシュ・重複排除は SWR に委譲する。マウント時に一度取得し、その後の
- * 自動 revalidation（フォーカス/再接続/stale）は行わない。WebSocket 経由の
+ * 取得・キャッシュ・重複排除と一時障害後の再取得は SWR に委譲する。WebSocket 経由の
  * `llm_mode_change` イベントでも状態を更新するため、SWR キャッシュを直接書き換える
  * setter（setLlmModeState / setLlmModeOptions / setLlmModeLabels）も併せて公開する。
  * 公開 API と表示挙動は従来の useState 実装と互換。
@@ -106,14 +105,19 @@ export function useChatLlmMode() {
     },
   );
 
-  const wasConnectedRef = useRef(false);
+  const wasConnectedRef = useRef(runtime?.isConnected === true);
+  const hasConnectedRef = useRef(runtime?.isConnected === true);
   useEffect(() => {
     const connected = runtime?.isConnected === true;
     if (connected && !wasConnectedRef.current) {
-      void mutate();
+      // SWR already starts the initial fetch. A successful first health check
+      // must not invalidate that in-flight request and start a second one.
+      // Refresh after a real reconnect or recover a failed initial fetch.
+      if (hasConnectedRef.current || error) void mutate();
+      hasConnectedRef.current = true;
     }
     wasConnectedRef.current = connected;
-  }, [mutate, runtime?.isConnected]);
+  }, [error, mutate, runtime?.isConnected]);
 
   const llmMode = data?.mode ?? "";
   const llmModeOptions = data?.options ?? EMPTY_OPTIONS;

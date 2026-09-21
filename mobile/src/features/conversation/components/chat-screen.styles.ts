@@ -13,7 +13,7 @@ export const chatScreenStyles = StyleSheet.create({
   connectionBar: {
     minHeight: 30,
     flexDirection: "row",
-    flexWrap: "nowrap",
+    flexWrap: "wrap",
     alignItems: "center",
     paddingHorizontal: 14,
     paddingVertical: 4,
@@ -29,15 +29,6 @@ export const chatScreenStyles = StyleSheet.create({
     color: "#cdd6f4",
     fontSize: 12,
     fontWeight: "700",
-  },
-  projectChip: { maxWidth: 132, backgroundColor: "#313244", height: 28 },
-  projectChipText: { color: "#cdd6f4", fontSize: 11 },
-  projectError: {
-    color: "#f38ba8",
-    backgroundColor: "#2d1822",
-    fontSize: 12,
-    paddingHorizontal: 14,
-    paddingVertical: 6,
   },
   pendingBadge: {
     backgroundColor: "#453a2b",

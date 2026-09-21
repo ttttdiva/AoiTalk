@@ -71,7 +71,7 @@ API 所有境界を変更するときは「この文書に書いてあるから�
 
 セットアップと起動は [setup_guide.md](setup_guide.md) を正本とします。過去の rebuild 用に Python API と Next dev server を別々に手動起動する手順を標準手順として使いません。
 
-変更時は `AGENTS.md` / `CLAUDE.md` に従い、変更範囲の targeted test/typecheck/lint を実行します。ユーザーが触る task UI を変更した場合は [ai_webui_qa.md](ai_webui_qa.md) の独立 AI browser QA が必要です。
+変更時は [AGENTS.md](../AGENTS.md) に従い、変更範囲の targeted test/typecheck/lint を実行します。ユーザーが触る task UI を変更した場合は [ai_webui_qa.md](ai_webui_qa.md) の独立 AI browser QA が必要です。
 
 ## 文書化ルール
 

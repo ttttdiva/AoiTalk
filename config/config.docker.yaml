@@ -9,7 +9,7 @@ llm_provider: gemini
 
 openrouter:
   base_url: https://openrouter.ai/api/v1
-  model: openai/gpt-4o-mini
+  model: openai/gpt-5.5
   app_name: AoiTalk
   site_url: ''
 
@@ -64,14 +64,12 @@ memory:
   enable_history_logging: true
   enable_search: true
   auto_cleanup_enabled: true
-  embedding_model: all-MiniLM-L6-v2
   history_batch_size: 100
   history_retention_days: 180
   log_retention_days: 365
   max_active_messages: 10
   max_context_tokens: 8000
   max_search_results: 5
-  preload_embedding_model: false
   save_assistant_messages: true
   save_function_calls: true
   save_user_messages: true

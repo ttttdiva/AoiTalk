@@ -88,3 +88,32 @@ validator は network/server を起動せず、結果をソートした determin
 変更時は capability の acceptance と対応する regression / integration / Android
 scenario を同時に更新します。validator PASS は unit/実機 QA の代替ではなく、API・
 navigation・scope の入口を失っていないことを保証する conformance gate です。
+
+
+## Native Chat: compact navigation and immediate submission
+
+The native conversation screen owns one safe-area-aware navigation row: Back,
+project-name selector, character display-name selector and title editing. It must
+not add a second screen-title/status toolbar, space-path prefix or character prefix.
+Both selectors stay single-line and truncate long names; project selection still
+uses the scoped project chooser and character names resolve from the offline cache.
+
+The composer represents the **next** turn's model and model-specific effort, not
+an earlier effective fallback route or the server's unrelated global mode. An
+explicit empty effort capability hides the effort selector. Model and effort are
+snapshotted together in the durable dispatch payload and validated server-side.
+
+Native submission has a single Send control. Pressing it immediately clears the
+draft and inserts a stable-ID user bubble, before SQLite or network work finishes.
+A following send interrupts the active response without an extra steer/stop choice.
+Direct requests use abort signals; server requests serialize confirmed cancellation
+before handoff. Late events from retired generations do not modify the new stream.
+Group chat uses this same submission path. Session promotion changes route params
+without replacing the screen, and loading transitions never remount its children.
+
+Foreground chat writes and background synchronization share the SQLite write
+coordinator. User insertion and session counts commit atomically; transient lock
+retries yield the JS thread and reuse the same submission ID. Accepted failures
+stay in history for retry rather than reappearing in the composer. Unsaved-bubble
+retry persists the original identity before dispatch. Account/server scope is
+retained with queued input and must match before sending.

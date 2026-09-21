@@ -1,4 +1,9 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   KeyboardAvoidingView,
   Modal,
@@ -16,7 +21,19 @@ import {
   TextInput,
 } from "react-native-paper";
 import type { ClipIngestResult } from "../../lib/docs-api";
-import { runClipIngest } from "../../lib/clip-ingest";
+import {
+  resumeClipIngestOperation,
+  runClipIngest,
+  type ClipIngestOutcome,
+} from "../../lib/clip-ingest";
+import { getConfiguredApiServerFingerprint } from "../../lib/api-client";
+import { docsRepo } from "../../repositories/docs";
+import {
+  listRecoverableClipIngestOperations,
+  type ClipIngestStrandReason,
+  type PendingClipIngestRow,
+} from "../../repositories/pending-clip-ingest";
+import { runSync } from "../../sync/engine";
 
 type IngestResult = ClipIngestResult;
 
@@ -31,6 +48,36 @@ const ACTION_LABELS: Record<IngestResult["action"], string> = {
 // 内容が未確認・未整理のまま保存されることがある（未確認事項に表示される）。
 const LOCAL_MODE_NOTE =
   "AoiTalkサーバーへ接続できなかったため、端末だけで取り込みました。接続時に自動で同期されます。";
+
+function strandMessage(reason: ClipIngestStrandReason): string {
+  switch (reason) {
+    case "auth_changed":
+      return "取り込み開始時の認証スコープを現在利用できません。元のアカウントへ戻すと同じoperation keyで再開できます。";
+    case "server_changed":
+      return "この取り込みは別のAoiTalkサーバーに固定されています。元のAPIサーバーへ戻すと同じoperation keyで再開できます。";
+    case "server_unknown":
+      return "この旧journalには元のAoiTalkサーバー識別子がありません。安全のため自動再送しません。入力を復元して、新しい操作として明示的に取り込んでください。";
+    default:
+      return "取り込みjournalの識別情報が不完全なため自動再送できません。入力を確認して新しい操作として取り込んでください。";
+  }
+}
+
+function recoveryStatusLabel(status: string): string {
+  switch (status) {
+    case "remote_succeeded":
+      return "サーバー保存済み";
+    case "remote_pending":
+      return "サーバー処理中";
+    case "remote_unknown":
+      return "サーバー応答確認待ち";
+    case "remote_ready":
+      return "送信状態確認待ち";
+    case "local_pending":
+      return "端末処理未完了";
+    default:
+      return "未送信";
+  }
+}
 
 function errorMessage(error: unknown): string {
   const raw = error instanceof Error ? error.message : String(error || "");
@@ -50,20 +97,53 @@ export function ClipIngestDialog({
   visible,
   onDismiss,
   onOpenNode,
+  targetNodeId,
+  sessionId,
+  projectId,
 }: {
   visible: boolean;
   onDismiss: () => void;
   onOpenNode: (nodeId: string) => void;
+  /** Optional controller-provided scope context for durable jobs. */
+  targetNodeId?: string | null;
+  sessionId?: string | null;
+  projectId?: string | null;
 }) {
   const [source, setSource] = useState("");
   const [status, setStatus] = useState<
-    "idle" | "running" | "success" | "queued" | "failure"
+    "idle" | "running" | "success" | "queued" | "stranded" | "failure"
   >("idle");
   const [result, setResult] = useState<IngestResult | null>(null);
   const [error, setError] = useState("");
   const [syncWarning, setSyncWarning] = useState("");
   const [localNote, setLocalNote] = useState("");
+  const [queuedRemoteAttempted, setQueuedRemoteAttempted] = useState(false);
+  const [queuedLegacyShape, setQueuedLegacyShape] = useState(false);
+  const [queuedOperationId, setQueuedOperationId] = useState<string | null>(null);
+  const [strandedReason, setStrandedReason] =
+    useState<ClipIngestStrandReason | null>(null);
+  const [recoveryRows, setRecoveryRows] =
+    useState<PendingClipIngestRow[]>([]);
+  const [currentServerFingerprint, setCurrentServerFingerprint] =
+    useState("");
+  const [recoveryBusyId, setRecoveryBusyId] = useState<string | null>(null);
+  const [openingNode, setOpeningNode] = useState(false);
   const inFlightRef = useRef(false);
+
+  const hydrateRecovery = useCallback(async () => {
+    try {
+      const [rows, serverFingerprint] = await Promise.all([
+        listRecoverableClipIngestOperations(),
+        getConfiguredApiServerFingerprint(),
+      ]);
+      setRecoveryRows(rows);
+      setCurrentServerFingerprint(serverFingerprint);
+    } catch {
+      // Recovery discovery must never make the normal Clip input unusable.
+      setRecoveryRows([]);
+      setCurrentServerFingerprint("");
+    }
+  }, []);
 
   useEffect(() => {
     if (!visible) return;
@@ -73,12 +153,50 @@ export function ClipIngestDialog({
     setError("");
     setSyncWarning("");
     setLocalNote("");
+    setQueuedRemoteAttempted(false);
+    setQueuedLegacyShape(false);
+    setQueuedOperationId(null);
+    setStrandedReason(null);
+    setRecoveryRows([]);
+    setCurrentServerFingerprint("");
+    setRecoveryBusyId(null);
+    setOpeningNode(false);
     inFlightRef.current = false;
-  }, [visible]);
+    void hydrateRecovery();
+  }, [visible, hydrateRecovery]);
 
   const dismiss = () => {
     if (inFlightRef.current) return;
     onDismiss();
+  };
+
+  const applyOutcome = (outcome: ClipIngestOutcome) => {
+    setQueuedOperationId(null);
+    setStrandedReason(null);
+    setQueuedRemoteAttempted(false);
+    setQueuedLegacyShape(false);
+    setLocalNote("");
+    setSyncWarning("");
+
+    if (outcome.mode === "queued") {
+      setQueuedOperationId(outcome.pendingId);
+      setQueuedRemoteAttempted(outcome.remoteAttempted === true);
+      setQueuedLegacyShape(
+        !Object.prototype.hasOwnProperty.call(outcome, "remoteAttempted"),
+      );
+      setStatus("queued");
+      return;
+    }
+    if (outcome.mode === "stranded") {
+      setQueuedOperationId(outcome.pendingId);
+      setStrandedReason(outcome.reason);
+      setStatus("stranded");
+      return;
+    }
+    setResult(outcome.result);
+    setSyncWarning(outcome.mode === "server" ? outcome.syncWarning : "");
+    setLocalNote(outcome.mode === "local" ? LOCAL_MODE_NOTE : "");
+    setStatus("success");
   };
 
   const submit = async () => {
@@ -89,20 +207,72 @@ export function ClipIngestDialog({
     setError("");
     setSyncWarning("");
     setLocalNote("");
+    setQueuedRemoteAttempted(false);
+    setQueuedLegacyShape(false);
     try {
-      const outcome = await runClipIngest(source);
-      if (outcome.mode === "queued") {
-        setStatus("queued");
-        return;
-      }
-      setResult(outcome.result);
-      setSyncWarning(outcome.mode === "server" ? outcome.syncWarning : "");
-      setLocalNote(outcome.mode === "local" ? LOCAL_MODE_NOTE : "");
-      setStatus("success");
+      const hasContext = targetNodeId != null || sessionId != null || projectId != null;
+      const outcome = hasContext
+        ? await runClipIngest(source, { targetNodeId, sessionId, projectId })
+        : await runClipIngest(source);
+      applyOutcome(outcome);
     } catch (requestError) {
       setError(errorMessage(requestError));
       setStatus("failure");
     } finally {
+      inFlightRef.current = false;
+    }
+  };
+
+  const resumeOperation = async (operationId: string) => {
+    if (inFlightRef.current) return;
+    inFlightRef.current = true;
+    setRecoveryBusyId(operationId);
+    setError("");
+    try {
+      const outcome = await resumeClipIngestOperation(operationId);
+      applyOutcome(outcome);
+      await hydrateRecovery();
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setStatus("failure");
+    } finally {
+      setRecoveryBusyId(null);
+      inFlightRef.current = false;
+    }
+  };
+
+  const restoreRecoveryInput = (row: PendingClipIngestRow) => {
+    if (inFlightRef.current) return;
+    setSource(row.source);
+    setStatus("idle");
+    setResult(null);
+    setError("");
+    setSyncWarning("");
+    setLocalNote("");
+    setQueuedOperationId(null);
+    setStrandedReason(null);
+    setRecoveryRows((rows) => rows.filter((candidate) => candidate.id !== row.id));
+  };
+
+  const syncAndOpenResult = async () => {
+    if (!result || inFlightRef.current) return;
+    inFlightRef.current = true;
+    setOpeningNode(true);
+    setError("");
+    try {
+      await runSync();
+      const node = await docsRepo.getNode(result.open_node_id);
+      if (!node) {
+        throw new Error(
+          "同期後も保存ノードを確認できませんでした。接続状態を確認して再度お試しください。",
+        );
+      }
+      onOpenNode(node.id);
+    } catch (requestError) {
+      setError(errorMessage(requestError));
+      setStatus("failure");
+    } finally {
+      setOpeningNode(false);
       inFlightRef.current = false;
     }
   };
@@ -120,7 +290,15 @@ export function ClipIngestDialog({
           behavior={Platform.OS === "ios" ? "padding" : undefined}
         >
           <View style={styles.header}>
-            <Button textColor="#a6adc8" disabled={status === "running"} onPress={dismiss}>
+            <Button
+              textColor="#a6adc8"
+              disabled={
+                status === "running"
+                || recoveryBusyId !== null
+                || openingNode
+              }
+              onPress={dismiss}
+            >
               閉じる
             </Button>
             <Text variant="titleMedium" style={styles.headerTitle}>クリップ取り込み</Text>
@@ -139,7 +317,11 @@ export function ClipIngestDialog({
               accessibilityLabel="取り込むURLまたは文章"
               value={source}
               onChangeText={setSource}
-              editable={status !== "running"}
+              editable={
+                status !== "running"
+                && recoveryBusyId === null
+                && !openingNode
+              }
               mode="outlined"
               multiline
               numberOfLines={10}
@@ -147,6 +329,63 @@ export function ClipIngestDialog({
               placeholder={"https://example.com/article\n補足したい文章やメモ"}
               style={styles.input}
             />
+
+            {recoveryRows.length > 0 ? (
+              <View style={styles.recoveryBox}>
+                <Text style={styles.recoveryTitle}>
+                  未完了・復旧可能な取り込み
+                </Text>
+                <Text style={styles.helperText}>
+                  通常の「取り込む」は常に新しい操作です。クラッシュ後の処理は、ここから既存operation keyを再開してください。
+                </Text>
+                {recoveryRows.map((row) => {
+                  const serverMismatch =
+                    !row.serverFingerprint
+                    || row.serverFingerprint !== currentServerFingerprint;
+                  return (
+                    <View key={row.id} style={styles.recoveryRow}>
+                      <Text style={styles.resultText} numberOfLines={2}>
+                        {row.source}
+                      </Text>
+                      <Text style={styles.recoveryMeta}>
+                        {recoveryStatusLabel(row.status)}
+                      </Text>
+                      {serverMismatch ? (
+                        <Text style={styles.helperText}>
+                          {strandMessage(
+                            row.serverFingerprint
+                              ? "server_changed"
+                              : "server_unknown",
+                          )}
+                        </Text>
+                      ) : null}
+                      <Button
+                        compact
+                        mode="outlined"
+                        loading={recoveryBusyId === row.id}
+                        disabled={
+                          recoveryBusyId !== null
+                          || openingNode
+                        }
+                        onPress={() => {
+                          if (serverMismatch) {
+                            restoreRecoveryInput(row);
+                          } else {
+                            void resumeOperation(row.id);
+                          }
+                        }}
+                      >
+                        {serverMismatch
+                          ? "入力を復元"
+                          : row.status === "remote_succeeded"
+                            ? "結果を復元"
+                            : "状態を確認"}
+                      </Button>
+                    </View>
+                  );
+                })}
+              </View>
+            ) : null}
 
             {status === "running" ? (
               <View accessibilityRole="progressbar" style={styles.statusBox}>
@@ -169,10 +408,33 @@ export function ClipIngestDialog({
               <View accessibilityRole="summary" style={[styles.statusBox, styles.successBox]}>
                 <Text style={styles.successTitle}>取り込みを保留しました</Text>
                 <Text style={styles.resultText}>
-                  AoiTalkサーバーへ接続できなかったため、入力を端末に保存しました。
+                  {queuedRemoteAttempted
+                    ? "サーバーへの取り込み要求は送信済み、または応答確認中です。"
+                    : "サーバーへ未送信の入力を端末に保存しました。"}
                 </Text>
                 <Text style={styles.helperText}>
-                  接続できたときに自動で取り込みます。アプリを閉じても保留は消えません。
+                  {queuedLegacyShape
+                    ? "接続できたときに自動で取り込みます。アプリを閉じても保留は消えません。"
+                    : queuedRemoteAttempted
+                    ? "同じoperation keyで状態を自動確認します。再実行する必要はありません。アプリを閉じても状態は消えません。"
+                    : "接続できたときに同じoperation keyで自動取り込みします。アプリを閉じても保留は消えません。"}
+                </Text>
+              </View>
+            ) : null}
+
+            {status === "stranded" && strandedReason ? (
+              <View
+                accessibilityRole="alert"
+                style={[styles.statusBox, styles.errorBox]}
+              >
+                <Text style={styles.errorTitle}>
+                  取り込みを安全に再開できません
+                </Text>
+                <Text style={styles.errorText}>
+                  {strandMessage(strandedReason)}
+                </Text>
+                <Text style={styles.helperText}>
+                  このjournalは削除・別サーバー送信されず、そのまま端末に保持されます。
                 </Text>
               </View>
             ) : null}
@@ -207,6 +469,9 @@ export function ClipIngestDialog({
                 {syncWarning ? (
                   <View accessibilityRole="alert" style={styles.syncWarningBox}>
                     <Text style={styles.helperText}>{syncWarning}</Text>
+                    <Text style={styles.helperText}>
+                      同期後に保存ノードを開けます
+                    </Text>
                   </View>
                 ) : null}
               </View>
@@ -215,13 +480,46 @@ export function ClipIngestDialog({
 
           <View style={styles.actions}>
             {status === "queued" ? (
-              <Button mode="contained" icon="tray-full" buttonColor="#7c3aed" onPress={dismiss}>
+              queuedOperationId && !queuedLegacyShape ? (
+                <Button
+                  mode="contained"
+                  icon="sync"
+                  buttonColor="#7c3aed"
+                  loading={recoveryBusyId === queuedOperationId}
+                  onPress={() => void resumeOperation(queuedOperationId)}
+                >
+                  {queuedRemoteAttempted ? "状態を確認" : "同じ操作を再開"}
+                </Button>
+              ) : (
+                <Button
+                  mode="contained"
+                  icon="tray-full"
+                  buttonColor="#7c3aed"
+                  onPress={dismiss}
+                >
+                  閉じる
+                </Button>
+              )
+            ) : status === "stranded" ? (
+              <Button
+                mode="contained"
+                icon="shield-alert-outline"
+                buttonColor="#7c3aed"
+                onPress={dismiss}
+              >
                 閉じる
               </Button>
             ) : status === "success" && result ? (
               syncWarning ? (
-                <Button mode="contained" icon="cloud-sync-outline" disabled>
-                  同期後に保存ノードを開けます
+                <Button
+                  mode="contained"
+                  icon="cloud-sync-outline"
+                  buttonColor="#7c3aed"
+                  loading={openingNode}
+                  disabled={openingNode}
+                  onPress={() => void syncAndOpenResult()}
+                >
+                  同期して保存ノードを開く
                 </Button>
               ) : (
                 <Button
@@ -296,6 +594,28 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     padding: 10,
     backgroundColor: "#302a1a",
+  },
+  recoveryBox: {
+    gap: 10,
+    borderWidth: 1,
+    borderColor: "#45475a",
+    borderRadius: 10,
+    padding: 14,
+    backgroundColor: "#181825",
+  },
+  recoveryTitle: {
+    color: "#cdd6f4",
+    fontWeight: "700",
+  },
+  recoveryRow: {
+    gap: 6,
+    borderTopWidth: 1,
+    borderTopColor: "#313244",
+    paddingTop: 10,
+  },
+  recoveryMeta: {
+    color: "#a6adc8",
+    fontSize: 12,
   },
   actions: {
     borderTopWidth: 1,

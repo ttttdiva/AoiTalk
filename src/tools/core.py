@@ -12,6 +12,7 @@ from typing import (
     Dict,
     Iterable,
     List,
+    Mapping,
     Optional,
     Union,
     get_args,
@@ -35,6 +36,38 @@ class ToolParam:
     schema: Optional[Dict[str, Any]] = None
 
 
+class ToolArgumentValidationError(ValueError):
+    """Safe deterministic failure raised before a tool callable is invoked."""
+
+    def __init__(
+        self,
+        tool_name: str,
+        *,
+        code: str,
+        argument_names: Iterable[str] = (),
+    ) -> None:
+        self.tool_name = str(tool_name or "tool").strip() or "tool"
+        self.code = str(code or "tool_argument_invalid").strip()
+        self.argument_names = tuple(
+            sorted(
+                {
+                    str(name or "").strip()
+                    for name in argument_names
+                    if str(name or "").strip()
+                }
+            )
+        )
+        label = {
+            "tool_argument_unknown": "unknown arguments",
+            "tool_argument_conflict": "conflicting arguments",
+            "tool_argument_missing": "missing arguments",
+            "tool_argument_invalid": "invalid arguments",
+        }.get(self.code, "invalid arguments")
+        # Values and caller-controlled property names intentionally stay out
+        # of exception text because provider/tool failures can reach logs.
+        super().__init__(f"{self.tool_name}: {label}")
+
+
 @dataclass
 class ToolDefinition:
     """バックエンド非依存のツール定義"""
@@ -50,12 +83,222 @@ class ToolDefinition:
     supports_parallel: bool = True
     owner: str = "core"
     availability: Optional[Dict[str, Any]] = None
+    argument_aliases: Dict[str, str] = field(default_factory=dict)
+    hidden_argument_names: tuple[str, ...] = field(default_factory=tuple)
+    _legacy_variadic_kwargs: bool = field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )
+
+    def __post_init__(self) -> None:
+        """Populate a schema for legacy definitions that omit ``parameters``.
+
+        Most tools are built through :func:`tool` and already carry an
+        explicit schema.  A number of direct/third-party integrations still
+        construct ``ToolDefinition`` with only a callable, however.  Keeping
+        those definitions executable after argument validation means the
+        closed-schema contract can be applied consistently without silently
+        treating every argument as unknown. Variadic callables remain
+        schema-less because their accepted keys cannot be represented as a
+        closed JSON object. A legacy definition whose only keyword surface is
+        ``**kwargs`` retains that historical open-key behavior; explicit or
+        inferable schemas remain closed.
+
+        """
+
+        # An explicit schema is always authoritative, including when the
+        # backing callable itself happens to accept **kwargs.
+        if self.parameters or not callable(self.function):
+            return
+        try:
+            signature = inspect.signature(self.function)
+        except (TypeError, ValueError):
+            return
+        try:
+            hints = get_type_hints(self.function)
+        except Exception:  # noqa: BLE001 - annotations are advisory only
+            hints = {}
+
+        inferred: List[ToolParam] = []
+        has_variadic_kwargs = False
+        for name, parameter in signature.parameters.items():
+            if name in {"self", "cls"}:
+                continue
+            if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
+                # Tool invocations are keyword mappings; *args contributes no
+                # representable JSON-object properties.
+                continue
+            if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+                has_variadic_kwargs = True
+                continue
+            py_type = hints.get(name, str)
+            json_type, is_optional = _resolve_type(py_type)
+            has_default = parameter.default is not inspect.Parameter.empty
+            inferred.append(
+                ToolParam(
+                    name=name,
+                    type=json_type,
+                    required=not (is_optional or has_default),
+                    default=(parameter.default if has_default else None),
+                    schema=_resolve_param_schema(py_type, json_type),
+                )
+            )
+        self.parameters = inferred
+        # Compatibility is intentionally limited to the otherwise
+        # unrepresentable legacy shape ``ToolDefinition(function=fn)`` where
+        # fn exposes no named keyword contract and accepts **kwargs. Mixed
+        # ``named, **kwargs`` callables use the inferred named schema and stay
+        # closed.
+        self._legacy_variadic_kwargs = bool(
+            has_variadic_kwargs and not inferred
+        )
+
+    def add_argument_alias(self, alias: str, canonical: str) -> None:
+        """Add one explicitly supported compatibility alias.
+
+        Aliases exist only at the tool boundary. The backing Python callable
+        always receives the canonical key.
+        """
+
+        alias_name = str(alias or "").strip()
+        canonical_name = str(canonical or "").strip()
+        parameter_names = {param.name for param in self.parameters}
+        if (
+            not alias_name
+            or not canonical_name
+            or canonical_name not in parameter_names
+            or alias_name in parameter_names
+        ):
+            raise ValueError(
+                f"Invalid argument alias for {self.name}: "
+                f"{alias_name or '<empty>'}->{canonical_name or '<empty>'}"
+            )
+        existing = self.argument_aliases.get(alias_name)
+        if existing is not None and existing != canonical_name:
+            raise ValueError(
+                f"Conflicting argument alias for {self.name}: {alias_name}"
+            )
+        self.argument_aliases[alias_name] = canonical_name
+
+    def normalize_arguments(
+        self,
+        arguments: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """Validate and canonicalize provider/model arguments.
+
+        Unknown keys and conflicting aliases are rejected before the backing
+        Python callable runs.
+        """
+
+        if arguments is None:
+            raw: Dict[str, Any] = {}
+        elif isinstance(arguments, Mapping):
+            raw = dict(arguments)
+        else:
+            raise ToolArgumentValidationError(
+                self.name,
+                code="tool_argument_invalid",
+            )
+
+        if any(not isinstance(key, str) for key in raw):
+            raise ToolArgumentValidationError(
+                self.name,
+                code="tool_argument_unknown",
+                argument_names=("<non-string>",),
+            )
+
+        # There is no finite key set to validate for this narrow legacy shape.
+        # Explicit and inferred schemas never enter this branch, so unknown-key
+        # rejection remains authoritative everywhere a real schema exists.
+        if self._legacy_variadic_kwargs:
+            return raw
+
+        canonical_names = {param.name for param in self.parameters}
+        alias_names = set(self.argument_aliases)
+        all_hidden_names = {
+            str(name or "").strip()
+            for name in self.hidden_argument_names
+            if str(name or "").strip()
+        }
+        # Hidden arguments are consumed by a trusted boundary wrapper (for
+        # example a TurnContext binder) and intentionally omitted from the
+        # provider schema.  They still need to pass through this boundary so
+        # the wrapper can validate/reject forged values itself.
+        hidden_names = all_hidden_names - canonical_names - alias_names
+        invalid_aliases = [
+            alias
+            for alias, canonical in self.argument_aliases.items()
+            if canonical not in canonical_names or alias in canonical_names
+        ]
+        if invalid_aliases:
+            raise ToolArgumentValidationError(
+                self.name,
+                code="tool_argument_invalid",
+                argument_names=invalid_aliases,
+            )
+
+        unknown = sorted(set(raw) - canonical_names - alias_names - hidden_names)
+        if unknown:
+            raise ToolArgumentValidationError(
+                self.name,
+                code="tool_argument_unknown",
+                argument_names=unknown,
+            )
+
+        normalized = dict(raw)
+        for alias, canonical in sorted(self.argument_aliases.items()):
+            if alias not in normalized:
+                continue
+            alias_value = normalized.pop(alias)
+            if canonical in normalized:
+                canonical_value = normalized[canonical]
+                same_value = canonical_value == alias_value
+                if isinstance(canonical_value, str) and isinstance(
+                    alias_value,
+                    str,
+                ):
+                    same_value = canonical_value.strip() == alias_value.strip()
+                if not same_value:
+                    raise ToolArgumentValidationError(
+                        self.name,
+                        code="tool_argument_conflict",
+                        argument_names=(canonical, alias),
+                    )
+                continue
+            normalized[canonical] = alias_value
+
+        missing = [
+            param.name
+            for param in self.parameters
+            if param.required
+            and param.name not in normalized
+            and param.name not in all_hidden_names
+        ]
+        if missing:
+            raise ToolArgumentValidationError(
+                self.name,
+                code="tool_argument_missing",
+                argument_names=missing,
+            )
+        return normalized
 
     def to_json_schema(self) -> Dict[str, Any]:
         """標準 JSON Schema フォーマットでパラメータ定義を返す"""
         properties: Dict[str, Any] = {}
         required: List[str] = []
+        hidden_names = {
+            str(name or "").strip()
+            for name in self.hidden_argument_names
+            if str(name or "").strip()
+        }
         for p in self.parameters:
+            # Hidden arguments are trusted server-side inputs.  They remain
+            # accepted by ``normalize_arguments`` for the wrapper boundary,
+            # but must never be advertised to a model/provider schema.
+            if p.name in hidden_names:
+                continue
             prop: Dict[str, Any] = deepcopy(p.schema) if p.schema else {"type": p.type}
             prop.setdefault("type", p.type)
             if p.description:
@@ -65,15 +308,34 @@ class ToolDefinition:
             properties[p.name] = prop
             if p.required:
                 required.append(p.name)
+
+        for alias, canonical in sorted(self.argument_aliases.items()):
+            canonical_schema = properties.get(canonical)
+            if canonical_schema is None:
+                continue
+            alias_schema = deepcopy(canonical_schema)
+            existing_description = str(
+                alias_schema.get("description") or ""
+            ).strip()
+            compatibility_note = (
+                f"Compatibility alias for `{canonical}`. Prefer `{canonical}`."
+            )
+            alias_schema["description"] = (
+                f"{existing_description} {compatibility_note}".strip()
+            )
+            properties[alias] = alias_schema
+
         return {
             "type": "object",
             "properties": properties,
             "required": required,
+            "additionalProperties": bool(self._legacy_variadic_kwargs),
         }
 
     def execute(self, **kwargs) -> Any:
         """ツールを実行（全バックエンドで共通）"""
-        result = self.function(**kwargs)
+        normalized = self.normalize_arguments(kwargs)
+        result = self.function(**normalized)
         if asyncio.iscoroutine(result):
             # 非同期関数の場合、イベントループで実行
             try:
@@ -99,11 +361,12 @@ class ToolDefinition:
         重いコマンドやユーザー承認待ちの間ループ全体が停止し、SSE配信も
         承認応答の受信も止まって実質フリーズする。
         """
+        normalized = self.normalize_arguments(kwargs)
         if self.is_async or inspect.iscoroutinefunction(self.function):
-            return await self._await_with_timeout(self.function(**kwargs))
+            return await self._await_with_timeout(self.function(**normalized))
 
         return await self._await_with_timeout(
-            asyncio.to_thread(lambda: self.function(**kwargs))
+            asyncio.to_thread(lambda: self.function(**normalized))
         )
 
     async def _await_with_timeout(self, awaitable: Any) -> Any:

@@ -2,14 +2,15 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { getToken, getTokenAuthScope } from "./auth";
 import {
   fetchApi,
-  getBaseUrl,
+  getConfiguredApiServerFingerprint,
   isApiConnectionError,
   isApiHttpError,
 } from "./api-client";
 import { normalizeApiUrl } from "./api-url";
+import { getNetworkEndpointRoutingConfig } from "./connection-routing";
 import type { ManagedCharacter } from "../types/api";
 
-const CHARACTER_CACHE_PREFIX = "aoitalk_character_profiles_v2";
+const CHARACTER_CACHE_PREFIX = "aoitalk_character_profiles_v3";
 
 /**
  * サーバー未接続・初回起動でも通常チャットを開始できる最低限の定義。
@@ -21,6 +22,13 @@ export const OFFLINE_DEFAULT_CHARACTER: ManagedCharacter = {
   slug: "project_manager",
   character_type: "assistant",
   description: "案件・タスク・予定の整理を支援する標準キャラクターです。",
+  // scripts/init_db_schema.py / src/memory/migrations.py の標準seedと同じ人格。
+  system_prompt: "通常チャットに答えつつ、ユーザーが案件・タスク・WBS・進捗・予定・台帳などの管理作業を求めた時だけ、AoiTalk の Project を案件の基準IDとして扱って支援する。\n日本語で簡潔、実務的、結論先出しで応答する。",
+  greeting: "案件まわり、確認する？",
+  invalid_content_reply: "その内容は扱えない。別の形で整理しよう。",
+  fallback_reply: "うまく整理できなかった。対象案件か、やりたい操作をもう少し具体的に教えて。",
+  goodbye_reply: "また必要になったら呼んで。",
+  recognition_aliases: ["案件管理", "案件管理アシスタント", "プロジェクト管理", "進行管理", "PM"],
   is_enabled: true,
 };
 
@@ -54,7 +62,7 @@ function isManagedCharacter(value: unknown): value is ManagedCharacter {
 }
 
 async function characterCacheKey(enabledOnly: boolean): Promise<string> {
-  const [baseUrl, token] = await Promise.all([getBaseUrl(), getToken()]);
+  const [baseUrl, token] = await Promise.all([getConfiguredApiServerFingerprint(), getToken()]);
   const normalizedBaseUrl = normalizeApiUrl(baseUrl).toLowerCase();
   const authScope = getTokenAuthScope(token);
   const mode = enabledOnly ? "enabled" : "all";
@@ -89,6 +97,26 @@ async function readCachedCharacters(
   }
 }
 
+// 旧版の経路別キャッシュを、現在設定されている同一サーバーの候補からのみ移行する。
+// 到達性probeやHTTP要求は行わない。新形式が存在する場合、古い定義を復活させない。
+async function readProfileCache(enabledOnly: boolean): Promise<ManagedCharacter[]> {
+  const key = await characterCacheKey(enabledOnly);
+  if (await AsyncStorage.getItem(key)) return readCachedCharacters(key);
+  const [server, token, routing] = await Promise.all([
+    getConfiguredApiServerFingerprint(), getToken(), getNetworkEndpointRoutingConfig(),
+  ]);
+  const candidates = [server, ...(routing.enabled ? [routing.wifiApiUrl, routing.cellularApiUrl] : [])];
+  for (const url of candidates.filter(Boolean)) {
+    const oldKey = `aoitalk_character_profiles_v2:${encodeURIComponent(normalizeApiUrl(url).toLowerCase())}:${encodeURIComponent(getTokenAuthScope(token))}:${enabledOnly ? "enabled" : "all"}`;
+    const cached = await readCachedCharacters(oldKey);
+    if (cached.length) {
+      await cacheCharacters(key, cached);
+      return cached;
+    }
+  }
+  return [];
+}
+
 async function readOfflineCharacters(
   enabledOnly: boolean,
   savedSlug?: string | null,
@@ -97,9 +125,10 @@ async function readOfflineCharacters(
   try {
     // full cacheを読むことで、enabled_only取得だけを先に行った端末でも
     // ローカル一覧の組み立ては常に同じになる。
-    cached = await readCachedCharacters(
-      await characterCacheKey(false),
-    );
+    cached = await readProfileCache(false);
+    if (!cached.length && !(await AsyncStorage.getItem(await characterCacheKey(false)))) {
+      cached = await readProfileCache(true);
+    }
   } catch {
     // SecureStore/AsyncStorageの読み取り失敗でも同梱定義は返す。
   }
@@ -170,9 +199,7 @@ export const characterApi = {
   },
 
   async getCachedList(enabledOnly = false): Promise<ManagedCharacter[]> {
-    const cached = await readCachedCharacters(
-      await characterCacheKey(enabledOnly),
-    );
+    const cached = await readProfileCache(enabledOnly);
     return enabledOnly
       ? cached.filter((character) => character.is_enabled !== false)
       : cached;
@@ -195,6 +222,15 @@ export const characterApi = {
           character.slug === normalized && character.is_enabled !== false,
       ) ?? null
     );
+  },
+
+  /** Directは端末の完全な定義だけで開始する。保存slugの表示用placeholderは使わない。 */
+  async getDirectProfile(slug: string): Promise<ManagedCharacter | null> {
+    const normalized = requireCharacterSlug(slug);
+    const characters = await readOfflineCharacters(false);
+    return characters.find((character) =>
+      character.slug === normalized && character.is_enabled !== false,
+    ) ?? null;
   },
 
   async toggle(characterId: string): Promise<ManagedCharacter> {

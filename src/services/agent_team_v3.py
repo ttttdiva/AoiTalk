@@ -43,6 +43,10 @@ AGENT_TEAM_CAPABILITY_CATALOG: dict[str, dict[str, Any]] = {
     # Shared integrations are intentionally not fresh Team entries.
     "media": {"id": "media", "family": "media", "access": "write", "native": False},
     "spotify": {"id": "spotify", "family": "spotify", "access": "write", "native": False},
+    # Declarations only: the server-owned action policy/attempt boundary
+    # authorizes execution independently of a Team or model tool selection.
+    "external_action_propose": {"id": "external_action_propose", "family": "employee", "access": "write", "native": False},
+    "telephony_control": {"id": "telephony_control", "family": "employee", "access": "write", "native": False},
 }
 AGENT_TEAM_SHARED_READ_CAPABILITIES = frozenset({"web_read"})
 
@@ -90,6 +94,7 @@ def _subagent(
 
 # Code-level catalog only; it is never serialized as App Config topology.
 AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
+    "employee_operator": _subagent("employee_operator", "社員業務", "管理者が設定した自動化と電話受付を担当する。", "承認された範囲の業務のみ扱う。外部操作は登録済みActionPolicyで検証し、電話転送には許可されたdestination_keyだけを使う。", ["external_action_propose", "telephony_control"], scalable=False, default_instances=1, max_instances=1, workspace="none", native_tools=False),
     "general_worker": _subagent("general_worker", "汎用作業", "特定分野へ固定しない一般作業。比較、整理、要約、補助調査、小規模なファイル作業等。", "特定分野に固定せず、比較、整理、要約、補助調査、小規模なファイル作業を行う。CLI Agentを選択した場合はnative toolsを利用できる。", ["workspace_read", "workspace_write", "repo_map", "aoi_tools"], scalable=True, default_instances=1, max_instances=4, workspace="write", native_tools=True),
     "general_researcher": _subagent("general_researcher", "汎用調査", "Web・Workspace を直接調査し、Docs/Project は専用 operator へ委譲する横断調査。", "Web検索とWorkspace/repo mapのread-only調査を行う。DocsやProject/Tasksの詳細は docs_operator / project_operator への委譲を前提とし、自分で high-level Docs/Project tools を直接使わない。根拠を添えて報告する。", ["workspace_read", "repo_map", "web_read", "aoi_tools"], scalable=True, default_instances=1, max_instances=6, workspace="read", native_tools=True),
     "docs_operator": _subagent("docs_operator", "Docs操作", "Docsノードの検索、読み取り、整理、再構成、更新。", "AoiTalkのDocs high-level toolsのみ使用する。canonical nodeを確認し、曖昧な対象を推測して更新せず、書き込み前に対象を確認する。AoiTalk DBへ直接アクセスしない。", ["docs_read", "docs_write"], scalable=True, default_instances=1, max_instances=4, workspace="none", native_tools=False),
@@ -110,6 +115,7 @@ AGENT_TEAM_SUBAGENT_CATALOG: dict[str, dict[str, Any]] = {
 }
 
 AGENT_TEAM_DEFAULT_TEAMS: dict[str, dict[str, Any]] = {
+    "employee": {"team_id": "employee", "name": "Employee", "description": "AI社員が明示的に選択する業務実行Team。", "enabled": True, "sort_order": 40, "activation": {"mode": "manual", "contexts": []}, "subagent_ids": ["employee_operator"]},
     "general": {"team_id": "general", "name": "General", "description": "AoiTalkの通常利用を担う常用Team。", "enabled": True, "sort_order": 10, "activation": {"mode": "always", "contexts": []}, "subagent_ids": ["general_worker", "general_researcher", "docs_operator", "project_operator", "workspace_operator"]},
     "app_development": {"team_id": "app_development", "name": "App Development", "description": "アプリ開発の探索、設計、実装、レビュー。", "enabled": True, "sort_order": 20, "activation": {"mode": "contextual", "contexts": ["app_development"]}, "subagent_ids": ["code_explorer", "architecture_planner", "code_implementer", "code_reviewer"]},
     "story": {"team_id": "story", "name": "Story", "description": "Storyの執筆、取り込み、整合性・キャラクター口調レビュー。", "enabled": True, "sort_order": 30, "activation": {"mode": "contextual", "contexts": ["story"]}, "subagent_ids": ["story_writer", "story_consistency_reviewer", "character_voice_reviewer", "story_import", "general_worker"]},

@@ -5,6 +5,7 @@ import {
   knowledgeNodes,
   knowledgeNodeSupertags,
   knowledgeSupertags,
+  projects,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { reconcileDocsTaskBinding } from "@/lib/server/docs-task-binding";
@@ -17,6 +18,7 @@ import {
 import { insertDocsNode } from "@/lib/server/docs-node-writer";
 import {
   lockAndAssertGenericDocsMutationAllowed,
+  ManagedDocsAccessError,
   ManagedDocsMutationError,
 } from "@/lib/server/managed-docs-policy";
 
@@ -54,6 +56,21 @@ export async function PUT(
     return NextResponse.json(
       { detail: "nodeが見つからないか権限がありません" },
       { status: 404 },
+    );
+  }
+
+  // Project-information roots and the Personal 案件情報 hub are identity
+  // metadata.  Their tag graph is repaired only by the dedicated Project
+  // Information API; allowing a generic relation PUT/DELETE would let a
+  // caller detach the project_info link while the Project pointer remains.
+  const systemKey = String(access.node.systemKey ?? "").trim();
+  if (
+    systemKey === "project_information_root"
+    || systemKey.startsWith("project_information:")
+  ) {
+    return NextResponse.json(
+      { detail: "案件情報の正本nodeは通常のDocs supertag操作で変更できません" },
+      { status: 409 },
     );
   }
 
@@ -119,7 +136,40 @@ export async function PUT(
   let createdNodes: Array<typeof knowledgeNodes.$inferSelect>;
   try {
     const result = await db.transaction(async (tx) => {
-      await lockAndAssertGenericDocsMutationAllowed(access.node, tx);
+      if (typeof tx.execute === "function" || access.node.projectId || systemKey) {
+        const pointerSelect = tx.select({ id: projects.id });
+        const pointerFrom = pointerSelect.from(projects);
+        const pointerWhere = pointerFrom.where(eq(projects.knowledgeNodeId, access.node.id));
+        const pointerLimited = typeof pointerWhere.limit === "function"
+          ? pointerWhere.limit(2)
+          : pointerWhere;
+        const pointerRows = typeof pointerLimited.for === "function"
+          ? await pointerLimited.for("update")
+          : await pointerLimited;
+        if (pointerRows.length > 0) {
+          throw new ManagedDocsMutationError("project_information");
+        }
+      }
+      await lockAndAssertGenericDocsMutationAllowed(access.node, tx, user);
+      // Recheck canonical identity after the managed-policy lock. A Project
+      // repair can assign its reverse pointer/system key after the initial
+      // preflight query; relation writes must fail closed in that case.
+      const postPolicyPointers = await tx
+        .select({ id: projects.id })
+        .from(projects)
+        .where(eq(projects.knowledgeNodeId, access.node.id));
+      const [postPolicyNode] = await tx
+        .select({ systemKey: knowledgeNodes.systemKey })
+        .from(knowledgeNodes)
+        .where(eq(knowledgeNodes.id, access.node.id));
+      const postPolicySystemKey = String(postPolicyNode?.systemKey ?? "").trim();
+      if (
+        postPolicyPointers.length > 0
+        || postPolicySystemKey === "project_information_root"
+        || postPolicySystemKey.startsWith("project_information:")
+      ) {
+        throw new ManagedDocsMutationError("project_information");
+      }
       const previousRows = await tx
         .select({ supertagId: knowledgeNodeSupertags.supertagId })
         .from(knowledgeNodeSupertags)
@@ -293,6 +343,9 @@ export async function PUT(
       );
     }
     if (error instanceof ManagedDocsMutationError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    if (error instanceof ManagedDocsAccessError) {
       return NextResponse.json({ detail: error.message }, { status: error.status });
     }
     throw error;

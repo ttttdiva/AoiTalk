@@ -9,7 +9,7 @@ export default function ChatLayout() {
       }}
     >
       <Stack.Screen name="index" options={{ headerShown: false }} />
-      <Stack.Screen name="[sessionId]" options={{ title: 'Chat Session' }} />
+      <Stack.Screen name="[sessionId]" options={{ headerShown: false }} />
     </Stack>
   );
 }

@@ -4,6 +4,10 @@ import { useEffect } from "react";
 import { usePathname } from "next/navigation";
 import { APP_ALT_SHORTCUTS } from "@/lib/app-navigation";
 import { OPEN_DOCS_CLIP_INGEST_EVENT } from "@/lib/clip-ingest-shortcut";
+import {
+  OPEN_HEADER_PROJECT_SELECTOR_EVENT,
+  OPEN_HEADER_SPACE_SELECTOR_EVENT,
+} from "@/lib/header-selector-shortcuts";
 
 export function KeyboardShortcuts() {
   const pathname = usePathname();
@@ -35,6 +39,34 @@ export function KeyboardShortcuts() {
       ) {
         e.preventDefault();
         handleOpenClipIngest();
+        return;
+      }
+
+      // Ctrl+Alt+S: グローバルヘッダーのスペース選択を開く
+      if (
+        e.ctrlKey
+        && e.altKey
+        && !e.shiftKey
+        && !e.metaKey
+        && !e.repeat
+        && e.key.toLowerCase() === "s"
+      ) {
+        e.preventDefault();
+        window.dispatchEvent(new Event(OPEN_HEADER_SPACE_SELECTOR_EVENT));
+        return;
+      }
+
+      // Ctrl+Alt+P: グローバルヘッダーのプロジェクト選択を開く
+      if (
+        e.ctrlKey
+        && e.altKey
+        && !e.shiftKey
+        && !e.metaKey
+        && !e.repeat
+        && e.key.toLowerCase() === "p"
+      ) {
+        e.preventDefault();
+        window.dispatchEvent(new Event(OPEN_HEADER_PROJECT_SELECTOR_EVENT));
         return;
       }
 

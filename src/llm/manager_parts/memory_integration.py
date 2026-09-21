@@ -11,8 +11,10 @@ from ..conversation_context import (
     compact_model_transcript_for_history,
     merge_model_transcript_snapshot,
 )
+from ..context_snapshot import context_manifest_metadata
 from ..native_runtime import AgentDefinition as Agent
 from ...services.agent_run_service import redact_sensitive_model_transcript
+from ...services.privacy_masking_projection import is_privacy_masking_source
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +111,10 @@ class MemoryIntegrationMixin:
         for msg in messages[-max_messages:]:
             if msg.role not in {"user", "assistant", "system"}:
                 continue
+            # Raw masking source turns stay in durable chat history but are
+            # excluded from provider-local prompt state and transcript replay.
+            if is_privacy_masking_source(msg):
+                continue
             self.history_manager.add_message(msg.role, msg.content)
             metadata = getattr(msg, "message_metadata", None) or {}
             transcript = metadata.get("model_transcript") if isinstance(metadata, dict) else None
@@ -158,6 +164,10 @@ class MemoryIntegrationMixin:
         self, user_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
     ):
         """Update session identifiers used for memory logging."""
+        # Isolated Project Automation prompts are turn-local.  Clear only the
+        # dedicated override so a normal character-level system prompt keeps
+        # its existing ``_system_prompt_override`` semantics.
+        self._isolated_system_prompt_override = ""
         if user_id:
             self.session_user_id = str(user_id)
         if metadata:
@@ -178,6 +188,9 @@ class MemoryIntegrationMixin:
                     if isinstance(message, dict)
                 ]
             )
+        manifest = context_manifest_metadata(self)
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
         return metadata
 
     async def _build_past_conversation_recall(self, user_input: str) -> str:
@@ -362,6 +375,11 @@ Updated summary:
 
     async def cleanup(self):
         """Clean up resources, especially MCP connections and memory manager"""
+        states = getattr(self, "_native_completed_agent_run_states", None)
+        lock = getattr(self, "_native_completed_agent_run_states_lock", None)
+        if isinstance(states, dict) and hasattr(lock, "__enter__"):
+            with lock:
+                states.clear()
         # Clean up memory manager
         if self.memory_manager:
             try:

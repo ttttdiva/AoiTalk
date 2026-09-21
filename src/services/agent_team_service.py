@@ -188,6 +188,18 @@ def _main_route(config: Any) -> dict[str, Any]:
             model = str(_raw_config_get(config, key, "") or "").strip()
             if model:
                 break
+    # Keep Agent Team inheritance on the same provider-aware resolver as the
+    # direct runtime.  Persisted legacy mini-model values are treated as
+    # missing and replaced with the provider's canonical safe default.
+    from ..llm.deployment_resolver import (
+        canonical_model_for_provider,
+        is_retired_model,
+    )
+
+    if is_retired_model(model):
+        model = canonical_model_for_provider(config, provider)
+    elif not model:
+        model = canonical_model_for_provider(config, provider)
     route: dict[str, Any] = {"provider": provider, "model": model}
     effort = _catalog_main_effort(config, provider, model)
     if effort:
@@ -235,7 +247,110 @@ def _legacy_agent_team_scope_active(
 # continuation state.  These are in-memory/request-scoped by design; no DB
 # table or migration is required.
 
-_NON_CIRCUIT_ERROR_CODES = {"not_found", "ambiguous_target", "user_validation", "validation", "cancelled"}
+_NON_CIRCUIT_ERROR_CODES = {
+    "not_found",
+    "ambiguous_target",
+    "user_validation",
+    "validation",
+    "cancelled",
+    "docs_access_denied",
+    "docs_not_found",
+    "docs_ambiguous_target",
+    "docs_validation",
+    "tool_argument_unknown",
+    "tool_argument_conflict",
+    "tool_argument_missing",
+    "tool_argument_invalid",
+}
+
+# Failure signatures may be copied into circuit-open tool payloads and
+# telemetry.  Keep the set closed so a provider/model-controlled value cannot
+# smuggle a credential, URL, or document text through an otherwise harmless
+# looking ``docs_*``/``provider_*`` token.
+_SAFE_FAILURE_CODES = frozenset(
+    {
+        *_NON_CIRCUIT_ERROR_CODES,
+        "tool_error",
+        "circuit_open",
+        "docs_access_internal",
+        "project_not_found",
+        "overview_refresh_failed",
+        "overview_refresh_requeue_failed",
+        "overview_refresh_invalid_state",
+        "provider_http_429",
+        "provider_timeout",
+        "provider_response_unavailable",
+        "client_creation_failed",
+        "config_unavailable",
+        "empty_response",
+        "invalid_json",
+        "json_not_object",
+        "invalid_route",
+        "layout_validation_failed",
+        "persistence_failed",
+        "unexpected_generation_failure",
+    }
+)
+
+_SAFE_DOCS_DIAGNOSTIC_OPERATIONS = frozenset(
+    {
+        "docs",
+        "docs_read",
+        "docs_search",
+        "docs_query",
+        "docs_create_nodes",
+        "docs_update_node",
+        "docs_move_node",
+        "docs_archive_node",
+        "docs_ensure_inbox",
+        "docs_attach_workspace_file",
+        "docs_place_workspace_file",
+        "inbox_search_items",
+        "inbox_update_item",
+    }
+)
+_SAFE_DOCS_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "execution",
+        "argument_resolution",
+        "database_manager",
+        "open_session",
+        "authorization",
+        "authorization_scope",
+        "workspace_resolution",
+        "node_resolution",
+        "content_read",
+        "document_validation",
+        "search",
+        "render",
+        "mutation",
+        "copy",
+        "approval_receipt",
+        "commit",
+    }
+)
+_SAFE_DIAGNOSTIC_EXCEPTION_TYPES = frozenset(
+    {
+        "attributeerror",
+        "dbapierror",
+        "fileexistserror",
+        "filenotfounderror",
+        "integrityerror",
+        "keyerror",
+        "lookuperror",
+        "multipleobjectsreturned",
+        "noresultfound",
+        "notimplementederror",
+        "operationalerror",
+        "oserror",
+        "permissionerror",
+        "runtimeerror",
+        "sqlalchemyerror",
+        "timeouterror",
+        "typeerror",
+        "valueerror",
+    }
+)
 
 
 def tool_failure_family(tool_name: Any) -> str:
@@ -260,7 +375,13 @@ def tool_failure_family(tool_name: Any) -> str:
         return "workspace"
     if name.startswith(("media_", "spotify_")):
         return "media"
-    return name or "unknown"
+    # A provider-controlled function name is not an operator-controlled
+    # diagnostic namespace. Never use it verbatim as a breaker key or in a
+    # circuit-open message: names can contain arbitrary text (including
+    # credentials) and can otherwise poison the retry budget. Unknown tools
+    # deliberately share one bounded family; repository-defined prefixes above
+    # retain their stable cross-tool families.
+    return "unknown"
 
 
 @dataclass(frozen=True)
@@ -281,12 +402,35 @@ def _normalize_root_cause(value: Any) -> str:
     text = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27,}", "<uuid>", text)
     text = re.sub(r"\b\d+\b", "<n>", text)
     text = re.sub(r"\s+", " ", text)
-    return text.strip()[:240] or "unknown"
+    text = text.strip()
+    if not text:
+        return "unknown"
+    # Only stable, repository-defined diagnostic namespaces may be included in
+    # a circuit signature.  Generic exception text can contain credentials,
+    # URLs, or document content and must never be echoed in model-facing
+    # circuit-open payloads or warning logs.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_.:-]{0,127}", text):
+        return "tool_error"
+    if text in _SAFE_FAILURE_CODES:
+        return text
+    parts = text.split(".")
+    if (
+        len(parts) == 3
+        and parts[0] in _SAFE_DOCS_DIAGNOSTIC_OPERATIONS
+        and parts[1] in _SAFE_DOCS_DIAGNOSTIC_STAGES
+        and parts[2] in _SAFE_DIAGNOSTIC_EXCEPTION_TYPES
+    ):
+        return text
+    return "tool_error"
 
 
 def normalize_tool_failure_signature(tool_family: Any, error_code: Any = "", root_cause: Any = "") -> ToolFailureSignature:
     family = re.sub(r"[^a-z0-9_.-]+", "_", str(tool_family or "unknown").strip().lower()) or "unknown"
+    if family not in {"docs", "project", "workspace", "media", "unknown"}:
+        family = "unknown"
     code = re.sub(r"[^a-z0-9_.-]+", "_", str(error_code or "unknown").strip().lower()) or "unknown"
+    if code not in _SAFE_FAILURE_CODES:
+        code = "tool_error"
     return ToolFailureSignature(family, code, _normalize_root_cause(root_cause))
 
 
@@ -307,6 +451,7 @@ def parse_structured_tool_failure(value: Any) -> dict[str, Any] | None:
                     "error_code": "docs_access_internal",
                     "retryable": False,
                     "error": "Docsの内部処理に失敗しました。",
+                    "root_cause": "docs_access_internal",
                 }
             return None
         payload = parsed if isinstance(parsed, dict) else {}
@@ -314,10 +459,19 @@ def parse_structured_tool_failure(value: Any) -> dict[str, Any] | None:
         payload = {}
     if payload.get("success", True) is not False:
         return None
+    error = str(
+        payload.get("error") or payload.get("message") or ""
+    )
+    diagnostic_code = str(
+        payload.get("diagnostic_code") or ""
+    ).strip()
+    retryable_value = payload.get("retryable", False)
+    retryable = retryable_value if isinstance(retryable_value, bool) else False
     return {
         "error_code": str(payload.get("error_code") or payload.get("code") or "tool_error"),
-        "retryable": bool(payload.get("retryable", False)),
-        "error": str(payload.get("error") or payload.get("message") or ""),
+        "retryable": retryable,
+        "error": error,
+        "root_cause": diagnostic_code or error,
     }
 
 
@@ -352,7 +506,7 @@ class ToolFailureCircuitBreaker:
         if parsed:
             error_code = parsed["error_code"]
             retryable = parsed["retryable"]
-            root_cause = parsed["error"]
+            root_cause = parsed.get("root_cause") or parsed["error"]
         if retryable is None:
             retryable = False
         signature = normalize_tool_failure_signature(tool_family, error_code, root_cause)

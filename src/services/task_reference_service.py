@@ -7,7 +7,7 @@ from pathlib import PurePosixPath
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
@@ -17,6 +17,71 @@ from ..memory.models import (
     ConversationSession,
     TaskReference,
 )
+from ..memory.project_repository import ProjectRepository
+
+
+async def conversation_reference_visible(
+    session: AsyncSession,
+    conversation: ConversationSession | None,
+    *,
+    user_id: UUID,
+    project_id: UUID | str | None,
+) -> bool:
+    """Return whether a conversation may be referenced from a Project task.
+
+    Owner/participant membership alone is insufficient for a Work Intelligence
+    reference.  Project-bound conversations must be in the task's current
+    Project and the actor must retain a live Project ``read`` grant.  A
+    projectless conversation is not referenceable from a project task.
+    """
+
+    if conversation is None or getattr(conversation, "deleted_at", None) is not None:
+        return False
+    try:
+        actor_uuid = UUID(str(user_id))
+        expected_project = UUID(str(project_id)) if project_id is not None else None
+        conversation_project = (
+            UUID(str(conversation.project_id))
+            if getattr(conversation, "project_id", None) is not None
+            else None
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if expected_project is None or conversation_project is None:
+        return False
+    if expected_project != conversation_project:
+        return False
+
+    owner_match = str(getattr(conversation, "user_id", "")) == str(actor_uuid)
+    participant_match = False
+    if not owner_match:
+        try:
+            participant_match = (
+                await session.scalar(
+                    select(ConversationParticipant.id).where(
+                        ConversationParticipant.session_id == conversation.id,
+                        ConversationParticipant.participant_type == "user",
+                        ConversationParticipant.participant_id == str(actor_uuid),
+                        ConversationParticipant.status == "joined",
+                    )
+                )
+                is not None
+            )
+        except Exception:
+            return False
+    if not owner_match and not participant_match:
+        return False
+    try:
+        return bool(
+            await ProjectRepository.has_permission(
+                session,
+                project_id=expected_project,
+                user_id=actor_uuid,
+                permission="read",
+            )
+        )
+    except Exception:
+        return False
 
 
 async def resolve_agent_run_origin(
@@ -24,6 +89,7 @@ async def resolve_agent_run_origin(
     *,
     agent_run_id: str | UUID | None,
     user_id: UUID,
+    project_id: UUID | str | None = None,
 ) -> dict[str, Any] | None:
     """現在Runから親を辿り、閲覧可能な発生元チャットを返す。"""
     try:
@@ -42,21 +108,15 @@ async def resolve_agent_run_origin(
                 select(ConversationSession).where(
                     ConversationSession.id == run.session_id,
                     ConversationSession.deleted_at.is_(None),
-                    or_(
-                        ConversationSession.user_id == str(user_id),
-                        ConversationSession.id.in_(
-                            select(ConversationParticipant.session_id).where(
-                                ConversationParticipant.session_id == run.session_id,
-                                ConversationParticipant.participant_type == "user",
-                                ConversationParticipant.participant_id == str(user_id),
-                                ConversationParticipant.status == "joined",
-                            )
-                        ),
-                    ),
                 )
             )
             conversation = access.scalar_one_or_none()
-            if conversation is not None:
+            if await conversation_reference_visible(
+                session,
+                conversation,
+                user_id=user_id,
+                project_id=project_id,
+            ):
                 return {
                     "session": conversation,
                     "source_run_id": run.id,
@@ -147,7 +207,10 @@ async def attach_agent_run_source_reference(
     agent_run_id: str | UUID | None,
 ) -> TaskReference | None:
     origin = await resolve_agent_run_origin(
-        session, agent_run_id=agent_run_id, user_id=user_id
+        session,
+        agent_run_id=agent_run_id,
+        user_id=user_id,
+        project_id=project_id,
     )
     if origin is None:
         return None

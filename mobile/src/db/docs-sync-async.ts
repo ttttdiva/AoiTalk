@@ -10,6 +10,10 @@
  */
 
 import { getSqlite } from "./client";
+import {
+  hasPendingForegroundSqliteWrite,
+  runBackgroundSqliteWrite,
+} from "./sqlite-write-coordinator";
 
 export type DocsSqliteAsyncStatement = {
   executeAsync: (params?: unknown[] | Record<string, unknown>) => Promise<unknown>;
@@ -53,13 +57,110 @@ export function docsSqliteAsyncAvailable(): boolean {
 export function withDocsExclusiveTransaction<T>(
   task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
 ): Promise<T> {
-  return (async () => {
+  return runBackgroundSqliteWrite(async () => {
     let result!: T;
     await asAsyncDatabase().withExclusiveTransactionAsync(async (tx) => {
       result = await task(tx);
     });
     return result;
-  })();
+  });
+}
+
+class ForegroundSqliteWriteRequestedError extends Error {
+  constructor() {
+    super("foreground SQLite write requested");
+    this.name = "ForegroundSqliteWriteRequestedError";
+  }
+}
+
+function yieldIfForegroundWriteIsWaiting(): void {
+  if (hasPendingForegroundSqliteWrite()) {
+    throw new ForegroundSqliteWriteRequestedError();
+  }
+}
+
+function foregroundYieldingTransaction(
+  tx: DocsSqliteAsyncTransaction,
+): DocsSqliteAsyncTransaction {
+  const yielding: DocsSqliteAsyncTransaction = {
+    getAllAsync: <T>(
+      source: string,
+      ...params: unknown[]
+    ): Promise<T[]> => {
+      yieldIfForegroundWriteIsWaiting();
+      return tx.getAllAsync<T>(source, ...params);
+    },
+    getFirstAsync: <T>(
+      source: string,
+      ...params: unknown[]
+    ): Promise<T | null> => {
+      yieldIfForegroundWriteIsWaiting();
+      return tx.getFirstAsync<T>(source, ...params);
+    },
+    runAsync: (
+      source: string,
+      ...params: unknown[]
+    ): Promise<unknown> => {
+      yieldIfForegroundWriteIsWaiting();
+      return tx.runAsync(source, ...params);
+    },
+  };
+
+  if (tx.prepareAsync) {
+    yielding.prepareAsync = async (
+      source: string,
+    ): Promise<DocsSqliteAsyncStatement> => {
+      yieldIfForegroundWriteIsWaiting();
+      const statement = await tx.prepareAsync!(source);
+      return {
+        executeAsync: (
+          params?: unknown[] | Record<string, unknown>,
+        ): Promise<unknown> => {
+          yieldIfForegroundWriteIsWaiting();
+          return statement.executeAsync(params);
+        },
+        // Resource cleanup must never be skipped merely because foreground
+        // work arrived while the statement was active.
+        finalizeAsync: () => statement.finalizeAsync(),
+      };
+    };
+  }
+
+  return yielding;
+}
+
+/**
+ * Run a retry-safe long Docs transaction while allowing queued interactive
+ * writes to take priority.
+ *
+ * A foreground request causes the current native transaction to throw and
+ * roll back at the next SQLite statement boundary. The coordinator then
+ * executes the queued foreground write before this background transaction is
+ * re-enqueued. No two SQLite writes run concurrently.
+ *
+ * Use only for callbacks whose externally visible effects are contained in
+ * the SQLite transaction and therefore safe to repeat after rollback.
+ */
+export async function withForegroundYieldingDocsExclusiveTransaction<T>(
+  task: (tx: DocsSqliteAsyncTransaction) => Promise<T>,
+): Promise<T> {
+  for (;;) {
+    try {
+      return await withDocsExclusiveTransaction(async (tx) => {
+        const result = await task(foregroundYieldingTransaction(tx));
+        // Close the small window between the final SQL statement and commit.
+        yieldIfForegroundWriteIsWaiting();
+        return result;
+      });
+    } catch (error) {
+      if (!(error instanceof ForegroundSqliteWriteRequestedError)) {
+        throw error;
+      }
+      // The failed exclusive transaction has rolled back. Re-enqueue the
+      // complete background transaction; coordinator priority lets the
+      // already-waiting foreground operation run first.
+    }
+  }
 }
 
 /** Drizzle's `text(..., { mode: "json" })` wire representation. */

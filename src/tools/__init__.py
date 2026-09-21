@@ -1,5 +1,12 @@
 """Tools package for voice assistant runtime."""
 
+import logging
+
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
+
 from .core import ToolDefinition, tool
 from .registry import get_registry, init_global_tools_registry, register_tool
 from ..features import Features
@@ -85,7 +92,11 @@ for _tool_def in _tools_to_register:
     if isinstance(_tool_def, ToolDefinition):
         register_tool(_tool_def)
 
-print(f"[Tools] {len(get_registry())} tools registered")
+logger.info(
+    "Tool registry initialized (%s tools registered)",
+    len(get_registry()),
+    extra=FILE_ONLY_LOG_EXTRA,
+)
 
 __all__ = [
     "ToolDefinition",

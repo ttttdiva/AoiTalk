@@ -35,6 +35,134 @@ logger = logging.getLogger(__name__)
 MAX_USER_CSV_BYTES = 2 * 1024 * 1024
 MAX_USER_CSV_ROWS = 10_000
 
+# AD identities are credential-managed by the directory.  Keep this message
+# deliberately free of directory details (host names, DNs, objectGUIDs, and
+# exception text) because it is returned at a browser/API boundary.
+AD_PASSWORD_OPERATION_DETAIL = (
+    "Active Directory managed users do not have local passwords; "
+    "manage credentials through Active Directory."
+)
+
+
+def _normalized_auth_source(user: object, serialized: dict[str, object] | None = None) -> str:
+    """Return the account's explicit credential source safely.
+
+    The migration backfills existing rows as ``local``.  The fallback is also
+    intentional for old test doubles / rolling deployments that do not expose
+    ``auth_source`` yet: absence must never turn an ordinary local account into
+    an AD account.
+    """
+
+    raw = getattr(user, "auth_source", None)
+    if raw is None and isinstance(user, dict):
+        raw = user.get("auth_source")
+    if raw is None and isinstance(serialized, dict):
+        raw = serialized.get("auth_source")
+    value = str(getattr(raw, "value", raw) or "local").strip().lower()
+    return (
+        "ad"
+        if value in {"ad", "active_directory", "active-directory", "active directory"}
+        else "local"
+    )
+
+
+def _is_ad_managed(user: object) -> bool:
+    """Whether ``user`` is an AD-managed account (never inferred by name)."""
+
+    return _normalized_auth_source(user) == "ad"
+
+
+def _serialize_user(user: object) -> dict[str, object]:
+    """Serialize an admin-visible user with safe source metadata.
+
+    ``User.to_dict`` intentionally omits password hashes and directory
+    identifiers.  This defensive wrapper keeps the source marker present for
+    old model instances and lightweight test doubles without exposing any
+    additional AD identity material.
+    """
+
+    serializer = getattr(user, "to_dict", None)
+    if callable(serializer):
+        try:
+            candidate = serializer()
+        except Exception:
+            candidate = None
+    elif isinstance(user, dict):
+        candidate = dict(user)
+    else:
+        candidate = None
+    data: dict[str, object] = dict(candidate) if isinstance(candidate, dict) else {}
+    # Keep this boundary defensive even if a future serializer grows extra
+    # fields.  Directory identifiers and credential material are never needed
+    # by the admin UI and must not cross the API response boundary.
+    for sensitive_key in {
+        "password",
+        "password_hash",
+        "object_guid",
+        "objectGUID",
+        "external_id",
+        "external_identity_bindings",
+        "distinguished_name",
+        "dn",
+    }:
+        data.pop(sensitive_key, None)
+    data["auth_source"] = _normalized_auth_source(user, data)
+    return data
+
+
+def _is_external_password_error(exc: BaseException) -> bool:
+    """Recognize repository-level AD password guards without hard coupling.
+
+    The repository owns the persistence-level guard and may expose a dedicated
+    exception class.  Routes remain compatible with older deployments and
+    test doubles by recognizing the stable class-name/attribute contract only;
+    arbitrary database errors are still treated as internal failures.
+    """
+
+    cls_name = exc.__class__.__name__
+    if cls_name in {
+        "ExternalIdentityCredentialError",
+        "ADPasswordOperationError",
+        "PasswordOperationNotAllowed",
+    }:
+        return True
+    return getattr(exc, "auth_source", None) == "ad"
+
+
+async def _load_user_for_password_operation(
+    repository: object,
+    session: object,
+    user_id: object,
+    *,
+    lock: bool = True,
+) -> object | None:
+    """Load a target account, preferring the row-locking repository API."""
+
+    method_name = "get_by_id_locked" if lock else "get_by_id"
+    loader = getattr(repository, method_name, None)
+    if not callable(loader):
+        loader = getattr(repository, "get_by_id", None)
+    if not callable(loader):
+        return None
+    candidate = loader(session, user_id)
+    return await candidate if inspect.isawaitable(candidate) else candidate
+
+
+def _has_user_loader(repository: object, *, lock: bool = True) -> bool:
+    """Whether a repository can preflight a password-operation target."""
+
+    method_name = "get_by_id_locked" if lock else "get_by_id"
+    return callable(getattr(repository, method_name, None)) or callable(
+        getattr(repository, "get_by_id", None)
+    )
+
+
+def _reject_ad_password_operation(user: object) -> None:
+    """Raise the public-safe conflict used by all local password operations."""
+
+    if _is_ad_managed(user):
+        raise HTTPException(status_code=409, detail=AD_PASSWORD_OPERATION_DETAIL)
+
 
 def _parse_csv_bool(value: object, *, default: bool | None = None) -> bool:
     """Parse the small, explicit CSV boolean vocabulary.
@@ -157,7 +285,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
 
                 return JSONResponse(
                     {
-                        "users": [user.to_dict() for user in users],
+                        "users": [_serialize_user(user) for user in users],
                         "total_count": total_count,
                         "limit": limit,
                         "offset": offset,
@@ -182,6 +310,19 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                 detail="User management is not available (database not configured)",
             )
 
+        # This endpoint creates local break-glass/application accounts only;
+        # AD users are created JIT by a successful directory authentication.
+        # Keep the guard future-proof if a rolling payload gains an explicit
+        # source field rather than accidentally provisioning an AD shadow hash.
+        requested_source = getattr(payload, "auth_source", None)
+        if (
+            requested_source is not None
+            and str(requested_source).strip().lower() != "local"
+        ):
+            raise HTTPException(
+                status_code=409, detail=AD_PASSWORD_OPERATION_DETAIL
+            )
+
         try:
             session = await server._db_manager.get_session()
             try:
@@ -199,7 +340,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                 return JSONResponse(
                     {
                         "success": True,
-                        "user": user.to_dict(),
+                        "user": _serialize_user(user),
                         "message": f"User '{payload.username}' created successfully",
                     }
                 )
@@ -452,6 +593,12 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                             )
 
                             if existing_user:
+                                # CSV import is a local-account maintenance
+                                # path.  A non-empty password must never be
+                                # applied to an AD-managed account; reject the
+                                # whole row before profile fields are changed.
+                                if password:
+                                    _reject_ad_password_operation(existing_user)
                                 if (
                                     getattr(existing_user, "role", None) == "admin"
                                     and bool(getattr(existing_user, "is_active", False))
@@ -575,7 +722,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                 if not user:
                     raise HTTPException(status_code=404, detail="User not found")
 
-                return JSONResponse({"user": user.to_dict()})
+                return JSONResponse({"user": _serialize_user(user)})
             finally:
                 await session.close()
         except HTTPException:
@@ -646,6 +793,17 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                     if not existing:
                         raise HTTPException(status_code=404, detail="User not found")
 
+                    # ``is_password_reset_required`` is a local credential
+                    # lifecycle flag.  AD users are always reset-free and
+                    # must remain managed by the directory, so reject both
+                    # attempts to request and attempts to clear a local reset
+                    # through the generic admin patch endpoint.
+                    if (
+                        _is_ad_managed(existing)
+                        and "is_password_reset_required" in update_data
+                    ):
+                        _reject_ad_password_operation(existing)
+
                     if "user_settings" in update_data:
                         update_data["user_settings"] = UserRepository.merge_user_settings(
                             existing.user_settings, update_data["user_settings"]
@@ -673,7 +831,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                     response = JSONResponse(
                         {
                             "success": True,
-                            "user": user.to_dict(),
+                            "user": _serialize_user(user),
                             "message": f"User '{user.username}' updated successfully",
                         }
                     )
@@ -717,6 +875,17 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
             session = await server._db_manager.get_session()
             try:
                 async with session.begin():
+                    can_preflight = _has_user_loader(UserRepository, lock=True)
+                    target = await _load_user_for_password_operation(
+                        UserRepository,
+                        session,
+                        uuid_obj,
+                        lock=True,
+                    )
+                    if can_preflight and not target:
+                        raise HTTPException(status_code=404, detail="User not found")
+                    if target is not None:
+                        _reject_ad_password_operation(target)
                     request_reset = getattr(
                         UserRepository, "request_password_reset", None
                     )
@@ -732,7 +901,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                     )
                     if not user:
                         raise HTTPException(status_code=404, detail="User not found")
-                    serialized = user.to_dict()
+                    serialized = _serialize_user(user)
                 return JSONResponse(
                     {
                         "success": True,
@@ -745,6 +914,10 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
         except HTTPException:
             raise
         except ValueError as exc:
+            if _is_external_password_error(exc):
+                raise HTTPException(
+                    status_code=409, detail=AD_PASSWORD_OPERATION_DETAIL
+                ) from exc
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as exc:
             logger.error(f"Failed to issue password reset link: {exc}")
@@ -791,7 +964,7 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                         raise HTTPException(status_code=404, detail="User not found")
 
                     username = user.username
-                    serialized_user = user.to_dict()
+                    serialized_user = _serialize_user(user)
                 if not user:
                     raise HTTPException(status_code=404, detail="User not found")
 
@@ -913,6 +1086,17 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
         try:
             session = await server._db_manager.get_session()
             try:
+                can_preflight = _has_user_loader(UserRepository, lock=True)
+                target = await _load_user_for_password_operation(
+                    UserRepository,
+                    session,
+                    uuid_obj,
+                    lock=True,
+                )
+                if can_preflight and not target:
+                    raise HTTPException(status_code=404, detail="User not found")
+                if target is not None:
+                    _reject_ad_password_operation(target)
                 success = await UserRepository.update_password(
                     session=session,
                     user_id=uuid_obj,
@@ -931,6 +1115,12 @@ def register_user_admin_routes(app: FastAPI, server: "WebChatServer") -> None:
                 await session.close()
         except HTTPException:
             raise
+        except ValueError as exc:
+            if _is_external_password_error(exc):
+                raise HTTPException(
+                    status_code=409, detail=AD_PASSWORD_OPERATION_DETAIL
+                ) from exc
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         except Exception as e:
             logger.error(f"Failed to change password: {e}")
             raise HTTPException(status_code=500, detail="Failed to change password")

@@ -25,6 +25,13 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from .outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
+
 logger = logging.getLogger(__name__)
 
 # 出力ディレクトリ
@@ -291,8 +298,10 @@ class ComfyUIService:
         max_download_bytes: int = 64 * 1024 * 1024,
         max_upload_bytes: int = 32 * 1024 * 1024,
         max_upload_response_bytes: int = 64 * 1024,
+        config: Any | None = None,
     ):
         self.enabled = bool(enabled)
+        self.config = config
         self.base_url = validate_comfyui_base_url(base_url)
         if workflows_dir:
             self.workflows_dir = Path(workflows_dir)
@@ -311,6 +320,63 @@ class ComfyUIService:
         
         # ワークフローディレクトリの確保
         self.workflows_dir.mkdir(parents=True, exist_ok=True)
+
+    def _privacy_gateway(self) -> OutboundPrivacyGateway:
+        """Resolve the common gateway for ComfyUI HTTP transactions.
+
+        ComfyUI is loopback by default, but the configured URL may be an
+        explicitly allowlisted remote worker.  Keeping the policy boundary
+        here prevents a remote worker from becoming an unreviewed image/
+        prompt sink while preserving the trusted-local fast path.
+        """
+
+        config = self.config
+        if config is None:
+            try:
+                from ..config import Config
+
+                config = Config()
+                self.config = config
+            except Exception:
+                # A directly constructed loopback service remains usable in
+                # stripped/test environments.  Remote destinations without
+                # an application policy are fail-closed below.
+                config = None
+        host = (urlsplit(self.base_url).hostname or "").strip().lower()
+        local_host = host in {"localhost", "localhost.localdomain"}
+        if not local_host:
+            try:
+                local_host = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                local_host = False
+        if config is None and not local_host:
+            raise PrivacyError("ComfyUI privacy configuration is unavailable")
+        inherited = get_privacy_policy_context()
+        try:
+            from .turn_context import get_turn_context
+
+            turn = get_turn_context()
+        except Exception:
+            turn = None
+        session_context = inherited.session_context
+        project_metadata = inherited.project_metadata
+        user_id = str(
+            (session_context or {}).get("user_id")
+            if isinstance(session_context, Mapping)
+            else ""
+        ) or str(getattr(turn, "user_id", "") or "")
+        session_id = str(
+            (session_context or {}).get("session_id")
+            if isinstance(session_context, Mapping)
+            else ""
+        ) or str(getattr(turn, "session_id", "") or "")
+        return OutboundPrivacyGateway(
+            config,
+            user_id=user_id,
+            session_id=session_id,
+            session_context=session_context,
+            project_metadata=project_metadata,
+        )
 
     def _http_session(self, timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
         # Revalidate policy at request time, then pin the connector to the exact
@@ -337,6 +403,7 @@ class ComfyUIService:
             default_workflow_path=comfyui_conf.get("default_workflow"),
             workflows_dir=comfyui_conf.get("workflows_dir"),
             timeout_seconds=comfyui_conf.get("timeout_seconds", 120),
+            config=config,
         )
 
     async def is_available(self) -> bool:
@@ -344,13 +411,8 @@ class ComfyUIService:
         if not self.enabled:
             return False
         try:
-            timeout = aiohttp.ClientTimeout(total=5)
-            async with self._http_session(timeout) as session:
-                async with session.get(
-                    f"{self.base_url}/system_stats",
-                    allow_redirects=False,
-                ) as resp:
-                    return resp.status == 200
+            await self._request_json("GET", "/system_stats", timeout_seconds=5)
+            return True
         except Exception:
             return False
 
@@ -362,39 +424,77 @@ class ComfyUIService:
         payload: Mapping[str, Any] | None = None,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
-        timeout = aiohttp.ClientTimeout(
-            total=float(timeout_seconds or min(self.timeout_seconds, 30))
-        )
-        try:
-            async with self._http_session(timeout) as session:
-                async with session.request(
-                    method,
-                    f"{self.base_url}{path}",
-                    json=dict(payload) if payload is not None else None,
-                    allow_redirects=False,
-                ) as response:
-                    if 300 <= response.status < 400:
-                        raise ComfyUIError(
-                            f"ComfyUI {path} redirectは許可されていません"
-                        )
-                    if response.status < 200 or response.status >= 300:
-                        raise ComfyUIError(
-                            f"ComfyUI {path} 失敗: HTTP {response.status}"
-                        )
-                    body = await response.text()
-                    if not body.strip():
-                        value = {}
-                    else:
-                        try:
-                            value = json.loads(body)
-                        except json.JSONDecodeError as exc:
+        normalized_method = str(method or "").strip().upper()
+        if not normalized_method or not isinstance(path, str) or not path.startswith("/"):
+            raise ComfyUIError("ComfyUI request method/pathが不正です")
+        destination = f"{self.base_url}{path}"
+        request_payload = {
+            "method": normalized_method,
+            "path": path,
+            "payload": dict(payload) if payload is not None else None,
+        }
+
+        async def send(final_payload: Any) -> dict[str, Any]:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("ComfyUI outbound payload is malformed")
+            if str(final_payload.get("method") or "").strip().upper() != normalized_method:
+                raise PrivacyError("ComfyUI method binding changed")
+            if final_payload.get("path") != path:
+                raise PrivacyError("ComfyUI path binding changed")
+            final_body = final_payload.get("payload")
+            if final_body is not None and not isinstance(final_body, Mapping):
+                raise PrivacyError("ComfyUI JSON payload is malformed")
+            timeout = aiohttp.ClientTimeout(
+                total=float(timeout_seconds or min(self.timeout_seconds, 30))
+            )
+            try:
+                async with self._http_session(timeout) as session:
+                    async with session.request(
+                        normalized_method,
+                        destination,
+                        json=dict(final_body) if final_body is not None else None,
+                        allow_redirects=False,
+                    ) as response:
+                        if 300 <= response.status < 400:
                             raise ComfyUIError(
-                                f"ComfyUI {path} の応答がJSONではありません"
-                            ) from exc
-        except ComfyUIError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise ComfyUIError(f"ComfyUI {path} 通信失敗: {exc}") from exc
+                                f"ComfyUI {path} redirectは許可されていません"
+                            )
+                        if response.status < 200 or response.status >= 300:
+                            raise ComfyUIError(
+                                f"ComfyUI {path} 失敗: HTTP {response.status}"
+                            )
+                        body = await response.text()
+                        if not body.strip():
+                            value = {}
+                        else:
+                            try:
+                                value = json.loads(body)
+                            except json.JSONDecodeError as exc:
+                                raise ComfyUIError(
+                                    f"ComfyUI {path} の応答がJSONではありません"
+                                ) from exc
+            except ComfyUIError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise ComfyUIError(f"ComfyUI {path} 通信失敗: {exc}") from exc
+            if not isinstance(value, Mapping):
+                raise ComfyUIError(f"ComfyUI {path} の応答がJSON objectではありません")
+            return dict(value)
+
+        value = await self._privacy_gateway().execute(
+            request_payload,
+            provider="comfyui",
+            descriptor=EgressDescriptor(
+                action=f"comfyui.{normalized_method.lower()}",
+                transport="aiohttp.ClientSession.request",
+                destination=destination,
+                provider="comfyui",
+                tool="comfyui",
+            ),
+            sender=send,
+            base_url=destination,
+            source_kind="comfyui_http",
+        )
         if not isinstance(value, Mapping):
             raise ComfyUIError(f"ComfyUI {path} の応答がJSON objectではありません")
         return dict(value)
@@ -482,58 +582,106 @@ class ComfyUIService:
             raise ValueError("ComfyUI upload checksumが不正です")
         if hashlib.sha256(content).hexdigest() != checksum:
             raise ValueError("ComfyUI upload checksumがbytesと一致しません")
-        form = aiohttp.FormData()
-        form.add_field(
-            "image",
-            content,
-            filename=safe_filename,
-            content_type=safe_mime,
-        )
-        form.add_field("type", "input")
-        form.add_field("subfolder", safe_subfolder)
-        form.add_field("overwrite", "true")
-        timeout = aiohttp.ClientTimeout(
-            total=float(timeout_seconds or min(self.timeout_seconds, 30))
-        )
-        try:
-            async with self._http_session(timeout) as session:
-                async with session.request(
-                    "POST",
-                    f"{self.base_url}/upload/image",
-                    data=form,
-                    allow_redirects=False,
-                ) as response:
-                    if 300 <= response.status < 400:
-                        raise ComfyUIError(
-                            "ComfyUI /upload/image redirectは許可されていません"
-                        )
-                    if response.status < 200 or response.status >= 300:
-                        raise ComfyUIError(
-                            f"ComfyUI /upload/image 失敗: HTTP {response.status}"
-                        )
-                    chunks: list[bytes] = []
-                    response_size = 0
-                    while True:
-                        chunk = await response.content.read(16 * 1024)
-                        if not chunk:
-                            break
-                        response_size += len(chunk)
-                        if response_size > self.max_upload_response_bytes:
+        destination = f"{self.base_url}/upload/image"
+        request_payload = {
+            "method": "POST",
+            "path": "/upload/image",
+            "content": content,
+            "filename": safe_filename,
+            "subfolder": safe_subfolder,
+            "mime_type": safe_mime,
+        }
+
+        async def send(final_payload: Any) -> dict[str, Any]:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("ComfyUI upload payload is malformed")
+            if str(final_payload.get("method") or "").upper() != "POST":
+                raise PrivacyError("ComfyUI upload method binding changed")
+            if final_payload.get("path") != "/upload/image":
+                raise PrivacyError("ComfyUI upload path binding changed")
+            outbound_content = final_payload.get("content")
+            if not isinstance(outbound_content, (bytes, bytearray, memoryview)):
+                raise PrivacyError("ComfyUI upload content is unavailable")
+            if bytes(outbound_content) != content:
+                raise PrivacyError("ComfyUI upload content binding changed")
+            if final_payload.get("filename") != safe_filename:
+                raise PrivacyError("ComfyUI upload filename binding changed")
+            if final_payload.get("subfolder") != safe_subfolder:
+                raise PrivacyError("ComfyUI upload subfolder binding changed")
+            if final_payload.get("mime_type") != safe_mime:
+                raise PrivacyError("ComfyUI upload MIME binding changed")
+            form = aiohttp.FormData()
+            form.add_field(
+                "image",
+                bytes(outbound_content),
+                filename=safe_filename,
+                content_type=safe_mime,
+            )
+            form.add_field("type", "input")
+            form.add_field("subfolder", safe_subfolder)
+            form.add_field("overwrite", "true")
+            timeout = aiohttp.ClientTimeout(
+                total=float(timeout_seconds or min(self.timeout_seconds, 30))
+            )
+            try:
+                async with self._http_session(timeout) as session:
+                    async with session.request(
+                        "POST",
+                        destination,
+                        data=form,
+                        allow_redirects=False,
+                    ) as response:
+                        if 300 <= response.status < 400:
                             raise ComfyUIError(
-                                "ComfyUI /upload/image 応答sizeが上限を超えています"
+                                "ComfyUI /upload/image redirectは許可されていません"
                             )
-                        chunks.append(chunk)
-                    body = b"".join(chunks)
-        except ComfyUIError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise ComfyUIError(f"ComfyUI /upload/image 通信失敗: {exc}") from exc
-        try:
-            value = json.loads(body.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ComfyUIError(
-                "ComfyUI /upload/image 応答がJSONではありません"
-            ) from exc
+                        if response.status < 200 or response.status >= 300:
+                            raise ComfyUIError(
+                                f"ComfyUI /upload/image 失敗: HTTP {response.status}"
+                            )
+                        chunks: list[bytes] = []
+                        response_size = 0
+                        while True:
+                            chunk = await response.content.read(16 * 1024)
+                            if not chunk:
+                                break
+                            response_size += len(chunk)
+                            if response_size > self.max_upload_response_bytes:
+                                raise ComfyUIError(
+                                    "ComfyUI /upload/image 応答sizeが上限を超えています"
+                                )
+                            chunks.append(chunk)
+                        body = b"".join(chunks)
+            except ComfyUIError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise ComfyUIError(f"ComfyUI /upload/image 通信失敗: {exc}") from exc
+            try:
+                value = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ComfyUIError(
+                    "ComfyUI /upload/image 応答がJSONではありません"
+                ) from exc
+            if not isinstance(value, Mapping):
+                raise ComfyUIError(
+                    "ComfyUI /upload/image 応答がJSON objectではありません"
+                )
+            return dict(value)
+
+        value = await self._privacy_gateway().execute(
+            request_payload,
+            provider="comfyui",
+            descriptor=EgressDescriptor(
+                action="comfyui.upload_image",
+                transport="aiohttp.ClientSession.request",
+                destination=destination,
+                provider="comfyui",
+                tool="comfyui",
+            ),
+            sender=send,
+            base_url=destination,
+            source_kind="comfyui_upload",
+        )
         if not isinstance(value, Mapping):
             raise ComfyUIError(
                 "ComfyUI /upload/image 応答がJSON objectではありません"
@@ -720,38 +868,66 @@ class ComfyUIService:
         }
         if not params["filename"]:
             raise ValueError("output locatorにfilenameが必要です")
-        timeout = aiohttp.ClientTimeout(total=min(self.timeout_seconds, 30))
-        try:
-            async with self._http_session(timeout) as session:
-                async with session.get(
-                    f"{self.base_url}/view",
-                    params=params,
-                    allow_redirects=False,
-                ) as response:
-                    if 300 <= response.status < 400:
-                        raise ComfyUIError("ComfyUI /view redirectは許可されていません")
-                    if response.status != 200:
-                        raise ComfyUIError(
-                            f"ComfyUI /view 失敗: HTTP {response.status}"
-                        )
-                    content_type = str(response.headers.get("Content-Type") or "")
-                    if not content_type.lower().startswith("image/"):
-                        raise ComfyUIError("ComfyUI /view がimage content-typeではありません")
-                    declared = response.content_length
-                    if declared is not None and declared > self.max_download_bytes:
-                        raise ComfyUIError("ComfyUI /view の画像が上限を超えています")
-                    chunks: list[bytes] = []
-                    received = 0
-                    async for chunk in response.content.iter_chunked(64 * 1024):
-                        received += len(chunk)
-                        if received > self.max_download_bytes:
+        destination = f"{self.base_url}/view"
+        request_payload = {"method": "GET", "path": "/view", "params": params}
+
+        async def send(final_payload: Any) -> bytes:
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError("ComfyUI view payload is malformed")
+            if str(final_payload.get("method") or "").upper() != "GET":
+                raise PrivacyError("ComfyUI view method binding changed")
+            if final_payload.get("path") != "/view":
+                raise PrivacyError("ComfyUI view path binding changed")
+            final_params = final_payload.get("params")
+            if not isinstance(final_params, Mapping) or dict(final_params) != params:
+                raise PrivacyError("ComfyUI view locator binding changed")
+            timeout = aiohttp.ClientTimeout(total=min(self.timeout_seconds, 30))
+            try:
+                async with self._http_session(timeout) as session:
+                    async with session.get(
+                        destination,
+                        params=dict(final_params),
+                        allow_redirects=False,
+                    ) as response:
+                        if 300 <= response.status < 400:
+                            raise ComfyUIError("ComfyUI /view redirectは許可されていません")
+                        if response.status != 200:
+                            raise ComfyUIError(
+                                f"ComfyUI /view 失敗: HTTP {response.status}"
+                            )
+                        content_type = str(response.headers.get("Content-Type") or "")
+                        if not content_type.lower().startswith("image/"):
+                            raise ComfyUIError("ComfyUI /view がimage content-typeではありません")
+                        declared = response.content_length
+                        if declared is not None and declared > self.max_download_bytes:
                             raise ComfyUIError("ComfyUI /view の画像が上限を超えています")
-                        chunks.append(chunk)
-                    return b"".join(chunks)
-        except ComfyUIError:
-            raise
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            raise ComfyUIError(f"ComfyUI /view 通信失敗: {exc}") from exc
+                        chunks: list[bytes] = []
+                        received = 0
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            received += len(chunk)
+                            if received > self.max_download_bytes:
+                                raise ComfyUIError("ComfyUI /view の画像が上限を超えています")
+                            chunks.append(chunk)
+                        return b"".join(chunks)
+            except ComfyUIError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                raise ComfyUIError(f"ComfyUI /view 通信失敗: {exc}") from exc
+
+        return await self._privacy_gateway().execute(
+            request_payload,
+            provider="comfyui",
+            descriptor=EgressDescriptor(
+                action="comfyui.view",
+                transport="aiohttp.ClientSession.get",
+                destination=destination,
+                provider="comfyui",
+                tool="comfyui",
+            ),
+            sender=send,
+            base_url=destination,
+            source_kind="comfyui_view",
+        )
 
     async def list_workflows(self) -> list[dict[str, Any]]:
         """利用可能なワークフローJSONの一覧を取得する。"""
@@ -931,17 +1107,7 @@ class ComfyUIService:
     async def _select_available_checkpoint(self) -> str:
         """ComfyUI に登録されている checkpoint から実在するものを選ぶ。"""
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with self._http_session(timeout) as session:
-                async with session.get(
-                    f"{self.base_url}/object_info/CheckpointLoaderSimple",
-                    allow_redirects=False,
-                ) as resp:
-                    if 300 <= resp.status < 400:
-                        raise ComfyUIError("checkpoint 一覧のredirectは許可されていません")
-                    if resp.status != 200:
-                        raise ComfyUIError(f"checkpoint 一覧取得失敗: HTTP {resp.status}")
-                    info = await resp.json()
+            info = await self.object_info("CheckpointLoaderSimple")
         except ComfyUIError:
             raise
         except Exception as e:
@@ -1267,6 +1433,7 @@ def get_comfyui_service(config=None) -> ComfyUIService:
             except Exception:
                 _instance = ComfyUIService()
     elif config:
+        _instance.config = config
         comfyui_conf = config.get("comfyui", {}) if hasattr(config, "get") else {}
         _instance.update_config(
             enabled=comfyui_conf.get("enabled", True),

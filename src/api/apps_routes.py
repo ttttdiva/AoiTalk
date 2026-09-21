@@ -117,8 +117,8 @@ _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{1,119}$")
 # 制御文字を潰しておかないと、展開先や Content-Disposition が壊れる。
 _ARCHIVE_UNSAFE_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
 _ARCHIVE_DRIVE_RE = re.compile(r"^[A-Za-z]:")
-_ARCHIVE_DEPENDENCY_DIRS = APP_IGNORED_PATHS - {"logs", "runtime data", "secrets"}
-_ARCHIVE_RUNTIME_DIRS = {"logs", "runtime data"}
+_ARCHIVE_RUNTIME_DIRS = {".local", ".runtime", "log", "logs", "runtime data"}
+_ARCHIVE_DEPENDENCY_DIRS = APP_IGNORED_PATHS - _ARCHIVE_RUNTIME_DIRS - {"secrets"}
 
 # 入力上限はアップロード/取り込み経路 (app_source_update_service) と同じ定数から
 # 導出する。max_length は文字数なので、byte 上限の MAX_FILE_SIZE をそのまま
@@ -140,6 +140,60 @@ MAX_APP_JSON_DEPTH = 16
 #: AppJob.input_json は AOITALK_APP_INPUT_JSON へ json.dumps されるため、
 #: 実行時に環境変数構築で落ちる前に 422 で弾く。
 MAX_APP_INPUT_JSON_ENV_CHARS = 32_767
+
+
+def _effective_capabilities_for_target(
+    grants: dict[str, Any] | None,
+    *,
+    target_key: str,
+    declared: set[str],
+    targets: list[AppTarget],
+) -> set[str]:
+    """Resolve the currently granted capabilities for one target only.
+
+    ``validate_capability_grants`` intentionally returns a flat set for
+    backwards-compatible callers.  Bridge invocation is target-scoped, so a
+    grant written for another target must not leak merely because both targets
+    declare the same capability.  Validation still runs against every current
+    target to reject malformed/unknown grants before this narrow intersection.
+    """
+
+    raw = grants or {}
+    if not isinstance(raw, dict):
+        # Keep the canonical error text/status from the shared validator.
+        validate_capability_grants(raw, targets)  # type: ignore[arg-type]
+        return set()
+    validate_capability_grants(raw, targets)
+    target_keys = {
+        str(item.target_key or "")
+        for item in targets
+        if str(item.target_key or "")
+    }
+    requested: set[str] = set()
+
+    def _add(values: Any) -> None:
+        if isinstance(values, list):
+            requested.update(
+                str(value).strip()
+                for value in values
+                if isinstance(value, str) and str(value).strip()
+            )
+
+    for key, value in raw.items():
+        normalized_key = str(key)
+        if normalized_key in {"capabilities", "grants", target_key}:
+            _add(value)
+        elif normalized_key in target_keys:
+            # Explicit grants for another target do not apply here.
+            continue
+        elif isinstance(value, bool):
+            if value:
+                requested.add(normalized_key)
+        elif isinstance(value, list):
+            # Legacy ``{"some.capability": [..]}`` shapes are global unless
+            # the key is itself a known target key (handled above).
+            _add(value)
+    return requested.intersection(declared)
 
 
 def _reject_oversized_json(value: dict[str, Any] | None, label: str) -> dict[str, Any] | None:
@@ -816,7 +870,14 @@ def create_apps_router(
             value = get_app_config()
         except Exception:
             return {}
-        return value if isinstance(value, dict) else {}
+        if isinstance(value, dict):
+            return value
+        # WebChatServer exposes the DB-backed Config object at this seam.  The
+        # App Job execution policy consumes the persisted mapping (including
+        # apps.jobs.server_execution_enabled); dropping it here would make the
+        # API silently report every operator-enabled job as disabled.
+        nested = getattr(value, "config", None)
+        return nested if isinstance(nested, dict) else {}
 
     async def current_user(request: Request) -> dict[str, Any]:
         user = await get_user_from_request(request)
@@ -1484,6 +1545,9 @@ def create_apps_router(
                 description=app.description or str(imported_manifest.get("description") or ""),
                 readme=imported_readme,
                 llm_client=get_llm_client() if get_llm_client is not None else None,
+                config=_app_config(),
+                user_id=str(_user_id(user)),
+                project_id=str(project_uuid),
                 manifest=imported_manifest,
                 evidence=imported_evidence,
             )
@@ -1879,6 +1943,9 @@ def create_apps_router(
                 description=app.description or str(manifest.get("description") or ""),
                 readme=readme,
                 llm_client=llm_client,
+                config=_app_config(),
+                user_id=str(_user_id(user)),
+                project_id=str(project_uuid) if project_uuid else None,
                 manifest=manifest,
                 evidence=evidence,
             )
@@ -2045,8 +2112,10 @@ def create_apps_router(
             app, _ = await require_app(session, app_id, user, project_id=project_uuid)
             selected_bundle = await installed_source_bundle(session, app, project_uuid)
             if selected_bundle:
-                return {"files": release_file_entries(selected_bundle[2]), "release_id": str(selected_bundle[1].id)}
-            return {"files": list_app_files(app.id, workspace_root=workspace_root)}
+                files = await asyncio.to_thread(release_file_entries, selected_bundle[2])
+                return {"files": files, "release_id": str(selected_bundle[1].id)}
+            files = await asyncio.to_thread(list_app_files, app.id, workspace_root=workspace_root)
+            return {"files": files}
         finally:
             await session.close()
 
@@ -2434,7 +2503,7 @@ def create_apps_router(
         finally:
             await session.close()
         try:
-            return AppGitService(workspace_root=workspace_root).status(app.id)
+            return await asyncio.to_thread(AppGitService(workspace_root=workspace_root).status, app.id)
         except AppGitError as exc:
             raise _error(503, str(exc)) from exc
 
@@ -2457,7 +2526,7 @@ def create_apps_router(
         finally:
             await session.close()
         try:
-            return {"history": AppGitService(workspace_root=workspace_root).history(app.id, limit=limit)}
+            return {"history": await asyncio.to_thread(AppGitService(workspace_root=workspace_root).history, app.id, limit=limit)}
         except AppGitError as exc:
             raise _error(503, str(exc)) from exc
 
@@ -2474,7 +2543,7 @@ def create_apps_router(
         finally:
             await session.close()
         try:
-            return {"diff": AppGitService(workspace_root=workspace_root).diff(app.id, rev_a, rev_b, path=path)}
+            return {"diff": await asyncio.to_thread(AppGitService(workspace_root=workspace_root).diff, app.id, rev_a, rev_b, path=path)}
         except (AppGitError, AppStorageError) as exc:
             raise _error(400, str(exc)) from exc
 
@@ -2705,7 +2774,16 @@ def create_apps_router(
                 )
             if not any(log_path == root or root in log_path.parents for root in allowed_roots):
                 raise _error(403, "Job log path is outside App scope")
-            return {"job_id": str(job.id), "logs": log_path.read_text(encoding="utf-8") if log_path.exists() else ""}
+            return {
+                "job_id": str(job.id),
+                # Older Windows jobs may have been emitted in the console code
+                # page.  Replace undecodable bytes rather than turning an
+                # otherwise authorized log read into a generic 500; new jobs
+                # force UTF-8 through the runner environment.
+                "logs": log_path.read_text(encoding="utf-8", errors="replace")
+                if log_path.exists()
+                else "",
+            }
         finally:
             await session.close()
 
@@ -3152,8 +3230,6 @@ def create_apps_router(
         capabilities = {
             str(item) for item in token.get("capabilities", []) if isinstance(item, str)
         }
-        if payload.method not in capabilities:
-            raise _error(403, "Project Appで許可されていないCapabilityです")
 
         session = await get_db_manager().get_session()
         try:
@@ -3165,6 +3241,8 @@ def create_apps_router(
             app = await app_or_404(session, app_id)
             project_id = token.get("project_id")
             release_readme: str | None = None
+            release_manifest: dict[str, Any] | None = None
+            binding: ProjectApp | None = None
             if project_id:
                 project_uuid = _uuid(str(project_id), "project_id")
                 binding = await session.scalar(select(ProjectApp).where(
@@ -3216,9 +3294,48 @@ def create_apps_router(
                         expected_sha256=source_artifact.sha256,
                         expected_size_bytes=source_artifact.size_bytes,
                     )
-                    _manifest, _manifest_text, release_readme = release_manifest_and_readme(archive_path)
+                    release_manifest, _manifest_text, release_readme = release_manifest_and_readme(archive_path)
                 except (AppStorageError, OSError, zipfile.BadZipFile) as exc:
                     raise _error(422, "固定ReleaseのREADMEを読み込めません") from exc
+
+            # Re-evaluate the token's capability grant at *use* time.  A
+            # short-lived signed token is not a durable permission: ProjectApp
+            # grants may be revoked, and a target Manifest may be edited after
+            # issuance.  For a pinned Release use that immutable Release
+            # target snapshot; otherwise use the current AppTarget snapshot.
+            if release_manifest is not None:
+                current_snapshot = (release_manifest.get("targets") or {}).get(target_key)
+                current_snapshot = current_snapshot if isinstance(current_snapshot, dict) else {}
+            else:
+                current_snapshot = target.manifest_snapshot if isinstance(target.manifest_snapshot, dict) else {}
+            declared = {
+                str(item)
+                for item in current_snapshot.get("capabilities", [])
+                if isinstance(item, str)
+            }
+            effective_capabilities: set[str] = set()
+            if project_id and binding is not None:
+                targets = list(
+                    (
+                        await session.scalars(
+                            select(AppTarget).where(AppTarget.app_id == target.app_id)
+                        )
+                    ).all()
+                )
+                try:
+                    effective_capabilities = _effective_capabilities_for_target(
+                        binding.capability_grants_json or {},
+                        target_key=target_key,
+                        declared=declared,
+                        targets=targets,
+                    )
+                except ValueError as exc:
+                    raise _error(403, "Project AppのCapability grantが無効です") from exc
+            # Projectless bridge tokens are intentionally capability-free.  A
+            # forged/legacy token carrying capabilities cannot cross this
+            # boundary because the current grant intersection is empty.
+            if payload.method not in capabilities or payload.method not in effective_capabilities:
+                raise _error(403, "Project Appで許可されていないCapabilityです")
             if payload.method == "docs.read":
                 if release_readme is not None:
                     return {
@@ -3364,7 +3481,7 @@ def create_apps_router(
                     # ?with_git=1 を指定したときだけ展開する。
                     if git is not None:
                         try:
-                            item["git_status"] = git.status(app.id)
+                            item["git_status"] = await asyncio.to_thread(git.status, app.id)
                         except AppGitError:
                             item["git_status"] = {"available": False, "clean": None, "revision": None}
                 latest_job = latest_job_by_app.get(app.id)

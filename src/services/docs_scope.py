@@ -13,10 +13,12 @@ from typing import Any, Iterable
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.orm import load_only
 
 from ..memory.models import DocsLibrary, KnowledgeNode, Project, ProjectKnowledgeRef
 from ..memory.project_repository import ProjectRepository
-from .docs_acl import can_read_node
+from .docs_acl import can_read_node, docs_readable_node_predicate
+from .docs_workspace import get_canonical_project_information_node
 
 
 class DocsScopeMode(str, Enum):
@@ -25,6 +27,7 @@ class DocsScopeMode(str, Enum):
     CURRENT_PROJECT = "current_project"
     PROJECT_PLUS_PERSONAL = "project_plus_personal"
     PERSONAL_ONLY = "personal_only"
+    ACCESSIBLE = "accessible"
 
 
 @dataclass(frozen=True)
@@ -96,6 +99,7 @@ async def _resolve_project_nodes(
     session: Any,
     actor_user_id: UUID,
     project: Project,
+    expand_subtrees: bool = True,
 ) -> tuple[list[KnowledgeNode], list[KnowledgeNode], set[UUID]]:
     """Resolve canonical and explicitly referenced nodes for an authorized Project."""
 
@@ -105,18 +109,24 @@ async def _resolve_project_nodes(
     seen_related: set[UUID] = set()
     library_ids: set[UUID] = set()
 
-    if project.knowledge_node_id:
-        node = await session.get(KnowledgeNode, project.knowledge_node_id)
-        if node is not None and await can_read_node(
-            session, node, actor_user_id
-        ):
-            node_id = _as_uuid(getattr(node, "id", None))
-            if node_id is not None:
-                canonical.append(node)
-                seen_canonical.add(node_id)
-                library_id = _as_uuid(getattr(node, "docs_library_id", None))
-                if library_id is not None:
-                    library_ids.add(library_id)
+    # ``Project.knowledge_node_id`` is only a denormalized pointer.  Resolve
+    # it through the strict canonical contract before adding the node to a
+    # request's visibility scope; a stale pointer must fail closed even when
+    # the target happens to be ACL-readable.
+    canonical_root = await get_canonical_project_information_node(
+        session,
+        project_id=project.id,
+        actor_user_id=actor_user_id,
+    )
+    node = canonical_root
+    if node is not None and await can_read_node(session, node, actor_user_id):
+        node_id = _as_uuid(getattr(node, "id", None))
+        if node_id is not None:
+            canonical.append(node)
+            seen_canonical.add(node_id)
+            library_id = _as_uuid(getattr(node, "docs_library_id", None))
+            if library_id is not None:
+                library_ids.add(library_id)
 
     # The service contract has no soft-delete column on ProjectKnowledgeRef;
     # a stale/archived target is therefore omitted at resolution time.
@@ -131,6 +141,10 @@ async def _resolve_project_nodes(
         ),
     )
     for ref in refs:
+        if str(getattr(ref, "relation_type", "related")).casefold() == "canonical":
+            # A relationship label is not canonical identity authority.
+            if canonical_root is None or ref.knowledge_node_id != canonical_root.id:
+                continue
         node = await session.get(KnowledgeNode, ref.knowledge_node_id)
         if node is None or getattr(node, "archived_at", None) is not None:
             continue
@@ -150,7 +164,91 @@ async def _resolve_project_nodes(
         if node_id not in seen_related and node_id not in seen_canonical:
             related.append(node)
             seen_related.add(node_id)
+    if not expand_subtrees:
+        return canonical, related, library_ids
+    canonical = await _expand_readable_subtrees(
+        session, canonical, actor_user_id, required_project_id=project.id
+    )
+    canonical_ids = {node.id for node in canonical}
+    related = [
+        node for node in await _expand_readable_subtrees(session, related, actor_user_id)
+        if node.id not in canonical_ids
+    ]
+    library_ids = {node.docs_library_id for node in [*canonical, *related]}
     return canonical, related, library_ids
+
+
+async def _expand_readable_subtrees(
+    session: Any,
+    roots: list[KnowledgeNode],
+    actor_user_id: UUID,
+    *,
+    required_project_id: UUID | None = None,
+) -> list[KnowledgeNode]:
+    """Expand containment, not references or library membership, then authorize.
+
+    Traversal crosses hidden/archived intermediates: a descendant may have an
+    independent grant. Only readable active rows are emitted. No implicit
+    scope cap is allowed to turn a partial corpus into an apparently exact one.
+    """
+    visible: list[KnowledgeNode] = []
+    emitted: set[UUID] = set()
+    for library_id in dict.fromkeys(node.docs_library_id for node in roots):
+        library = await session.get(DocsLibrary, library_id)
+        frontier = [node.id for node in roots if node.docs_library_id == library_id]
+        seen = set(frontier)
+        for node in roots:
+            if node.docs_library_id == library_id and node.id not in emitted:
+                visible.append(node)
+                emitted.add(node.id)
+        while frontier:
+            following: list[UUID] = []
+            for offset in range(0, len(frontier), 500):
+                parent_ids = set(frontier[offset:offset + 500])
+                rows = await _scalars(
+                    session,
+                    select(KnowledgeNode).options(load_only(
+                        KnowledgeNode.id, KnowledgeNode.docs_library_id,
+                        KnowledgeNode.project_id, KnowledgeNode.parent_id,
+                        KnowledgeNode.archived_at,
+                    )).where(
+                        KnowledgeNode.docs_library_id == library_id,
+                        KnowledgeNode.parent_id.in_(parent_ids),
+                    ).order_by(KnowledgeNode.sort_order, KnowledgeNode.id),
+                )
+                candidates = []
+                for node in rows:
+                    if (node.id in seen or node.docs_library_id != library_id
+                            or getattr(node, "parent_id", None) not in parent_ids):
+                        continue
+                    seen.add(node.id)
+                    following.append(node.id)
+                    if required_project_id is not None and node.project_id != required_project_id:
+                        continue
+                    if node.archived_at is not None:
+                        continue
+                    candidates.append(node)
+                if not candidates:
+                    continue
+                # Evaluate the shared SQL/point-ACL contract as a set, rather
+                # than issuing one Project/share query per descendant.
+                readable_ids = set(await _scalars(session, select(KnowledgeNode.id).where(
+                    KnowledgeNode.id.in_([node.id for node in candidates]),
+                    KnowledgeNode.docs_library_id == library_id,
+                    KnowledgeNode.archived_at.is_(None),
+                    docs_readable_node_predicate(
+                        KnowledgeNode, docs_library_id=library_id, user_id=actor_user_id,
+                        library_owner_id=getattr(library, "owner_user_id", None),
+                    ),
+                )))
+                for node in candidates:
+                    if node.id not in readable_ids:
+                        continue
+                    if node.id not in emitted:
+                        emitted.add(node.id)
+                        visible.append(node)
+            frontier = following
+    return visible
 
 
 async def _resolve_personal_nodes(
@@ -220,6 +318,10 @@ async def _resolve_personal_nodes(
                     KnowledgeNode.docs_library_id.in_(
                         tuple(owner_library_ids)
                     ),
+                    select(DocsLibrary.id).where(
+                        DocsLibrary.id == KnowledgeNode.docs_library_id,
+                        DocsLibrary.owner_user_id == actor_user_id,
+                    ).exists(),
                 )
                 .order_by(KnowledgeNode.id)
                 .limit(limit),
@@ -292,13 +394,14 @@ async def _resolve_personal_nodes(
     # Exhaustive path used by ordinary Docs scope/search callers.  Do not add
     # a LIMIT here: the public Docs ACL semantics remain unchanged.
 
-    nodes = await _scalars(
-        session,
-        select(KnowledgeNode).where(
-            KnowledgeNode.project_id.is_(None),
-            KnowledgeNode.archived_at.is_(None),
-        ),
-    )
+    nodes = []
+    for library_id, library in library_by_id.items():
+        nodes.extend(node for node in await _scalars(session, select(KnowledgeNode).where(
+            KnowledgeNode.docs_library_id == library_id,
+            KnowledgeNode.project_id.is_(None), KnowledgeNode.archived_at.is_(None),
+            docs_readable_node_predicate(KnowledgeNode, docs_library_id=library_id,
+                user_id=actor_user_id, library_owner_id=getattr(library, "owner_user_id", None)),
+        )) if node.docs_library_id == library_id)
     visible: list[KnowledgeNode] = []
     visible_library_ids: set[UUID] = set(owner_library_ids)
     for node in nodes:
@@ -324,6 +427,7 @@ async def resolve_docs_scope(
     project_id: UUID | None,
     mode: DocsScopeMode,
     max_personal_nodes: int | None = None,
+    expand_project_subtrees: bool = True,
 ) -> DocsScope:
     """Resolve the actor's compact Docs scope for one request.
 
@@ -341,6 +445,24 @@ async def resolve_docs_scope(
     actor = _as_uuid(actor_user_id)
     if actor is None:
         return _empty_scope(normalized_mode, reason="invalid_actor")
+
+    if normalized_mode is DocsScopeMode.ACCESSIBLE:
+        if project_id is not None:
+            return _empty_scope(normalized_mode, reason="global_scope_requires_no_project")
+        libraries = await _scalars(session, select(DocsLibrary).order_by(DocsLibrary.id))
+        visible = []
+        for library in libraries:
+            visible.extend(await _scalars(session, select(KnowledgeNode).options(load_only(
+                KnowledgeNode.id, KnowledgeNode.docs_library_id, KnowledgeNode.project_id,
+            )).where(
+                KnowledgeNode.docs_library_id == library.id, KnowledgeNode.archived_at.is_(None),
+                docs_readable_node_predicate(KnowledgeNode, docs_library_id=library.id,
+                    user_id=actor, library_owner_id=library.owner_user_id),
+            ).order_by(KnowledgeNode.id)))
+        return DocsScope(mode=normalized_mode, project_id=None,
+            project_ids=tuple(sorted({node.project_id for node in visible if node.project_id}, key=str)),
+            allowed_library_ids=tuple(sorted({node.docs_library_id for node in visible}, key=str)),
+            canonical_node_ids=(), related_node_ids=tuple(node.id for node in visible), personal_allowed=True)
 
     if normalized_mode is DocsScopeMode.PERSONAL_ONLY:
         personal_nodes, personal_libraries = await _resolve_personal_nodes(
@@ -388,6 +510,7 @@ async def resolve_docs_scope(
         session=session,
         actor_user_id=actor,
         project=project_row,
+        expand_subtrees=expand_project_subtrees,
     )
     personal_allowed = normalized_mode is DocsScopeMode.PROJECT_PLUS_PERSONAL
     personal_library_ids: set[UUID] = set()

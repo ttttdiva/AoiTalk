@@ -7,12 +7,19 @@ This module maintains the rebuildable Qdrant index used for hybrid retrieval.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hashlib
+import json
 import logging
 import math
+import os
 import re
+import threading
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date, datetime, time, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -35,6 +42,34 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 logger = logging.getLogger(__name__)
+
+# Like the native runner lock, these locks work across sync-bridge event loops.
+# This service is the sole Knowledge index writer within the runtime process.
+_SYNC_LOCKS: dict[tuple[str, ...], tuple[Any, int]] = {}
+_SYNC_LOCKS_GUARD = threading.Lock()
+_LOCAL_INDEX_IO_LOCK = threading.RLock()
+
+
+@asynccontextmanager
+async def _index_lock(key: tuple[str, ...]):
+    with _SYNC_LOCKS_GUARD:
+        lock, references = _SYNC_LOCKS.get(key, (threading.Lock(), 0))
+        _SYNC_LOCKS[key] = (lock, references + 1)
+    acquired = False
+    try:
+        while not lock.acquire(blocking=False):
+            await asyncio.sleep(0.005)
+        acquired = True
+        yield
+    finally:
+        if acquired:
+            lock.release()
+        with _SYNC_LOCKS_GUARD:
+            _, references = _SYNC_LOCKS[key]
+            if references == 1:
+                del _SYNC_LOCKS[key]
+            else:
+                _SYNC_LOCKS[key] = (lock, references - 1)
 
 
 def _knowledge_search_enabled() -> bool:
@@ -114,10 +149,16 @@ class HashingSparseEncoder:
 
 
 class KnowledgeIndexService:
-    """Synchronize and query the derived Qdrant Knowledge index."""
+    """Sole writer for the derived Knowledge collection; never auto-migrate it.
+
+    Source syncs serialize across threads/loops in this runtime process. A
+    deployment must route writes here through one process, not independent
+    writers. Incompatible collections require an explicit operator migration.
+    """
 
     dense_vector_name = "dense"
     sparse_vector_name = "sparse"
+    dense_input_version = "knowledge-context-v1"
 
     def __init__(self, config: Optional[RagConfig] = None) -> None:
         self.config = config or get_rag_config()
@@ -127,23 +168,85 @@ class KnowledgeIndexService:
         self.sparse_encoder = HashingSparseEncoder()
         self._initialized = False
         self._is_local_mode = False
+        self._initialization_failure: Optional[KnowledgeIndexSyncResult] = None
 
     async def initialize(self) -> bool:
+        async with _index_lock((*self._lock_scope(), "initialize")):
+            return await self._initialize()
+
+    def _lock_scope(self) -> tuple[str, ...]:
+        config = self.config.qdrant
+        endpoint = (
+            os.path.normcase(str(Path(config.local_path).resolve()))
+            if config.local_path
+            else f"{config.host.casefold()}:{config.port}"
+        )
+        return (endpoint, self.collection_name)
+
+    async def _index_io(self, operation, *args, **kwargs):
+        finished = threading.Event()
+
+        def invoke():
+            try:
+                if self._is_local_mode:
+                    # Embedded Qdrant must not query while another index operation
+                    # mutates its arrays, even for a different source or event loop.
+                    with _LOCAL_INDEX_IO_LOCK:
+                        return operation(*args, **kwargs)
+                return operation(*args, **kwargs)
+            finally:
+                finished.set()
+
+        # The loop owns this bounded executor and shuts it down on teardown.
+        # Use a Future, not a Task that asyncio.run's all-task cancellation can
+        # mark done before its thread finishes. Preserve to_thread's context.
+        worker = asyncio.get_running_loop().run_in_executor(
+            None, contextvars.copy_context().run, invoke
+        )
+
+        def consume_exception(future):
+            if not future.cancelled():
+                future.exception()
+
+        # Cancellation can win over an eventual I/O failure. Retrieve that
+        # exception even if its delivery to the loop follows finished.set().
+        worker.add_done_callback(consume_exception)
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # A thread cannot be cancelled: retain the source lock until any
+            # in-flight write finishes, including during loop teardown and
+            # repeated cancellation. Only the executing thread signals this.
+            while not finished.is_set():
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    continue
+            raise
+
+    async def _initialize(self) -> bool:
         if self._initialized:
             return True
         if not _knowledge_search_enabled():
+            self._initialization_failure = KnowledgeIndexSyncResult(status="disabled")
             logger.info(
                 "Knowledge index is disabled (search.knowledge_enabled is off)"
             )
             return False
         if not QDRANT_AVAILABLE:
-            logger.warning("qdrant-client is not installed; Knowledge index disabled")
-            return False
-        if not await self.embedding.initialize():
-            logger.warning("Embedding model could not be initialized; Knowledge index disabled")
+            self._initialization_failure = KnowledgeIndexSyncResult(
+                status="unavailable", error="qdrant-client is not installed"
+            )
+            logger.warning(self._initialization_failure.error)
             return False
 
         try:
+            if not await self.embedding.initialize():
+                self._initialization_failure = KnowledgeIndexSyncResult(
+                    status="unavailable", error="Knowledge embedding model could not be initialized"
+                )
+                logger.warning(self._initialization_failure.error)
+                return False
             if self.config.qdrant.local_path:
                 self.client = SharedQdrantClient.get_client(self.config.qdrant.local_path)
                 self._is_local_mode = True
@@ -154,10 +257,15 @@ class KnowledgeIndexService:
                     api_key=self.config.qdrant.api_key,
                 )
                 self._is_local_mode = False
-            self._ensure_collection()
+            await self._index_io(self._ensure_collection)
             self._initialized = True
+            self._initialization_failure = None
             return True
         except Exception as exc:
+            self._initialization_failure = KnowledgeIndexSyncResult(
+                status="error",
+                error=f"Knowledge index initialization failed: {exc or type(exc).__name__}",
+            )
             logger.exception("Failed to initialize Knowledge index")
             return False
 
@@ -168,12 +276,10 @@ class KnowledgeIndexService:
         collections = self.client.get_collections()
         names = {collection.name for collection in collections.collections}
         if self.collection_name in names and not self._collection_is_compatible():
-            logger.warning(
-                "Recreating incompatible Knowledge index collection %s; index data is derived",
-                self.collection_name,
+            raise RuntimeError(
+                f"Knowledge collection {self.collection_name!r} is incompatible "
+                "or could not be inspected; explicit migration is required"
             )
-            self.client.delete_collection(self.collection_name)
-            names.remove(self.collection_name)
 
         if self.collection_name not in names:
             self.client.create_collection(
@@ -210,18 +316,36 @@ class KnowledgeIndexService:
             params = info.config.params
             vectors = getattr(params, "vectors", None)
             sparse_vectors = getattr(params, "sparse_vectors", None)
-            has_dense = isinstance(vectors, dict) and self.dense_vector_name in vectors
-            has_sparse = isinstance(sparse_vectors, dict) and self.sparse_vector_name in sparse_vectors
-            return bool(has_dense and has_sparse)
+            if not isinstance(vectors, dict) or not isinstance(sparse_vectors, dict):
+                return False
+            if (
+                set(vectors) != {self.dense_vector_name}
+                or set(sparse_vectors) != {self.sparse_vector_name}
+            ):
+                return False
+            dense = vectors[self.dense_vector_name]
+            return (
+                getattr(dense, "size", None) == self.embedding.dimension
+                and getattr(dense, "distance", None) == models.Distance.COSINE
+                and getattr(dense, "multivector_config", None) is None
+            )
         except Exception:
             logger.debug("Could not inspect Knowledge index collection", exc_info=True)
             return False
 
     async def sync_source(self, session: AsyncSession, source_id: uuid.UUID) -> KnowledgeIndexSyncResult:
+        async with _index_lock((*self._lock_scope(), "source", str(source_id))):
+            return await self._sync_source(session, source_id)
+
+    async def _sync_source(self, session: AsyncSession, source_id: uuid.UUID) -> KnowledgeIndexSyncResult:
         if not await self.initialize():
-            return KnowledgeIndexSyncResult(status="disabled")
+            return self._initialization_failure or KnowledgeIndexSyncResult(
+                status="unavailable", error="Knowledge index initialization failed"
+            )
         if self.client is None or models is None:
-            return KnowledgeIndexSyncResult(status="unavailable")
+            return KnowledgeIndexSyncResult(
+                status="unavailable", error="Knowledge Qdrant client is not available"
+            )
 
         rows = await session.execute(
             select(KnowledgeChunk, KnowledgeDocument, KnowledgeSource)
@@ -234,22 +358,46 @@ class KnowledgeIndexService:
             .order_by(KnowledgeDocument.path.asc(), KnowledgeChunk.chunk_index.asc())
         )
         chunk_rows = list(rows.all())
-        await asyncio.to_thread(self._delete_source_points, source_id)
         if not chunk_rows:
+            await self._index_io(self._delete_source_points, source_id)
             return KnowledgeIndexSyncResult(status="synced", indexed_chunks=0)
 
-        texts = [chunk.text for chunk, _, _ in chunk_rows]
-        dense_vectors = await self.embedding.embed(texts)
-        if len(dense_vectors) != len(chunk_rows):
+        existing = await self._index_io(self._source_points, source_id)
+        payloads = [self._payload(*row) for row in chunk_rows]
+        dense_vectors = []
+        changed = []
+        for index, ((chunk, _, _), payload) in enumerate(zip(chunk_rows, payloads)):
+            previous = existing.get(str(chunk.id))
+            old_payload = (previous.payload or {}) if previous is not None else {}
+            vectors = previous.vector if previous is not None else None
+            dense = vectors.get(self.dense_vector_name) if isinstance(vectors, dict) else None
+            if (
+                old_payload.get("content_hash") != payload["content_hash"]
+                or old_payload.get("embedding_fingerprint") != payload["embedding_fingerprint"]
+                or not self._valid_dense_vector(dense)
+            ):
+                dense = None
+                changed.append(index)
+            dense_vectors.append(dense)
+
+        generated = []
+        if changed:
+            generated = await self.embedding.embed(
+                [self._dense_text(*chunk_rows[index]) for index in changed]
+            )
+        if len(generated) != len(changed) or any(
+            not self._valid_dense_vector(vector) for vector in generated
+        ):
             return KnowledgeIndexSyncResult(
                 status="error",
-                error="embedding vector count did not match Knowledge chunks",
+                error="invalid Knowledge embeddings (count, dimension or finite values)",
             )
+        for index, dense in zip(changed, generated):
+            dense_vectors[index] = dense
 
         points = []
-        for dense, (chunk, document, source) in zip(dense_vectors, chunk_rows):
+        for dense, (chunk, document, source), payload in zip(dense_vectors, chunk_rows, payloads):
             vector_id = str(chunk.id)
-            chunk.vector_id = vector_id
             points.append(
                 models.PointStruct(
                     id=vector_id,
@@ -259,18 +407,57 @@ class KnowledgeIndexService:
                             self._sparse_text(chunk, document, source)
                         ),
                     },
-                    payload=self._payload(chunk, document, source),
+                    payload=payload,
                 )
             )
 
-        for index in range(0, len(points), self.config.indexing.batch_size):
-            batch = points[index : index + self.config.indexing.batch_size]
-            await asyncio.to_thread(
+        batch_size = max(1, self.config.indexing.batch_size)
+        for index in range(0, len(points), batch_size):
+            batch = points[index : index + batch_size]
+            # Upsert replaces the entire payload, clearing legacy plaintext
+            # text even when we reuse the dense vector. Sparse is refreshed too.
+            await self._index_io(
                 self.client.upsert,
                 collection_name=self.collection_name,
                 points=batch,
+                wait=True,
             )
+        retained = {str(chunk.id) for chunk, _, _ in chunk_rows}
+        stale = sorted(set(existing) - retained)
+        for index in range(0, len(stale), batch_size):
+            await self._index_io(
+                self._delete_source_points, source_id, stale[index:index + batch_size]
+            )
+        for chunk, _, _ in chunk_rows:
+            chunk.vector_id = str(chunk.id)
         return KnowledgeIndexSyncResult(status="synced", indexed_chunks=len(points))
+
+    def _valid_dense_vector(self, vector: Any) -> bool:
+        return (
+            isinstance(vector, list)
+            and len(vector) == self.embedding.dimension
+            and all(
+                isinstance(value, (int, float)) and math.isfinite(value)
+                for value in vector
+            )
+            and any(value != 0 for value in vector)
+        )
+
+    def _source_points(self, source_id: uuid.UUID) -> dict[str, Any]:
+        points = {}
+        offset = None
+        while True:
+            records, offset = self.client.scroll(
+                collection_name=self.collection_name,
+                scroll_filter=self._source_filter(source_id),
+                with_payload=True,
+                with_vectors=[self.dense_vector_name],
+                limit=max(1, self.config.indexing.batch_size),
+                offset=offset,
+            )
+            points.update((str(point.id), point) for point in records)
+            if offset is None:
+                return points
 
     async def search(
         self,
@@ -313,7 +500,7 @@ class KnowledgeIndexService:
 
         try:
             if len(prefetch) == 1:
-                response = await asyncio.to_thread(
+                response = await self._index_io(
                     self.client.query_points,
                     collection_name=self.collection_name,
                     query=prefetch[0].query,
@@ -323,7 +510,7 @@ class KnowledgeIndexService:
                     with_payload=["chunk_id"],
                 )
             else:
-                response = await asyncio.to_thread(
+                response = await self._index_io(
                     self.client.query_points,
                     collection_name=self.collection_name,
                     prefetch=prefetch,
@@ -348,21 +535,25 @@ class KnowledgeIndexService:
                 continue
         return hits
 
-    def _delete_source_points(self, source_id: uuid.UUID) -> None:
+    def _source_filter(self, source_id: uuid.UUID):
+        return models.Filter(must=[
+            models.FieldCondition(
+                key="source_id", match=models.MatchValue(value=str(source_id))
+            )
+        ])
+
+    def _delete_source_points(self, source_id: uuid.UUID, point_ids: Optional[list[str]] = None) -> None:
         if self.client is None or models is None:
             return
+        source_filter = self._source_filter(source_id)
+        if point_ids is not None:
+            if not point_ids:
+                return
+            source_filter.must.append(models.HasIdCondition(has_id=point_ids))
         self.client.delete(
             collection_name=self.collection_name,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="source_id",
-                            match=models.MatchValue(value=str(source_id)),
-                        )
-                    ]
-                )
-            ),
+            points_selector=models.FilterSelector(filter=source_filter),
+            wait=True,
         )
 
     def _build_filter(self, filters: Any):
@@ -374,6 +565,11 @@ class KnowledgeIndexService:
                 match=models.MatchValue(value="active"),
             )
         ]
+        readable_sources = getattr(filters, "readable_source_ids", None)
+        if readable_sources is not None:
+            must.append(models.FieldCondition(
+                key="source_id", match=models.MatchAny(any=[str(value) for value in readable_sources]),
+            ))
         if getattr(filters, "source_id", None):
             must.append(
                 models.FieldCondition(
@@ -414,7 +610,6 @@ class KnowledgeIndexService:
         source: KnowledgeSource,
     ) -> dict[str, Any]:
         return {
-            "text": chunk.text,
             "chunk_id": str(chunk.id),
             "document_id": str(document.id),
             "source_id": str(source.id),
@@ -426,11 +621,123 @@ class KnowledgeIndexService:
             "extension": document.extension,
             "heading_path": chunk.heading_path or [],
             "chunk_index": chunk.chunk_index,
-            "content_hash": chunk.content_hash,
+            # The Qdrant hash covers the complete deterministic embedding
+            # context.  Keep the source chunk hash separately for callers that
+            # need to identify a body-only change.
+            "content_hash": self._index_content_hash(chunk, document, source),
+            "embedding_fingerprint": self._embedding_fingerprint(),
+            "chunk_content_hash": chunk.content_hash,
             "tags": document.tags or [],
             "project_refs": [str(ref) for ref in document.project_refs or []],
             "task_refs": [str(ref) for ref in document.task_refs or []],
+            "source_created_at": self._serialize_datetime(
+                getattr(source, "created_at", None)
+            ),
+            "source_updated_at": self._serialize_datetime(
+                getattr(source, "updated_at", None)
+            ),
+            "source_last_synced_at": self._serialize_datetime(
+                getattr(source, "last_synced_at", None)
+            ),
+            "document_created_at": self._serialize_datetime(
+                getattr(document, "created_at", None)
+            ),
+            "document_updated_at": self._serialize_datetime(
+                getattr(document, "updated_at", None)
+            ),
+            "document_modified_at": self._serialize_datetime(
+                getattr(document, "modified_at", None)
+            ),
+            "document_date": self._serialize_datetime(
+                getattr(document, "document_date", None)
+            ),
+            "document_date_source": getattr(document, "document_date_source", None),
+            "document_last_indexed_at": self._serialize_datetime(
+                getattr(document, "last_indexed_at", None)
+            ),
+            "chunk_created_at": self._serialize_datetime(
+                getattr(chunk, "created_at", None)
+            ),
         }
+
+    @staticmethod
+    def _serialize_datetime(value: Any) -> Optional[str]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            return value.isoformat()
+        if isinstance(value, date):
+            return datetime.combine(value, time.min).replace(
+                tzinfo=timezone.utc
+            ).isoformat()
+        isoformat = getattr(value, "isoformat", None)
+        if callable(isoformat):
+            return str(isoformat())
+        return str(value)
+
+    @staticmethod
+    def _metadata_text(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, (list, tuple)):
+            return " ".join(str(item) for item in value)
+        return str(value)
+
+    def _dense_text(
+        self,
+        chunk: KnowledgeChunk,
+        document: KnowledgeDocument,
+        source: KnowledgeSource,
+    ) -> str:
+        """Build deterministic context for the dense embedding lane.
+
+        The query side still embeds the user's raw query.  Adding stable
+        source/document hierarchy to indexed chunks keeps otherwise identical
+        bodies distinguishable without an LLM-generated enrichment step.
+        """
+        heading_path = " > ".join(
+            str(item) for item in (chunk.heading_path or [])
+        )
+        return "\n".join(
+            [
+                f"Source: {source.name or ''}",
+                f"Source type: {source.source_type or ''}",
+                f"Document title: {document.title or ''}",
+                f"Document path: {document.path or ''}",
+                f"Tags: {self._metadata_text(document.tags)}",
+                f"Project refs: {self._metadata_text(document.project_refs)}",
+                f"Task refs: {self._metadata_text(document.task_refs)}",
+                f"Heading: {heading_path}",
+                f"Chunk index: {chunk.chunk_index}",
+                f"Chunk: {chunk.text or ''}",
+            ]
+        )
+
+    def _index_content_hash(
+        self,
+        chunk: KnowledgeChunk,
+        document: KnowledgeDocument,
+        source: KnowledgeSource,
+    ) -> str:
+        """Hash the exact dense input so metadata changes trigger reindexing."""
+        dense_text = self._dense_text(chunk, document, source)
+        return hashlib.sha256(
+            dense_text.encode("utf-8", errors="replace")
+        ).hexdigest()
+
+    def _embedding_fingerprint(self) -> str:
+        identity = {
+            "model": self.embedding.config.model,
+            "dimension": self.embedding.dimension,
+            "input_version": self.dense_input_version,
+        }
+        return hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
     def _sparse_text(
         self,

@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, gte, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
 import {
   notificationDeliveries,
   taskOccurrences,
+  taskRecurrenceScheduleSegments,
   taskRecurrenceRules,
   tasks,
   timeEntries,
@@ -16,7 +17,9 @@ import {
   canReuseOccurrenceRowForOverride,
   isRecurrenceOverrideSourceKind,
   isRecurrenceSkipSourceKind,
+  resolveOccurrenceOriginalStartAt,
   resolveOccurrenceCutoffSource,
+  matchesOccurrenceIdentity,
   shouldFindOccurrenceByStartAt,
 } from "@/lib/recurrence-exceptions";
 import {
@@ -27,6 +30,13 @@ import {
 } from "@/lib/server/db-time";
 import { fetchPythonApi } from "@/lib/server/python-api-proxy";
 import { canWriteProjectId } from "@/lib/server/task-route-utils";
+import {
+  applyRecurrenceScheduleSegment,
+  getRecurrenceSegmentEnvelopeMs,
+  type RecurrenceScheduleSegment,
+} from "@/lib/recurrence-schedule-segments";
+import { computeOccurrenceCandidatesInRange } from "@/lib/recurrence-preview";
+import { parseRrule } from "@/lib/recurrence-rrule";
 
 function parseDate(value: unknown, fieldName: string): Date {
   const parsed =
@@ -109,6 +119,8 @@ async function getTaskWithRecurrence(taskId: string) {
 
 async function ensureSingleSkipRow(params: {
   taskId: string;
+  occurrenceId?: string | null;
+  actualOccurrenceStartAt?: Date | null;
   occurrenceStartAt: Date;
   occurrenceEndAt: Date;
   status: string | null;
@@ -124,18 +136,114 @@ async function ensureSingleSkipRow(params: {
     reminderOffsets,
   } = params;
 
-  const [existing] = await db
+  let existing = params.occurrenceId
+    ? (
+        await db
+          .select()
+          .from(taskOccurrences)
+          .where(
+            and(
+              eq(taskOccurrences.id, params.occurrenceId),
+              eq(taskOccurrences.taskId, taskId),
+            ),
+          )
+          .limit(1)
+      )[0] ?? null
+    : null;
+  if (
+    existing &&
+    !matchesOccurrenceIdentity({
+      sourceKind: existing.sourceKind,
+      originalStartAt: existing.originalStartAt,
+      startAt: existing.startAt,
+      canonicalStartAt: occurrenceStartAt,
+      actualStartAt: params.actualOccurrenceStartAt ?? occurrenceStartAt,
+    })
+  ) {
+    existing = null;
+  }
+  if (!existing) {
+    [existing] = await db
     .select()
     .from(taskOccurrences)
     .where(
       and(
         eq(taskOccurrences.taskId, taskId),
-        eq(taskOccurrences.startAt, toDbLocalTimestamp(occurrenceStartAt)),
+        eq(taskOccurrences.sourceKind, buildRecurrenceSkipSourceKind()),
+        eq(
+          taskOccurrences.originalStartAt,
+          toDbLocalTimestamp(occurrenceStartAt),
+        ),
       ),
     )
     .limit(1);
+  }
+
+  // Legacy skip rows predate original_start_at.  Their source kind is still
+  // canonical, so use the old timestamp lookup only after restricting the
+  // row to recurrence_skip (never a normal materialized row).
+  if (!existing) {
+    [existing] = await db
+      .select()
+      .from(taskOccurrences)
+      .where(
+        and(
+          eq(taskOccurrences.taskId, taskId),
+          eq(taskOccurrences.sourceKind, buildRecurrenceSkipSourceKind()),
+          eq(taskOccurrences.startAt, toDbLocalTimestamp(occurrenceStartAt)),
+        ),
+      )
+      .limit(1);
+  }
+  if (!existing) {
+    // Reuse the canonical normal row when available.  Leaving it alongside
+    // the new skip+override pair would expose a duplicate old occurrence to
+    // FastAPI/Mobile list readers and notification workers.
+    [existing] = await db
+      .select()
+      .from(taskOccurrences)
+      .where(
+        and(
+          eq(taskOccurrences.taskId, taskId),
+          eq(
+            taskOccurrences.originalStartAt,
+            toDbLocalTimestamp(occurrenceStartAt),
+          ),
+          inArray(taskOccurrences.sourceKind, ["recurrence", "task_schedule"]),
+        ),
+      )
+      .limit(1);
+  }
+  if (!existing) {
+    // Legacy materialized rows may still have original_start_at=NULL.  The
+    // pre-migration fallback is safe only when the row is a normal recurrence
+    // row at the canonical timestamp; never select an arbitrary actual-time
+    // row after actual timestamp collisions became valid.
+    [existing] = await db
+      .select()
+      .from(taskOccurrences)
+      .where(
+        and(
+          eq(taskOccurrences.taskId, taskId),
+          eq(taskOccurrences.startAt, toDbLocalTimestamp(occurrenceStartAt)),
+          inArray(taskOccurrences.sourceKind, ["recurrence", "task_schedule"]),
+        ),
+      )
+      .limit(1);
+  }
 
   if (existing && isRecurrenceSkipSourceKind(existing.sourceKind)) {
+    if (!existing.originalStartAt) {
+      const [updated] = await db
+        .update(taskOccurrences)
+        .set({
+          originalStartAt: toDbLocalTimestamp(occurrenceStartAt),
+          updatedAt: new Date(),
+        })
+        .where(eq(taskOccurrences.id, existing.id))
+        .returning();
+      return updated;
+    }
     return existing;
   }
 
@@ -143,6 +251,7 @@ async function ensureSingleSkipRow(params: {
     taskId,
     startAt: toDbLocalTimestamp(occurrenceStartAt),
     endAt: toDbLocalTimestamp(occurrenceEndAt),
+    originalStartAt: toDbLocalTimestamp(occurrenceStartAt),
     status: status ?? "open",
     allDay: !!allDay,
     reminderOffsets: reminderOffsets ?? [],
@@ -208,6 +317,9 @@ async function upsertOverrideRow(params: {
     : null;
 
   if (shouldFindOccurrenceByStartAt(occurrenceId, reuseOccurrenceId)) {
+    // Resolve an existing override by canonical identity, not actual start.
+    // Segment offsets can make two canonical occurrences share one displayed
+    // timestamp, so task_id + start_at is no longer a safe lookup key.
     existing =
       (
         await db
@@ -217,8 +329,10 @@ async function upsertOverrideRow(params: {
             and(
               eq(taskOccurrences.taskId, taskId),
               eq(
-                taskOccurrences.startAt,
-                toDbLocalTimestamp(nextStartAt),
+                taskOccurrences.originalStartAt,
+                toDbLocalTimestamp(
+                  parseDate(originalStartAtText, "original_start_at"),
+                ),
               ),
             ),
           )
@@ -239,10 +353,7 @@ async function upsertOverrideRow(params: {
 
   if (
     !existing ||
-    !canReuseOccurrenceRowForOverride(
-      existing.sourceKind,
-      reuseOccurrenceId,
-    )
+    !canReuseOccurrenceRowForOverride(existing.sourceKind, reuseOccurrenceId)
   ) {
     existing =
       (
@@ -263,6 +374,9 @@ async function upsertOverrideRow(params: {
     taskId,
     startAt: toDbLocalTimestamp(nextStartAt),
     endAt: toDbLocalTimestamp(nextEndAt),
+    originalStartAt: toDbLocalTimestamp(
+      parseDate(originalStartAtText, "original_start_at"),
+    ),
     status: status ?? "open",
     allDay: !!allDay,
     reminderOffsets: reminderOffsets ?? [],
@@ -287,6 +401,53 @@ async function upsertOverrideRow(params: {
   return created;
 }
 
+function resolveStoredOccurrenceOriginalStartAt(row: {
+  sourceKind: string | null;
+  originalStartAt?: Date | string | null;
+  startAt: Date | string;
+}): Date | null {
+  const value =
+    row.originalStartAt ??
+    resolveOccurrenceOriginalStartAt(row.sourceKind, row.startAt);
+  return value ? dbTimestampToLocalDate(value) : null;
+}
+
+function resolveFutureSegmentResult(params: {
+  canonicalStart: Date;
+  canonicalEnd: Date;
+  baseStartAt: Date;
+  baseEndAt: Date;
+  nextStartAt: Date;
+  nextEndAt: Date;
+  allDay: boolean;
+}) {
+  const startOffsetSeconds = Math.round(
+    (params.nextStartAt.getTime() - params.baseStartAt.getTime()) / 1000,
+  );
+  const endOffsetSeconds = Math.round(
+    (params.nextEndAt.getTime() - params.baseEndAt.getTime()) / 1000,
+  );
+  return {
+    startOffsetSeconds,
+    endOffsetSeconds,
+    ...applyRecurrenceScheduleSegment({
+      canonicalStart: params.canonicalStart,
+      canonicalEnd: params.canonicalEnd,
+      baseStartAt: params.baseStartAt,
+      baseEndAt: params.baseEndAt,
+      baseAllDay: params.allDay,
+      segments: [
+        {
+          effectiveFrom: params.canonicalStart,
+          startOffsetSeconds,
+          endOffsetSeconds,
+          allDay: params.allDay,
+        },
+      ],
+    }),
+  };
+}
+
 export async function PATCH(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
@@ -308,7 +469,10 @@ export async function PATCH(
       );
     }
     if (!(await canWriteProjectId(user, task.projectId))) {
-      return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
+      return NextResponse.json(
+        { detail: "Permission denied" },
+        { status: 403 },
+      );
     }
 
     const occurrenceStartAt = parseDate(
@@ -360,6 +524,7 @@ export async function PATCH(
             override.endAt,
             override.allDay ?? false,
           ),
+          all_day: override.allDay ?? false,
           source_kind: override.sourceKind,
           original_start_at: originalStartAtText,
         },
@@ -378,8 +543,360 @@ export async function PATCH(
               ),
           );
 
+    const mode = body.mode === "future" ? "future" : "single";
+
+    if (mode === "future") {
+      const canonicalStart = originalStartAt;
+      const baseDurationMs = getTaskDurationMs(task);
+      const canonicalEnd = new Date(canonicalStart.getTime() + baseDurationMs);
+      const effectiveAllDay =
+        typeof body.all_day === "boolean"
+          ? body.all_day
+          : (task.allDay ?? false);
+      let baseStartAt = occurrenceStartAt;
+      let baseEndAt = occurrenceEndAt;
+      const taskBaseStart = dbTimestampToLocalDate(task.startAt ?? task.endAt);
+      if (taskBaseStart?.getTime() === canonicalStart.getTime()) {
+        // The range generator intentionally returns occurrences after the
+        // base row.  For a second future edit of the first occurrence, use
+        // the unshifted task base rather than the currently displayed time so
+        // absolute offsets do not accumulate.
+        baseStartAt = taskBaseStart;
+        baseEndAt = new Date(taskBaseStart.getTime() + baseDurationMs);
+      }
+      if (taskBaseStart) {
+        const parsedRule = parseRrule(rule.rrule);
+        const candidates = computeOccurrenceCandidatesInRange(
+          taskBaseStart,
+          {
+            freq: parsedRule.freq,
+            interval: parsedRule.interval,
+            byDay: parsedRule.byDay,
+            skipWeekend: rule.skipWeekend ?? false,
+            skipHoliday: rule.skipHoliday ?? false,
+            skipMode: rule.skipMode ?? "shift_forward",
+            endCount: rule.endCount ?? null,
+            endDate: rule.endDate ? serializeDbTimestamp(rule.endDate) : null,
+          },
+          new Date(canonicalStart.getTime() - 16 * 24 * 60 * 60 * 1000),
+          new Date(canonicalStart.getTime() + 16 * 24 * 60 * 60 * 1000),
+          20000,
+        );
+        const candidate = candidates.find(
+          (value) =>
+            value.canonicalStart.getTime() === canonicalStart.getTime(),
+        );
+        if (candidate) {
+          baseStartAt = candidate.occurrenceStart;
+          baseEndAt = new Date(baseStartAt.getTime() + baseDurationMs);
+        }
+      }
+      const segmentValues = resolveFutureSegmentResult({
+        canonicalStart,
+        canonicalEnd,
+        baseStartAt,
+        baseEndAt,
+        nextStartAt,
+        nextEndAt,
+        allDay: effectiveAllDay,
+      });
+
+      await db.transaction(async (tx) => {
+        // Replacing a future boundary also replaces any later schedule
+        // changes.  This prevents an older future edit from taking effect
+        // again after the newly selected boundary.
+        await tx
+          .delete(taskRecurrenceScheduleSegments)
+          .where(
+            and(
+              eq(taskRecurrenceScheduleSegments.taskId, id),
+              gte(
+                taskRecurrenceScheduleSegments.effectiveFrom,
+                toDbLocalTimestamp(canonicalStart),
+              ),
+            ),
+          );
+
+        await tx
+          .insert(taskRecurrenceScheduleSegments)
+          .values({
+            taskId: id,
+            effectiveFrom: toDbLocalTimestamp(canonicalStart),
+            startOffsetSeconds: segmentValues.startOffsetSeconds,
+            endOffsetSeconds: segmentValues.endOffsetSeconds,
+            allDay: segmentValues.allDay,
+            updatedAt: new Date(),
+          })
+          .onConflictDoUpdate({
+            target: [
+              taskRecurrenceScheduleSegments.taskId,
+              taskRecurrenceScheduleSegments.effectiveFrom,
+            ],
+            set: {
+              startOffsetSeconds: segmentValues.startOffsetSeconds,
+              endOffsetSeconds: segmentValues.endOffsetSeconds,
+              allDay: segmentValues.allDay,
+              updatedAt: new Date(),
+            },
+          });
+
+        // A single exception at the selected boundary is promoted to the
+        // series segment.  Exceptions at earlier/later canonical boundaries
+        // remain intact so the future mutation cannot silently lose data.
+        const rows = await tx
+          .select({
+            id: taskOccurrences.id,
+            sourceKind: taskOccurrences.sourceKind,
+            startAt: taskOccurrences.startAt,
+            endAt: taskOccurrences.endAt,
+            originalStartAt: taskOccurrences.originalStartAt,
+            status: taskOccurrences.status,
+            reminderOffsets: taskOccurrences.reminderOffsets,
+          })
+          .from(taskOccurrences)
+          .where(eq(taskOccurrences.taskId, id));
+        const exceptionIds = rows
+          .filter(
+            (row) =>
+              isRecurrenceSkipSourceKind(row.sourceKind) ||
+              isRecurrenceOverrideSourceKind(row.sourceKind),
+          )
+          .filter((row) => {
+            const rowCanonical = resolveStoredOccurrenceOriginalStartAt(row);
+            return (
+              rowCanonical !== null &&
+              rowCanonical.getTime() === canonicalStart.getTime()
+            );
+          })
+          .map((row) => row.id);
+        const boundaryException = rows
+          .filter((row) => {
+            const rowCanonical = resolveStoredOccurrenceOriginalStartAt(row);
+            return (
+              rowCanonical !== null &&
+              rowCanonical.getTime() === canonicalStart.getTime() &&
+              (isRecurrenceOverrideSourceKind(row.sourceKind) ||
+                isRecurrenceSkipSourceKind(row.sourceKind))
+            );
+          })
+          .sort(
+            (a, b) =>
+              Number(isRecurrenceOverrideSourceKind(b.sourceKind)) -
+              Number(isRecurrenceOverrideSourceKind(a.sourceKind)),
+          )[0];
+        if (exceptionIds.length > 0) {
+          // Keep the occurrence row's historical activity/time-entry records
+          // while detaching their optional occurrence reference.  The FK
+          // columns are not ON DELETE CASCADE, so deleting a boundary
+          // skip/override without this step can make a valid future edit
+          // fail with a constraint violation.
+          await tx
+            .update(notificationDeliveries)
+            .set({ occurrenceId: null })
+            .where(
+              inArray(notificationDeliveries.occurrenceId, exceptionIds),
+            );
+          await tx
+            .update(timeEntries)
+            .set({ occurrenceId: null })
+            .where(inArray(timeEntries.occurrenceId, exceptionIds));
+          await tx
+            .delete(taskOccurrences)
+            .where(inArray(taskOccurrences.id, exceptionIds));
+        }
+
+        // Reconcile already-materialized normal rows in place.  The Web GET
+        // route can re-apply a segment at read time, but FastAPI/Mobile and
+        // notification workers read these stored timestamps directly.  Keep
+        // the same row IDs and canonical identity while updating their actual
+        // values inside this transaction.
+        const activeSegmentRows = await tx
+          .select({
+            effectiveFrom: taskRecurrenceScheduleSegments.effectiveFrom,
+            startOffsetSeconds:
+              taskRecurrenceScheduleSegments.startOffsetSeconds,
+            endOffsetSeconds:
+              taskRecurrenceScheduleSegments.endOffsetSeconds,
+            allDay: taskRecurrenceScheduleSegments.allDay,
+          })
+          .from(taskRecurrenceScheduleSegments)
+          .where(eq(taskRecurrenceScheduleSegments.taskId, id));
+        const activeSegments: RecurrenceScheduleSegment[] =
+          activeSegmentRows.map((row) => ({
+            effectiveFrom: row.effectiveFrom,
+            startOffsetSeconds: row.startOffsetSeconds ?? 0,
+            endOffsetSeconds: row.endOffsetSeconds ?? 0,
+            allDay: row.allDay ?? false,
+          }));
+        const taskBaseStart = dbTimestampToLocalDate(task.startAt ?? task.endAt);
+        if (taskBaseStart) {
+          let canonicalRows = rows
+            .map((row) => ({
+              row,
+              canonical: resolveStoredOccurrenceOriginalStartAt(row),
+            }))
+            .filter(
+              (entry): entry is { row: (typeof rows)[number]; canonical: Date } =>
+                entry.canonical !== null &&
+                !isRecurrenceSkipSourceKind(entry.row.sourceKind) &&
+                !isRecurrenceOverrideSourceKind(entry.row.sourceKind),
+            );
+          const canonicalTimes = rows
+            .map((row) => dbTimestampToLocalDate(row.startAt)?.getTime())
+            .filter((value): value is number => value !== undefined);
+          const minCanonical = Math.min(
+            canonicalStart.getTime(),
+            ...canonicalTimes,
+          );
+          const maxCanonical = Math.max(
+            canonicalStart.getTime(),
+            ...canonicalTimes,
+          );
+          const paddingMs = getRecurrenceSegmentEnvelopeMs(activeSegments);
+          const candidateRangeStart = new Date(
+            minCanonical - baseDurationMs - paddingMs,
+          );
+          const candidateRangeEnd = new Date(
+            maxCanonical + baseDurationMs + paddingMs,
+          );
+          const parsedRule = parseRrule(rule.rrule);
+          const candidates = computeOccurrenceCandidatesInRange(
+            taskBaseStart,
+            {
+              freq: parsedRule.freq,
+              interval: parsedRule.interval,
+              byDay: parsedRule.byDay,
+              skipWeekend: rule.skipWeekend ?? false,
+              skipHoliday: rule.skipHoliday ?? false,
+              skipMode: rule.skipMode ?? "shift_forward",
+              endCount: rule.endCount ?? null,
+              endDate: rule.endDate
+                ? serializeDbTimestamp(rule.endDate)
+                : null,
+            },
+            candidateRangeStart,
+            candidateRangeEnd,
+            20000,
+          );
+          const candidateByActual = new Map<number, (typeof candidates)[number]>();
+          for (const candidate of candidates) {
+            if (!candidateByActual.has(candidate.occurrenceStart.getTime())) {
+              candidateByActual.set(candidate.occurrenceStart.getTime(), candidate);
+            }
+          }
+          // Recover raw canonical identity for legacy normal rows that still
+          // have original_start_at=NULL.  Their stored actual timestamp is
+          // matched against the same canonical/actual pair generator used by
+          // the dynamic route; do this before applying the new segment.
+          canonicalRows = canonicalRows.map((entry) => {
+            if (entry.row.originalStartAt === null) {
+              const rowStart = dbTimestampToLocalDate(entry.row.startAt);
+              const candidate = rowStart
+                ? candidateByActual.get(rowStart.getTime())
+                : undefined;
+              if (candidate) return { ...entry, canonical: candidate.canonicalStart };
+            }
+            return entry;
+          });
+          const candidateByCanonical = new Map(
+            candidates.map((candidate) => [
+              candidate.canonicalStart.getTime(),
+              candidate,
+            ]),
+          );
+          for (const { row, canonical } of canonicalRows) {
+            const candidate = candidateByCanonical.get(canonical.getTime());
+            const storedStart = dbTimestampToLocalDate(row.startAt);
+            const storedEnd = dbTimestampToLocalDate(row.endAt);
+            const baseStart =
+              candidate?.occurrenceStart ??
+              (canonical.getTime() === taskBaseStart.getTime()
+                ? canonical
+                : storedStart);
+            if (!baseStart) continue;
+            const baseEnd = candidate
+              ? new Date(baseStart.getTime() + baseDurationMs)
+              : storedEnd;
+            if (!baseEnd) continue;
+            const applied = applyRecurrenceScheduleSegment({
+              canonicalStart: canonical,
+              canonicalEnd: new Date(canonical.getTime() + baseDurationMs),
+              baseStartAt: baseStart,
+              baseEndAt: baseEnd,
+              baseAllDay: task.allDay ?? false,
+              segments: activeSegments,
+            });
+            if (!applied.endAt) continue;
+            await tx
+              .update(taskOccurrences)
+              .set({
+                startAt: toDbLocalTimestamp(applied.startAt),
+                endAt: toDbLocalTimestamp(applied.endAt),
+                originalStartAt: toDbLocalTimestamp(canonical),
+                allDay: applied.allDay,
+                updatedAt: new Date(),
+              })
+              .where(eq(taskOccurrences.id, row.id));
+          }
+
+          const reconciledCanonicalKeys = new Set(
+            canonicalRows.map((entry) => entry.canonical.getTime()),
+          );
+          if (!reconciledCanonicalKeys.has(canonicalStart.getTime())) {
+            const candidate = candidateByCanonical.get(canonicalStart.getTime());
+            const baseStart = candidate?.occurrenceStart ?? canonicalStart;
+            const baseEnd = new Date(baseStart.getTime() + baseDurationMs);
+            const applied = applyRecurrenceScheduleSegment({
+              canonicalStart,
+              canonicalEnd,
+              baseStartAt: baseStart,
+              baseEndAt: baseEnd,
+              baseAllDay: task.allDay ?? false,
+              segments: activeSegments,
+            });
+            if (applied.endAt) {
+              await tx.insert(taskOccurrences).values({
+                taskId: id,
+                startAt: toDbLocalTimestamp(applied.startAt),
+                endAt: toDbLocalTimestamp(applied.endAt),
+                originalStartAt: toDbLocalTimestamp(canonicalStart),
+                status: boundaryException?.status ?? task.status ?? "open",
+                allDay: applied.allDay,
+                reminderOffsets:
+                  boundaryException?.reminderOffsets ??
+                  task.reminderOffsets ??
+                  [],
+                sourceKind: "recurrence",
+                isGenerated: true,
+                updatedAt: new Date(),
+              });
+            }
+          }
+        }
+      });
+
+      await deleteDueSoonNotifications(id);
+
+      return NextResponse.json({
+        success: true,
+        occurrence: {
+          id: `generated-${id}-${serializeDbTimestamp(canonicalStart) ?? canonicalStart.toISOString()}`,
+          task_id: id,
+          status: resolveOccurrenceStatus(body.status, task.status),
+          start_at: serializeOccurrenceTimestamp(nextStartAt, effectiveAllDay),
+          end_at: serializeOccurrenceTimestamp(nextEndAt, effectiveAllDay),
+          source_kind: "rrule",
+          original_start_at: serializeDbTimestamp(canonicalStart),
+          all_day: effectiveAllDay,
+        },
+      });
+    }
+
     await ensureSingleSkipRow({
       taskId: id,
+      occurrenceId:
+        typeof body.occurrence_id === "string" ? body.occurrence_id : null,
+      actualOccurrenceStartAt: occurrenceStartAt,
       occurrenceStartAt: originalStartAt,
       occurrenceEndAt,
       status: task.status,
@@ -418,6 +935,7 @@ export async function PATCH(
           override.endAt,
           override.allDay ?? false,
         ),
+        all_day: override.allDay ?? false,
         source_kind: override.sourceKind,
         original_start_at: originalStartAtText,
       },
@@ -450,7 +968,10 @@ export async function DELETE(
       );
     }
     if (!(await canWriteProjectId(user, task.projectId))) {
-      return NextResponse.json({ detail: "Permission denied" }, { status: 403 });
+      return NextResponse.json(
+        { detail: "Permission denied" },
+        { status: 403 },
+      );
     }
 
     const mode = body.mode === "future" ? "future" : "single";
@@ -490,6 +1011,9 @@ export async function DELETE(
 
       await ensureSingleSkipRow({
         taskId: id,
+        occurrenceId:
+          typeof body.occurrence_id === "string" ? body.occurrence_id : null,
+        actualOccurrenceStartAt: occurrenceStartAt,
         occurrenceStartAt: originalStartAt,
         occurrenceEndAt,
         status: task.status,
@@ -509,10 +1033,13 @@ export async function DELETE(
     const taskStartAt = dbTimestampToLocalDate(task.startAt ?? task.endAt);
     if (taskStartAt && taskStartAt.getTime() >= originalStartAt.getTime()) {
       await deleteDueSoonNotifications(id);
-      const upstream = await fetchPythonApi(`/api/tasks/${encodeURIComponent(id)}`, {
-        method: "DELETE",
-        user,
-      });
+      const upstream = await fetchPythonApi(
+        `/api/tasks/${encodeURIComponent(id)}`,
+        {
+          method: "DELETE",
+          user,
+        },
+      );
       if (!upstream.ok) {
         const body = await upstream.text().catch(() => "");
         return new NextResponse(
@@ -562,7 +1089,9 @@ export async function DELETE(
       await db
         .update(notificationDeliveries)
         .set({ occurrenceId: null })
-        .where(inArray(notificationDeliveries.occurrenceId, staleOccurrenceIds));
+        .where(
+          inArray(notificationDeliveries.occurrenceId, staleOccurrenceIds),
+        );
       await db
         .update(timeEntries)
         .set({ occurrenceId: null })

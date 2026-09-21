@@ -1,8 +1,12 @@
 """アプリ設定・音声状態・キャラクター系ルート (server.py から移設)"""
 
+import asyncio
 import logging
+import os
+from ...services.browser_agent_models import browser_settings_payload, validate_browser_settings_update
 import re
-from typing import TYPE_CHECKING
+import time
+from typing import TYPE_CHECKING, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -63,6 +67,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _attach_server_timing(
+    response: JSONResponse,
+    name: str,
+    started_at: float,
+) -> JSONResponse:
+    """Attach a stable, proxy-safe Server-Timing diagnostic to *response*."""
+
+    duration_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+    response.headers["Server-Timing"] = f"{name};dur={duration_ms:.1f}"
+    return response
+
+
 def _request_correlation_ids(request: Request | None) -> tuple[str | None, str | None]:
     """Read optional correlation headers without echoing their raw values."""
 
@@ -98,6 +114,37 @@ def _character_lookup_http_exception(
         status_code=character_lookup_http_status(typed),
         detail=character_lookup_http_detail(typed),
     )
+
+
+def _load_character_catalog(config: Any) -> tuple[list[str], list[dict[str, str]]]:
+    """Load character names and slug options with one catalog lookup.
+
+    ``Config.get_available_characters`` is a compatibility projection over
+    ``get_available_character_options``.  Prefer that richer projection when
+    available so the API does not issue the same database list query twice;
+    lightweight configs that only implement the legacy method retain their
+    existing fallback behavior.
+    """
+
+    option_loader = getattr(config, "get_available_character_options", None)
+    if callable(option_loader):
+        character_options = option_loader()
+        if not isinstance(character_options, list):
+            character_options = list(character_options or [])
+        characters = sorted(
+            {
+                option["name"]
+                for option in character_options
+                if isinstance(option, dict) and option.get("name")
+            }
+        )
+        return characters, character_options
+
+    characters_loader = getattr(config, "get_available_characters", None)
+    if not callable(characters_loader):
+        return [], []
+    characters = list(characters_loader())
+    return characters, [{"slug": name, "name": name} for name in characters]
 
 
 def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
@@ -174,15 +221,14 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         _: None = Depends(require_auth),
     ):
         """Get list of available characters"""
+        started_at = time.perf_counter()
         try:
-            characters = server.config.get_available_characters()
-            option_loader = getattr(
-                server.config, "get_available_character_options", None
-            )
-            character_options = (
-                option_loader()
-                if callable(option_loader)
-                else [{"slug": name, "name": name} for name in characters]
+            # Character catalog access ultimately performs synchronous DB work
+            # through the legacy Config adapter. Run the complete projection in
+            # a worker and derive legacy names from the same option list.
+            characters, character_options = await asyncio.to_thread(
+                _load_character_catalog,
+                server.config,
             )
             current_character = await resolve_request_character_name(server, request)
             if any(
@@ -191,12 +237,16 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 if isinstance(option, dict)
             ):
                 current_character = canonicalize_character_slug(current_character)
-            return JSONResponse(
-                {
-                    "characters": characters,
-                    "character_options": character_options,
-                    "current": current_character,
-                }
+            return _attach_server_timing(
+                JSONResponse(
+                    {
+                        "characters": characters,
+                        "character_options": character_options,
+                        "current": current_character,
+                    }
+                ),
+                "aoi_characters",
+                started_at,
             )
         except CharacterLookupError as exc:
             logger.error(
@@ -218,6 +268,12 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     # ── Settings API Endpoints ──────────────────────────────────────────
     # Allowed settings that can be modified via WebUI
     ALLOWED_SETTINGS = {
+        # Provider visibility is a global, UI-only preference.  The enclosing
+        # application config is DB-backed and the route's existing admin gate
+        # protects writes; it is deliberately not consulted by LLM execution
+        # or session authorization.
+        "llm_provider_visibility": {"type": "object"},
+        "llm_provider_visibility.hidden_provider_ids": {"type": "str_list"},
         "external_llm.auto_approve": {"type": "bool"},
         "agent_team.orchestration_mode": {
             "type": "enum",
@@ -251,6 +307,34 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             "values": ["block", "confirm"],
         },
         "external_model_privacy.cache_enabled": {"type": "bool"},
+        # Cloud Advisor is an independent parent-owned advisory capability;
+        # route/policy controls are intentionally separate from Agent Team v3
+        # topology and never expose credentials or review payloads.
+        "browser_agent": {"type": "object"},
+        "cloud_advisor.mode": {
+            "type": "enum",
+            "values": ["disabled", "manual", "automatic"],
+        },
+        "cloud_advisor.provider": {
+            "type": "enum",
+            # Web ChatGPT is a first-class Cloud Advisor route, but it is a
+            # parent-owned browser façade rather than an API-provider factory
+            # target.  Credentials/profile details remain out of settings.
+            "values": ["openai", "deepinfra", "chatgpt-web"],
+        },
+        "cloud_advisor.model": {"type": "str"},
+        "cloud_advisor.reasoning_effort": {
+            "type": "enum",
+            "values": [
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            ],
+        },
         "chatgpt_web.profile_dir": {"type": "str"},
         "chatgpt_web.response_timeout_seconds": {
             "type": "int",
@@ -339,14 +423,17 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         "mage_vl.max_pixels": {"type": "int", "min": 0, "max": 4000000},
         "mage_vl.max_new_tokens": {"type": "int", "min": 1, "max": 8192},
     }
+    from ...llm.manager import TARGET_CLIENT_PROVIDERS
+
     class_provider_values = {
         "vision": [""] + sorted(MODEL_ROUTING_PROVIDERS - {"claude-cli", "grok-cli", "deepseek"}),
         # 専用client factoryが生成できるproviderだけを許可する。
         # claude/grok はメディア向け互換APIでは使えるが、target factory未対応。
         "clip_ingest": [""] + sorted(AGENT_TEAM_PROVIDERS),
+        "project_automation": [""] + sorted(TARGET_CLIENT_PROVIDERS),
         "video": ["", "mage_vl"],
     }
-    for route_class in ("vision", "clip_ingest", "video"):
+    for route_class in ("vision", "clip_ingest", "project_automation", "video"):
         ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.inherit"] = {"type": "bool"}
         ALLOWED_SETTINGS[f"model_routing.classes.{route_class}.provider"] = {
             "type": "enum",
@@ -359,6 +446,13 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
     ALLOWED_SETTINGS["model_routing.classes.vision.mode"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.clip_ingest.reasoning_effort"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.clip_ingest.mode"] = {"type": "str"}
+    ALLOWED_SETTINGS["model_routing.classes.project_automation.reasoning_effort"] = {
+        "type": "str"
+    }
+    ALLOWED_SETTINGS["model_routing.classes.project_automation.mode"] = {
+        "type": "enum",
+        "values": ["", "inherit", "dedicated"],
+    }
     ALLOWED_SETTINGS["model_routing.classes.video.reasoning_effort"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.video.mode"] = {"type": "str"}
     ALLOWED_SETTINGS["model_routing.classes.audio.engine"] = {
@@ -377,6 +471,25 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             if field == "provider"
             else {"type": "str"}
         )
+
+    def _normalize_provider_visibility_ids(value: Any) -> list[str]:
+        """Normalize the global provider hide list without creating an ACL."""
+
+        if isinstance(value, str):
+            values = value.split(",")
+        elif isinstance(value, (list, tuple, set)):
+            values = value
+        else:
+            return []
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in values:
+            normalized = str(item or "").strip().lower()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                result.append(normalized)
+        return result
+
     @app.get("/api/settings")
     async def get_settings(
         request: Request,
@@ -413,6 +526,13 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                 "external_llm": {
                     "auto_approve": server.config.get(
                         "external_llm.auto_approve", True
+                    )
+                },
+                "llm_provider_visibility": {
+                    "hidden_provider_ids": _normalize_provider_visibility_ids(
+                        server.config.get(
+                            "llm_provider_visibility.hidden_provider_ids", []
+                        )
                     )
                 },
                 "agent_team": {
@@ -461,6 +581,25 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     ),
                     "cache_enabled": bool(
                         server.config.get("external_model_privacy.cache_enabled", True)
+                    ),
+                },
+                "browser_agent": {
+                    **browser_settings_payload(server.config),
+                    "pc_bridge_required": True,
+                    "jev_configured": bool(os.environ.get("JEV_API_KEY", "").strip()),
+                },
+                "cloud_advisor": {
+                    "mode": server.config.get(
+                        "cloud_advisor.mode", "disabled"
+                    ),
+                    "provider": server.config.get(
+                        "cloud_advisor.provider", "openai"
+                    ),
+                    "model": str(
+                        server.config.get("cloud_advisor.model", "") or ""
+                    ).strip(),
+                    "reasoning_effort": server.config.get(
+                        "cloud_advisor.reasoning_effort", "high"
                     ),
                 },
                 "chatgpt_web": {
@@ -972,13 +1111,18 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                         f"Value must be one of: {setting_schema['values']}"
                     )
             elif setting_schema["type"] == "str":
-                if key == "search.openai_model" and (
-                    not isinstance(value, str) or not value.strip()
-                ):
-                    raise ValueError("OpenAI検索モデルを指定してください")
-                value = str(value).strip()
-                if key == "chatgpt_web.profile_dir" and not value:
-                    raise ValueError("ChatGPT会話プロファイルの保存先を指定してください")
+                if key == "cloud_advisor.model":
+                    # Empty means use canonical_model_for_provider() at
+                    # consultation time; this is an intentional setting.
+                    value = "" if value is None else str(value).strip()
+                else:
+                    if key == "search.openai_model" and (
+                        not isinstance(value, str) or not value.strip()
+                    ):
+                        raise ValueError("OpenAI検索モデルを指定してください")
+                    value = str(value).strip()
+                    if key == "chatgpt_web.profile_dir" and not value:
+                        raise ValueError("ChatGPT会話プロファイルの保存先を指定してください")
             elif setting_schema["type"] == "int":
                 if isinstance(value, bool):
                     raise ValueError(f"Setting '{key}' must be an integer")
@@ -1011,9 +1155,19 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     ]
                 else:
                     raise ValueError("Value must be a list of strings")
+                if key == "llm_provider_visibility.hidden_provider_ids":
+                    value = _normalize_provider_visibility_ids(value)
             elif setting_schema["type"] == "object":
+                if key == "browser_agent":
+                    value = validate_browser_settings_update(value)
                 if not isinstance(value, dict):
                     raise ValueError("Value must be an object")
+                if key == "llm_provider_visibility":
+                    value = {
+                        "hidden_provider_ids": _normalize_provider_visibility_ids(
+                            value.get("hidden_provider_ids", [])
+                        )
+                    }
             if key == "agent_team.orchestration_mode" and value == "director":
                 if (
                     str(server.config.get("llm_provider", "") or "")
@@ -1041,6 +1195,36 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
                     raise ValueError(
                         "Directorモードを有効にする前にChatGPT接続設定を完成させてください"
                     )
+            if key.startswith("model_routing.classes.project_automation."):
+                from ...services.project_automation_model import (
+                    ProjectAutomationRouteError,
+                    resolve_project_automation_route,
+                )
+
+                current_route = server.config.get(
+                    "model_routing.classes.project_automation",
+                    {},
+                )
+                candidate_route = (
+                    dict(current_route)
+                    if isinstance(current_route, dict)
+                    else {}
+                )
+                route_field = key.rsplit(".", 1)[-1]
+                candidate_route[route_field] = value
+                candidate_config = {
+                    "llm_provider": server.config.get("llm_provider", ""),
+                    "llm_model": server.config.get("llm_model", ""),
+                    "model_routing": {
+                        "classes": {
+                            "project_automation": candidate_route,
+                        }
+                    },
+                }
+                try:
+                    resolve_project_automation_route(candidate_config)
+                except ProjectAutomationRouteError as exc:
+                    raise ValueError(str(exc)) from exc
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
@@ -1141,7 +1325,10 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
         """Switch to a different character"""
         try:
             # Validate character exists before mutating user/session state.
-            char_config = server.config.get_character_config(character_name)
+            char_config = await asyncio.to_thread(
+                server.config.get_character_config,
+                character_name,
+            )
             db_character = char_config.get("_db_character", {})
             canonical_character_name = (
                 str(db_character.get("slug") or character_name).strip()
@@ -1156,10 +1343,16 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
             ).strip()
 
             if auth_enabled is False or is_admin:
+                # Keep manager callbacks on the FastAPI event-loop thread.
+                # The WebSocket notifier schedules a coroutine via the running
+                # loop; moving this call to ``to_thread`` would silently skip
+                # that notification and allow concurrent switches to race.
                 character_manager = CharacterSwitchManager()
-                success = character_manager.switch_character(
-                    character_name,
-                    canonical_character_name,
+                success = bool(
+                    character_manager.switch_character(
+                        character_name,
+                        canonical_character_name,
+                    )
                 )
                 if not success:
                     raise HTTPException(
@@ -1170,13 +1363,16 @@ def register_config_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             if success:
                 if auth_enabled is False or is_admin:
-                    if hasattr(server.config, "save_to_file"):
-                        if not server.config.save_to_file(
-                            "default_character", character_name
-                        ):
-                            raise RuntimeError("Failed to persist default_character")
-                    else:
-                        server.config.set("default_character", character_name)
+                    def _persist_default_character_sync() -> None:
+                        if hasattr(server.config, "save_to_file"):
+                            if not server.config.save_to_file(
+                                "default_character", character_name
+                            ):
+                                raise RuntimeError("Failed to persist default_character")
+                        else:
+                            server.config.set("default_character", character_name)
+
+                    await asyncio.to_thread(_persist_default_character_sync)
 
                     # Update server's character name
                     server.character_name = character_name

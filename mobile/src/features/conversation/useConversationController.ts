@@ -1,3 +1,7 @@
+import { readLocalTaskContext } from "./local-task-context";
+import { useProjectStore } from "../../stores/project";
+import { getToken, getTokenAuthScope } from "../../lib/auth";
+import { getConfiguredApiServerFingerprint } from "../../lib/api-client";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentRun,
@@ -14,7 +18,6 @@ import {
   type LlmModeResponse,
 } from "../../lib/chat-api";
 import { isApiHttpError } from "../../lib/api-client";
-import { taskApi } from "../../lib/task-api";
 import { ChatWebSocket } from "../../lib/websocket";
 import {
   generateMobileLlmReply,
@@ -33,6 +36,9 @@ import {
   getPromotedConversationSessionId,
 } from "../../repositories";
 import { chatRepo } from "../../repositories/chat";
+import { applyRemoteConversationMessages } from "../../repositories/conversations";
+import { runForegroundSqliteWrite } from "../../db/sqlite-write-coordinator";
+import { prepareDirectConversationHandoff } from "./direct-handoff";
 import { appsRepo } from "../../repositories/apps";
 import { isServerKnownUnreachable, useNetworkStore } from "../../stores/network";
 import { deepResearchApi, type DeepResearchJob } from "../../lib/deep-research-api";
@@ -61,10 +67,9 @@ import type {
 import { appContextCompatibleWithProject } from "./app-context";
 import { type SkillSlashCommand } from "./chat-commands";
 import {
-  getCachedLlmMode,
   getCachedLlmModelCatalog,
   getCachedSkillSlashCommands,
-  primeLlmMode,
+  refreshLlmModelCatalog,
 } from "./llm-meta-cache";
 import {
   describeFallbackFailure,
@@ -89,6 +94,7 @@ import {
 } from "./character-session";
 import { buildReplaceableConversationFallbackTitle } from "./local-title-fallback";
 import { buildResponseModelOptions } from "./response-model-options";
+import { resolveServerModelEffort, snapshotServerModelTarget } from "./server-model-effort";
 import {
   attemptPendingRetry,
   findAcceptedRemoteMessage,
@@ -102,7 +108,6 @@ import {
   isAssistantPersistenceEvent,
 } from "./cancelled-generation";
 import {
-  SERVER_DEFAULT_MODE,
   createDefaultChatLlmPreferences,
   normalizeLlmMode,
   normalizeResponseTarget,
@@ -114,8 +119,6 @@ import {
   type ChatResponseTarget,
 } from "./chat-llm-preferences";
 import {
-  LatestSelectionSynchronizer,
-  type LatestSelectionSyncEvent,
   type LatestSelectionTask,
 } from "./latest-selection-sync";
 import {
@@ -132,6 +135,7 @@ import {
 import { loadConversationRemoteData } from "./useConversationData";
 import { useConversationDurableTimeline } from "./useConversationTimeline";
 import { ConversationGenerationEventGate } from "./conversation-generation-events";
+import { ConversationSubmissionQueue, RetainedSubmissionError, conversationMessageIdentity, useSubmissionTimeline } from "./conversation-submissions";
 
 type ControllerArgs = {
   sessionId?: string | null;
@@ -142,6 +146,13 @@ type ControllerArgs = {
   onSessionPromoted?: (sessionId: string) => void;
   initialAppContext?: ChatAppContext | null;
 };
+
+/** Direct cloud providers require Internet, unlike a LAN AoiTalk server. */
+export function canDispatchDirectCloud(
+  networkOnline: boolean | null | undefined,
+): boolean {
+  return networkOnline !== false;
+}
 
 type BranchSwitchRuntime = {
   fetchBranches: (
@@ -218,7 +229,9 @@ function deepResearchToConversationJob(job: DeepResearchJob): ConversationJob {
         ? "running"
         : job.status === "completed"
           ? "completed"
-          : job.status,
+          : job.status === "interrupted"
+            ? "failed"
+            : job.status,
     progress: job.progress,
     progressText: latestEvent?.message,
     resultText: job.report_markdown,
@@ -328,29 +341,6 @@ function extractActivityMessage(message: WSMessage): string | null {
   return value && value.trim() ? value.trim() : null;
 }
 
-function parseLlmModePayload(value: unknown): LlmModeResponse | null {
-  const data =
-    value && typeof value === "object"
-      ? (value as Record<string, unknown>)
-      : null;
-  if (!data || typeof data.mode !== "string" || !data.mode.trim()) return null;
-  return {
-    mode: data.mode,
-    available_modes: Array.isArray(data.available_modes)
-      ? data.available_modes.filter((item): item is string => typeof item === "string")
-      : undefined,
-    labels:
-      data.labels && typeof data.labels === "object" && !Array.isArray(data.labels)
-        ? (data.labels as Record<string, string>)
-        : undefined,
-    kind: typeof data.kind === "string" ? data.kind : undefined,
-    provider: typeof data.provider === "string" ? data.provider : undefined,
-    model: typeof data.model === "string" ? data.model : undefined,
-    success: typeof data.success === "boolean" ? data.success : undefined,
-    message: typeof data.message === "string" ? data.message : undefined,
-  };
-}
-
 type LlmModeSyncResult =
   | { kind: "accepted"; state: LlmModeResponse }
   | {
@@ -383,7 +373,7 @@ export function useConversationController(
   refreshFromServer: () => Promise<void>;
   stopGeneration: () => Promise<void>;
   sendConversationCommand: (command: SendConversationCommand) => Promise<void>;
-  retryPendingMessage: (message: ConversationMessage) => Promise<void>;
+  retryPendingMessage: (message: ConversationMessage, route?: "server" | "direct") => Promise<void>;
   respondPermission: (requestId: string, approved: boolean) => void;
   startDeepResearch: (query: string) => Promise<void>;
   editMessage: (message: ConversationMessage, content: string) => Promise<void>;
@@ -396,6 +386,7 @@ export function useConversationController(
   changeLlmMode: (mode: string) => void;
   changeResponseTarget: (target: ChatResponseTarget) => void;
   refreshLlmMode: () => Promise<void>;
+  refreshResponseModelOptions: () => Promise<void>;
   refreshSkillCommands: () => Promise<void>;
   changeCharacter: (slug: string) => Promise<void>;
   serverGenerationActive: boolean;
@@ -421,6 +412,11 @@ export function useConversationController(
     onSessionPromoted,
     initialAppContext,
   } = args;
+  // `online` is Internet-only.  Conversation REST/WebSocket transport uses
+  // the physical route so a LAN AoiTalk server remains usable without WAN.
+  const networkConnected = useNetworkStore(
+    (state) => state.connected ?? state.online,
+  );
   const networkOnline = useNetworkStore((state) => state.online);
   const networkServerReachable = useNetworkStore(
     (state) => state.serverReachable,
@@ -434,7 +430,11 @@ export function useConversationController(
   focusedRef.current = isFocused;
   focusEpochRef.current = focusEpoch;
   const [session, setSession] = useState<ConversationSession | null>(null);
-  const [messages, setMessages] = useState<ConversationMessage[]>([]);
+  const { messages, setMessages, submitMessage, promoteMessages } = useSubmissionTimeline(sessionId ?? "");
+  const submissionQueueRef = useRef(new ConversationSubmissionQueue());
+  const backgroundFlushRef = useRef<Promise<unknown> | null>(null);
+  const latestSubmissionIdRef = useRef<string | null>(null);
+  const promotedSubmissionSessionsRef = useRef(new Map<string, string>());
   const sessionStateRef = useRef<ConversationSession | null>(null);
   const messagesStateRef = useRef<ConversationMessage[]>([]);
   const pendingMessagesRef = useRef(0);
@@ -457,18 +457,6 @@ export function useConversationController(
   const [streamContent, setStreamContent] = useState("");
   const [activeTool, setActiveTool] = useState<string | null>(null);
   const [activityMessage, setActivityMessage] = useState<string | null>(null);
-  const [llmMode, setLlmMode] = useState(
-    () => createDefaultChatLlmPreferences().mode.mode,
-  );
-  const [llmModeOptions, setLlmModeOptions] = useState<string[]>(
-    () => createDefaultChatLlmPreferences().mode.available_modes ?? [],
-  );
-  const [llmModeLabels, setLlmModeLabels] = useState<Record<string, string>>(
-    () => createDefaultChatLlmPreferences().mode.labels ?? {},
-  );
-  const [llmModeKind, setLlmModeKind] = useState<string | null>(
-    () => createDefaultChatLlmPreferences().mode.kind ?? null,
-  );
   const [llmModeSyncStatus, setLlmModeSyncStatus] =
     useState<LlmSelectionSyncStatus>("idle");
   const [llmSelectionMessage, setLlmSelectionMessage] = useState<string | null>(null);
@@ -527,23 +515,9 @@ export function useConversationController(
   const llmPreferencesRef = useRef<ChatLlmPreferences>(
     createDefaultChatLlmPreferences(),
   );
-  const llmModeRef = useRef("");
   const responseModelOptionsRef = useRef<ChatResponseModelOption[]>([]);
   const responseTargetRef = useRef<ChatResponseTarget>({ kind: "server" });
   const appContextAttemptRef = useRef<string | null>(null);
-  const llmSyncEventHandlerRef = useRef<
-    (event: LatestSelectionSyncEvent<string, LlmModeSyncResult>) => void
-  >(() => undefined);
-  const llmModeSynchronizerRef = useRef<
-    LatestSelectionSynchronizer<string, LlmModeSyncResult> | null
-  >(null);
-  if (!llmModeSynchronizerRef.current) {
-    llmModeSynchronizerRef.current = new LatestSelectionSynchronizer(
-      syncLatestLlmMode,
-      (event) => llmSyncEventHandlerRef.current(event),
-    );
-  }
-  llmModeRef.current = llmMode;
   responseModelOptionsRef.current = responseModelOptions;
   responseTargetRef.current = responseTarget;
 
@@ -576,19 +550,10 @@ export function useConversationController(
       "conversation",
     );
     mountedRef.current = true;
-    // React StrictModeのeffect再セットアップでも、cleanup済みqueueを再利用しない。
-    if (!llmModeSynchronizerRef.current) {
-      llmModeSynchronizerRef.current = new LatestSelectionSynchronizer(
-        syncLatestLlmMode,
-        (event) => llmSyncEventHandlerRef.current(event),
-      );
-    }
     return () => {
       mountedRef.current = false;
       loadRequestRef.current += 1;
       llmPreferenceHydrationRef.current += 1;
-      llmModeSynchronizerRef.current?.dispose();
-      llmModeSynchronizerRef.current = null;
       streamBufferRef.current?.flush("unmount");
       scheduledRefreshCancelRef.current?.();
       if (terminalRefreshTimerRef.current) {
@@ -623,6 +588,8 @@ export function useConversationController(
   const transportState = buildTransportState({
     isAuthenticated,
     isConnected,
+    target: responseTarget.kind,
+    connected: networkConnected,
     online: networkOnline,
   });
   const pendingMessages = useMemo(
@@ -661,6 +628,8 @@ export function useConversationController(
     connectionCapability: buildConnectionCapability({
       isAuthenticated,
       isConnected,
+      target: responseTarget.kind,
+      connected: networkConnected,
       online: networkOnline,
       serverReachable: networkServerReachable,
     }),
@@ -1404,142 +1373,19 @@ export function useConversationController(
     [],
   );
 
-  const applyLlmModeView = useCallback((value: LlmModeResponse) => {
-    const result = normalizeLlmMode(value);
-    llmModeRef.current = result.mode;
-    setLlmMode(result.mode);
-    setLlmModeOptions(result.available_modes ?? [result.mode]);
-    setLlmModeLabels(result.labels ?? {});
-    setLlmModeKind(result.kind ?? null);
-    return result;
-  }, []);
-
-  const applyServerLlmMode = useCallback(
-    (value: LlmModeResponse, scope: string) => {
-      if (llmPreferenceScopeRef.current !== scope) return;
-      const serverState = normalizeLlmMode(value);
-      primeLlmMode(serverState, scope);
-      const pendingTask = llmModeSynchronizerRef.current?.pendingTask();
-      if (
-        pendingTask?.scope === scope &&
-        pendingTask.value !== serverState.mode
-      ) {
-        // 遅延response/WebSocket Aで、最新ローカル選択Bを上書きしない。
-        const localMode = pendingTask.value;
-        const localState = normalizeLlmMode({
-          ...serverState,
-          mode: localMode,
-          available_modes: [
-            localMode,
-            ...(serverState.available_modes ?? []).filter((mode) => mode !== localMode),
-          ],
-          labels: {
-            ...(serverState.labels ?? {}),
-            ...(llmPreferencesRef.current.mode.labels ?? {}),
-          },
-        });
-        applyLlmModeView(localState);
-        persistLlmPreferences({ mode: localState, modeSyncPending: true });
-        return;
-      }
-
-      applyLlmModeView(serverState);
-      persistLlmPreferences({ mode: serverState, modeSyncPending: false });
-    },
-    [applyLlmModeView, persistLlmPreferences],
-  );
-
-  llmSyncEventHandlerRef.current = (
-    event: LatestSelectionSyncEvent<string, LlmModeSyncResult>,
-  ) => {
-    if (event.status === "idle") {
-      setLlmModeSyncStatus("idle");
-      return;
-    }
-    if (llmPreferenceScopeRef.current !== event.task.scope) return;
-    if (event.status === "pending" || event.status === "syncing") {
-      setLlmModeSyncStatus(event.status);
-      if (event.status === "pending") setLlmSelectionMessage(null);
-      return;
-    }
-    if (event.status === "failure") {
-      setLlmModeSyncStatus("unsynced");
-      setLlmSelectionMessage(
-        "Effortは端末へ保存済みです。サーバーへ未同期のため、再接続後に再試行します。",
-      );
-      persistLlmPreferences({ modeSyncPending: true });
-      return;
-    }
-
-    const normalized = applyLlmModeView(event.result.state);
-    primeLlmMode(normalized, event.task.scope);
-    persistLlmPreferences({ mode: normalized, modeSyncPending: false });
-    if (event.result.kind === "rejected") {
-      setLlmModeSyncStatus("rejected");
-      const label = normalized.labels?.[normalized.mode] ?? normalized.mode;
-      setLlmSelectionMessage(
-        `${event.result.requestedMode} はサーバーで利用できないため、${label} に戻しました。`,
-      );
-    } else {
-      setLlmModeSyncStatus("synced");
-      setLlmSelectionMessage(null);
-    }
-  };
-
-  const refreshLlmModeForScope = useCallback(
-    async (scope: string) => {
-      if (!isAuthenticated) return;
-      try {
-        applyServerLlmMode(await getCachedLlmMode(scope), scope);
-      } catch {
-        // 永続cache/defaultを維持する。offlineで空表示へ戻さない。
-      }
-    },
-    [applyServerLlmMode, isAuthenticated],
-  );
-
-  const refreshLlmMode = useCallback(async () => {
-    const scope =
-      llmPreferenceScopeRef.current ??
-      (await resolveCurrentChatLlmPreferenceScope(
-        isAuthenticated
-          ? userId
-            ? `auth:${userId}`
-            : undefined
-          : "anonymous",
-      ));
-    await refreshLlmModeForScope(scope);
-  }, [isAuthenticated, refreshLlmModeForScope, userId]);
-
   const refreshResponseModelOptionsForScope = useCallback(
-    async (scope: string) => {
+    async (scope: string, force = false) => {
       if (!isAuthenticated) return;
-      if (responseModelOptionsRef.current.length === 0) {
+      if (force || responseModelOptionsRef.current.length === 0) {
         setResponseModelOptionsLoading(true);
       }
       try {
-        const [catalogResult, settingsResult] = await Promise.allSettled([
-          getCachedLlmModelCatalog(scope),
-          taskApi.getUserSettings(),
-        ]);
-        if (catalogResult.status === "rejected") throw catalogResult.reason;
+        const catalog = await (force
+          ? refreshLlmModelCatalog(scope)
+          : getCachedLlmModelCatalog(scope));
         if (llmPreferenceScopeRef.current !== scope) return;
 
-        let options: ChatResponseModelOption[];
-        if (settingsResult.status === "fulfilled") {
-          options = buildResponseModelOptions(
-            catalogResult.value,
-            settingsResult.value,
-          );
-        } else if (responseModelOptionsRef.current.length > 0) {
-          // hidden provider設定を取得できない時は、既に絞り込み済みのcacheを維持する。
-          options = responseModelOptionsRef.current;
-        } else {
-          // 初回にvisibilityを取得できない場合、非表示providerを漏らさず現在値だけ出す。
-          options = buildResponseModelOptions(catalogResult.value).filter(
-            (option) => option.isCurrent,
-          );
-        }
+        const options = buildResponseModelOptions(catalog);
         responseModelOptionsRef.current = options;
         setResponseModelOptions(options);
 
@@ -1567,6 +1413,16 @@ export function useConversationController(
     [isAuthenticated, persistLlmPreferences],
   );
 
+  const refreshResponseModelOptions = useCallback(async () => {
+    if (!isAuthenticated) return;
+    const scope =
+      llmPreferenceScopeRef.current ??
+      (await resolveCurrentChatLlmPreferenceScope(
+        userId ? `auth:${userId}` : undefined,
+      ));
+    await refreshResponseModelOptionsForScope(scope, true);
+  }, [isAuthenticated, refreshResponseModelOptionsForScope, userId]);
+
   const changeResponseTarget = useCallback(
     (value: ChatResponseTarget) => {
       const target = normalizeResponseTarget(value);
@@ -1581,37 +1437,21 @@ export function useConversationController(
     [persistLlmPreferences],
   );
 
-  const changeLlmMode = useCallback(
-    (mode: string) => {
-      const next = mode.trim();
-      const scope = llmPreferenceScopeRef.current;
-      if (!next || !scope) return;
-      const localState = normalizeLlmMode({
-        ...llmPreferencesRef.current.mode,
-        mode: next,
-        available_modes: [
-          next,
-          ...(llmPreferencesRef.current.mode.available_modes ?? []).filter(
-            (option) => option !== next,
-          ),
-        ],
-      });
-      applyLlmModeView(localState);
-
-      if (!isAuthenticated || next === SERVER_DEFAULT_MODE) {
-        setLlmModeSyncStatus("idle");
-        setLlmSelectionMessage(null);
-        persistLlmPreferences({ mode: localState, modeSyncPending: false });
-        return;
-      }
-
-      persistLlmPreferences({ mode: localState, modeSyncPending: true });
-      llmModeSynchronizerRef.current?.enqueue(scope, next, {
-        defer: !networkOnline || isServerKnownUnreachable(),
-      });
-    },
-    [applyLlmModeView, isAuthenticated, networkOnline, persistLlmPreferences],
+  const selectedServerEffort = useMemo(
+    () => resolveServerModelEffort(responseTarget, responseModelOptions),
+    [responseTarget, responseModelOptions],
   );
+  const changeLlmMode = useCallback((mode: string) => {
+    const selected = resolveServerModelEffort(responseTargetRef.current, responseModelOptionsRef.current);
+    if (!selected.model || !selected.options.includes(mode)) return;
+    changeResponseTarget({ kind: "server", responseModel: {
+      provider: selected.model.provider,
+      model: selected.model.model,
+      reasoning_effort: mode,
+    } });
+    setLlmModeSyncStatus("idle");
+  }, [changeResponseTarget]);
+  const refreshLlmMode = refreshResponseModelOptions;
 
   const refreshSkillCommands = useCallback(async () => {
     if (!isAuthenticated) {
@@ -1781,16 +1621,45 @@ export function useConversationController(
     [sessionId],
   );
 
-  const sendConversationCommand = useCallback(
-    async (command: SendConversationCommand) => {
-      if (!sessionId) return;
+  const deliverConversationCommand = useCallback(
+    async (command: SendConversationCommand, optimistic: ConversationMessage, signal: AbortSignal, acceptedScope: Promise<{ auth: string; server: string }>) => {
+      await backgroundFlushRef.current;
+      const scope = await acceptedScope;
+      const assertDirectScope = async () => {
+        if (getTokenAuthScope(await getToken()) !== scope.auth || await getConfiguredApiServerFingerprint() !== scope.server) {
+          throw new Error("送信中に接続先またはアカウントが変わりました。元の接続先で再試行してください。");
+        }
+      };
+      await assertDirectScope();
+      const sourceSessionId = optimistic.session_id;
+      const sessionId = promotedSubmissionSessionsRef.current.get(sourceSessionId)
+        ?? await getPromotedConversationSessionId(sourceSessionId).catch(() => null)
+        ?? sourceSessionId;
+      const session = sessionStateRef.current?.id === sessionId
+        ? sessionStateRef.current : await conversationsRepo.getSessionLocal(sessionId);
+      const history = messagesStateRef.current;
+      const cutoff = history.findIndex((message) => conversationMessageIdentity(message) === optimistic.id);
+      const messages = cutoff >= 0 ? history.slice(0, cutoff) : history.filter((message) => (message.created_at ?? "") <= (optimistic.created_at ?? ""));
+      const promote = (remoteId: string) => {
+        promotedSubmissionSessionsRef.current.set(sourceSessionId, remoteId);
+        promoteMessages(sourceSessionId, remoteId);
+        onSessionPromoted?.(remoteId);
+      };
+      // The optimistic identity is persisted before any profile/network lookup.
+      let localMessage = await conversationsRepo.appendLocalMessage(sessionId, "user", command.message.trim(), { ...optimistic.metadata, dispatch_auth_scope: scope.auth, dispatch_server_fingerprint: scope.server }, {
+        id: optimistic.id, created_at: optimistic.created_at ?? new Date().toISOString(),
+      }).catch((failure: unknown) => {
+        throw Object.assign(new Error(errorTextOf(failure, "メッセージを保存できませんでした。")), { persistenceFailed: true });
+      });
+      let sendFailure: string | null = null;
+      const reportSendError = (message: string | null) => { sendFailure = message; if (latestSubmissionIdRef.current === optimistic.id) setError(message); };
       const text = command.message.trim();
-      if (!text || isStreaming || serverGenerationActive) return;
+      if (!text) return;
       if (!tryStartConversationOperation(exclusiveOperationRef, "send")) {
-        setError(
+        reportSendError(
           "キャラクター変更または別の送信が完了してから再試行してください。",
         );
-        return;
+        throw new Error("キャラクター変更または別の送信が完了してから再試行してください。");
       }
       const resolveCharacterSnapshot = createCharacterProfileSnapshotResolver(
         session?.character_name,
@@ -1802,7 +1671,11 @@ export function useConversationController(
         },
       );
       try {
-        const requestedTarget = command.target ?? { kind: "server" as const };
+        const taskScope = {
+          projectId: (command.projectId === undefined ? effectiveProjectId : command.projectId) ?? null,
+          spaceId: useProjectStore.getState().selectedSpaceId,
+        };
+        const requestedTarget = snapshotServerModelTarget(command.target ?? { kind: "server" }, responseModelOptionsRef.current);
       const selectedAppId = command.appId ?? session?.app_id ?? null;
       const selectedAppTargetId =
         command.appTargetId ?? session?.app_target_id ?? null;
@@ -1815,29 +1688,36 @@ export function useConversationController(
       const requiresServerFeature =
         Boolean(command.commandCapabilities?.length) || text.startsWith("/");
       if (requestedTarget.kind === "direct" && requiresServerFeature) {
-        setError("組み込みコマンドとSkillsはServerモデルで実行してください。");
+        reportSendError("組み込みコマンドとSkillsはServerモデルで実行してください。");
         return;
       }
       if (appContextSelected && requestedTarget.kind === "direct") {
-        setError("App context付きChatではDirect/端末モデルを利用できません。");
+        reportSendError("App context付きChatではDirect/端末モデルを利用できません。");
         return;
       }
       if (appContextSelected && !session?.user_id) {
-        setError("Appを紐付ける前にServerへ接続してください。");
+        reportSendError("Appを紐付ける前にServerへ接続してください。");
         return;
       }
       if (requiresServerRuntime && !isAuthenticated) {
-        setError("組み込みコマンド、Skills、モデル指定はログイン中のみ利用できます。");
+        reportSendError("組み込みコマンド、Skills、モデル指定はログイン中のみ利用できます。");
+        return;
+      }
+      if (requestedTarget.kind === "direct" && !canDispatchDirectCloud(networkOnline)) {
+        reportSendError("Directモデルにはインターネット接続が必要です。");
         return;
       }
 
       let directSettings: MobileLlmSettings | null = null;
       let fallbackFromServer = false;
+      const serverTransportUnavailable =
+        requestedTarget.kind === "server" &&
+        (!networkConnected || isServerKnownUnreachable());
       const serverKnownUnreachable =
         requestedTarget.kind === "server" &&
         !appContextSelected &&
         !requiresServerFeature &&
-        isServerKnownUnreachable();
+        serverTransportUnavailable;
       if (requestedTarget.kind === "direct") {
         directSettings = await getDirectMobileLlmSettings(requestedTarget.selection);
       } else if (serverKnownUnreachable) {
@@ -1845,7 +1725,7 @@ export function useConversationController(
         fallbackFromServer = Boolean(directSettings);
       }
 
-      setError(null);
+      reportSendError(null);
       setIsWaiting(true);
       const usesDirect = Boolean(directSettings);
       const dispatchMetadata = buildPendingDispatchMetadata({
@@ -1865,7 +1745,9 @@ export function useConversationController(
         commandCapabilities: command.commandCapabilities,
         attachments: command.attachments,
       });
-      const localMessage = await conversationsRepo.appendLocalMessage(sessionId, "user", text, {
+      const deliveryMetadata = {
+        submission_id: command.submissionId,
+        persistence_error: false,
         local_only: true,
         pending: isAuthenticated && !usesDirect,
         anonymous_only: !isAuthenticated,
@@ -1876,9 +1758,12 @@ export function useConversationController(
             : "local-draft",
         delivery_route: usesDirect ? "direct" : "server",
         ...dispatchMetadata,
-      });
+      };
+      await conversationsRepo.mergeMessageMetadata(localMessage.id, deliveryMetadata);
+      localMessage = { ...localMessage, metadata: { ...localMessage.metadata, ...deliveryMetadata } };
       setMessages((prev) => upsertConversationMessage(prev, localMessage));
 
+      let directHandoffPrepared = false;
       const appendDirectReply = async (
         directSettings: MobileLlmSettings,
         metadata: Record<string, unknown> = {},
@@ -1904,38 +1789,79 @@ export function useConversationController(
           ),
         };
         if (mountedRef.current) setEffectiveGeneration(effectiveRoute);
-        const reply = await generateCharacterAwareDirectReply(
-          directSettings,
-          messages,
-          text,
-          resolveCharacterSnapshot,
-        );
-        const assistantMessage = await conversationsRepo.appendLocalMessage(
-          sessionId,
-          "assistant",
-          reply.content,
-          {
-            local_only: true,
-            direct_cloud: true,
-            provider: directSettings.provider,
-            model: directSettings.model,
-            ...(directSettings.reasoningEffort
-              ? { reasoning_effort: directSettings.reasoningEffort }
-              : {}),
-            ...(reply.assistantPayload
-              ? {
-                  [KIMI_ASSISTANT_PAYLOAD_METADATA_KEY]: reply.assistantPayload,
-                }
-              : {}),
+        await assertDirectScope();
+        await conversationsRepo.beginDirectReply(localMessage);
+        const assertNotInterrupted = () => {
+          if (signal.aborted) throw Object.assign(new Error("次の入力で応答を中断しました。"), { name: "AbortError" });
+        };
+        let assistantMessage: ConversationMessage;
+        let persistedMetadata: Record<string, unknown>;
+        try {
+          assertNotInterrupted();
+          if (!directHandoffPrepared) {
+            await prepareDirectConversationHandoff({
+              sessionId,
+              canStopServer: Boolean(isAuthenticated && session?.user_id &&
+                networkConnected && !isServerKnownUnreachable()),
+              signal,
+              assertScope: assertDirectScope,
+              retireServerGeneration: () => {
+                const previous = getGenerationIdentity();
+                if (previous?.sessionId !== sessionId) return;
+                clearServerGenerationState("cancel", previous);
+                generationEventGateRef.current.complete(previous);
+              },
+              persistInterruptedMessages: async (interrupted) => {
+                await runForegroundSqliteWrite(() => applyRemoteConversationMessages(interrupted));
+                setMessages((current) => interrupted.reduce(upsertConversationMessage, current));
+              },
+            });
+            directHandoffPrepared = true;
+            // Retiring the Server lifecycle clears its indicators. This turn
+            // now owns them, including when a provider fallback reuses it.
+            if (mountedRef.current) { setIsStreaming(true); setIsWaiting(true); }
+          }
+          const taskContext = await readLocalTaskContext(taskScope);
+          await assertDirectScope();
+          const reply = await generateCharacterAwareDirectReply(
+            directSettings,
+            messages.filter((message) => message.id !== localMessage.id),
+            text,
+            resolveCharacterSnapshot,
+            async (settings, history, input, profile) => {
+              assertNotInterrupted();
+              await assertDirectScope();
+              effectiveMetadata.character_slug = profile?.slug;
+              effectiveMetadata.character_profile_source = (profile as { id?: string } | null)?.id === "offline-project-manager" ? "bundled" : "device-cache";
+              effectiveMetadata.task_scope = taskScope;
+              return generateMobileLlmReply(settings, history, input, profile, { signal }, taskContext);
+            },
+          );
+          await assertDirectScope();
+          assertNotInterrupted();
+          assistantMessage = await conversationsRepo.completeDirectReply(localMessage, reply.content, {
+            provider: directSettings.provider, model: directSettings.model,
+            ...(directSettings.reasoningEffort ? { reasoning_effort: directSettings.reasoningEffort } : {}),
+            ...(reply.assistantPayload ? { [KIMI_ASSISTANT_PAYLOAD_METADATA_KEY]: reply.assistantPayload } : {}),
             ...effectiveMetadata,
-          },
-        );
-        const persistedMetadata =
-          buildDirectReplyPersistedMetadata(effectiveMetadata);
-        await conversationsRepo.mergeMessageMetadata(
-          localMessage.id,
-          persistedMetadata,
-        );
+          });
+          persistedMetadata = buildDirectReplyPersistedMetadata({ ...effectiveMetadata, direct_error: null });
+        } catch (failure) {
+          await assertDirectScope();
+          if (signal.aborted) {
+            const interrupted = { pending: false, delivery_route: "direct", message_state: "interrupted", direct_error: null };
+            await conversationsRepo.mergeMessageMetadata(localMessage.id, interrupted);
+            setMessages((prev) => prev.map((message) => message.id === localMessage.id
+              ? { ...message, metadata: { ...message.metadata, ...interrupted } } : message));
+            return;
+          }
+          const directError = errorTextOf(failure, "Direct応答に失敗しました。");
+          const failedMetadata = { pending: false, delivery_route: "direct", message_state: "direct-failed", direct_error: directError };
+          await conversationsRepo.mergeMessageMetadata(localMessage.id, failedMetadata);
+          setMessages((prev) => prev.map((message) => message.id === localMessage.id
+            ? { ...message, metadata: { ...message.metadata, ...failedMetadata } } : message));
+          throw failure;
+        }
         setMessages((prev) => [
           ...prev.map((message) =>
             message.id === localMessage.id
@@ -1950,6 +1876,7 @@ export function useConversationController(
           ),
           assistantMessage,
         ]);
+        if (assistantMessage.session_id !== sessionId) promote(assistantMessage.session_id);
         if (session) {
           void maybeGenerateLocalTitle(
             session,
@@ -1959,8 +1886,65 @@ export function useConversationController(
         }
       };
 
+      const markDirectUnavailable = async () => {
+        const directUnavailableMessage =
+          "Directモデルにはインターネット接続が必要です。";
+        const failedMetadata = {
+          pending: false,
+          message_state: "direct-failed",
+          delivery_route: "direct",
+          direct_error: directUnavailableMessage,
+        };
+        await conversationsRepo.mergeMessageMetadata(
+          localMessage.id,
+          failedMetadata,
+        );
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === localMessage.id
+              ? { ...message, metadata: { ...message.metadata, ...failedMetadata } }
+              : message,
+          ),
+        );
+        reportSendError(directUnavailableMessage);
+        setIsWaiting(false);
+      };
+
+      const keepServerFallbackPending = async () => {
+        const directUnavailableMessage =
+          "Directフォールバックにはインターネット接続が必要です。";
+        const pendingMetadata = {
+          pending: true,
+          message_state: "queued",
+          delivery_route: "server",
+          direct_error: directUnavailableMessage,
+        };
+        await conversationsRepo.mergeMessageMetadata(
+          localMessage.id,
+          pendingMetadata,
+        );
+        setMessages((prev) =>
+          prev.map((message) =>
+            message.id === localMessage.id
+              ? { ...message, metadata: { ...message.metadata, ...pendingMetadata } }
+              : message,
+          ),
+        );
+        reportSendError(directUnavailableMessage);
+        setIsWaiting(false);
+      };
+
       const errorText = errorTextOf;
       const combinedFallbackError = describeFallbackFailure;
+
+      if (directSettings && !canDispatchDirectCloud(networkOnline)) {
+        if (fallbackFromServer) {
+          await keepServerFallbackPending();
+        } else {
+          await markDirectUnavailable();
+        }
+        return;
+      }
 
       if (directSettings) {
         setIsStreaming(true);
@@ -1970,28 +1954,21 @@ export function useConversationController(
             ...(fallbackFromServer ? { fallback_from_server: true } : {}),
           });
         } catch (directError) {
-          const failedMetadata = {
-            pending: fallbackFromServer,
-            message_state: fallbackFromServer ? "queued" : "direct-failed",
-            delivery_route: fallbackFromServer ? "server" : "direct",
-            direct_error: errorText(directError, "Direct応答に失敗しました。"),
-          };
-          await conversationsRepo.mergeMessageMetadata(
-            localMessage.id,
-            failedMetadata,
-          );
-          setMessages((prev) =>
-            prev.map((message) =>
-              message.id === localMessage.id
-                ? { ...message, metadata: { ...message.metadata, ...failedMetadata } }
-                : message,
-            ),
-          );
-          setError(errorText(directError, "Direct応答に失敗しました。"));
+          reportSendError(errorText(directError, "Direct応答に失敗しました。"));
         } finally {
           setIsStreaming(false);
           setIsWaiting(false);
         }
+        return;
+      }
+
+      // Keep the local pending message, but do not even start a Server
+      // request when the physical path is absent or a recent transport
+      // failure is still inside its retry TTL.  This also protects the
+      // promotion/dispatch path from accidentally probing while offline.
+      if (serverTransportUnavailable) {
+        reportSendError("AoiTalkサーバーへの接続を確認できるまで送信を保留します。");
+        setIsWaiting(false);
         return;
       }
 
@@ -2010,7 +1987,7 @@ export function useConversationController(
           if (remoteSessionId === sessionId) {
             throw new Error("ローカルチャットをServerへ接続できませんでした。");
           }
-          onSessionPromoted?.(remoteSessionId);
+          promote(remoteSessionId);
         } catch (promotionError) {
           if (isLikelyConnectivityFailure(promotionError)) {
             useNetworkStore.getState().setServerReachable(false);
@@ -2019,7 +1996,7 @@ export function useConversationController(
             await getPromotedConversationSessionId(sessionId).catch(() => null);
           if (promotedSessionId) {
             // 別経路で既に昇格済み。その Server セッションへ切り替える。
-            onSessionPromoted?.(promotedSessionId);
+            promote(promotedSessionId);
             setIsWaiting(false);
             return;
           }
@@ -2029,6 +2006,10 @@ export function useConversationController(
             : await getConfiguredFallbackMobileLlmSettings("server").catch(
                 () => null,
               );
+          if (fallback && !canDispatchDirectCloud(networkOnline)) {
+            await keepServerFallbackPending();
+            return;
+          }
           if (fallback) {
             setIsStreaming(true);
             try {
@@ -2040,14 +2021,14 @@ export function useConversationController(
                 ),
               });
             } catch (fallbackError) {
-              setError(combinedFallbackError(promotionError, fallbackError));
+              reportSendError(combinedFallbackError(promotionError, fallbackError));
             } finally {
               setIsStreaming(false);
               setIsWaiting(false);
             }
             return;
           }
-          setError(
+          reportSendError(
             errorText(
               promotionError,
               "ローカルチャットをServerへ接続できませんでした。",
@@ -2064,6 +2045,10 @@ export function useConversationController(
           ? settings
           : await getConfiguredDirectMobileLlmSettings(settings.provider);
         if (directMain) {
+          if (!canDispatchDirectCloud(networkOnline)) {
+            await markDirectUnavailable();
+            return;
+          }
           setIsStreaming(true);
           try {
             await appendDirectReply(directMain);
@@ -2072,7 +2057,7 @@ export function useConversationController(
               ? await getConfiguredFallbackMobileLlmSettings(settings.provider)
               : null;
             if (!fallback) {
-              setError(errorText(directError, "メッセージ送信に失敗しました。"));
+              reportSendError(errorText(directError, "メッセージ送信に失敗しました。"));
               return;
             }
             try {
@@ -2081,14 +2066,14 @@ export function useConversationController(
                 main_error: errorText(directError, "direct failed"),
               });
             } catch (fallbackError) {
-              setError(combinedFallbackError(directError, fallbackError));
+              reportSendError(combinedFallbackError(directError, fallbackError));
             }
           } finally {
             setIsStreaming(false);
             setIsWaiting(false);
           }
         } else {
-          setError(
+          reportSendError(
             "Directモデルまたはフォールバックモデルを設定してください。",
           );
           setIsWaiting(false);
@@ -2099,6 +2084,7 @@ export function useConversationController(
       const settings = await getMobileLlmSettings();
       if (
         isDirectProvider(settings.provider) &&
+        canDispatchDirectCloud(networkOnline) &&
         !appContextSelected &&
         !requiresServerRuntime &&
         !forceServer
@@ -2117,15 +2103,25 @@ export function useConversationController(
                 main_error: errorText(directError, "direct failed"),
               });
             } catch (fallbackError) {
-              setError(combinedFallbackError(directError, fallbackError));
+              reportSendError(combinedFallbackError(directError, fallbackError));
             }
             return;
           }
-          setError(errorText(directError, "メッセージ送信に失敗しました。"));
+          reportSendError(errorText(directError, "メッセージ送信に失敗しました。"));
         } finally {
           setIsStreaming(false);
           setIsWaiting(false);
         }
+        return;
+      }
+      if (
+        isDirectProvider(settings.provider) &&
+        !canDispatchDirectCloud(networkOnline) &&
+        !appContextSelected &&
+        !requiresServerRuntime &&
+        !forceServer
+      ) {
+        await markDirectUnavailable();
         return;
       }
 
@@ -2143,29 +2139,28 @@ export function useConversationController(
           kind: "server",
           provider: selectedServerOption?.provider,
           model: selectedServerOption?.model,
-          reasoningEffort: llmModeRef.current || undefined,
+          reasoningEffort: requestedTarget.kind === "server" ? requestedTarget.responseModel?.reasoning_effort ?? undefined : undefined,
           fallback: false,
         });
       }
-      const dispatchedGeneration = beginServerGeneration(
-        sessionId,
-        localMessage.id,
-      );
-      if (!dispatchedGeneration) {
-        setIsWaiting(false);
-        setError("進行中の応答が完了してから再試行してください。");
-        return;
-      }
-      generationEventGateRef.current.bindTransportId(
-        localMessage.id,
-        dispatchedGeneration,
-      );
+      let dispatchedGeneration: ReturnType<typeof beginServerGeneration> = null;
+      const onHandoff = () => {
+        const previous = getGenerationIdentity();
+        if (previous) {
+          clearServerGenerationState("cancel", previous);
+          generationEventGateRef.current.complete(previous);
+        }
+        dispatchedGeneration = beginServerGeneration(sessionId, localMessage.id);
+        if (!dispatchedGeneration) throw new Error("新しい応答を開始できませんでした。");
+        generationEventGateRef.current.bindTransportId(localMessage.id, dispatchedGeneration);
+      };
       try {
+        await assertDirectScope();
         await dispatchPendingConversationMessage(
           sessionId,
           localMessage,
           pendingDispatchPayload(localMessage),
-          { checkRemoteDuplicate: false },
+          { checkRemoteDuplicate: false, onHandoff },
         );
         setMessages((prev) =>
           prev.map((message) =>
@@ -2183,7 +2178,7 @@ export function useConversationController(
         );
         scheduleRefresh();
       } catch (dispatchError) {
-        completeServerGeneration(dispatchedGeneration);
+        if (dispatchedGeneration) completeServerGeneration(dispatchedGeneration);
         const connectivityFailure = isLikelyConnectivityFailure(dispatchError);
         if (connectivityFailure) {
           useNetworkStore.getState().setServerReachable(false);
@@ -2227,7 +2222,7 @@ export function useConversationController(
           }
 
           if (accepted) {
-            setError(null);
+            reportSendError(null);
             setIsWaiting(false);
             scheduleRefresh();
             return;
@@ -2249,7 +2244,7 @@ export function useConversationController(
                 : message,
             ),
           );
-          setError(
+          reportSendError(
             "送信結果を確認できませんでした。接続復旧後に自動確認します。",
           );
           setIsWaiting(false);
@@ -2269,35 +2264,145 @@ export function useConversationController(
               : message,
           ),
         );
-        setError(dispatchErrorText);
+        reportSendError(dispatchErrorText);
         setIsWaiting(false);
       }
       } finally {
         finishConversationOperation(exclusiveOperationRef, "send");
+        setIsWaiting(false);
+        if (sendFailure) throw new RetainedSubmissionError(sendFailure);
       }
     },
     [
       isAuthenticated,
-      isStreaming,
-      serverGenerationActive,
+      networkOnline,
+      networkConnected,
       beginServerGeneration,
       completeServerGeneration,
-      messages,
       maybeGenerateLocalTitle,
       onSessionPromoted,
       scheduleRefresh,
       effectiveProjectId,
-      session?.user_id,
-      session?.character_name,
-      session?.app_id,
-      session?.app_target_id,
-      sessionId,
+      promoteMessages,
+      getGenerationIdentity,
+      clearServerGenerationState,
+      setMessages,
+      userId,
     ],
   );
 
+  const sendConversationCommand = useCallback((command: SendConversationCommand): Promise<void> => {
+    const text = command.message.trim();
+    if (!text) return Promise.resolve();
+    if (!sessionId || !sessionStateRef.current) return Promise.reject(new Error("会話を読み込んでから再試行してください。"));
+    if (exclusiveOperationRef.current && exclusiveOperationRef.current !== "send" && exclusiveOperationRef.current !== "background-flush") {
+      return Promise.reject(new Error("キャラクターまたはプロジェクトの変更が完了してから送信してください。"));
+    }
+    const target = snapshotServerModelTarget(command.target ?? { kind: "server" }, responseModelOptionsRef.current);
+    const id = command.retryMessageId ?? command.submissionId ?? `mobile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const retry = command.retryMessageId ? messagesStateRef.current.find((message) => message.id === id) : undefined;
+    if (command.retryMessageId && (!retry || retry.role !== "user" || retry.content.trim() !== text ||
+      (!retry.metadata?.pending && retry.metadata?.message_state !== "direct-failed"))) {
+      return Promise.reject(new Error("この入力は再試行できません。履歴を確認してください。"));
+    }
+    const now = new Date().toISOString();
+    const snapshot: SendConversationCommand = { ...command, message: text, target,
+      projectId: command.projectId === undefined ? effectiveProjectId : command.projectId,
+      appId: command.appId ?? sessionStateRef.current.app_id,
+      appTargetId: command.appTargetId ?? sessionStateRef.current.app_target_id,
+      submissionId: command.submissionId ?? id,
+    };
+    const optimistic: ConversationMessage = { ...(retry ?? {}),
+      id, session_id: sessionId, role: "user", content: text,
+      created_at: retry?.created_at ?? now, updated_at: now,
+      parent_message_id: null, branch_index: 0, is_active_branch: true,
+      metadata: { ...retry?.metadata, local_only: true, submission_id: snapshot.submissionId,
+        pending: isAuthenticated && target.kind === "server", message_state: "queued",
+        delivery_route: target.kind, anonymous_only: !isAuthenticated,
+        ...buildPendingDispatchMetadata({ message: text, projectId: snapshot.projectId,
+          appId: snapshot.appId, appTargetId: snapshot.appTargetId,
+          includeProjectContext: snapshot.includeProjectContext ?? Boolean(snapshot.projectId),
+          agentMode: snapshot.agentMode ?? "confirm", editMessageId: snapshot.editMessageId,
+          responseModel: target.kind === "server" ? target.responseModel : undefined,
+          commandCapabilities: snapshot.commandCapabilities, attachments: snapshot.attachments }),
+      },
+    };
+    const acceptedScope = Promise.all([getToken(), getConfiguredApiServerFingerprint()])
+      .then(([token, server]) => ({ auth: getTokenAuthScope(token), server }));
+    void acceptedScope.catch(() => undefined);
+    latestSubmissionIdRef.current = id;
+    submitMessage(optimistic);
+    setError(null);
+    setIsWaiting(true);
+    return submissionQueueRef.current.enqueue(id, (signal) => deliverConversationCommand(snapshot, optimistic, signal, acceptedScope))
+      .catch((failure: unknown) => {
+        const message = errorTextOf(failure, "送信できませんでした。履歴から再試行してください。");
+        setMessages((current) => current.map((item) => item.id === id ? { ...item,
+          metadata: { ...item.metadata, direct_error: message,
+            ...(failure && typeof failure === "object" && "persistenceFailed" in failure ? { persistence_error: true } : {}),
+            message_state: item.metadata?.delivery_route === "direct" ? "direct-failed" : "queued" },
+        } : item));
+        if (latestSubmissionIdRef.current === id) { setError(message); setIsWaiting(false); }
+        throw new RetainedSubmissionError(message);
+      });
+  }, [deliverConversationCommand, effectiveProjectId, isAuthenticated, sessionId, setMessages, submitMessage]);
+
+  useEffect(() => {
+    const queue = submissionQueueRef.current;
+    return () => queue.cancelDirect();
+  }, []);
+
   const retryPendingMessage = useCallback(
-    async (message: ConversationMessage) => {
-      if (!sessionId || !isAuthenticated) return;
+    async (message: ConversationMessage, route: "server" | "direct" = "server") => {
+      if (!sessionId) return;
+      if (route === "server" && message.metadata?.persistence_error) {
+        const payload = pendingDispatchPayload(message);
+        await sendConversationCommand({ message: message.content, retryMessageId: message.id,
+          projectId: payload.project_id, appId: payload.app_id, appTargetId: payload.app_target_id,
+          includeProjectContext: payload.include_project_context, agentMode: payload.agent_mode,
+          commandCapabilities: payload.command_capabilities, attachments: payload.attachments,
+          target: { kind: "server", responseModel: payload.response_model ?? undefined },
+        });
+        return;
+      }
+      if (route === "direct") {
+        if (retryingMessageIds.includes(message.id)) return;
+        setRetryingMessageIds((current) => [...current, message.id]);
+        try {
+          const settings = responseTarget.kind === "direct"
+            ? await getDirectMobileLlmSettings(responseTarget.selection)
+            : await getConfiguredFallbackMobileLlmSettings("server") ?? await getMobileLlmSettings();
+          if (!settings || !isDirectProvider(settings.provider)) {
+            throw new Error("Directモデルまたはフォールバックモデルを設定してから再試行してください。");
+          }
+          const payload = pendingDispatchPayload(message, {
+            projectId: effectiveProjectId, appId: session?.app_id, appTargetId: session?.app_target_id,
+            includeProjectContext: Boolean(effectiveProjectId), agentMode: "confirm",
+          });
+          await sendConversationCommand({
+            message: payload.message, retryMessageId: message.id,
+            projectId: payload.project_id ?? null,
+            appId: payload.app_id, appTargetId: payload.app_target_id,
+            includeProjectContext: payload.include_project_context,
+            agentMode: payload.agent_mode, commandCapabilities: payload.command_capabilities,
+            attachments: payload.attachments,
+            target: { kind: "direct", selection: { provider: settings.provider, model: settings.model, reasoningEffort: settings.reasoningEffort } },
+          });
+        } catch (error) {
+          setError(errorTextOf(error, "Directでの再試行に失敗しました。元の入力は履歴に残っています。"));
+        } finally {
+          setRetryingMessageIds((current) => current.filter((id) => id !== message.id));
+        }
+        return;
+      }
+      if (!isAuthenticated) {
+        setError("サーバーへの再送にはログインが必要です。Directで再試行できます。");
+        return;
+      }
+      if (!networkConnected || (!networkServerReachable && isServerKnownUnreachable())) {
+        setError("AoiTalkサーバーへの接続を確認できるまで再送を保留します。");
+        return;
+      }
       if (
         retryingMessageIds.includes(message.id) ||
         !tryStartConversationOperation(exclusiveOperationRef, "send")
@@ -2381,10 +2486,14 @@ export function useConversationController(
     },
     [
       isAuthenticated,
+      networkConnected,
+      networkServerReachable,
       beginServerGeneration,
       completeServerGeneration,
       refreshFromServer,
       retryingMessageIds,
+      responseTarget,
+      sendConversationCommand,
       effectiveProjectId,
       session?.app_id,
       session?.app_target_id,
@@ -2430,7 +2539,8 @@ export function useConversationController(
           if (
             job.status === "completed" ||
             job.status === "failed" ||
-            job.status === "cancelled"
+            job.status === "cancelled" ||
+            job.status === "interrupted"
           ) {
             const poller = jobPollersRef.current[jobId];
             if (poller) clearInterval(poller);
@@ -2487,8 +2597,11 @@ export function useConversationController(
         max_iterations: 2,
         questions_per_iteration: 3,
         max_results_per_query: 5,
-        engines: ["duckduckgo"],
-        include_local_rag: Boolean(effectiveProjectId),
+        // SearXNG is the local authority; Personal deployments retain the
+        // deep client fallback while Enterprise never inherits public egress.
+        engines: ["searxng"],
+        include_local_knowledge: Boolean(effectiveProjectId),
+        ...(requestedSessionId ? { session_id: requestedSessionId } : {}),
         project_id: effectiveProjectId ?? null,
       });
       if (
@@ -2540,6 +2653,8 @@ export function useConversationController(
           agentMode: "confirm",
           editMessageId: message.id,
           target: { kind: "server", responseModel },
+        }).catch((error: unknown) => {
+          setError(errorTextOf(error, "再生成に失敗しました。履歴から再試行できます。"));
         });
         return;
       }
@@ -2556,6 +2671,8 @@ export function useConversationController(
           agentMode: "confirm",
           editMessageId: source.id,
           target: { kind: "server", responseModel },
+        }).catch((error: unknown) => {
+          setError(errorTextOf(error, "再生成に失敗しました。履歴から再試行できます。"));
         });
       }
     },
@@ -2614,7 +2731,7 @@ export function useConversationController(
 
   const flushPendingInBackground = useCallback(
     async (targetSessionId: string): Promise<string | null> => {
-      const result = await runExclusiveConversationOperation(
+      const flight = runExclusiveConversationOperation(
         exclusiveOperationRef,
         "background-flush",
         async () => {
@@ -2626,7 +2743,13 @@ export function useConversationController(
           }
         },
       );
-      return result.started ? result.value : null;
+      backgroundFlushRef.current = flight;
+      try {
+        const result = await flight;
+        return result.started ? result.value : null;
+      } finally {
+        if (backgroundFlushRef.current === flight) backgroundFlushRef.current = null;
+      }
     },
     [],
   );
@@ -2667,7 +2790,6 @@ export function useConversationController(
     setEffectiveGeneration(null);
     responseTargetRef.current = defaults.responseTarget;
     responseModelOptionsRef.current = defaults.responseModelOptions;
-    applyLlmModeView(defaults.mode);
     setResponseTarget(defaults.responseTarget);
     setResponseModelOptions(defaults.responseModelOptions);
     setResponseModelOptionsLoading(false);
@@ -2690,31 +2812,15 @@ export function useConversationController(
       llmPreferencesRef.current = preferences;
       responseTargetRef.current = preferences.responseTarget;
       responseModelOptionsRef.current = preferences.responseModelOptions;
-      llmModeSynchronizerRef.current?.setScope(scope);
-      applyLlmModeView(preferences.mode);
       setResponseTarget(preferences.responseTarget);
       setResponseModelOptions(preferences.responseModelOptions);
       setLlmPreferencesReady(true);
 
-      if (
-        preferences.modeSyncPending &&
-        isAuthenticated &&
-        preferences.mode.mode !== SERVER_DEFAULT_MODE
-      ) {
-        const network = useNetworkStore.getState();
-        llmModeSynchronizerRef.current?.enqueue(
-          scope,
-          preferences.mode.mode,
-          {
-            immediate: true,
-            defer: !network.online || isServerKnownUnreachable(),
-          },
-        );
-      }
+      // A former global-mode retry must never mutate another model's config.
+      llmPreferencesRef.current = { ...preferences, modeSyncPending: false };
 
       if (isAuthenticated) {
         // cacheをpaintした後にだけserver revalidationを開始する。
-        void refreshLlmModeForScope(scope);
         void refreshResponseModelOptionsForScope(scope);
       }
     })().catch(() => {
@@ -2727,17 +2833,10 @@ export function useConversationController(
       }
     };
   }, [
-    applyLlmModeView,
     isAuthenticated,
-    refreshLlmModeForScope,
     refreshResponseModelOptionsForScope,
     userId,
   ]);
-
-  useEffect(() => {
-    if (!isAuthenticated || (!networkOnline && !networkServerReachable)) return;
-    llmModeSynchronizerRef.current?.retry();
-  }, [isAuthenticated, networkOnline, networkServerReachable]);
 
   useEffect(() => {
     void refreshSkillCommands();
@@ -2749,8 +2848,8 @@ export function useConversationController(
       !session ||
       session.user_id ||
       !isAuthenticated ||
-      !networkOnline ||
-      !networkServerReachable ||
+      !networkConnected ||
+      (!networkServerReachable && isServerKnownUnreachable()) ||
       pendingMessages === 0 ||
       runState !== "idle"
     ) {
@@ -2768,7 +2867,7 @@ export function useConversationController(
       .catch(() => undefined);
   }, [
     isAuthenticated,
-    networkOnline,
+    networkConnected,
     networkServerReachable,
     flushPendingInBackground,
     onSessionPromoted,
@@ -2796,7 +2895,6 @@ export function useConversationController(
       if (!isCurrentRuntime()) return;
       setIsConnected(connected);
       if (connected) {
-        llmModeSynchronizerRef.current?.retry();
         if (pendingMessagesRef.current > 0) {
           void flushPendingInBackground(sessionId)
             .then((remoteSessionId) => {
@@ -2815,15 +2913,9 @@ export function useConversationController(
     ws.setOnMessage((msg: WSMessage) => {
       if (!isCurrentRuntime()) return;
       switch (msg.type) {
-        case "llm_mode_change": {
-          const payload = parseLlmModePayload(msg.data ?? msg);
-          if (payload) {
-            const scope = llmPreferenceScopeRef.current;
-            if (scope) applyServerLlmMode(payload, scope);
-            else applyLlmModeView(payload);
-          }
+        case "llm_mode_change":
+          // This event describes the server default, not this turn's selection.
           break;
-        }
         case "external_llm_permission_request": {
           const data = (msg.data ?? {}) as Record<string, unknown>;
           const requestId = String(data.request_id ?? "");
@@ -2907,6 +2999,7 @@ export function useConversationController(
           break;
         }
         case "stream_start":
+          if (!generationEventGateRef.current.acceptsStart(msg)) break;
           generationLifecycleRef.current += 1;
           {
             const data =
@@ -2934,6 +3027,7 @@ export function useConversationController(
           setStreamContent("");
           break;
         case "stream_token":
+          if (!generationEventGateRef.current.acceptsToken(msg, getGenerationIdentity())) break;
           if (msg.content) {
             const identity = getGenerationIdentity();
             if (identity) {
@@ -3060,8 +3154,6 @@ export function useConversationController(
     void ws.connect(sessionId);
     return () => ws.disconnect();
   }, [
-    applyLlmModeView,
-    applyServerLlmMode,
     applyGeneratedTitle,
     beginServerGeneration,
     cancelScheduledRefresh,
@@ -3108,10 +3200,10 @@ export function useConversationController(
     loading,
     error,
     streamContent,
-    llmMode,
-    llmModeOptions,
-    llmModeLabels,
-    llmModeKind,
+    llmMode: selectedServerEffort.value,
+    llmModeOptions: selectedServerEffort.options,
+    llmModeLabels: selectedServerEffort.labels,
+    llmModeKind: selectedServerEffort.kind,
     llmModeSyncStatus,
     llmSelectionMessage,
     llmPreferencesReady,
@@ -3136,6 +3228,7 @@ export function useConversationController(
     changeLlmMode,
     changeResponseTarget,
     refreshLlmMode,
+    refreshResponseModelOptions,
     refreshSkillCommands,
     changeCharacter,
     serverGenerationActive,

@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from ..knowledge.service import KnowledgeSearchFilters, KnowledgeService
 from ..memory.models import KnowledgeAnnotation
+from .storage_errors import StorageErrorRoute
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def create_knowledge_router(
     get_user_from_request,
     require_auth_dependency,
 ) -> APIRouter:
-    router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
+    router = APIRouter(prefix="/api/knowledge", tags=["knowledge"], route_class=StorageErrorRoute)
 
     async def _get_user_or_401(request: Request) -> dict[str, Any]:
         user_info = await get_user_from_request(request)

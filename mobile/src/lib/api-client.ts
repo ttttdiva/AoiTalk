@@ -9,10 +9,17 @@ import {
 } from "./auth";
 import { DEFAULT_API_URL, API_TIMEOUT } from '../constants/config';
 import {
+  ApiEndpointUnavailableError,
   clearNetworkEndpointRoutingCache,
+  getNetworkEndpointRoutingRevision,
   resolveApiUrlForCurrentNetwork,
 } from './connection-routing';
-import { looksLikeHtml, normalizeApiUrl } from './api-url';
+import {
+  isInvalidApiUrlError,
+  looksLikeHtml,
+  normalizeApiUrl,
+  requireConfiguredApiUrl,
+} from './api-url';
 import { useNetworkStore } from '../stores/network';
 
 export class ApiHttpError extends Error {
@@ -85,6 +92,62 @@ export function isApiTimeoutError(error: unknown): error is ApiTimeoutError {
   return error instanceof ApiTimeoutError;
 }
 
+/**
+ * A durable operation was created for one configured AoiTalk server but the
+ * user changed API settings before the request/retry completed.  Callers must
+ * strand the operation instead of replaying it against the new server.
+ */
+export class ApiServerChangedError extends Error {
+  readonly expectedFingerprint: string;
+  readonly currentFingerprint: string;
+
+  constructor(expectedFingerprint: string, currentFingerprint: string) {
+    super(
+      `API server changed from ${expectedFingerprint} to ${currentFingerprint}`,
+    );
+    this.name = 'ApiServerChangedError';
+    this.expectedFingerprint = expectedFingerprint;
+    this.currentFingerprint = currentFingerprint;
+  }
+}
+
+export { ApiEndpointUnavailableError } from './connection-routing';
+
+export function isApiServerChangedError(
+  error: unknown,
+): error is ApiServerChangedError {
+  return error instanceof ApiServerChangedError;
+}
+
+/**
+ * Stable identity for the configured API endpoint.  Network-specific LAN /
+ * public routing is intentionally not included in this value.  Credentials,
+ * query parameters and fragments are never persisted in a journal key.
+ */
+export function normalizeApiServerFingerprint(value: string): string {
+  const normalized = normalizeApiUrl(value);
+  try {
+    const parsed = new URL(normalized);
+    parsed.username = '';
+    parsed.password = '';
+    parsed.search = '';
+    parsed.hash = '';
+    const pathname = parsed.pathname.replace(/\/+$/, '');
+    return (
+      `${parsed.protocol.toLowerCase()}//${parsed.host.toLowerCase()}`
+      + (pathname && pathname !== '/' ? pathname : '')
+    );
+  } catch {
+    return normalized.replace(/\/+$/, '');
+  }
+}
+
+/** Persist/replay identity of the currently configured API server. */
+export async function getConfiguredApiServerFingerprint(): Promise<string> {
+  const stored = await getApiUrl();
+  return normalizeApiServerFingerprint(stored || DEFAULT_API_URL);
+}
+
 let cachedApiUrl: string | null = null;
 // 同時に走る別APIの成功を、あとから完了した古い通信失敗で上書きしない。
 let reachabilitySuccessRevision = 0;
@@ -92,11 +155,65 @@ let reachabilityEndpointRevision = 0;
 
 /** 現在のAPI URLを取得 */
 export async function getBaseUrl(): Promise<string> {
-  if (!cachedApiUrl) {
-    const stored = await getApiUrl();
-    cachedApiUrl = normalizeApiUrl(stored || DEFAULT_API_URL);
+  if (cachedApiUrl === null) {
+    for (;;) {
+      const revisionAtStart = reachabilityEndpointRevision;
+      const stored = await getApiUrl();
+      if (revisionAtStart !== reachabilityEndpointRevision) continue;
+      cachedApiUrl = normalizeApiUrl(stored || DEFAULT_API_URL);
+      break;
+    }
   }
-  return resolveApiUrlForCurrentNetwork(cachedApiUrl);
+
+  const endpointRevisionAtStart = reachabilityEndpointRevision;
+  const routingRevisionAtStart = getNetworkEndpointRoutingRevision();
+  const routed = await resolveApiUrlForCurrentNetwork(cachedApiUrl, {
+    probe: probeApiEndpoint,
+  });
+  if (
+    endpointRevisionAtStart !== reachabilityEndpointRevision ||
+    routingRevisionAtStart !== getNetworkEndpointRoutingRevision()
+  ) {
+    // clearApiUrlCache() can race a route probe after that probe has populated
+    // its short-lived cache.  Invalidate the route cache before retrying so a
+    // stale endpoint cannot win the second resolution.
+    clearNetworkEndpointRoutingCache();
+    return getBaseUrl();
+  }
+  return requireConfiguredApiUrl(routed);
+}
+
+async function getBaseUrlForServerFingerprint(
+  expectedFingerprint: string,
+): Promise<string> {
+  const expected = normalizeApiServerFingerprint(expectedFingerprint);
+  for (;;) {
+    const endpointRevisionAtStart = reachabilityEndpointRevision;
+    const routingRevisionAtStart = getNetworkEndpointRoutingRevision();
+    const current = await getConfiguredApiServerFingerprint();
+    if (current !== expected) {
+      throw new ApiServerChangedError(expected, current);
+    }
+    // The configured server may still resolve to a LAN/public endpoint for the
+    // current network; that routing does not change durable server identity.
+    const routed = await resolveApiUrlForCurrentNetwork(expected, {
+      probe: probeApiEndpoint,
+    });
+    // Routing can await network/storage state. Re-check after that await so a
+    // settings write racing the resolution cannot send the operation to a new
+    // configured server.
+    const afterRouting = await getConfiguredApiServerFingerprint();
+    if (afterRouting !== expected) {
+      throw new ApiServerChangedError(expected, afterRouting);
+    }
+    if (
+      endpointRevisionAtStart !== reachabilityEndpointRevision ||
+      routingRevisionAtStart !== getNetworkEndpointRoutingRevision()
+    ) {
+      continue;
+    }
+    return requireConfiguredApiUrl(routed);
+  }
 }
 
 function formatApiError(status: number, text: string): ApiHttpError {
@@ -122,6 +239,12 @@ export function isApiHttpError(error: unknown): error is ApiHttpError {
 
 /** fetch 自体が応答を受け取れなかった通信不能・タイムアウトだけを判定する。 */
 export function isApiConnectionError(error: unknown): boolean {
+  if (
+    typeof ApiEndpointUnavailableError !== "undefined" &&
+    error instanceof ApiEndpointUnavailableError
+  ) {
+    return true;
+  }
   if (isApiHttpError(error)) return false;
   if (isApiTimeoutError(error)) return false;
   if (!(error instanceof Error)) return false;
@@ -141,6 +264,7 @@ async function fetchWithReachability(
   input: RequestInfo | URL,
   init?: RequestInit,
   isClientTimeout?: () => boolean,
+  clientTimeoutCountsAsUnreachable = false,
 ): Promise<Response> {
   const successRevisionAtStart = reachabilitySuccessRevision;
   const endpointRevisionAtStart = reachabilityEndpointRevision;
@@ -152,16 +276,113 @@ async function fetchWithReachability(
     }
     return response;
   } catch (error) {
+    const clientTimedOut = Boolean(isClientTimeout?.());
     // 自前timeoutでの打ち切りは「サーバーが応答しない」とは限らない
     // （処理が長いだけのことがある）ので、未到達として記録しない。
+    // 明示的なread-only reachability probeだけは例外として未到達扱いできる。
     if (
-      !isClientTimeout?.() &&
+      (!clientTimedOut || clientTimeoutCountsAsUnreachable) &&
       isApiConnectionError(error) &&
       reachabilityEndpointRevision === endpointRevisionAtStart &&
       reachabilitySuccessRevision === successRevisionAtStart
     ) {
       useNetworkStore.getState().setServerReachable(false);
     }
+    throw error;
+  }
+}
+
+function isAoiTalkHealthPayload(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const payload = value as { status?: unknown; boot_id?: unknown };
+  // FastAPI's /api/health returns {status: "ok"|"degraded", boot_id}.
+  // Requiring both fields prevents a generic JSON endpoint from being treated
+  // as an AoiTalk server merely because it returned HTTP 200.
+  if (payload.status !== "ok" && payload.status !== "degraded") return false;
+  return typeof payload.boot_id === "string" && payload.boot_id.trim().length > 0;
+}
+
+/**
+ * Probe one endpoint without routing through getBaseUrl().  This is used by
+ * route selection, so it must not recursively resolve the same route.
+ *
+ * The Caddy boundary requires a non-empty Authorization header before it
+ * forwards /api/* to FastAPI.  The value below is deliberately non-secret and
+ * is accepted by the unauthenticated FastAPI health route; it is never used
+ * for an application request or persisted as a credential.
+ */
+async function probeApiEndpoint(
+  endpoint: string,
+  timeoutMs = 2_000,
+): Promise<boolean> {
+  let timeoutId: ReturnType<typeof setTimeout> | null = null;
+  const endpointRevisionAtStart = reachabilityEndpointRevision;
+  const successRevisionAtStart = reachabilitySuccessRevision;
+  let timedOut = false;
+
+  try {
+    const baseUrl = requireConfiguredApiUrl(endpoint);
+    const controller = new AbortController();
+    timeoutId = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+
+    const response = await fetch(`${baseUrl}/api/health`, {
+      method: 'GET',
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json",
+        Authorization: "Bearer aoitalk-route-probe",
+      },
+    });
+    let payload: unknown;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+    const reachable = isAoiTalkHealthPayload(payload);
+
+    if (reachabilityEndpointRevision === endpointRevisionAtStart) {
+      if (reachable) {
+        reachabilitySuccessRevision += 1;
+        useNetworkStore.getState().setServerReachable(true);
+      } else if (reachabilitySuccessRevision === successRevisionAtStart) {
+        useNetworkStore.getState().setServerReachable(false);
+      }
+    }
+    return reachable;
+  } catch (error) {
+    if (
+      reachabilityEndpointRevision === endpointRevisionAtStart &&
+      reachabilitySuccessRevision === successRevisionAtStart &&
+      ((!timedOut && isApiConnectionError(error)) || timedOut)
+    ) {
+      useNetworkStore.getState().setServerReachable(false);
+    }
+    return false;
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
+  }
+}
+
+/**
+ * Read-only AoiTalk API reachability probe.
+ *
+ * A probe timeout/failure is safe to classify as temporarily unreachable
+ * because GET /api/health has no ambiguous server-side write outcome.  A
+ * response must have AoiTalk's health shape; an HTML/JSON response from an
+ * unrelated web server is not considered a usable API endpoint.
+ */
+export async function probeApiReachability(
+  timeoutMs = 2_000,
+): Promise<boolean> {
+  try {
+    const baseUrl = await getBaseUrl();
+    return probeApiEndpoint(baseUrl, timeoutMs);
+  } catch (error) {
+    if (isApiConnectionError(error) || isInvalidApiUrlError(error)) return false;
     throw error;
   }
 }
@@ -175,16 +396,26 @@ export function clearApiUrlCache(): void {
 
 type TokenSnapshot = Awaited<ReturnType<typeof getTokenSnapshot>>;
 
-const refreshInFlightByRevision = new Map<number, Promise<boolean>>();
+const refreshInFlightByRevision = new Map<string, Promise<boolean>>();
 
-async function refreshTokenOnce(snapshot: TokenSnapshot): Promise<boolean> {
+async function refreshTokenOnce(
+  snapshot: TokenSnapshot,
+  expectedServerFingerprint: string | null,
+): Promise<boolean> {
+  const { token, revision } = snapshot;
+  if (!token) return false;
+
+  const baseUrl = expectedServerFingerprint
+    ? await getBaseUrlForServerFingerprint(expectedServerFingerprint)
+    : await getBaseUrl();
+  const controller = new AbortController();
+  let timedOut = false;
+  const timeoutId = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, API_TIMEOUT);
+
   try {
-    const { token, revision } = snapshot;
-    if (!token) return false;
-
-    const baseUrl = await getBaseUrl();
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), API_TIMEOUT);
     const res = await fetchWithReachability(`${baseUrl}/api/auth/refresh`, {
       method: 'POST',
       signal: controller.signal,
@@ -192,22 +423,42 @@ async function refreshTokenOnce(snapshot: TokenSnapshot): Promise<boolean> {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
       },
-    }).finally(() => clearTimeout(timeoutId));
+    }, () => timedOut);
 
-    if (!res.ok) return false;
-    const data = await res.json();
-    if (data.access_token) {
-      return saveTokenIfRevision(data.access_token, revision);
+    // 認証拒否が確定した場合だけfalseを返す。通信断・一時的なHTTP障害を
+    // falseにすると呼び出し元が認証失効を通知し、保存済みtokenを削除してしまう。
+    if (res.status === 401 || res.status === 403) return false;
+    if (!res.ok) {
+      throw formatApiError(res.status, await res.text());
     }
-    return false;
-  } catch {
-    return false;
+    const data: unknown = await res.json();
+    const accessToken = data && typeof data === 'object'
+      ? (data as { access_token?: unknown }).access_token
+      : undefined;
+    if (typeof accessToken !== 'string' || !accessToken.trim()) {
+      throw new Error('認証更新APIが有効なaccess_tokenを返しませんでした');
+    }
+    return await saveTokenIfRevision(accessToken, revision);
+  } catch (error) {
+    if (timedOut && error instanceof Error && error.name === 'AbortError') {
+      throw new ApiTimeoutError(API_TIMEOUT);
+    }
+    // 一時障害や保存失敗は元の原因を保持し、次の同期で再試行できるようにする。
+    throw error;
+  } finally {
+    // ヘッダー受信時点で解除すると、本文が停止したrefreshが全同期を塞ぐ。
+    clearTimeout(timeoutId);
   }
 }
 
-/** トークンリフレッシュ試行。同じ認証世代の並行401だけを1リクエストへ集約する。 */
+/**
+ * 同じ認証世代の並行401を1リクエストへ集約する。
+ * falseは認証拒否・token不在・世代変更。一時的な通信/HTTP/保存障害はrejectし、
+ * 呼び出し元が保存済み認証を失効させず再試行できるよう区別する。
+ */
 export async function tryRefreshToken(
   expectedSnapshot?: TokenSnapshot,
+  expectedServerFingerprint: string | null = null,
 ): Promise<boolean> {
   const snapshot = expectedSnapshot ?? (await getTokenSnapshot());
   if (!snapshot.token) return false;
@@ -220,14 +471,26 @@ export async function tryRefreshToken(
     return false;
   }
 
-  const inFlight = refreshInFlightByRevision.get(snapshot.revision);
+  const normalizedFingerprint = expectedServerFingerprint
+    ? normalizeApiServerFingerprint(expectedServerFingerprint)
+    : null;
+  const refreshKey = `${snapshot.revision}:${normalizedFingerprint ?? '*'}`;
+  const inFlight = refreshInFlightByRevision.get(refreshKey);
   if (inFlight) return inFlight;
 
-  const refresh = refreshTokenOnce(snapshot);
-  refreshInFlightByRevision.set(snapshot.revision, refresh);
-  void refresh.finally(() => {
-    if (refreshInFlightByRevision.get(snapshot.revision) === refresh) {
-      refreshInFlightByRevision.delete(snapshot.revision);
+  const refresh = refreshTokenOnce(snapshot, normalizedFingerprint);
+  refreshInFlightByRevision.set(refreshKey, refresh);
+  // `finally()` would create a second rejected promise when a pinned refresh
+  // detects a server change.  Attach both fulfillment/rejection handlers so
+  // cleanup never surfaces as an unhandled rejection; the original promise
+  // still rejects to the request awaiting it.
+  void refresh.then(() => {
+    if (refreshInFlightByRevision.get(refreshKey) === refresh) {
+      refreshInFlightByRevision.delete(refreshKey);
+    }
+  }, () => {
+    if (refreshInFlightByRevision.get(refreshKey) === refresh) {
+      refreshInFlightByRevision.delete(refreshKey);
     }
   });
   return refresh;
@@ -239,12 +502,15 @@ async function fetchApiInternal<T>(
   options: RequestInit,
   timeout: number,
   authRetryBudget: number,
+  expectedServerFingerprint: string | null,
   parseResponse: (response: Response) => Promise<T> = async (response) =>
     response.json() as Promise<T>,
 ): Promise<T> {
   const tokenSnapshot = await getTokenSnapshot();
   const token = tokenSnapshot.token;
-  const baseUrl = await getBaseUrl();
+  const baseUrl = expectedServerFingerprint
+    ? await getBaseUrlForServerFingerprint(expectedServerFingerprint)
+    : await getBaseUrl();
   const url = `${baseUrl}${path}`;
 
   const controller = new AbortController();
@@ -280,10 +546,20 @@ async function fetchApiInternal<T>(
         currentSnapshot.token !== tokenSnapshot.token;
       if (tokenChanged) {
         if (!currentSnapshot.token) throwAuthInvalidated();
-        return fetchApiInternal(path, options, timeout, authRetryBudget - 1, parseResponse);
+        return fetchApiInternal(
+          path,
+          options,
+          timeout,
+          authRetryBudget - 1,
+          expectedServerFingerprint,
+          parseResponse,
+        );
       }
 
-      const refreshed = await tryRefreshToken(tokenSnapshot);
+      const refreshed = await tryRefreshToken(
+        tokenSnapshot,
+        expectedServerFingerprint,
+      );
       if (!refreshed) {
         const afterRefreshSnapshot = await getTokenSnapshot();
         if (
@@ -291,23 +567,39 @@ async function fetchApiInternal<T>(
           (afterRefreshSnapshot.revision !== tokenSnapshot.revision ||
             afterRefreshSnapshot.token !== tokenSnapshot.token)
         ) {
-          return fetchApiInternal(path, options, timeout, authRetryBudget - 1, parseResponse);
+          return fetchApiInternal(
+            path,
+            options,
+            timeout,
+            authRetryBudget - 1,
+            expectedServerFingerprint,
+            parseResponse,
+          );
         }
         throwAuthInvalidated();
       }
       // refresh後も401なら再帰せず、認証エラーとして呼び出し元へ返す。
-      return fetchApiInternal(path, options, timeout, 0, parseResponse);
+      return fetchApiInternal(
+        path,
+        options,
+        timeout,
+        0,
+        expectedServerFingerprint,
+        parseResponse,
+      );
     }
 
     if (!res.ok) {
-      const text = await res.text().catch(() => '');
+      const text = await res.text();
       throw formatApiError(res.status, text);
     }
 
     // 204 No Content
     if (res.status === 204) return undefined as T;
 
-    return parseResponse(res);
+    // 本文の受信・解析完了までtimeoutとcatchを有効にする。awaitを省くと
+    // finallyが先に実行され、止まった本文がsyncのsingle-flightを占有し続ける。
+    return await parseResponse(res);
   } catch (error) {
     // 自前のtimeoutで打ち切ったabortは、通信不能と区別できるようにして投げる。
     if (timedOut && error instanceof Error && error.name === 'AbortError') {
@@ -325,7 +617,23 @@ export async function fetchApi<T>(
   timeout: number = API_TIMEOUT,
 ): Promise<T> {
   // token切替後の再試行1回 + refresh後の再試行1回を上限にする。
-  return fetchApiInternal(path, options, timeout, 2);
+  return fetchApiInternal(path, options, timeout, 2, null);
+}
+
+/** Durable mutation/read pinned to the configured server captured at intent. */
+export async function fetchApiAtServerFingerprint<T>(
+  serverFingerprint: string,
+  path: string,
+  options: RequestInit = {},
+  timeout: number = API_TIMEOUT,
+): Promise<T> {
+  return fetchApiInternal(
+    path,
+    options,
+    timeout,
+    2,
+    normalizeApiServerFingerprint(serverFingerprint),
+  );
 }
 
 /**
@@ -339,7 +647,14 @@ export async function fetchApiText(
   options: RequestInit = {},
   timeout: number = API_TIMEOUT,
 ): Promise<string> {
-  return fetchApiInternal(path, options, timeout, 2, (response) => response.text());
+  return fetchApiInternal(
+    path,
+    options,
+    timeout,
+    2,
+    null,
+    (response) => response.text(),
+  );
 }
 
 export { AuthError };

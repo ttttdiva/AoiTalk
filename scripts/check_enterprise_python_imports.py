@@ -333,6 +333,7 @@ class BindingEvent:
     position: tuple[int, int, int]
     import_target: str | None
     may_bind: bool = False
+    definite_regions: tuple[ast.AST, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -353,6 +354,7 @@ class Scope:
     globals: set[str] = field(default_factory=set)
     nonlocals: set[str] = field(default_factory=set)
     wildcard_imports: list[BindingEvent] = field(default_factory=list)
+    node_positions: dict[ast.AST, tuple[int, int, int]] = field(default_factory=dict)
 
     def bind_import(
         self,
@@ -373,10 +375,11 @@ class Scope:
         position: tuple[int, int, int],
         *,
         may_bind: bool = False,
+        definite_regions: tuple[ast.AST, ...] = (),
     ) -> None:
         self.local_names.add(name)
         self.bindings.setdefault(name, []).append(
-            BindingEvent(position, None, may_bind)
+            BindingEvent(position, None, may_bind, definite_regions)
         )
 
 
@@ -388,6 +391,20 @@ def _bound_names(target: ast.AST) -> Iterable[str]:
             yield from _bound_names(item)
     elif isinstance(target, ast.Starred):
         yield from _bound_names(target.value)
+
+
+def _target_expressions(target: ast.AST) -> Iterable[ast.AST]:
+    """Yield expressions evaluated while assigning to *target*."""
+    if isinstance(target, (ast.Tuple, ast.List)):
+        for item in target.elts:
+            yield from _target_expressions(item)
+    elif isinstance(target, ast.Starred):
+        yield from _target_expressions(target.value)
+    elif isinstance(target, ast.Attribute):
+        yield target.value
+    elif isinstance(target, ast.Subscript):
+        yield target.value
+        yield target.slice
 
 
 def _pattern_bound_names(pattern: ast.AST) -> Iterable[str]:
@@ -420,8 +437,12 @@ class ScopeBuilder(ast.NodeVisitor):
         self.root = Scope("module", None)
         self.current = self.root
         self.scopes: dict[ast.AST, Scope] = {}
+        self.node_positions = self.root.node_positions
         self._event_sequence = 0
         self._may_bind_depth = 0
+        self._target_binding_after: ast.AST | None = None
+        self._target_may_bind: bool | None = None
+        self._target_definite_regions: tuple[ast.AST, ...] = ()
 
     @property
     def _may_bind(self) -> bool:
@@ -437,6 +458,9 @@ class ScopeBuilder(ast.NodeVisitor):
 
     def _position_after(self, node: ast.AST) -> tuple[int, int, int]:
         self._event_sequence += 1
+        if node in self.node_positions:
+            line, column, _ = self.node_positions[node]
+            return (line, column, self._event_sequence)
         return (
             getattr(node, "end_lineno", getattr(node, "lineno", 0)),
             getattr(node, "end_col_offset", getattr(node, "col_offset", 0)),
@@ -444,10 +468,87 @@ class ScopeBuilder(ast.NodeVisitor):
         )
 
     def _shadow_target(self, target: ast.AST, event_node: ast.AST | None = None) -> None:
-        position = self._position_after(event_node or target)
+        position = self._position_after(
+            self._target_binding_after or event_node or target
+        )
+        may_bind = (
+            self._may_bind
+            if self._target_may_bind is None
+            else self._target_may_bind
+        )
         for name in _bound_names(target):
             if name not in self.current.globals and name not in self.current.nonlocals:
-                self.current.bind_shadow(name, position, may_bind=self._may_bind)
+                self.current.bind_shadow(
+                    name,
+                    position,
+                    may_bind=may_bind,
+                    definite_regions=self._target_definite_regions,
+                )
+
+    def _declare_target_names(self, target: ast.AST) -> None:
+        for name in _bound_names(target):
+            if name not in self.current.globals and name not in self.current.nonlocals:
+                self.current.local_names.add(name)
+
+    def _visit_target_expressions(self, target: ast.AST) -> None:
+        for expression in _target_expressions(target):
+            self.visit(expression)
+
+    def visit(self, node: ast.AST) -> object:
+        if self._target_binding_after is not None:
+            self.node_positions[node] = self._position_after(
+                self._target_binding_after
+            )
+        return super().visit(node)
+
+    def _visit_and_shadow_target(
+        self,
+        target: ast.AST,
+        *,
+        binding_after: ast.AST | None = None,
+        event_node: ast.AST | None = None,
+        may_bind: bool | None = None,
+        definite_regions: tuple[ast.AST, ...] = (),
+    ) -> None:
+        previous_binding_after = self._target_binding_after
+        previous_may_bind = self._target_may_bind
+        previous_definite_regions = self._target_definite_regions
+        if binding_after is not None:
+            self._target_binding_after = binding_after
+        if may_bind is not None:
+            self._target_may_bind = may_bind
+        if definite_regions:
+            self._target_definite_regions = definite_regions
+        try:
+            self._visit_and_shadow_target_inner(target, event_node)
+        finally:
+            self._target_binding_after = previous_binding_after
+            self._target_may_bind = previous_may_bind
+            self._target_definite_regions = previous_definite_regions
+
+    def _visit_and_shadow_target_inner(
+        self, target: ast.AST, event_node: ast.AST | None
+    ) -> None:
+        if isinstance(target, (ast.Tuple, ast.List)):
+            for item in target.elts:
+                self._visit_and_shadow_target_inner(item, event_node)
+        elif isinstance(target, ast.Starred):
+            self._visit_and_shadow_target_inner(target.value, event_node)
+        elif isinstance(target, ast.Attribute):
+            self.visit(target.value)
+        elif isinstance(target, ast.Subscript):
+            self.visit(target.value)
+            self.visit(target.slice)
+        else:
+            self._shadow_target(target, event_node)
+
+    def _visit_expression_after(self, node: ast.AST, after: ast.AST) -> None:
+        previous_binding_after = self._target_binding_after
+        self._target_binding_after = after
+        try:
+            self.visit(node)
+        finally:
+            self._target_binding_after = previous_binding_after
 
     def _enter(self, node: ast.AST, kind: str, arguments: ast.arguments | None = None) -> None:
         parent = self.current
@@ -522,35 +623,51 @@ class ScopeBuilder(ast.NodeVisitor):
     def visit_Assign(self, node: ast.Assign) -> None:
         self.visit(node.value)
         for target in node.targets:
-            self._shadow_target(target, node)
+            self._visit_and_shadow_target(
+                target, binding_after=node.value, event_node=node
+            )
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
         if node.value:
             self.visit(node.value)
-        self._shadow_target(node.target, node)
+            self._visit_and_shadow_target(
+                node.target, binding_after=node.value, event_node=node
+            )
+            self._visit_expression_after(node.annotation, node.value)
+        else:
+            self._visit_target_expressions(node.target)
+            self._declare_target_names(node.target)
+            self.visit(node.annotation)
 
     def visit_AugAssign(self, node: ast.AugAssign) -> None:
         self.visit(node.value)
-        self._shadow_target(node.target, node)
+        self._visit_and_shadow_target(node.target, event_node=node)
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         target_scope = self.current
         while target_scope.kind == "comprehension" and target_scope.parent is not None:
             target_scope = target_scope.parent
-        position = self._position_after(node)
+        self.visit(node.value)
+        position = self._position_after(self._target_binding_after or node)
         for name in _bound_names(node.target):
             target_scope.bind_shadow(
                 name,
                 position,
-                may_bind=self._may_bind and target_scope is self.current,
+                may_bind=self._may_bind_depth > 0,
+                definite_regions=self._target_definite_regions,
             )
-        self.visit(node.value)
 
     def visit_For(self, node: ast.For) -> None:
         self.visit(node.iter)
         self._may_bind_depth += 1
         try:
-            self._shadow_target(node.target, node.target)
+            self._visit_and_shadow_target(
+                node.target,
+                binding_after=node.iter,
+                event_node=node.iter,
+                may_bind=True,
+                definite_regions=tuple(node.body),
+            )
             for statement in (*node.body, *node.orelse):
                 self.visit(statement)
         finally:
@@ -577,7 +694,11 @@ class ScopeBuilder(ast.NodeVisitor):
         for item in node.items:
             self.visit(item.context_expr)
             if item.optional_vars:
-                self._shadow_target(item.optional_vars, item.optional_vars)
+                self._visit_and_shadow_target(
+                    item.optional_vars,
+                    binding_after=item.context_expr,
+                    event_node=item.optional_vars,
+                )
         for statement in node.body:
             self.visit(statement)
 
@@ -594,7 +715,7 @@ class ScopeBuilder(ast.NodeVisitor):
 
     def visit_Delete(self, node: ast.Delete) -> None:
         for target in node.targets:
-            self._shadow_target(target, node)
+            self._visit_and_shadow_target(target, event_node=node)
 
     def visit_TypeAlias(self, node: ast.AST) -> None:
         target = getattr(node, "name", None)
@@ -675,18 +796,29 @@ class ScopeBuilder(ast.NodeVisitor):
         child = Scope("comprehension", parent)
         self.scopes[node] = child
         self.current = child
-        for index, generator in enumerate(generators):
-            if index:
-                self.visit(generator.iter)
-            self._shadow_target(generator.target, generator.target)
-            for condition in generator.ifs:
-                self.visit(condition)
-        if isinstance(node, ast.DictComp):
-            self.visit(node.key)
-            self.visit(node.value)
-        else:
-            self.visit(node.elt)  # type: ignore[attr-defined]
-        self.current = parent
+        previous_definite_regions = self._target_definite_regions
+        self._target_definite_regions = ()
+        self._may_bind_depth += 1
+        try:
+            for index, generator in enumerate(generators):
+                if index:
+                    self.visit(generator.iter)
+                self._visit_and_shadow_target(
+                    generator.target,
+                    binding_after=generator.iter,
+                    event_node=generator.target,
+                )
+                for condition in generator.ifs:
+                    self.visit(condition)
+            if isinstance(node, ast.DictComp):
+                self.visit(node.key)
+                self.visit(node.value)
+            else:
+                self.visit(node.elt)  # type: ignore[attr-defined]
+        finally:
+            self._may_bind_depth -= 1
+            self._target_definite_regions = previous_definite_regions
+            self.current = parent
 
     visit_ListComp = _visit_comprehension
     visit_SetComp = _visit_comprehension
@@ -697,6 +829,7 @@ class ScopeBuilder(ast.NodeVisitor):
 class BindingResolver:
     def __init__(self, root: Scope) -> None:
         self.root = root
+        self.node_positions = root.node_positions
 
     def _next_scope(self, scope: Scope) -> Scope | None:
         parent = scope.parent
@@ -704,13 +837,12 @@ class BindingResolver:
             return parent.parent
         return parent
 
-    @staticmethod
-    def _position(node: ast.AST) -> tuple[int, int, int]:
-        return (
+    def _position(self, node: ast.AST) -> tuple[int, int, int]:
+        return self.node_positions.get(node, (
             getattr(node, "lineno", 0),
             getattr(node, "col_offset", 0),
             1 << 30,
-        )
+        ))
 
     def resolve(self, name: str, scope: Scope, node: ast.AST) -> BindingResolution:
         return self._resolve(name, scope, self._position(node))
@@ -736,14 +868,25 @@ class BindingResolver:
         events = [
             event for event in current.bindings.get(name, ()) if event.position <= position
         ]
+        def is_definite_here(event: BindingEvent) -> bool:
+            node_position = position[:2]
+            return not event.may_bind or any(
+                (getattr(region, "lineno", 0), getattr(region, "col_offset", 0))
+                <= node_position
+                <= _node_end(region)
+                for region in event.definite_regions
+            )
+
         definite = max(
-            (event for event in events if not event.may_bind),
+            (event for event in events if is_definite_here(event)),
             key=lambda event: event.position,
             default=None,
         )
         cutoff = definite.position if definite is not None else (-1, -1, -1)
         uncertain = [
-            event for event in events if event.may_bind and event.position > cutoff
+            event
+            for event in events
+            if not is_definite_here(event) and event.position > cutoff
         ]
         uncertain.extend(
             event
@@ -808,6 +951,7 @@ class RegistryDefinition:
     name: str
     scope: Scope
     may_bind: bool = False
+    definite_regions: tuple[ast.AST, ...] = ()
 
 
 @dataclass
@@ -851,11 +995,20 @@ def _collect_registry_values(
         event: ast.AST,
         scope: Scope,
         may_bind: bool,
+        definite_regions: tuple[ast.AST, ...] = (),
     ) -> None:
         position = _node_end(event)
         for name in _bound_names(target):
             key = ".".join([*qualname, name])
-            definition = RegistryDefinition(position, value, key, name, scope, may_bind)
+            definition = RegistryDefinition(
+                position,
+                value,
+                key,
+                name,
+                scope,
+                may_bind,
+                definite_regions,
+            )
             index.definitions.setdefault(key, []).append(definition)
             index.by_binding[(scope, name, position)] = definition
             index.fragments[definition] = [(position, value)]
@@ -902,7 +1055,7 @@ def _collect_registry_values(
                 if value is not None:
                     for target in targets:
                         record_definitions(
-                            target, value, qualname, statement, scope, may_bind
+                            target, value, qualname, value, scope, may_bind
                         )
                         if isinstance(target, ast.Subscript):
                             record_mutation(target, value, qualname, _node_end(statement))
@@ -915,9 +1068,10 @@ def _collect_registry_values(
                     statement.target,
                     statement.iter,
                     qualname,
-                    statement.target,
+                    statement.iter,
                     scope,
                     may_bind or scope.kind in {"module", "class"},
+                    tuple(statement.body),
                 )
                 branch_may_bind = may_bind or scope.kind in {"module", "class"}
                 walk_statements(statement.body, qualname, scope, branch_may_bind)
@@ -1055,16 +1209,25 @@ def _definition_for_name(
     scope: Scope,
 ) -> RegistryDefinition | None:
     binding = resolver.resolve(node.id, scope, node)
-    if (
-        binding.state != "shadowed"
-        or binding.scope is None
-        or binding.binding_position is None
-    ):
+    if binding.scope is None or binding.binding_position is None:
         return None
     definition = registries.by_binding.get(
         (binding.scope, node.id, binding.binding_position)
     )
-    if definition is None or definition.may_bind:
+    if definition is None:
+        return None
+    position = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+    inside_definite_region = any(
+        (getattr(region, "lineno", 0), getattr(region, "col_offset", 0))
+        <= position
+        <= _node_end(region)
+        for region in definition.definite_regions
+    )
+    if binding.state != "shadowed" and not (
+        binding.state == "ambiguous" and inside_definite_region
+    ):
+        return None
+    if definition.may_bind and not inside_definite_region:
         return None
     return definition
 
@@ -1428,6 +1591,12 @@ class ImportVisitor(ast.NodeVisitor):
         if name.startswith("."):
             package_node = self._argument(node, 1, "package")
             package = self._literal_string(package_node)
+            # ``import_module(..., package=__package__)`` is deterministic for
+            # the artifact module itself.  Treating the builtin module package
+            # name as a literal keeps the closure checker fail-closed while
+            # allowing the lazy service adapters used by the current source.
+            if package is None and isinstance(package_node, ast.Name) and package_node.id == "__package__":
+                package = self.package
             if package is None:
                 self.errors.add(CheckError(self.path, node.lineno, "non-literal dynamic import"))
                 return
@@ -1596,6 +1765,8 @@ class ImportVisitor(ast.NodeVisitor):
         for index, generator in enumerate(generators):
             if index:
                 self.visit(generator.iter)
+            for expression in _target_expressions(generator.target):
+                self.visit(expression)
             for condition in generator.ifs:
                 self.visit(condition)
         if isinstance(node, ast.DictComp):

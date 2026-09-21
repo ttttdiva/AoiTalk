@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import os
 import platform
-import traceback
+import logging
 from typing import Any, Mapping
 
 from .manager import TTSManager
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+logger = logging.getLogger(__name__)
 
 
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
@@ -125,7 +128,15 @@ async def initialize_tts_engine(
             engine_initialized = True
 
     if not engine_initialized:
-        traceback.print_exc()
+        # No active exception exists here; the old traceback.print_exc()
+        # emitted a misleading ``NoneType: None`` line directly to stdout.
+        # Keep the failure detail in the configured file logger and let the
+        # caller surface one bounded operator-facing startup error.
+        logger.error(
+            "TTS engine initialization returned no engine: preferred_engine=%s",
+            preferred_engine,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         raise RuntimeError(
             f"指定されたTTSエンジン '{preferred_engine}' の初期化に失敗しました"
         )

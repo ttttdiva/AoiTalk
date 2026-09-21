@@ -72,6 +72,7 @@ import { SnippetPopup } from "@/components/ui/snippet-popup";
 import { VoicePanel } from "@/components/voice/voice-panel";
 import { useSnippets } from "@/contexts/snippets-context";
 import { useUserSettings } from "@/contexts/user-settings-context";
+import type { UserSettings } from "@/lib/user-settings";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
 import {
   getChatComposerShortcutAction,
@@ -116,11 +117,13 @@ import { isChatComposerCursorInCodeBlock } from "@/lib/chat-composer-blocks";
 import { formatRouteLabel } from "@/lib/chat-session-route";
 import { useChatSessionRoute } from "@/hooks/use-chat-session-route";
 import {
-  HIDDEN_CHAT_SKILL_NAMES,
   completeChatCommandPrefix,
   filterChatCommands,
+  filterVisibleChatSkillCommands,
   firstMatchingChatCommand,
   findChatCommand,
+  isHiddenChatSkillName,
+  isChatHelpCommand,
   isSlashCommandToken,
   resolveChatCommandSubmission,
   type ActiveChatCommand,
@@ -194,6 +197,12 @@ export type ChatComposerSendResult = "accepted" | "pending" | "failed";
 const runtimeSelectClassName =
   "h-9 min-w-0 rounded-md border border-input bg-background px-2 text-xs text-foreground outline-none transition-colors focus-visible:border-ring";
 
+const STRICT_RUNTIME_PROVIDERS = new Set([
+  "openai_compatible_local",
+  "ollama",
+  "sglang",
+]);
+
 type DisplayRoute = {
   provider: string;
   model: string;
@@ -225,6 +234,18 @@ function resolveRuntimeDisplayRoute(
     runtime.currentLlm?.model,
   );
   if (current) return current;
+
+  const effective = normalizeDisplayRoute(
+    runtime.effectiveLlm?.provider,
+    runtime.effectiveLlm?.model,
+  );
+  if (effective) return effective;
+
+  const persisted = normalizeDisplayRoute(
+    runtime.persistedLlm?.provider,
+    runtime.persistedLlm?.model,
+  );
+  if (persisted) return persisted;
 
   const catalogCurrent = normalizeDisplayRoute(
     runtime.llmCatalog?.current?.provider,
@@ -279,6 +300,10 @@ type QueuedChatMessage = {
   id: string;
   sessionId: string | null;
   content: string;
+  // 添付は composer state から切り離して送信単位で保持する。
+  // File は localStorage に保存できないため、キューが生きている間だけ
+  // メモリ上の snapshot として扱い、draft storage には含めない。
+  attachedFiles: File[];
   generationProfile: GenerationProfile;
   mentions: MentionItem[];
   capabilities: ChatCommandCapability[];
@@ -301,6 +326,53 @@ function createQueueId(): string {
     return crypto.randomUUID();
   }
   return `queue-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Re-attach files from a failed/edited queue item without duplicating files
+ * that are already present in the current composer.  File object identity is
+ * intentional: two files with the same name are still distinct attachments.
+ */
+function appendQueuedAttachments(
+  current: File[],
+  queued: readonly File[],
+): File[] {
+  if (queued.length === 0) return current;
+  const available = new Map<File, number>();
+  for (const file of current) {
+    available.set(file, (available.get(file) ?? 0) + 1);
+  }
+  const additions: File[] = [];
+  for (const file of queued) {
+    const count = available.get(file) ?? 0;
+    if (count > 0) {
+      available.set(file, count - 1);
+    } else {
+      additions.push(file);
+    }
+  }
+  return additions.length > 0 ? [...current, ...additions] : current;
+}
+
+/** Remove only the files belonging to one queue item, preserving newer input. */
+function removeQueuedAttachments(
+  current: File[],
+  queued: readonly File[],
+): File[] {
+  if (queued.length === 0 || current.length === 0) return current;
+  const remaining = new Map<File, number>();
+  for (const file of queued) {
+    remaining.set(file, (remaining.get(file) ?? 0) + 1);
+  }
+  let removed = false;
+  const next = current.filter((file) => {
+    const count = remaining.get(file) ?? 0;
+    if (count <= 0) return true;
+    remaining.set(file, count - 1);
+    removed = true;
+    return false;
+  });
+  return removed ? next : current;
 }
 
 function formatTokens(value?: number | null): string {
@@ -542,7 +614,7 @@ function ModelControl({
   onLlmModeRefresh,
 }: {
   runtime: RuntimeContextValue;
-  userSettings: Parameters<typeof filterVisibleProviders>[1];
+  userSettings: UserSettings | null | undefined;
   llmMode?: LlmMode;
   llmModeOptions: LlmMode[];
   llmModeLabels: Record<string, string>;
@@ -575,11 +647,14 @@ function ModelControl({
     providerDisabled: routeProviderDisabled,
     modelDisabled: routeModelDisabled,
     settingsLoading: routeSettingsLoading,
+    sessionEffectiveMain,
+    newChatEffectiveMain,
+    modelDiscoveryError,
     summaryLabel,
     updateEffort,
     ...routeFields
   } = routeState;
-  const [modeRefreshing, setModeRefreshing] = useState(false);
+  const [modeRefreshing] = useState(false);
 
   const available = filterAvailableProviders(
     runtime.llmEngines,
@@ -589,8 +664,8 @@ function ModelControl({
   );
   const visible = filterVisibleProviders(
     available,
-    userSettings,
-    [runtime.currentLlm?.provider],
+    runtime.llmCatalog?.provider_visibility,
+    [],
     (item) => item.provider,
   );
   const llmStatus =
@@ -602,8 +677,6 @@ function ModelControl({
         : "error");
   const runtimeDisplayRoute = resolveRuntimeDisplayRoute(runtime);
   const llmDataPending = llmStatus === "loading" || runtime.llmRefreshing === true;
-  const modelBusy =
-    runtime.llmChanging || modeRefreshing || !runtime.isConnected;
   const currentEngine: RuntimeLlmEngine | null = runtimeDisplayRoute
     ? {
         provider: runtimeDisplayRoute.provider,
@@ -613,80 +686,108 @@ function ModelControl({
     : null;
   // エンジン一覧の一時的な取得失敗中も、last-known-goodの現在Modelを選択欄に
   // 残す。候補一覧が復旧すれば通常の候補へ自然に置き換わる。
-  const currentVisibleEngine = currentEngine
-    ? filterVisibleProviders(
-        filterAvailableProviders(
-          [currentEngine],
-          runtime.llmDeployment,
-          (item) => item.provider,
-          (item) => item,
-        ),
-        userSettings,
-        [currentEngine.provider],
-        (item) => item.provider,
-      )[0]
-    : null;
-  const currentEngineKey = currentEngine
-    ? `${currentEngine.provider}::${currentEngine.model}`
-    : "";
-  // The backend normally completes the current option, but keep the
-  // controlled select valid if a partial catalog temporarily omits it.
-  const selectableModels =
-    currentVisibleEngine &&
-    !visible.some(
-      (engine) => `${engine.provider}::${engine.model}` === currentEngineKey,
-    )
-      ? [currentVisibleEngine, ...visible]
-      : visible.length > 0
-        ? visible
-        : currentVisibleEngine
-          ? [currentVisibleEngine]
-          : [];
-  const currentValue = runtimeDisplayRoute
-    ? `${runtimeDisplayRoute.provider}::${runtimeDisplayRoute.model}`
-    : "";
+  // Never reinsert a hidden/stale current engine into the selector.  The
+  // persisted route remains executable (visibility is not authorization),
+  // while the UI asks the user to choose a currently available option.
+  const selectableModels = visible;
   const deploymentProvider = resolveEffectiveProviderId(runtime.llmDeployment);
   const deploymentModel = resolveEffectiveModelId(runtime.llmDeployment);
   const effectiveLabel = [deploymentProvider, deploymentModel]
     .filter(Boolean)
     .join(" / ");
+  const runtimeDefaultProvider =
+    deploymentProvider ||
+    runtime.effectiveLlm?.provider?.trim() ||
+    runtime.currentLlm?.provider?.trim() ||
+    "";
+  const runtimeDefaultModel =
+    deploymentModel ||
+    runtime.effectiveLlm?.model?.trim() ||
+    runtime.currentLlm?.model?.trim() ||
+    "";
+  const runtimeDefaultLabel =
+    runtimeDefaultProvider && runtimeDefaultModel
+      ? formatRouteLabel(runtimeDefaultProvider, runtimeDefaultModel)
+      : "";
   // A session's effective route is authoritative for that conversation.  The
   // deployment metadata is the runtime default/constraint, not the route that
   // will be used for a session with an explicit effective route.  Keep these
   // labels separate so a Qwen session is not reported as the global Gemma
   // default in Chat settings.
+  const sessionEffectiveProvider =
+    sessionEffectiveMain?.provider?.trim() || sessionProvider;
+  const sessionEffectiveModel =
+    sessionEffectiveMain?.model?.trim() || sessionModel;
   const sessionEffectiveLabel =
-    sessionProvider && sessionModel
-      ? formatRouteLabel(sessionProvider, sessionModel)
+    sessionEffectiveProvider && sessionEffectiveModel
+      ? formatRouteLabel(sessionEffectiveProvider, sessionEffectiveModel)
       : "";
   const hasSessionEffectiveRoute = Boolean(
     sessionId && hasSessionScopedRoute && sessionEffectiveLabel,
   );
+  const newChatEffectiveLabel = !sessionId &&
+    ((hasSessionScopedRoute && sessionProvider && sessionModel) ||
+      (newChatEffectiveMain?.provider && newChatEffectiveMain?.model))
+    ? formatRouteLabel(
+        newChatEffectiveMain?.provider?.trim() || sessionProvider,
+        newChatEffectiveMain?.model?.trim() || sessionModel,
+      )
+    : "";
+  const hasAuthoritativeRoute = Boolean(
+    (hasSessionEffectiveRoute && sessionEffectiveLabel) || newChatEffectiveLabel,
+  );
+  const authoritativeRouteLabel = hasSessionEffectiveRoute
+    ? sessionEffectiveLabel
+    : newChatEffectiveLabel;
   const runtimeDefaultDiffers = Boolean(
-    hasSessionEffectiveRoute &&
-      effectiveLabel &&
-      effectiveLabel !== sessionEffectiveLabel,
+    hasAuthoritativeRoute &&
+      runtimeDefaultLabel &&
+      runtimeDefaultLabel !== authoritativeRouteLabel,
   );
   const fixedDeployment =
-    runtime.llmDeployment?.fixed === true && Boolean(deploymentProvider);
+    runtime.llmDeployment?.fixed === true &&
+    Boolean(deploymentProvider && deploymentModel);
   const selectedRouteProvider = fixedDeployment
-    ? deploymentProvider
+    ? deploymentProvider || ""
     : sessionProvider || runtimeDisplayRoute?.provider || "";
   const selectedRouteModel = fixedDeployment
-    ? deploymentModel
+    ? deploymentModel || ""
     : sessionModel || runtimeDisplayRoute?.model || "";
+  const hasUsableLlmSnapshot = Boolean(
+    runtime.llmEngines.length > 0 ||
+      runtime.currentLlm ||
+      runtime.llmCatalog?.providers?.some((provider) => {
+        const models = Array.isArray(provider.chat_models)
+          ? provider.chat_models
+          : provider.models ?? [];
+        return models.length > 0;
+      }) ||
+      (sessionProvider && sessionModel) ||
+      (deploymentProvider && deploymentModel),
+  );
+  // Health is a connectivity hint, not a reason to strand controls when a
+  // usable catalog/engine/session snapshot is already on screen.
+  const healthUnavailable = !runtime.isConnected && !hasUsableLlmSnapshot;
+  const modelBusy = runtime.llmChanging || modeRefreshing || healthUnavailable;
   const selectedEngine = [
     ...runtime.llmEngines,
     ...(currentEngine ? [currentEngine] : []),
   ].find(
     (engine) =>
-      engine.provider === selectedRouteProvider &&
+      engine.provider.trim().toLowerCase() === selectedRouteProvider.trim().toLowerCase() &&
       engine.model === selectedRouteModel,
   );
-  const selectedCatalogProvider = runtime.llmCatalog?.providers?.find(
-    (provider) => provider.id === selectedRouteProvider,
+  const selectedCatalogProvider = routeFields.catalogProviders?.find(
+    (provider) =>
+      provider.id.trim().toLowerCase() === selectedRouteProvider.trim().toLowerCase(),
   );
-  const selectedCatalogModel = selectedCatalogProvider?.models?.find(
+  const selectedCatalogModels = Array.isArray(selectedCatalogProvider?.chat_models)
+    ? selectedCatalogProvider?.chat_models ?? []
+    : selectedCatalogProvider &&
+        !STRICT_RUNTIME_PROVIDERS.has(selectedCatalogProvider.id.trim().toLowerCase())
+      ? selectedCatalogProvider.models ?? []
+      : [];
+  const selectedCatalogModel = selectedCatalogModels.find(
     (model) => model.id === selectedRouteModel,
   );
   const effortUnsupported =
@@ -783,11 +884,51 @@ function ModelControl({
           : "No model available";
   const effortDisabled =
     routeEffortDisabled ||
-    !runtime.isConnected ||
+    healthUnavailable ||
+    fixedDeployment ||
     modeRefreshing ||
     (!hasSessionScopedRoute && !onLlmModeChange);
   const providerDisabled = routeProviderDisabled || modelBusy;
   const modelDisabled = routeModelDisabled || modelBusy;
+  const characterStatus =
+    runtime.characterStatus ??
+    (runtime.characters.length > 0
+      ? "ready"
+      : runtime.llmRefreshing || runtime.llmStatus === "loading"
+        ? "loading"
+        : runtime.llmStatus === "error"
+          ? "error"
+          : "ready");
+  const characterMetadataLoading =
+    runtime.characters.length === 0 &&
+    (characterStatus === "loading" || runtime.characterRefreshing === true);
+  const characterMetadataError = characterStatus === "error";
+  const characterMetadataStale = characterStatus === "stale";
+  // Keep the picker mounted while character metadata is in flight/failed so
+  // users receive an explicit status and retry action instead of a silently
+  // disappearing control.  A plain empty/ready snapshot remains hidden for
+  // backwards compatibility with runtimes that do not expose characters.
+  const characterControlVisible =
+    runtime.characters.length > 0 ||
+    characterMetadataLoading ||
+    characterMetadataError ||
+    (characterMetadataStale && runtime.characters.length === 0) ||
+    characterMetadataStale;
+  const characterOptions = runtime.characters.length > 0
+    ? runtime.characters
+    : runtime.currentCharacter
+      ? [{ slug: runtime.currentCharacter, name: runtime.currentCharacter }]
+      : [];
+  const characterDisabled =
+    characterMetadataLoading ||
+    characterMetadataError ||
+    runtime.characterChanging === true ||
+    (!runtime.isConnected &&
+      !(
+        (runtime.characterStatus === "ready" ||
+          runtime.characterStatus === "stale") &&
+        runtime.characters.length > 0
+      ));
   const currentCharacter = runtime.characters.find(
     (character) => character.slug === runtime.currentCharacter,
   );
@@ -795,6 +936,7 @@ function ModelControl({
     ? characterOptionLabel(currentCharacter, runtime.characters)
     : runtime.currentCharacter || "—";
   const contextLabel = percentage == null ? "—" : `${Math.round(percentage)}%`;
+  const retryCharacters = runtime.refreshCharacters ?? runtime.refreshLlm;
 
   // Chat settings has two explicit keyboard layers. `outerSelection` tracks
   // the settings field selected by the user, while `innerOpen` is the one
@@ -804,7 +946,7 @@ function ModelControl({
   const settingsItems = useMemo<ChatSettingsItemState[]>(
     () => [
       ...(!fixedDeployment &&
-      (runtime.llmCatalog?.providers?.length || selectableModels.length > 0)
+      (routeFields.catalogProviders.length > 0 || selectableModels.length > 0)
         ? [
             { id: "provider" as const, disabled: providerDisabled },
             { id: "model" as const, disabled: modelDisabled },
@@ -820,30 +962,26 @@ function ModelControl({
         : []),
       { id: "agentTeam", disabled: agentTeamDisabled },
       { id: "executionProfile", disabled: executionProfileDisabled },
-      ...(runtime.characters.length > 0
+      ...(characterControlVisible
         ? [
             {
               id: "character" as const,
-              disabled:
-                !runtime.isConnected || runtime.characterChanging === true,
+              disabled: characterDisabled,
             },
           ]
         : []),
     ],
     [
       agentTeamDisabled,
+      characterControlVisible,
+      characterDisabled,
       effectiveOptions.length,
       effortDisabled,
       executionProfileDisabled,
       fixedDeployment,
-      modeRefreshing,
       modelDisabled,
       providerDisabled,
-      routeSettingsLoading,
-      runtime.characterChanging,
-      runtime.characters.length,
-      runtime.isConnected,
-      runtime.llmCatalog?.providers?.length,
+      routeFields.catalogProviders.length,
       selectableModels.length,
     ],
   );
@@ -1336,7 +1474,7 @@ function ModelControl({
               · {modeLabel}
             </span>
           </span>
-          {runtime.characters.length > 0 && (
+          {characterControlVisible && (
             <span
               className="block max-w-full truncate text-[9px] text-muted-foreground/75"
               data-model-control-character="true"
@@ -1388,6 +1526,40 @@ function ModelControl({
             </div>
           ) : null}
 
+          {!fixedDeployment &&
+            runtime.llmCatalog != null &&
+            !llmDataPending &&
+            !modelDiscoveryError &&
+            selectedRouteProvider &&
+            selectedRouteModel &&
+            !selectedCatalogModel && (
+              <p
+                role="alert"
+                className="rounded-md border border-amber-500/50 bg-amber-50 px-2.5 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+              >
+                現在のモデルはruntimeで利用できません。利用可能なモデルを再選択してください。
+              </p>
+            )}
+          {!fixedDeployment && modelDiscoveryError && (
+            <div
+              role="alert"
+              className="flex items-center justify-between gap-2 rounded-md border border-amber-500/50 bg-amber-50 px-2.5 py-2 text-xs text-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+            >
+              <span>
+                {modelDiscoveryError}。前回利用可能だったモデルを表示しています。
+              </span>
+              {runtime.refreshLlm && (
+                <button
+                  type="button"
+                  className="shrink-0 text-primary underline-offset-2 hover:underline"
+                  onClick={() => void runtime.refreshLlm?.()}
+                >
+                  再取得
+                </button>
+              )}
+            </div>
+          )}
+
           <ChatModelSettingsFields
             runtime={runtime}
             userSettings={userSettings}
@@ -1405,6 +1577,10 @@ function ModelControl({
               effectiveModel: sessionModel,
               modelOptions: routeFields.modelOptions,
               providerDisabled: routeProviderDisabled,
+              // `useChatSessionRoute` owns model availability.  Do not add a
+              // second catalog-null lockout here: an engine LKG/served
+              // alternative can keep the model selector usable while the
+              // richer catalog is transiently unavailable.
               modelDisabled: routeModelDisabled,
               settingsLoading: routeSettingsLoading,
               updateAgentTeamValue: routeFields.updateAgentTeamValue,
@@ -1469,13 +1645,7 @@ function ModelControl({
                         handleInnerOpenChange("effort", nextOpen, details)
                       }
                       container={selectPortalHostRef}
-                      disabled={
-                        !runtime.isConnected ||
-                        modeRefreshing ||
-                        routeSettingsLoading ||
-                        effectiveOptions.length === 0 ||
-                        (!hasSessionScopedRoute && !onLlmModeChange)
-                      }
+                      disabled={effortDisabled}
                       className={cn(runtimeSelectClassName, "w-full")}
                       contentClassName="max-w-[min(28rem,calc(100vw-2rem))]"
                     >
@@ -1534,7 +1704,10 @@ function ModelControl({
                 </button>
               )}
             </div>
-          ) : !fixedDeployment && selectableModels.length === 0 && llmStatus === "error" ? (
+          ) :
+            !fixedDeployment &&
+            selectableModels.length === 0 &&
+            (llmStatus === "error" || llmStatus === "stale") ? (
             <div className="flex items-center justify-between gap-2 text-xs text-destructive">
               <span title={runtime.llmError ?? undefined}>Model情報を取得できません</span>
               {runtime.refreshLlm && (
@@ -1549,37 +1722,82 @@ function ModelControl({
             </div>
           ) : null}
 
-          {!fixedDeployment && (
-            <>
-              {hasSessionEffectiveRoute ? (
-                <div
-                  className="truncate text-[10px] text-muted-foreground"
-                  title={sessionEffectiveLabel}
-                >
-                  Session effective: {sessionEffectiveLabel}
-                </div>
-              ) : !sessionId && hasDeploymentMetadata(runtime.llmDeployment) && effectiveLabel ? (
-                <div
-                  className="truncate text-[10px] text-muted-foreground"
-                  title={effectiveLabel}
-                >
-                  Effective: {effectiveLabel}
-                </div>
-              ) : null}
-              {hasDeploymentMetadata(runtime.llmDeployment) && runtimeDefaultDiffers && (
-                <div
-                  className="truncate text-[10px] text-muted-foreground"
-                  title={effectiveLabel}
-                >
-                  Runtime default: {effectiveLabel}
-                </div>
-              )}
-            </>
+          {hasSessionEffectiveRoute ? (
+            <div
+              className="truncate text-[10px] text-muted-foreground"
+              title={sessionEffectiveLabel}
+            >
+              Session effective: {sessionEffectiveLabel}
+            </div>
+          ) : !sessionId && newChatEffectiveLabel ? (
+            <div
+              className="truncate text-[10px] text-muted-foreground"
+              title={newChatEffectiveLabel}
+            >
+              New-chat effective: {newChatEffectiveLabel}
+            </div>
+          ) : !fixedDeployment &&
+            !sessionId &&
+            hasDeploymentMetadata(runtime.llmDeployment) &&
+            effectiveLabel ? (
+            <div
+              className="truncate text-[10px] text-muted-foreground"
+              title={effectiveLabel}
+            >
+              Effective: {effectiveLabel}
+            </div>
+          ) : null}
+          {runtimeDefaultDiffers && (
+            <div
+              className="truncate text-[10px] text-muted-foreground"
+              title={runtimeDefaultLabel}
+            >
+              Runtime default: {runtimeDefaultLabel}
+            </div>
           )}
 
-          {runtime.characters.length > 0 && (
+          {characterControlVisible && (
             <label className="grid gap-1 text-xs text-muted-foreground">
               <span>Character</span>
+              {characterMetadataLoading && runtime.characters.length === 0 && (
+                <span role="status" className="text-[10px] text-muted-foreground">
+                  Character情報を読み込み中…
+                </span>
+              )}
+              {characterMetadataError && runtime.characters.length === 0 && (
+                <div className="flex items-center justify-between gap-2 text-[10px] text-destructive">
+                  <span role="alert" title={runtime.characterError ?? undefined}>
+                    Character情報を取得できません
+                  </span>
+                  {retryCharacters && (
+                    <button
+                      type="button"
+                      className="text-primary underline-offset-2 hover:underline"
+                      onClick={() => void retryCharacters()}
+                    >
+                      再取得
+                    </button>
+                  )}
+                </div>
+              )}
+              {characterMetadataStale && (
+                <div className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+                  <span role="status" title={runtime.characterError ?? undefined}>
+                    {runtime.characters.length > 0
+                      ? "Character情報の更新に失敗しました。前回の一覧を表示しています"
+                      : "Character情報が古いため再取得が必要です"}
+                  </span>
+                  {retryCharacters && (
+                    <button
+                      type="button"
+                      className="text-primary underline-offset-2 hover:underline"
+                      onClick={() => void retryCharacters()}
+                    >
+                      再取得
+                    </button>
+                  )}
+                </div>
+              )}
               <AppSelect
                 aria-label="キャラクター"
                 data-chat-settings-item="character"
@@ -1602,15 +1820,18 @@ function ModelControl({
                 className={cn(runtimeSelectClassName, "w-full")}
                 contentClassName="max-w-[min(28rem,calc(100vw-2rem))]"
                 showSelectedIndicator={false}
-                disabled={
-                  !runtime.isConnected || runtime.characterChanging === true
-                }
+                disabled={characterDisabled}
               >
-                {runtime.characters.map((character) => (
+                {characterOptions.map((character) => (
                   <option key={character.slug} value={character.slug}>
-                    {characterOptionLabel(character, runtime.characters)}
+                    {characterOptionLabel(character, characterOptions)}
                   </option>
                 ))}
+                {characterOptions.length === 0 && (
+                  <option value="" disabled>
+                    {characterMetadataLoading ? "読み込み中…" : "利用可能なCharacterなし"}
+                  </option>
+                )}
               </AppSelect>
             </label>
           )}
@@ -1667,16 +1888,23 @@ async function fetchSkillSlashCommands(
   );
   if (!res.ok) throw new Error(`API Error: ${res.status}`);
   const data: { skills?: SkillApiItem[] } = await res.json();
-  return (
+  return filterVisibleChatSkillCommands(
     (data.skills ?? [])
       // AUTO は LLM 自動判断専用なのでスラッシュ候補から除外する
       .filter((skill) => skill.trigger_mode !== "auto")
-      .filter((skill) => !HIDDEN_CHAT_SKILL_NAMES.has(skill.name))
-      .map((skill) => ({
-        command: `/${skill.name}`,
-        description: skill.description || "スキル",
-        usage: `/${skill.name} [入力]`,
-      }))
+      .filter((skill) => !isHiddenChatSkillName(skill.name))
+      .map((skill) => {
+        // Keep existing display/casing for ordinary skills while stripping a
+        // defensive leading slash from legacy API rows.
+        const skillName = String(skill.name ?? "")
+          .trim()
+          .replace(/^\/+/, "");
+        return {
+          command: `/${skillName}`,
+          description: skill.description || "スキル",
+          usage: `/${skillName} [入力]`,
+        };
+      }),
   );
 }
 
@@ -2047,13 +2275,17 @@ export function ChatComposer({
     () => filterChatCommands(slashQuery),
     [slashQuery],
   );
+  const visibleSkillCommands = useMemo(
+    () => filterVisibleChatSkillCommands(skillCommands),
+    [skillCommands],
+  );
   const filteredSkillCommands = useMemo(() => {
     const normalized = slashQuery.trim().toLowerCase();
-    if (!normalized || normalized === "/") return skillCommands;
-    return skillCommands.filter((item) =>
+    if (!normalized || normalized === "/") return visibleSkillCommands;
+    return visibleSkillCommands.filter((item) =>
       item.command.toLowerCase().startsWith(normalized),
     );
-  }, [skillCommands, slashQuery]);
+  }, [slashQuery, visibleSkillCommands]);
   const slashMenuItems = useMemo<SlashMenuItem[]>(
     () => [
       ...filteredChatCommands.map((command) => ({
@@ -2255,7 +2487,7 @@ export function ChatComposer({
       setMessageQueue(rest);
       const args = [
         next.content,
-        undefined,
+        next.attachedFiles.length > 0 ? next.attachedFiles : undefined,
         next.mentions.length ? next.mentions : undefined,
         next.generationProfile,
         next.capabilities.length ? next.capabilities : undefined,
@@ -2276,6 +2508,12 @@ export function ChatComposer({
             accepted !== "failed" &&
             accepted !== "pending"
           ) {
+            // enqueue 時点で composer から切り離しているが、controlled
+            // parent が遅延している場合に備え、当該 queue item の分だけ
+            // 条件付きで掃除する。送信後に追加された新しい添付は残す。
+            onAttachedFilesChange((current) =>
+              removeQueuedAttachments(current, next.attachedFiles),
+            );
             // キュー専用スコープは送信成功を確認してから削除する。
             clearChatComposerDraft(next.draftStorageKey, draftUserId);
             return;
@@ -2301,6 +2539,11 @@ export function ChatComposer({
           }
           clearChatComposerDraft(next.draftStorageKey, draftUserId);
           if (hasNewDraft) return;
+          // queue item を draft として再表示する場合、File は localStorage
+          // に保存できないため、メモリ上でのみ元の添付を復元する。
+          onAttachedFilesChange((current) =>
+            appendQueuedAttachments(current, next.attachedFiles),
+          );
           updateChatComposerDraft(
             next.draftRestoreKey,
             () => next.draftSnapshot,
@@ -2326,6 +2569,9 @@ export function ChatComposer({
           }
           clearChatComposerDraft(next.draftStorageKey, draftUserId);
           if (hasNewDraft) return;
+          onAttachedFilesChange((current) =>
+            appendQueuedAttachments(current, next.attachedFiles),
+          );
           updateChatComposerDraft(
             next.draftRestoreKey,
             (current) =>
@@ -2342,6 +2588,7 @@ export function ChatComposer({
     draftUserId,
     generationTerminalKey,
     messageQueue,
+    onAttachedFilesChange,
     onSend,
     sessionId,
   ]);
@@ -2417,7 +2664,7 @@ export function ChatComposer({
     el?.scrollIntoView({ block: "nearest" });
   }, [selectedSlashMenuIndex, showSlashMenu]);
 
-  const clearComposerAfterAcceptedSend = useCallback(
+  const clearComposerAfterSendStart = useCallback(
     (submittedDraft?: ChatComposerDraft) => {
       const currentDraft = getChatComposerDraft(composerDraftKey, draftUserId);
       // 送信開始後に同じキーへ新しい入力が入っていたら、それを消さない。
@@ -2480,8 +2727,23 @@ export function ChatComposer({
       } catch {
         return;
       }
+
+      const commandCapabilities = args[4];
+      const isDeepResearchSubmission =
+        deepResearchEnabled && !(commandCapabilities?.length);
+      const clearImmediately =
+        clearAfterAccepted &&
+        !isDeepResearchSubmission &&
+        result !== false &&
+        result !== "pending" &&
+        result !== "failed";
+      if (clearImmediately) {
+        clearComposerAfterSendStart(submittedDraft);
+      }
+
       void Promise.resolve(result)
         .then((accepted) => {
+          if (clearImmediately) return;
           // false/pending/failed はまだ dispatch 成功を確認できないため、
           // 下書きは残して再送できるようにする。
           // 既存の void callback は従来どおり成功扱いにする。
@@ -2493,23 +2755,31 @@ export function ChatComposer({
             return;
           }
           if (clearAfterAccepted) {
-            clearComposerAfterAcceptedSend(submittedDraft);
+            clearComposerAfterSendStart(submittedDraft);
           }
         })
         .catch(() => {
-          // 送信失敗時は下書きを保持する。
+          // 通常チャットは送信開始時に分離済み。Deep Research は失敗時も保持する。
         });
     },
-    [clearComposerAfterAcceptedSend, onSend],
+    [clearComposerAfterSendStart, deepResearchEnabled, onSend],
   );
 
   const enqueue = useCallback(() => {
     const text = value.trim();
-    if (!text) return;
+    const allowsAttachmentOnlySubmission =
+      activeCommand?.capability === "work_intake" && attachedFiles.length > 0;
+    if (
+      !text &&
+      activeCommand?.capability !== "aoitalk_help" &&
+      !allowsAttachmentOnlySubmission
+    ) {
+      return;
+    }
     const submission = resolveChatCommandSubmission(
       value,
       activeCommand,
-      false,
+      attachedFiles.length > 0,
     );
     if (submission.error) {
       toast.error(submission.error);
@@ -2532,6 +2802,7 @@ export function ChatComposer({
         id,
         sessionId: sessionId ?? null,
         content: submission.content,
+        attachedFiles: [...attachedFiles],
         generationProfile,
         mentions: [...mentions],
         capabilities: submission.capabilities ?? [],
@@ -2545,6 +2816,9 @@ export function ChatComposer({
         draftRestoreKey: composerDraftKey,
       },
     ]);
+    // 添付はこの送信単位へ消費する。キューに移した後も composer に残すと、
+    // 次の入力へ同じ screenshot/file が意図せず再添付されてしまう。
+    onAttachedFilesChange([]);
     setValue("");
     setActiveCommand(null);
     setToolFreeMode(false);
@@ -2557,12 +2831,14 @@ export function ChatComposer({
     });
   }, [
     appContext,
+    attachedFiles,
     composerDraftKey,
     draftUserId,
     value,
     activeCommand,
     generationProfile,
     mentions,
+    onAttachedFilesChange,
     sessionId,
     toolFreeMode,
     setActiveCommand,
@@ -2575,8 +2851,17 @@ export function ChatComposer({
     (options?: { steerImmediately?: boolean }) => {
       if (isSteeringMode) {
         const text = value.trim();
-        if (!text) return;
-        if (options?.steerImmediately) {
+        const helpCommandSelected =
+          activeCommand?.capability === "aoitalk_help";
+        const helpCommandTyped = isChatHelpCommand(text);
+        const helpCommandActive = helpCommandSelected || helpCommandTyped;
+        if (!text && !helpCommandActive) return;
+        // Help is a reserved one-turn capability.  Even while another
+        // generation is active, never downgrade a menu-selected Help request
+        // to the steer protocol (which carries plain text only and would
+        // lose the trusted Guide grounding metadata).
+        if (options?.steerImmediately && !helpCommandActive) {
+          if (!text) return;
           if (!onSteer) return;
           onSteer(text);
           setValue("");
@@ -2610,7 +2895,10 @@ export function ChatComposer({
         );
         return;
       }
-      if (isEmpty || disabled) return;
+      const emptySubmissionAllowed =
+        activeCommand?.capability === "work_intake" ||
+        activeCommand?.capability === "aoitalk_help";
+      if ((isEmpty && !emptySubmissionAllowed) || disabled) return;
       const args = [
         submission.content,
         attachedFiles.length > 0 ? attachedFiles : undefined,
@@ -2694,6 +2982,9 @@ export function ChatComposer({
           : item.content,
       );
       setMentions((prev) => [...prev, ...item.mentions]);
+      onAttachedFilesChange((current) =>
+        appendQueuedAttachments(current, item.attachedFiles),
+      );
       onAppContextChange?.(item.appContext);
       setMessageQueue((prev) => prev.filter((q) => q.id !== item.id));
       requestAnimationFrame(() => {
@@ -2706,7 +2997,7 @@ export function ChatComposer({
         textarea.style.height = `${Math.min(textarea.scrollHeight, maxHeight)}px`;
       });
     },
-    [onAppContextChange, setMentions, setValue],
+    [onAppContextChange, onAttachedFilesChange, setMentions, setValue],
   );
 
   const removeQueuedMessage = useCallback((id: string) => {
@@ -2717,6 +3008,19 @@ export function ChatComposer({
     (command: ChatCommandDefinition) => {
       setShowSlashMenu(false);
       setSlashSelectionIndex(0);
+
+      // Literal commands remain in the submitted message.  In particular,
+      // /masking must reach the server parser as the same raw token whether
+      // the user picked it from the menu or typed it directly; it is not an
+      // active LLM capability and must never be routed through one.
+      if (command.kind === "literal") {
+        setValue(`${command.command} `);
+        setActiveCommand(null);
+        setToolFreeMode(false);
+        requestAnimationFrame(() => textareaRef.current?.focus());
+        return;
+      }
+
       setValue("");
 
       if (command.kind === "toggle") {
@@ -2947,6 +3251,19 @@ export function ChatComposer({
 
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
+      // A directly typed bare `/help` is a complete one-turn request, not a
+      // request to arm a persistent command chip.  The slash menu remains
+      // available for users who intentionally select Help and then type a
+      // question (or submit the empty chip with the send button).
+      if (value.trim().toLowerCase() === "/help") {
+        setShowSlashMenu(false);
+        setSlashSelectionIndex(0);
+        // Help is a complete command turn.  Even while another generation is
+        // running, queue it instead of sending a steer payload that would
+        // lose the reserved capability metadata.
+        handleSend();
+        return;
+      }
       if (confirmSlashCommand()) return;
       if (!showSlashMenu && !showMentionMenu) {
         handleSend({
@@ -3412,38 +3729,87 @@ export function ChatComposer({
           />
 
           <div className="relative min-w-[min(100%,16rem)] flex-1">
-            {activeCommand && !isSteeringMode && (
-              <div className="mb-1 flex items-center gap-1.5">
-                <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
-                  <span className="truncate">{activeCommand.label}</span>
-                  <button
-                    type="button"
-                    className="rounded-sm text-primary/70 hover:text-primary"
-                    onClick={() => setActiveCommand(null)}
-                    aria-label={`${activeCommand.label} commandを解除`}
-                    title={`${activeCommand.label} commandを解除`}
-                  >
-                    <X className="size-3" />
-                  </button>
-                </span>
-              </div>
-            )}
-            {appContext && !isSteeringMode && (
-              <div className="mb-1 flex items-center gap-1.5">
-                <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
-                  <span className="truncate">
-                    App: {appContext.appName} / {appContext.targetKey}
+            {!isSteeringMode && (Boolean(activeCommand) || toolsMenuActive) && (
+              <div
+                className="mb-1 flex min-w-0 flex-wrap items-center gap-1.5"
+                data-testid="chat-composer-active-chips"
+              >
+                {activeCommand && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">{activeCommand.label}</span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => setActiveCommand(null)}
+                      aria-label={`${activeCommand.label} commandを解除`}
+                      title={`${activeCommand.label} commandを解除`}
+                    >
+                      <X className="size-3" />
+                    </button>
                   </span>
-                  <button
-                    type="button"
-                    className="rounded-sm text-primary/70 hover:text-primary"
-                    onClick={() => onAppContextChange?.(null)}
-                    aria-label="App contextを解除"
-                    title="App contextを解除"
-                  >
-                    <X className="size-3" />
-                  </button>
-                </span>
+                )}
+
+                {projectContextEnabled && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">Project context</span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => handleProjectContextMenuToggle(false)}
+                      aria-label="Project contextを解除"
+                      title="Project contextを解除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                )}
+
+                {deepResearchEnabled && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">Deep Research</span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => handleDeepResearchMenuToggle(false)}
+                      aria-label="Deep Researchを解除"
+                      title="Deep Researchを解除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                )}
+
+                {toolFreeMode && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">ツールなし（無料枠優先）</span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => setToolFreeMode(false)}
+                      aria-label="ツールなし（無料枠優先）を解除"
+                      title="ツールなし（無料枠優先）を解除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                )}
+
+                {appContext && (
+                  <span className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-primary/35 bg-primary/10 px-2 py-1 text-xs font-medium text-primary">
+                    <span className="truncate">
+                      App: {appContext.appName} / {appContext.targetKey}
+                    </span>
+                    <button
+                      type="button"
+                      className="rounded-sm text-primary/70 hover:text-primary"
+                      onClick={() => onAppContextChange?.(null)}
+                      aria-label="App contextを解除"
+                      title="App contextを解除"
+                    >
+                      <X className="size-3" />
+                    </button>
+                  </span>
+                )}
               </div>
             )}
 
@@ -3485,6 +3851,13 @@ export function ChatComposer({
                               <span className="font-mono text-sm">
                                 {cmd.command}
                               </span>
+                              {(cmd.kind === "literal" ||
+                                (cmd.kind === "capability" &&
+                                  cmd.capability === "aoitalk_help")) && (
+                                <span className="text-sm font-medium text-foreground">
+                                  {cmd.label}
+                                </span>
+                              )}
                               <span className="text-xs text-muted-foreground">
                                 {cmd.description}
                               </span>
@@ -3594,7 +3967,9 @@ export function ChatComposer({
                 size="icon"
                 onMouseDown={(event) => event.preventDefault()}
                 onClick={() => handleSend()}
-                disabled={!value.trim()}
+                disabled={
+                  !value.trim() && activeCommand?.capability !== "aoitalk_help"
+                }
                 className="shrink-0"
                 title="送信待ちに追加 (Enter)"
                 aria-label="送信待ちに追加"
@@ -3621,7 +3996,9 @@ export function ChatComposer({
               onMouseDown={(event) => event.preventDefault()}
               onClick={() => handleSend()}
               disabled={
-                (isEmpty && activeCommand?.capability !== "work_intake") ||
+                (isEmpty &&
+                  activeCommand?.capability !== "work_intake" &&
+                  activeCommand?.capability !== "aoitalk_help") ||
                 disabled
               }
               className="shrink-0"

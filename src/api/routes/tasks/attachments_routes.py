@@ -19,7 +19,7 @@ from ....memory.models import TaskAttachment, TaskComment
 from ....memory.project_repository import ProjectRepository
 from ....tools.file_explorer.storage_context import calculate_storage_usage
 from ....services.task_management_service import TaskManagementError
-from ._shared import TaskRouterContext
+from ._shared import TaskRouterContext, _parse_browse_scope
 
 logger = logging.getLogger(__name__)
 
@@ -138,9 +138,21 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            scoped_project_ids = None
+            if browse_project_id is not None or browse_space_id is not None:
+                scoped_project_ids = await service.resolve_browse_project_ids(
+                    session,
+                    user_id=user_id,
+                    browse_project_id=browse_project_id,
+                    browse_space_id=browse_space_id,
+                )
             task = await _load_task_for_attachment(
                 session, user_id=user_id, task_id=task_id, permission="read"
             )
+            if scoped_project_ids is not None:
+                if task.project_id not in scoped_project_ids:
+                    raise TaskManagementError("Task not found", status_code=404)
             result = await session.execute(
                 select(TaskAttachment)
                 .where(TaskAttachment.task_id == task.id)
@@ -288,9 +300,21 @@ def register_attachment_routes(router: APIRouter, ctx: TaskRouterContext) -> Non
         user_id, _ = await _get_current_user(request)
         session = await get_db_manager().get_session()
         try:
+            browse_project_id, browse_space_id = _parse_browse_scope(request)
+            scoped_project_ids = None
+            if browse_project_id is not None or browse_space_id is not None:
+                scoped_project_ids = await service.resolve_browse_project_ids(
+                    session,
+                    user_id=user_id,
+                    browse_project_id=browse_project_id,
+                    browse_space_id=browse_space_id,
+                )
             task = await _load_task_for_attachment(
                 session, user_id=user_id, task_id=task_id, permission="read"
             )
+            if scoped_project_ids is not None:
+                if task.project_id not in scoped_project_ids:
+                    raise TaskManagementError("Task not found", status_code=404)
             result = await session.execute(
                 select(TaskAttachment).where(
                     TaskAttachment.id == parse_uuid_or_400(attachment_id, "attachment_id"),

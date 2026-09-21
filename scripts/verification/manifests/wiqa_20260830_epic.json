@@ -1,0 +1,194 @@
+{
+  "schema_version": 1,
+  "manifest_id": "wiqa_20260830_epic",
+  "run_id": "wiqa_20260830_epic",
+  "verification_run_id": "wiqa_20260830_epic",
+  "classification": "A",
+  "disposable": true,
+  "source": "legacy_runtime_inventory:WIQA/J8",
+  "created_at": "2026-08-30T00:00:00Z",
+  "reason": "The project carries the explicit project_metadata.qa_fixture marker wiqa_20260830_epic and every selected task is rooted in that project. This bounded manifest is the one-time cleanup authority; names and status are not selectors.",
+  "selection": {
+    "projects": [
+      "c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+    ],
+    "tasks": [
+      "4b2831f5-6019-4ef9-809e-50dde120ecc8",
+      "635c495c-c27a-4701-81c3-347dd5494f4c",
+      "576fd72a-68a3-4fa8-9b8c-dfd111edbdc7",
+      "fa030541-3781-4e2f-913d-bb1528fc8ecd",
+      "7ebebde4-a82a-451a-abfc-ee30ac9ae5a7",
+      "b8d90503-5819-413d-adc4-1cf08af45b0d",
+      "869f59ef-150b-4fa1-920f-0901f9fa370f"
+    ],
+    "users": []
+  },
+  "entities": [
+    {
+      "entity_type": "project",
+      "entity_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+      "category": "A",
+      "owner_id": "118eb287-43cf-43aa-bb10-c8cabaf21b0f",
+      "metadata": {
+        "qa_fixture": "wiqa_20260830_epic"
+      },
+      "counts": {
+        "projects": 1,
+        "tasks": 7,
+        "knowledge_nodes": 22,
+        "sessions": 18
+      }
+    }
+  ],
+  "anchors": {
+    "project": {
+      "id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+      "metadata_key": "project_metadata.qa_fixture",
+      "metadata_value": "wiqa_20260830_epic"
+    },
+    "knowledge_root": {
+      "id": "70151ac3-1a55-47d1-b71f-622a21411656",
+      "library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+      "parent_id": "fbfc2405-5035-4a03-a4f2-2f76203d255f",
+      "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+    },
+    "space": {
+      "id": "40813367-bc26-4705-afd9-660ca3e21246",
+      "disposition": "preserve_shared_space"
+    }
+  },
+  "workspace": {
+    "project_root": "workspaces/_users/user_118eb287-43cf-43aa-bb10-c8cabaf21b0f/_projects/project_c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+    "legacy_file": "workspaces/_users/user_118eb287-43cf-43aa-bb10-c8cabaf21b0f/_projects/project_c324a9db-fd9e-4f9b-badb-7cfb787b0707/wiqa_20260830_epic_repo_note.md"
+  },
+  "protection": {
+    "user_purge_ids": [],
+    "preserve_user_ids": [
+      "118eb287-43cf-43aa-bb10-c8cabaf21b0f",
+      "568a4cda-3426-4b0d-a15b-f7d59a05cf65",
+      "f03ea3d3-377e-4227-abea-bb608a3325ea"
+    ],
+    "preserve_space_ids": [
+      "40813367-bc26-4705-afd9-660ca3e21246"
+    ],
+    "name_is_not_authority": true,
+    "unknown_provenance_fails_closed": true
+  },
+  "source_evidence": {
+    "repository_paths": [],
+    "runtime_paths_considered": [
+      "frontend/e2e-live/onboarding-regular-user.spec.ts",
+      "frontend/e2e/play-convergence.spec.ts"
+    ],
+    "inventory_date": "2026-09-01",
+    "inventory_note": "Counts and assertions are a bounded snapshot from the local runtime inventory. The cleanup service must re-read every ID and metadata assertion immediately before mutation."
+  },
+  "category": "A",
+  "entity_evidence": {
+    "projects": [
+      {
+        "id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+        "name": "wiqa_20260830_epic Work Intelligence QA",
+        "slug": "wiqa_20260830_epic_work_intelligence_qa",
+        "owner_id": "118eb287-43cf-43aa-bb10-c8cabaf21b0f",
+        "space_id": "40813367-bc26-4705-afd9-660ca3e21246",
+        "metadata_assertions": {
+          "qa_fixture": "wiqa_20260830_epic",
+          "workspace_tools_enabled": true,
+          "links": {
+            "workspace_root": "_projects/project_c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+          }
+        }
+      }
+    ],
+    "tasks": [
+      {
+        "id": "4b2831f5-6019-4ef9-809e-50dde120ecc8",
+        "title": "wiqa_20260830_epic: API migration blocker を解消",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+        "metadata_assertions": {
+          "task_metadata.qa_fixture": "wiqa_20260830_epic"
+        }
+      },
+      {
+        "id": "635c495c-c27a-4701-81c3-347dd5494f4c",
+        "title": "wiqa_20260830_epic: rollout owner の確認",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+        "metadata_assertions": {
+          "task_metadata.qa_fixture": "wiqa_20260830_epic"
+        }
+      },
+      {
+        "id": "576fd72a-68a3-4fa8-9b8c-dfd111edbdc7",
+        "title": "wiqa_20260830_epic: 検証結果をDocsへ反映",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+        "metadata_assertions": {
+          "task_metadata.qa_fixture": "wiqa_20260830_epic"
+        }
+      },
+      {
+        "id": "fa030541-3781-4e2f-913d-bb1528fc8ecd",
+        "title": "WIQA-J8-SEEDED-1788106128493 Task",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+      },
+      {
+        "id": "7ebebde4-a82a-451a-abfc-ee30ac9ae5a7",
+        "title": "WIQA-J8-FINAL-20260831-0401-B8E2 Task proof",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+      },
+      {
+        "id": "b8d90503-5819-413d-adc4-1cf08af45b0d",
+        "title": "WIQA-J8-FINAL-20260831-0438-E1F6 Task proof",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707"
+      },
+      {
+        "id": "869f59ef-150b-4fa1-920f-0901f9fa370f",
+        "title": "WIQA-J8-FINAL-20260831-0542-G4B8 Task proof",
+        "project_id": "c324a9db-fd9e-4f9b-badb-7cfb787b0707",
+        "deletion_assertions": {
+          "deleted_at": "2026-08-31T01:55:54Z",
+          "deletion_batch_id": "1fdd3b1e-a9c6-4ea2-add0-139a1b04a1df"
+        }
+      }
+    ],
+    "users": []
+  },
+  "inventory_counts": {
+    "projects": 1,
+    "tasks": 7,
+    "users": 0,
+    "project_members": 3,
+    "sessions": 18,
+    "messages": 95,
+    "session_participants": 21,
+    "knowledge_nodes": 22,
+    "knowledge_search_index": 22,
+    "context_memories": 22,
+    "notifications": 8,
+    "scoped_memory_jobs": 14,
+    "project_overviews": 1,
+    "project_overview_refresh_jobs": 7,
+    "task_references": 4,
+    "content_deletion_events": 5,
+    "agent_runs": 44,
+    "heartbeat_history": 1,
+    "heartbeat_state": 1,
+    "token_usage": 274
+  },
+  "expected_counts": {
+    "projects": 1,
+    "tasks": 7,
+    "users": 0,
+    "knowledge_nodes": 22,
+    "sessions": 18,
+    "messages": 95
+  },
+  "counts": {
+    "projects": 1,
+    "tasks": 7,
+    "users": 0,
+    "knowledge_nodes": 22,
+    "sessions": 18,
+    "messages": 95
+  }
+}

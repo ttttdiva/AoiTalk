@@ -105,7 +105,10 @@ def register_remote_proxy_routes(app: FastAPI, server: "WebChatServer") -> None:
         if not record.enabled:
             raise HTTPException(status_code=409, detail="Profile is disabled")
         return RemoteServerConnector(
-            base_url=record.base_url, auth_token=record.get_auth_token()
+            base_url=record.base_url,
+            auth_token=record.get_auth_token(),
+            config=getattr(server, "config", None),
+            user_id=str(user_id),
         )
 
     async def _proxy_get(

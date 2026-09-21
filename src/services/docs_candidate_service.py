@@ -11,6 +11,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
@@ -18,12 +19,20 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.database import get_db_session
-from ..memory.models import DocsCandidate, KnowledgeNode, Project
+from ..memory.models import (
+    ConversationMessage,
+    ConversationSession,
+    DocsCandidate,
+    KnowledgeNode,
+    Project,
+)
 from ..memory.project_repository import ProjectRepository
 from .docs_acl import can_read_node, can_write_node
 from .project_information_docs import update_project_information_doc
+from .privacy_masking_projection import is_privacy_masking_source
 
 DOCS_CANDIDATE_STATUSES = frozenset({"proposed", "approved", "rejected", "superseded"})
 DOCS_CANDIDATE_SENSITIVITIES = frozenset({"normal", "private", "secret"})
@@ -181,7 +190,11 @@ async def _project_for_actor(
     permission: str,
 ) -> Project:
     project = await session.get(Project, project_id)
-    if project is None or getattr(project, "deleted_at", None) is not None:
+    if (
+        project is None
+        or getattr(project, "deleted_at", None) is not None
+        or bool(getattr(project, "is_completed", False))
+    ):
         raise DocsCandidateNotFound("project not found")
     allowed = await ProjectRepository.has_permission(
         session,
@@ -198,6 +211,111 @@ async def _rollback(session: Any) -> None:
     rollback = getattr(session, "rollback", None)
     if callable(rollback):
         await rollback()
+
+
+def _same_actor(value: Any, expected: Any) -> bool:
+    try:
+        left = UUID(str(value))
+        right = UUID(str(expected))
+    except (TypeError, ValueError, AttributeError):
+        return str(value or "").strip().casefold() == str(expected or "").strip().casefold()
+    return left == right
+
+
+def _normalized_chat_text(value: Any) -> str:
+    return " ".join(
+        unicodedata.normalize("NFKC", str(value or "").replace("\r\n", "\n"))
+        .strip()
+        .split()
+    )
+
+
+async def _validate_source_chat_binding(
+    session: Any,
+    *,
+    project_id: UUID,
+    actor_id: UUID,
+    session_id: UUID | None,
+    source_message_id: UUID | None,
+    user_input: str | None,
+) -> bool:
+    """Lock and verify chat provenance before a Docs candidate mutation."""
+
+    if session_id is None and source_message_id is not None:
+        return False
+    execute = getattr(session, "execute", None)
+    locked_execute = isinstance(session, AsyncSession) and callable(execute)
+    if not locked_execute and session_id is None:
+        # Tiny compatibility doubles cannot express a row lock. Production
+        # AsyncSession always exposes execute and takes the locked path.
+        return True
+    if not locked_execute and source_message_id is None:
+        # Tiny compatibility doubles cannot express a row lock. Production
+        # AsyncSession always exposes execute and takes the locked path.
+        return True
+
+    async def locked(model: Any, identifier: UUID) -> Any:
+        if locked_execute:
+            result = await execute(
+                select(model)
+                .where(model.id == identifier)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            scalar_one_or_none = getattr(result, "scalar_one_or_none", None)
+            if callable(scalar_one_or_none):
+                return scalar_one_or_none()
+            one_or_none = getattr(result, "one_or_none", None)
+            if callable(one_or_none):
+                row = one_or_none()
+                if isinstance(row, tuple):
+                    return row[0] if row else None
+                return row
+            scalars = getattr(result, "scalars", None)
+            if callable(scalars):
+                values = scalars()
+                first = getattr(values, "first", None)
+                if callable(first):
+                    return first()
+            return None
+        return await session.get(model, identifier)
+
+    # Project lifecycle writers lock the parent before linked chat rows.  Use
+    # the same order here so completion/deletion cannot race candidate
+    # creation, and refresh the identity-map instance before checking state.
+    project = await locked(Project, project_id)
+    if (
+        project is None
+        or getattr(project, "deleted_at", None) is not None
+        or bool(getattr(project, "is_completed", False))
+    ):
+        return False
+
+    conversation = await locked(ConversationSession, session_id)
+    if conversation is None or getattr(conversation, "deleted_at", None) is not None:
+        return False
+    if not _same_actor(getattr(conversation, "user_id", None), actor_id):
+        return False
+    if not _same_actor(getattr(conversation, "project_id", None), project_id):
+        return False
+    if source_message_id is None:
+        return True
+    message = await locked(ConversationMessage, source_message_id)
+    if message is None or getattr(message, "deleted_at", None) is not None:
+        return False
+    if is_privacy_masking_source(message):
+        return False
+    if not _same_actor(getattr(message, "session_id", None), session_id):
+        return False
+    if str(getattr(message, "role", "") or "").strip().casefold() != "user":
+        return False
+    if not _same_actor(getattr(message, "sender_id", None), actor_id):
+        return False
+    if user_input not in (None, "") and _normalized_chat_text(
+        getattr(message, "content", None)
+    ) != _normalized_chat_text(user_input):
+        return False
+    return True
 
 
 def _expected_version(
@@ -231,6 +349,9 @@ async def create_candidate(
     evidence_hash: str | None = None,
     evidence_span: str | None = None,
     source_job_id: UUID | str | None = None,
+    source_session_id: UUID | str | None = None,
+    source_message_id: UUID | str | None = None,
+    source_user_input: str | None = None,
 ) -> dict[str, Any]:
     """Create one proposed candidate in a Project-scoped review queue."""
 
@@ -262,6 +383,20 @@ async def create_candidate(
     if evidence_hash_value is None and evidence_span_value:
         evidence_hash_value = hashlib.sha256(evidence_span_value.encode("utf-8")).hexdigest()
     source_job_uuid = _uuid(source_job_id, field="source_job_id", required=False)
+    source_session_uuid = _uuid(
+        source_session_id,
+        field="source_session_id",
+        required=False,
+    )
+    source_message_uuid = _uuid(
+        source_message_id,
+        field="source_message_id",
+        required=False,
+    )
+    if source_message_uuid is not None and source_session_uuid is None:
+        raise DocsCandidateValidation(
+            "source_message_id requires source_session_id"
+        )
     dedupe_key = _dedupe_key(
         project_id=project_uuid,
         source_job_id=source_job_uuid,
@@ -270,6 +405,15 @@ async def create_candidate(
     )
 
     async with await get_db_session() as session:
+        if not await _validate_source_chat_binding(
+            session,
+            project_id=project_uuid,
+            actor_id=creator_uuid,
+            session_id=source_session_uuid,
+            source_message_id=source_message_uuid,
+            user_input=source_user_input,
+        ):
+            raise DocsCandidateValidation("source chat is outside Project scope")
         # A candidate writer must at least be able to read the Project.  This
         # keeps background routing from writing across an unrelated Project.
         await _project_for_actor(
@@ -502,21 +646,6 @@ async def approve_candidate(
             await _rollback(session)
             raise
         result = _candidate_dict(candidate)
-    # The canonical Docs transaction committed above.  Scheduling outside it
-    # prevents a failed approval rollback from creating a rebuild job, while a
-    # transient queue failure does not hide the successful approval response.
-    from .project_context_pack_job_service import enqueue_project_context_pack_rebuild
-
-    try:
-        await enqueue_project_context_pack_rebuild(
-            project.id,
-            actor_uuid,
-            "docs_candidate_approved",
-        )
-    except Exception:
-        logger.exception(
-            "Failed to enqueue ProjectContextPack rebuild after Docs candidate approval"
-        )
     return result
 
 

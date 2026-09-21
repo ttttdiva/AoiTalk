@@ -2,8 +2,9 @@
  * Project Repository.
  *
  * M1 policy:
- *   - Reads: prefer local cache; if empty and online, fall back to remote
- *     and upsert into SQLite. Subsequent online reads refresh in the
+ *   - Reads: prefer local cache; if empty and an AoiTalk network path exists,
+ *     fall back to remote and upsert into SQLite. Subsequent server reads
+ *     refresh in the background.
  *     background.
  *   - Writes: not supported in mobile yet (mobile can only read projects
  *     at M1, per design doc). M2+ will wire via outbox.
@@ -24,7 +25,8 @@ import {
 } from "../lib/api-client";
 import { enqueueAuthScopeExclusive } from "../lib/auth-scope-queue";
 import { projectApi } from "../lib/project-api";
-import { useNetworkStore } from "../stores/network";
+import { isForeignDefaultInboxProject } from "../lib/project-list-visibility";
+import { canAttemptAoiTalkServer } from "../stores/network";
 import type { Project as ApiProject } from "../types/api";
 import { enqueueOutbox, randomId } from "./outbox";
 
@@ -47,6 +49,7 @@ function toApiShape(row: DbProject): ApiProject {
     color,
     metadata,
     owner_id: row.ownerId ?? null,
+    is_participating: row.isParticipating ?? null,
     space_id: row.spaceId ?? null,
     is_completed: row.isCompleted ?? false,
     storage_quota_mb: row.storageQuotaMb ?? undefined,
@@ -58,8 +61,7 @@ function toApiShape(row: DbProject): ApiProject {
 }
 
 async function canUseServer(): Promise<boolean> {
-  const network = useNetworkStore.getState();
-  return network.online && network.serverReachable && Boolean(await getToken());
+  return canAttemptAoiTalkServer() && Boolean(await getToken());
 }
 
 async function ensureAnonymousDefaultProject(): Promise<void> {
@@ -160,6 +162,7 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
         storageUsedMb:
           (p as { storage_used_mb?: number | null }).storage_used_mb ?? null,
         projectMetadata: metadata,
+        isParticipating: p.is_participating ?? null,
         createdAt: (p as { created_at?: string }).created_at ?? now,
         updatedAt: (p as { updated_at?: string }).updated_at ?? now,
         deletedAt: null,
@@ -180,6 +183,11 @@ export async function applyRemoteProjects(list: ApiProject[]): Promise<void> {
           storageUsedMb:
             (p as { storage_used_mb?: number | null }).storage_used_mb ?? null,
           projectMetadata: metadata,
+          // Mutation responses may omit the user projection; do not erase
+          // membership learned from the canonical list or sync.
+          ...(typeof p.is_participating === "boolean"
+            ? { isParticipating: p.is_participating }
+            : {}),
           updatedAt: (p as { updated_at?: string }).updated_at ?? now,
           deletedAt: null,
         },
@@ -298,7 +306,7 @@ async function refreshRemote(
 
     await applyRemoteProjects(list);
     await reconcileCanonicalProjects(list);
-    return list;
+    return list.filter((project) => !isForeignDefaultInboxProject(project, snapshot.authScope));
   });
 }
 
@@ -329,12 +337,14 @@ export const projectsRepo = {
   /** Read from local cache (deleted_at IS NULL). */
   async listLocal(): Promise<ApiProject[]> {
     await ensureAnonymousDefaultProject();
+    const authScope = authScopeForToken(await getToken());
     const db = getDb();
     const rows = await db
       .select()
       .from(schema.projects)
       .where(isNull(schema.projects.deletedAt));
-    return rows.map(toApiShape);
+    // 古いサーバーから取得済みのInboxも削除せず表示時に除外する。
+    return rows.map(toApiShape).filter((project) => !isForeignDefaultInboxProject(project, authScope));
   },
 
   /** Online returns fresh data; offline or failed refresh falls back to local cache. */

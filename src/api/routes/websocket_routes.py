@@ -92,6 +92,22 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
         await server._setup_user_context(websocket, ws_user_info)
 
         try:
+            # Replay only live in-memory interactions after authentication,
+            # session ACL validation, connection setup, and user-context
+            # setup.  Audit events are not actionable and are never rebuilt
+            # here.  Delivery is direct to this socket so reconnecting one
+            # client does not reopen the dialog on other connected clients.
+            interaction_manager = getattr(
+                server, "_human_interaction_manager", None
+            )
+            if interaction_manager is not None and ws_session_id:
+                replay_messages = await interaction_manager.select_pending_replays(
+                    user_id=ws_user_id,
+                    session_id=ws_session_id,
+                )
+                for replay_message in replay_messages:
+                    await websocket.send_json(replay_message)
+
             while True:
                 # Receive message from client
                 data = await websocket.receive_json()
@@ -149,9 +165,16 @@ def register_websocket_routes(app: FastAPI, server: "WebChatServer") -> None:
                             await websocket.close(code=1008)
                             return
                     # Run IDs are server-owned.  Accepting a client-supplied
-                    # ID would let a second WebSocket overwrite the existing
-                    # cancellation handle and generation fence.
-                    message_data.pop("agent_run_id", None)
+                    # ID or persistence-reuse marker would let a WebSocket
+                    # claim another durable turn. These fields are issued only
+                    # by the server/outbox lifecycle.
+                    for server_owned_field in (
+                        "agent_run_id",
+                        "persisted_user_message_id",
+                        "skip_user_persistence",
+                        "_dispatch_delivery_lifecycle",
+                    ):
+                        message_data.pop(server_owned_field, None)
                     generation_status = server.get_conversation_generation_status(
                         requested_session_id
                     )

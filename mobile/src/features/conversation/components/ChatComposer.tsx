@@ -5,6 +5,7 @@ import {
   filterSlashCommands,
   MOBILE_CHAT_COMMANDS,
   resolveMobileCommandSubmission,
+  visibleSkillSlashCommands,
   type ChatCommandCapability,
   type MobileChatCommand,
   type SkillSlashCommand,
@@ -19,6 +20,7 @@ function compactLabel(value: string): string {
 
 export type ChatComposerSubmission = {
   content: string;
+  submissionId?: string;
   capabilities?: ChatCommandCapability[];
 };
 
@@ -26,7 +28,6 @@ export type ChatComposerProps = {
   bottomInset: number;
   keyboardVisible: boolean;
   sendEnabled: boolean;
-  serverGenerationActive: boolean;
   directResponseActive: boolean;
   currentResponseModelLabel: string;
   currentLlmModeLabel: string;
@@ -37,10 +38,9 @@ export type ChatComposerProps = {
   isAuthenticated: boolean;
   pendingCount: number;
   onSend: (submission: ChatComposerSubmission) => Promise<void>;
-  onStopGeneration: () => Promise<void>;
-  onSteerGeneration?: (message: string) => Promise<unknown>;
   onOpenResponseModel: () => void;
   onOpenLlmMode: () => void;
+  onOpenContextDiagnostics?: () => void;
   onOpenPendingQueue: () => void;
   onStartDeepResearch: (query: string) => Promise<void>;
 };
@@ -49,7 +49,6 @@ export const ChatComposer = React.memo(function ChatComposer({
   bottomInset,
   keyboardVisible,
   sendEnabled,
-  serverGenerationActive,
   directResponseActive,
   currentResponseModelLabel,
   currentLlmModeLabel,
@@ -60,26 +59,27 @@ export const ChatComposer = React.memo(function ChatComposer({
   isAuthenticated,
   pendingCount,
   onSend,
-  onStopGeneration,
-  onSteerGeneration,
   onOpenResponseModel,
   onOpenLlmMode,
+  onOpenContextDiagnostics,
   onOpenPendingQueue,
   onStartDeepResearch,
 }: ChatComposerProps) {
   conversationPerformanceDiagnostics.recordRender("ChatComposer");
   const submissionRef = useRef(false);
+  const submissionSequenceRef = useRef(0);
+  const retrySubmissionRef = useRef<{ key: string; id: string } | null>(null);
   const [input, setInput] = useState("");
   const [activeCommand, setActiveCommand] = useState<MobileChatCommand | null>(null);
   const [composerError, setComposerError] = useState<string | null>(null);
   const [commandSheetVisible, setCommandSheetVisible] = useState(false);
   const [deepResearchVisible, setDeepResearchVisible] = useState(false);
   const [deepResearchQuery, setDeepResearchQuery] = useState("");
-  const [steerVisible, setSteerVisible] = useState(false);
-  const [steerDraft, setSteerDraft] = useState("");
-  const [steerError, setSteerError] = useState<string | null>(null);
-  const [steering, setSteering] = useState(false);
 
+  const visibleSkillCommands = useMemo(
+    () => visibleSkillSlashCommands(skillCommands),
+    [skillCommands],
+  );
   const slashQuery = /^\/[^\s\n]*$/.test(input) ? input : null;
   const slashSuggestions = useMemo(() => {
     if (!slashQuery) return [];
@@ -87,14 +87,29 @@ export const ChatComposer = React.memo(function ChatComposer({
       kind: "command" as const,
       command,
     }));
-    const skills = filterSlashCommands(skillCommands, slashQuery).map((command) => ({
+    const skills = filterSlashCommands(visibleSkillCommands, slashQuery).map((command) => ({
       kind: "skill" as const,
       command,
     }));
     return [...builtIns, ...skills].slice(0, 6);
-  }, [skillCommands, slashQuery]);
+  }, [slashQuery, visibleSkillCommands]);
 
   const selectBuiltInCommand = useCallback((command: MobileChatCommand) => {
+    // /masking is a trusted server operation.  Keep its literal slash token
+    // in the payload just like a manual Skill so direct typing and menu
+    // selection cannot diverge into a local/direct-model request.
+    if (command.serverOnly) {
+      setActiveCommand(null);
+      setInput((value) => {
+        const existing = value.trim();
+        return /^\/[^\s\n]*$/.test(value) || !existing
+          ? `${command.command} `
+          : `${command.command} ${existing}`;
+      });
+      setComposerError(null);
+      setCommandSheetVisible(false);
+      return;
+    }
     setActiveCommand(command);
     setComposerError(null);
     setInput((value) => (/^\/[^\s\n]*$/.test(value) ? "" : value));
@@ -125,12 +140,42 @@ export const ChatComposer = React.memo(function ChatComposer({
     setActiveCommand(null);
     setComposerError(null);
     submissionRef.current = true;
-    void onSend({
-      content: submission.content,
-      capabilities: submission.capabilities,
-    }).finally(() => {
-      submissionRef.current = false;
-    });
+    const key = JSON.stringify([submission.content, submission.capabilities]);
+    const sequence = ++submissionSequenceRef.current;
+    // Reuse an ID only for a rejected acceptance, never for a second deliberate
+    // press with identical text while the previous request is still pending.
+    const id = retrySubmissionRef.current?.key === key
+      ? retrySubmissionRef.current.id
+      : `mobile-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    retrySubmissionRef.current = null;
+    const restoreRejectedDraft = (error: unknown) => {
+      // Once accepted, the bubble owns retry/error state; never copy it back
+      // into the input and create a second submission on the next press.
+      if (error && typeof error === "object" && "retainedInTimeline" in error && error.retainedInTimeline === true) return;
+      if (submissionSequenceRef.current !== sequence) return;
+      retrySubmissionRef.current = { key, id };
+      // Delivery failures after acceptance belong to the history. This callback
+      // handles only validation/acceptance rejection from the controller.
+      const command = MOBILE_CHAT_COMMANDS.find((item) =>
+        item.capability && submission.capabilities?.includes(item.capability),
+      );
+      setInput((current) => current || (command
+        ? `${command.command} ${submission.content}`
+        : submission.content));
+      setComposerError(
+        error instanceof Error ? error.message : "送信を開始できませんでした。入力を保持しました。",
+      );
+    };
+    try {
+      void onSend({
+        content: submission.content,
+        capabilities: submission.capabilities,
+        submissionId: id,
+      }).catch(restoreRejectedDraft);
+    } catch (error) {
+      restoreRejectedDraft(error);
+    }
+    queueMicrotask(() => { submissionRef.current = false; });
   }, [activeCommand, directResponseActive, input, onSend, sendEnabled]);
   const submitDeepResearch = useCallback(() => {
     const query = deepResearchQuery.trim() || input.trim();
@@ -139,22 +184,6 @@ export const ChatComposer = React.memo(function ChatComposer({
     setDeepResearchQuery("");
     void onStartDeepResearch(query);
   }, [deepResearchQuery, input, onStartDeepResearch]);
-  const submitSteer = useCallback(async () => {
-    const value = steerDraft.trim();
-    if (!value || !onSteerGeneration || steering) return;
-    setSteering(true);
-    setSteerError(null);
-    try {
-      await onSteerGeneration(value);
-      setSteerDraft("");
-      setSteerVisible(false);
-    } catch (error) {
-      // Keep the draft so a transient failure never loses the user's instruction.
-      setSteerError(error instanceof Error ? error.message : "追加指示に失敗しました。");
-    } finally {
-      setSteering(false);
-    }
-  }, [onSteerGeneration, steerDraft, steering]);
 
   return (
     <>
@@ -269,9 +298,9 @@ export const ChatComposer = React.memo(function ChatComposer({
                 </Text>
                 <Text style={styles.composerSelectorChevron}>⌄</Text>
               </Pressable>
+              {effortEnabled ? (
               <Pressable
                 style={styles.composerSelector}
-                disabled={!effortEnabled}
                 onPress={() => {
                   conversationPerformanceDiagnostics.measureInteraction(
                     "ChatComposer.open-llm-mode",
@@ -295,38 +324,7 @@ export const ChatComposer = React.memo(function ChatComposer({
                 </Text>
                 <Text style={styles.composerSelectorChevron}>⌄</Text>
               </Pressable>
-              {serverGenerationActive ? (
-                <>
-                  {onSteerGeneration ? (
-                    <IconButton
-                      icon="message-processing-outline"
-                      iconColor="#11111b"
-                      containerColor="#f9e2af"
-                      size={22}
-                      style={styles.sendButton}
-                      onPress={() => {
-                        setSteerError(null);
-                        setSteerVisible(true);
-                      }}
-                      accessibilityLabel="生成中に追加指示"
-                    />
-                  ) : null}
-                  <IconButton
-                    icon="stop"
-                    iconColor="#11111b"
-                    containerColor="#f38ba8"
-                    size={22}
-                    style={styles.sendButton}
-                    onPress={() =>
-                      conversationPerformanceDiagnostics.measureInteraction(
-                        "ChatComposer.stop-generation",
-                        () => void onStopGeneration(),
-                      )
-                    }
-                    accessibilityLabel="応答生成を停止"
-                  />
-                </>
-              ) : (
+              ) : null}
                 <IconButton
                   icon="arrow-up"
                   iconColor={input.trim() && sendEnabled ? "#11111b" : "#6c7086"}
@@ -342,7 +340,6 @@ export const ChatComposer = React.memo(function ChatComposer({
                   disabled={!input.trim() || !sendEnabled}
                   accessibilityLabel="送信"
                 />
-              )}
             </View>
           </Surface>
       </View>
@@ -379,35 +376,6 @@ export const ChatComposer = React.memo(function ChatComposer({
           </Dialog>
         ) : null}
 
-        {steerVisible ? (
-          <Dialog
-            visible
-            onDismiss={() => {
-              if (!steering) setSteerVisible(false);
-            }}
-            style={styles.dialog}
-          >
-            <Dialog.Title style={styles.dialogTitle}>生成中に追加指示</Dialog.Title>
-            <Dialog.Content>
-              <ChatTextInput
-                value={steerDraft}
-                onChangeText={setSteerDraft}
-                mode="outlined"
-                multiline
-                autoFocus
-                placeholder="この生成に追加する指示"
-                style={styles.editInput}
-                disabled={steering}
-              />
-              {steerError ? <Text style={styles.composerError}>{steerError}</Text> : null}
-            </Dialog.Content>
-            <Dialog.Actions>
-              <Button textColor="#a6adc8" onPress={() => setSteerVisible(false)} disabled={steering}>閉じる</Button>
-              <Button textColor="#7c3aed" onPress={() => void submitSteer()} loading={steering} disabled={steering || !steerDraft.trim()}>送信</Button>
-            </Dialog.Actions>
-          </Dialog>
-        ) : null}
-
         {commandSheetVisible ? (
           <Dialog
             visible
@@ -418,6 +386,20 @@ export const ChatComposer = React.memo(function ChatComposer({
             <Dialog.ScrollArea style={styles.dialogScrollArea}>
               <ScrollView contentContainerStyle={styles.dialogScrollContent}>
                 <Text style={styles.commandSectionTitle}>ツール</Text>
+                {onOpenContextDiagnostics ? (
+                  <Button
+                    icon="chart-box-outline"
+                    textColor="#cdd6f4"
+                    contentStyle={styles.quickActionContent}
+                    disabled={!isAuthenticated}
+                    onPress={() => {
+                      setCommandSheetVisible(false);
+                      onOpenContextDiagnostics();
+                    }}
+                  >
+                    コンテキスト診断
+                  </Button>
+                ) : null}
                 <Button
                   icon="magnify"
                   textColor="#cdd6f4"
@@ -471,7 +453,7 @@ export const ChatComposer = React.memo(function ChatComposer({
                 ))}
                 <Divider style={styles.innerDivider} />
                 <Text style={styles.commandSectionTitle}>Skills</Text>
-                {skillCommands.map((command) => (
+                {visibleSkillCommands.map((command) => (
                   <Pressable
                     key={command.command}
                     style={styles.commandRow}
@@ -483,7 +465,7 @@ export const ChatComposer = React.memo(function ChatComposer({
                     </View>
                   </Pressable>
                 ))}
-                {skillCommands.length === 0 ? (
+                {visibleSkillCommands.length === 0 ? (
                   <Text style={styles.diagnosticsText}>利用可能な手動Skillはありません。</Text>
                 ) : null}
               </ScrollView>

@@ -41,7 +41,8 @@ function statusLabel(status: string): string {
 }
 
 export function DocsTaskBinding({ nodeId, projectId, readOnly = false }: DocsTaskBindingProps) {
-  const online = useNetworkStore((state) => state.online);
+  // Binding is server-backed, so an attached LAN path is sufficient.
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const [visible, setVisible] = useState(false);
   const [query, setQuery] = useState("");
   const [tasks, setTasks] = useState<DocsTaskBinding[]>([]);

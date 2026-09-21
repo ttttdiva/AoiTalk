@@ -1,23 +1,23 @@
 """Semantic index for the AoiTalk Docs graph (``KnowledgeNode``).
 
 The Docs graph stores content as an outliner: each node is one short claim and
-its "body" is its child nodes. So the retrieval unit is a single node, embedded
-together with a small amount of context (its ancestor path and tags) — the
-Contextual Retrieval pattern applied to an outliner.
+its "body" is its child nodes. The retrieval unit is a single node, embedded
+using only its own content and same-library tags. Ancestors can have different
+ACLs, so their text must never influence a readable descendant's vectors.
 
 This index is derived and rebuildable. The canonical data is Postgres. Indexing
-is opt-in via ``rag.docs_enabled`` (default off) so the default runtime does not
-load an embedding model on every Docs edit. When disabled or unavailable,
+is controlled by ``rag.docs_enabled`` (default on). When disabled or unavailable,
 ``search_docs_index`` returns ``[]`` and ``docs_search`` falls back to the
 lexical (DB) search.
 
 Design notes:
 - Collection ``rag.docs_collection_name`` (default ``aoitalk_docs``), separate
   from the Knowledge Workspace collection, with named dense + sparse vectors.
-- Point id = ``str(node_id)`` so upserts replace in place.
+- Record point IDs use node IDs; long text adds deterministic span IDs.
+  Search filters by payload node_id and collapses spans back to stable nodes.
 - A per-node content hash (over the embedding input) lets ``reconcile_library``
-  skip unchanged nodes and re-embed only what changed — including when a parent
-  rename changes a descendant's ancestor path.
+  skip unchanged nodes. An input version forces migration of legacy contextual
+  vectors; those points remain unsearchable until explicitly reconciled.
 - Frontend Docs edits write straight to Postgres (bypassing the Python service),
   so ``reconcile_library`` is the catch-all sync; ``enqueue_docs_reindex`` gives
   near-real-time updates for backend/agent-originated edits.
@@ -27,9 +27,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
+import math
 import logging
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Optional
 
@@ -37,13 +40,13 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
-    DocsLibrary,
     KnowledgeNode,
+    KnowledgeField,
+    KnowledgeFieldValue,
     KnowledgeNodeSupertag,
     KnowledgeSupertag,
 )
 from ..security.field_crypto import decrypt_json_value_if_needed, decrypt_text_if_needed
-from ..services.docs_acl import docs_readable_node_predicate
 from ..services.docs_graph_service import docs_searchable_body_text
 from .config import RagConfig, get_rag_config
 from .docs_search_telemetry import DocsIndexSearchTelemetry
@@ -74,6 +77,26 @@ class DocsIndexUnavailable(RuntimeError):
 REINDEX_INIT_RETRY_SECONDS = 30.0
 REINDEX_WORKER_BACKOFF_INITIAL_SECONDS = 5.0
 REINDEX_WORKER_BACKOFF_MAX_SECONDS = 60.0
+DOCS_INDEX_INPUT_VERSION = 4
+SEARCH_REPLENISH_ROUNDS = 4
+
+
+class _LocalNodeIdValues(list[str]):
+    """List-compatible, constant-time membership for embedded Qdrant.
+
+    Its payload evaluator uses ``value in match.any`` for every point. A
+    normal list makes an authorized corpus of N nodes take O(N**2) work.
+    Retain the normal MatchAny/list wire shape, including deepcopy and JSON
+    serialization, while indexing membership locally. These request-owned
+    values are constructed once and never mutated.
+    """
+
+    def __init__(self, values: Iterable[str]) -> None:
+        super().__init__(values)
+        self._members = frozenset(self)
+
+    def __contains__(self, value: object) -> bool:
+        return isinstance(value, str) and value in self._members
 
 
 def docs_rag_enabled(config: Optional[RagConfig] = None) -> bool:
@@ -88,8 +111,12 @@ def _node_text(
     description: str = "",
     body_text: str = "",
     body_json: object = None,
+    fields_text: str = "",
 ) -> str:
-    """Build the contextual text embedded for a node.
+    """Build the node-own text embedded for a node.
+
+    ``path_titles`` is retained for compatibility with indexing callers but
+    deliberately ignored: an ancestor can be unreadable to a node's reader.
 
     ``body_text`` is normally the title mirror and therefore does not need to
     be duplicated in the embedding input.  A typed Markdown/code block has
@@ -98,11 +125,8 @@ def _node_text(
     dense retrieval lanes.
     """
     parts: list[str] = []
-    path = " / ".join(t for t in path_titles if t)
-    if path:
-        parts.append(f"path: {path}")
     if tags:
-        parts.append("tags: " + " ".join(f"#{t}" for t in tags))
+        parts.append("tags: " + " ".join(f"#{t}" for t in sorted(tags)))
     title_text = str(title or "").strip()
     parts.append(title_text)
     body = docs_searchable_body_text(body_text, body_json).strip()
@@ -110,11 +134,34 @@ def _node_text(
         parts.append(body)
     if description:
         parts.append(str(description).strip())
+    if fields_text:
+        parts.append(fields_text)
     return "\n".join(p for p in parts if p)
 
 
 def _content_hash(text: str) -> str:
     return hashlib.blake2b(text.encode("utf-8"), digest_size=16).hexdigest()
+
+
+def docs_embedding_fingerprint(model: str, dimension: int | None) -> str:
+    return hashlib.sha256(json.dumps([model, dimension, DOCS_INDEX_INPUT_VERSION],
+                                    separators=(",", ":")).encode()).hexdigest()
+
+
+def _node_units(node_id, title, text):
+    """Rebuildable own-record spans; offsets belong to derived index text."""
+    yield str(node_id), text[:2000], 0
+    if len(text) > 2000:
+        prefix = "title: " + str(title or "")[:300] + "\n"
+        for start in range(1600, len(text), 1600):
+            yield str(uuid.uuid5(node_id, f"docs-span-v4:{start}")), prefix + text[start:start + 2000], start
+
+
+def _unit_ids(node_id, length):
+    result = {str(node_id)}
+    if length > 2000:
+        result.update(str(uuid.uuid5(node_id, f"docs-span-v4:{start}")) for start in range(1600, length, 1600))
+    return result
 
 
 class DocsIndexService:
@@ -177,8 +224,13 @@ class DocsIndexService:
                 self._mark_disabled()
                 return False
             if self.config.qdrant.local_path:
-                self.client = SharedQdrantClient.get_client(self.config.qdrant.local_path)
                 self._is_local_mode = True
+                # Opening embedded Qdrant loads every persisted collection.
+                # Keep this blocking startup work off the HTTP event loop,
+                # under the same lock and cancellation rules as index I/O.
+                self.client = await self._index_io(
+                    SharedQdrantClient.get_client, self.config.qdrant.local_path
+                )
             else:
                 self.client = QdrantClient(
                     host=self.config.qdrant.host,
@@ -186,7 +238,7 @@ class DocsIndexService:
                     api_key=self.config.qdrant.api_key,
                 )
                 self._is_local_mode = False
-            self._ensure_collection()
+            await self._index_io(self._ensure_collection)
             self._initialized = True
             self._disabled = False
             self._disabled_at = None
@@ -215,6 +267,39 @@ class DocsIndexService:
                     )
                 },
             )
+        else:
+            info = self.client.get_collection(self.collection_name)
+            vectors = info.config.params.vectors
+            dense = vectors.get(self.dense_vector_name) if isinstance(vectors, dict) else None
+            sparse = info.config.params.sparse_vectors or {}
+            if dense is None or dense.size != self.embedding.dimension or self.sparse_vector_name not in sparse:
+                raise DocsIndexUnavailable("Incompatible Docs collection retained; use an explicitly migrated collection")
+
+    def _embedding_fingerprint(self):
+        return docs_embedding_fingerprint(self.config.embedding.model, getattr(self.embedding, "dimension", None))
+
+    async def _index_io(self, operation, *args, **kwargs):
+        from ..knowledge.index_service import _LOCAL_INDEX_IO_LOCK
+
+        def invoke():
+            if self._is_local_mode:
+                with _LOCAL_INDEX_IO_LOCK:
+                    return operation(*args, **kwargs)
+            return operation(*args, **kwargs)
+        pending = asyncio.get_running_loop().run_in_executor(None, invoke)
+        try:
+            return await asyncio.shield(pending)
+        except asyncio.CancelledError:
+            while not pending.done():
+                try:
+                    await asyncio.shield(pending)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not pending.cancelled():
+                pending.exception()
+            raise
 
     # -- indexing -----------------------------------------------------------
 
@@ -223,7 +308,7 @@ class DocsIndexService:
             return
         guard = _LOCAL_QUERY_LOCK if self._is_local_mode else _NULL_GUARD
         async with guard:
-            await asyncio.to_thread(
+            await self._index_io(
                 self.client.upsert,
                 collection_name=self.collection_name,
                 points=points,
@@ -234,7 +319,7 @@ class DocsIndexService:
             return
         guard = _LOCAL_QUERY_LOCK if self._is_local_mode else _NULL_GUARD
         async with guard:
-            await asyncio.to_thread(
+            await self._index_io(
                 self.client.delete,
                 collection_name=self.collection_name,
                 points_selector=models.PointIdsList(points=[str(nid) for nid in node_ids]),
@@ -254,7 +339,8 @@ class DocsIndexService:
                 "project_id": str(node.project_id) if node.project_id else "",
                 "title": node.title or "",
                 "tags": tags,
-                "text": text,
+                "input_version": DOCS_INDEX_INPUT_VERSION,
+                "embedding_fingerprint": self._embedding_fingerprint(),
                 "content_hash": _content_hash(text),
             },
         )
@@ -298,7 +384,7 @@ class DocsIndexService:
         )
 
     async def _existing_points(
-        self, docs_library_id: uuid.UUID
+        self, docs_library_id: uuid.UUID, node_ids=None
     ) -> tuple[dict[str, str], set[str], dict[str, set[str]]]:
         """Return hashes, legacy node IDs, and Qdrant point IDs by node.
 
@@ -315,8 +401,16 @@ class DocsIndexService:
         point_ids_by_node: dict[str, set[str]] = {}
         next_offset = None
         flt = self._library_scan_filter(docs_library_id)
+        if node_ids is not None:
+            values = list(map(str, node_ids))
+            if not values:
+                return {}, set(), {}
+            flt = models.Filter(must=[flt, models.Filter(should=[
+                models.FieldCondition(key="node_id", match=models.MatchAny(any=values)),
+                models.HasIdCondition(has_id=values),
+            ])])
         while True:
-            records, next_offset = await asyncio.to_thread(
+            records, next_offset = await self._index_io(
                 self.client.scroll,
                 collection_name=self.collection_name,
                 scroll_filter=flt,
@@ -326,6 +420,9 @@ class DocsIndexService:
                     "content_hash",
                     "docs_library_id",
                     "workspace_id",
+                    "input_version",
+                    "embedding_fingerprint",
+                    "text",
                 ],
                 with_vectors=False,
                 offset=next_offset,
@@ -336,9 +433,17 @@ class DocsIndexService:
                 node_id = payload.get("node_id")
                 node_key = str(node_id) if node_id else ""
                 if node_key:
-                    hashes[node_key] = str(payload.get("content_hash") or "")
+                    point_hash = str(payload.get("content_hash") or "")
+                    if node_key in hashes and hashes[node_key] != point_hash:
+                        legacy_nodes.add(node_key)  # Interrupted partial replacement.
+                    hashes[node_key] = point_hash
                     point_ids_by_node.setdefault(node_key, set()).add(point_id)
-                    if payload.get("workspace_id"):
+                    if (
+                        payload.get("workspace_id")
+                        or payload.get("input_version") != DOCS_INDEX_INPUT_VERSION
+                        or payload.get("embedding_fingerprint") != self._embedding_fingerprint()
+                        or "text" in payload
+                    ):
                         legacy_nodes.add(node_key)
                 elif point_id:
                     # Keep malformed points in a dedicated bucket so the
@@ -367,7 +472,7 @@ class DocsIndexService:
         ids: set[uuid.UUID] = set()
         next_offset = None
         while True:
-            records, next_offset = await asyncio.to_thread(
+            records, next_offset = await self._index_io(
                 self.client.scroll,
                 collection_name=self.collection_name,
                 limit=2000,
@@ -389,38 +494,79 @@ class DocsIndexService:
                 break
         return ids
 
+    async def _record_fields(self, session, library_id, node_ids=None):
+        from ..services.docs_graph_service import DocsGraphService, TASK_FIELD_TO_TASK_UPDATE
+        statement = select(KnowledgeField, KnowledgeFieldValue).join(
+            KnowledgeFieldValue, KnowledgeFieldValue.field_id == KnowledgeField.id,
+        ).join(KnowledgeNode, KnowledgeNode.id == KnowledgeFieldValue.node_id).where(
+            KnowledgeNode.docs_library_id == library_id, KnowledgeNode.archived_at.is_(None),
+            KnowledgeField.docs_library_id == library_id,
+        ).order_by(KnowledgeFieldValue.node_id, KnowledgeField.id)
+        if node_ids is not None:
+            statement = statement.where(KnowledgeFieldValue.node_id.in_(node_ids))
+        rows = (await session.execute(statement)).all()
+        fields = {}
+        formatter = DocsGraphService(session)
+        for field, value in rows:
+            # A share of a Docs node is not a grant to bound Task metadata or a
+            # referenced node. Index only values owned by this record itself.
+            if field.field_type == "reference" or field.system_key in TASK_FIELD_TO_TASK_UPDATE:
+                continue
+            rendered = formatter._format_field_value(field, value)
+            if rendered:
+                fields.setdefault(value.node_id, []).append(f"{field.name}: {rendered}")
+        return {node_id: "\n".join(values) for node_id, values in fields.items()}
+
     async def _index_records(self, records: list[tuple[KnowledgeNode, str, list[str]]]) -> int:
-        """Embed and upsert a batch of (node, text, tags)."""
-        if not records:
-            return 0
-        texts = [text for _, text, _ in records]
-        dense_vectors = await self.embedding.embed(texts)
-        if len(dense_vectors) != len(records):
-            logger.warning("Docs index: embedding count mismatch; skipping batch")
-            return 0
-        points = [
-            self._build_point(node, text, tags, dense)
-            for dense, (node, text, tags) in zip(dense_vectors, records)
-        ]
+        """Embed/upsert bounded batches rather than all library vectors at once."""
         batch_size = max(1, int(self.config.indexing.batch_size))
-        for i in range(0, len(points), batch_size):
-            await self._upsert_points(points[i : i + batch_size])
-        return len(points)
+        pending = []
+        indexed = 0
+        async def flush():
+            nonlocal indexed
+            if not pending:
+                return
+            vectors = await self.embedding.embed([entry[2] for entry in pending])
+            dimension = getattr(self.embedding, "dimension", None)
+            if len(vectors) != len(pending) or any(
+                not vector or (isinstance(dimension, int) and len(vector) != dimension)
+                or any(not math.isfinite(float(value)) for value in vector) for vector in vectors
+            ):
+                raise DocsIndexUnavailable("Invalid Docs embeddings; durable queue retained")
+            points = []
+            for (node, point_id, unit_text, offset, tags, manifest_hash), vector in zip(pending, vectors):
+                point = self._build_point(node, unit_text, tags, vector)
+                point.id = point_id
+                point.payload.update(content_hash=manifest_hash, unit_kind="record" if offset == 0 else "span",
+                                     derived_text_offset=offset)
+                points.append(point)
+            await self._upsert_points(points)
+            indexed += len(points)
+            pending.clear()
+        for node, text, tags in records:
+            manifest_hash = _content_hash(text)
+            for point_id, unit_text, offset in _node_units(node.id, node.title, text):
+                pending.append((node, point_id, unit_text, offset, tags, manifest_hash))
+                if len(pending) >= batch_size:
+                    await flush()
+        await flush()
+        return indexed
 
     async def reconcile_library(self, session: AsyncSession, docs_library_id: uuid.UUID) -> dict:
         """Bring the index in line with Postgres for one workspace.
 
-        Re-embeds only nodes whose contextual text changed and removes points for
+        Re-embeds nodes whose own content or input version changed and removes points for
         archived/deleted nodes. Safe to run on a schedule; this is the catch-all
         sync for edits made through the frontend (which bypasses Python).
         """
+        from ..services.docs_consistency import lock_docs_index
+        await lock_docs_index(session)
         if not await self.initialize():
             return {"status": "disabled"}
 
         rows = await session.execute(
             select(
                 KnowledgeNode.id,
-                KnowledgeNode.parent_id,
                 KnowledgeNode.title,
                 KnowledgeNode.description,
                 KnowledgeNode.project_id,
@@ -432,14 +578,14 @@ class DocsIndexService:
             )
         )
         node_rows = list(rows.all())
-        title_by_id = {row.id: (row.title or "") for row in node_rows}
-        parent_by_id = {row.id: row.parent_id for row in node_rows}
 
         tag_rows = await session.execute(
             select(KnowledgeNodeSupertag.node_id, KnowledgeSupertag.name)
             .join(KnowledgeSupertag, KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id)
+            .join(KnowledgeNode, KnowledgeNode.id == KnowledgeNodeSupertag.node_id)
             .where(
-                KnowledgeNodeSupertag.node_id.in_(list(title_by_id.keys()) or [uuid.uuid4()]),
+                KnowledgeNode.docs_library_id == docs_library_id,
+                KnowledgeNode.archived_at.is_(None),
                 # A malformed cross-library relation must not inject a
                 # foreign tag name into this library's embedding text.
                 KnowledgeSupertag.docs_library_id == docs_library_id,
@@ -449,19 +595,11 @@ class DocsIndexService:
         for node_id, tag_name in tag_rows.all():
             tags_by_id.setdefault(node_id, []).append(tag_name)
 
-        def ancestor_titles(node_id: uuid.UUID) -> list[str]:
-            titles: list[str] = []
-            seen = {node_id}
-            current = parent_by_id.get(node_id)
-            while current is not None and current not in seen and current in title_by_id:
-                seen.add(current)
-                titles.append(title_by_id[current])
-                current = parent_by_id.get(current)
-            return list(reversed(titles))
-
+        record_fields = await self._record_fields(session, docs_library_id)
         existing, legacy_nodes, point_ids_by_node = await self._existing_points(docs_library_id)
         current_ids: set[str] = set()
         to_index: list[tuple[KnowledgeNode, str, list[str]]] = []
+        expected_by_node = {}
         for row in node_rows:
             current_ids.add(str(row.id))
             tags = tags_by_id.get(row.id, [])
@@ -475,12 +613,15 @@ class DocsIndexService:
             )
             text = _node_text(
                 row.title or "",
-                ancestor_titles(row.id),
+                [],
                 tags,
                 row.description or "",
                 body_text,
                 body_json,
+                record_fields.get(row.id, ""),
             )
+            expected = _unit_ids(row.id, len(text))
+            expected_by_node[str(row.id)] = expected
             node_point_ids = point_ids_by_node.get(str(row.id), set())
             # A legacy payload must be upserted even when its hash is current,
             # so the point gets the canonical ``docs_library_id`` key and no
@@ -488,7 +629,7 @@ class DocsIndexService:
             if (
                 existing.get(str(row.id)) == _content_hash(text)
                 and str(row.id) not in legacy_nodes
-                and node_point_ids.issubset({str(row.id)})
+                and node_point_ids == expected
             ):
                 continue
             node = KnowledgeNode(
@@ -505,16 +646,17 @@ class DocsIndexService:
         for node_key, point_ids in point_ids_by_node.items():
             if node_key.startswith("__point__:") or node_key not in current_ids:
                 stale_point_ids.update(point_ids)
-            elif node_key in current_ids and not point_ids.issubset({node_key}):
+            elif node_key in current_ids and point_ids != expected_by_node[node_key]:
                 # Duplicate/legacy point IDs for a live node are removed after
                 # the canonical point is upserted.
-                stale_point_ids.update(point_ids - {node_key})
+                stale_point_ids.update(point_ids - expected_by_node[node_key])
         await self._delete_ids(sorted(stale_point_ids))
 
         return {
             "status": "synced",
             "total": len(node_rows),
-            "reindexed": indexed,
+            "reindexed": len(to_index),
+            "indexed_units": indexed,
             "removed": len(stale_point_ids),
         }
 
@@ -530,11 +672,11 @@ class DocsIndexService:
         node_ids = node_ids or []
         if not node_ids:
             return 0
+        from ..services.docs_consistency import lock_docs_index
+        await lock_docs_index(session)
         if not await self.initialize_for_reindex():
             raise DocsIndexUnavailable("Docs semantic index is unavailable")
-        from ..services.docs_graph_service import DocsGraphService
-
-        service = DocsGraphService(session)
+        record_fields = await self._record_fields(session, docs_library_id, node_ids)
         records: list[tuple[KnowledgeNode, str, list[str]]] = []
         remove: list[uuid.UUID] = []
         for node_id in node_ids:
@@ -542,7 +684,6 @@ class DocsIndexService:
             if node is None or node.docs_library_id != docs_library_id or node.archived_at is not None:
                 remove.append(node_id)
                 continue
-            ancestors = await service.ancestor_titles(node)
             tag_rows = await session.execute(
                 select(KnowledgeSupertag.name)
                 .join(KnowledgeNodeSupertag, KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id)
@@ -554,17 +695,32 @@ class DocsIndexService:
             tags = [name for (name,) in tag_rows.all()]
             text = _node_text(
                 node.title or "",
-                ancestors,
+                [],
                 tags,
                 node.description or "",
                 node.body_text or "",
                 node.body_json,
+                record_fields.get(node.id, ""),
             )
             records.append((node, text, tags))
-        await self._delete_ids(remove)
-        return await self._index_records(records)
+        _, _, existing = await self._existing_points(docs_library_id, node_ids)
+        indexed = await self._index_records(records)
+        stale = set(map(str, remove))
+        desired = {str(node.id): _unit_ids(node.id, len(text)) for node, text, _ in records}
+        for node_key, point_ids in existing.items():
+            stale.update(point_ids - desired.get(node_key, set()))
+        await self._delete_ids(sorted(stale))
+        return len(records)
 
     # -- search -------------------------------------------------------------
+
+    def _node_id_condition(self, node_ids: Iterable[uuid.UUID]) -> models.FieldCondition:
+        match = models.MatchAny(any=[str(nid) for nid in sorted(node_ids, key=str)])
+        if self._is_local_mode:
+            # Install after model validation, which otherwise normalizes a
+            # list subclass back to an ordinary linear-membership list.
+            match.any = _LocalNodeIdValues(match.any)
+        return models.FieldCondition(key="node_id", match=match)
 
     @staticmethod
     def _empty_search_result(
@@ -596,6 +752,9 @@ class DocsIndexService:
         limit: int = 20,
         user_id: Optional[uuid.UUID] = None,
         session: Optional[AsyncSession] = None,
+        allowed_node_ids: Iterable[uuid.UUID] | None = None,
+        tag: str = "",
+        turn_project_id: uuid.UUID | None = None,
     ) -> "DocsIndexSearchResult":
         started = time.perf_counter()
         if docs_library_id is None:
@@ -603,149 +762,119 @@ class DocsIndexService:
         query = str(query or "").strip()
         if not query:
             return self._empty_search_result(fallback_reason="empty_query")
-        if not await self.initialize():
-            return self._empty_search_result(
-                fallback_reason="index_unavailable",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
-        if self.client is None or models is None:
-            return self._empty_search_result(
-                fallback_reason="client_unavailable",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-            )
+        scope_ids = None if allowed_node_ids is None else set(allowed_node_ids)
+        if scope_ids == set():
+            return self._empty_search_result(fallback_reason="empty_scope")
+        if (user_id is not None or scope_ids is not None or tag) and session is None:
+            return self._empty_search_result(fallback_reason="acl_session_required")
+        if scope_ids is not None and user_id is None:
+            return self._empty_search_result(fallback_reason="scope_actor_required")
+
+        try:
+            if session is not None:
+                from ..services.docs_graph_service import DocsGraphService
+
+                statement, _ = await DocsGraphService(session)._build_structured_query_statement(
+                    docs_library_id=docs_library_id, project_id=project_id,
+                    user_id=user_id, node_ids=scope_ids, tags=[tag] if tag else [],
+                    turn_project_id=turn_project_id,
+                )
+                eligibility = statement.with_only_columns(KnowledgeNode.id, maintain_column_froms=True)
+                eligible_ids = set((await session.execute(eligibility)).scalars().all())
+            else:
+                eligibility, eligible_ids = None, None
+        except Exception:
+            logger.debug("Docs index eligibility failed", exc_info=True)
+            return self._empty_search_result(fallback_reason="acl_filter_failed")
+        if eligible_ids == set():
+            return self._empty_search_result(fallback_reason="no_eligible_nodes")
+        if not await self.initialize() or self.client is None or models is None:
+            return self._empty_search_result(fallback_reason="index_unavailable")
 
         dense = await self.embedding.embed_query(query)
         sparse = self.sparse_encoder.encode(query)
-        dense_used = bool(dense)
-        sparse_used = bool(sparse.indices)
-        # Search is a current-runtime path: only canonical payloads are
-        # addressable.  Legacy ``workspace_id`` payloads are dual-read and
-        # canonicalized exclusively by ``reconcile_library``.
-        must = [self._library_filter(docs_library_id)]
-        if project_id is not None:
-            must.append(
-                models.FieldCondition(
-                    key="project_id", match=models.MatchValue(value=str(project_id))
-                )
-            )
-        query_filter = models.Filter(must=must)
-        search_limit = max(1, int(limit))
-
-        prefetch = []
-        if dense:
-            prefetch.append(
-                models.Prefetch(
-                    query=dense,
-                    using=self.dense_vector_name,
-                    filter=query_filter,
-                    limit=max(search_limit * 2, search_limit),
-                )
-            )
-        if sparse.indices:
-            prefetch.append(
-                models.Prefetch(
-                    query=sparse,
-                    using=self.sparse_vector_name,
-                    filter=query_filter,
-                    limit=max(search_limit * 2, search_limit),
-                )
-            )
-        if not prefetch:
-            return self._empty_search_result(
-                fallback_reason="no_vectors",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-                dense_used=dense_used,
-                sparse_used=sparse_used,
-            )
-
-        fusion = "rrf" if len(prefetch) > 1 else (
-            "dense" if dense_used else "sparse"
-        )
+        dense_used, sparse_used = bool(dense), bool(sparse.indices)
+        if not dense_used and not sparse_used:
+            return self._empty_search_result(fallback_reason="no_vectors")
+        must = [
+            self._library_filter(docs_library_id),
+            models.FieldCondition(key="input_version", match=models.MatchValue(value=DOCS_INDEX_INPUT_VERSION)),
+            models.FieldCondition(key="embedding_fingerprint", match=models.MatchValue(value=self._embedding_fingerprint())),
+        ]
+        if eligible_ids is not None:
+            must.append(self._node_id_condition(eligible_ids))
+        elif project_id is not None:
+            must.append(models.FieldCondition(key="project_id", match=models.MatchValue(value=str(project_id))))
+        search_limit = max(1, min(int(limit), 100))
+        fusion = "rrf" if dense_used and sparse_used else "dense" if dense_used else "sparse"
+        hits: list[uuid.UUID] = []
+        seen: set[uuid.UUID] = set()
+        exhausted = False
         guard = _LOCAL_QUERY_LOCK if self._is_local_mode else _NULL_GUARD
         try:
-            async with guard:
+            for _ in range(SEARCH_REPLENISH_ROUNDS):
+                query_filter = models.Filter(
+                    must=must,
+                    must_not=[self._node_id_condition(seen)] if seen else None,
+                )
+                prefetch = []
+                if dense_used:
+                    prefetch.append(models.Prefetch(query=dense, using=self.dense_vector_name,
+                                                   filter=query_filter, limit=max(64, search_limit * 8)))
+                if sparse_used:
+                    prefetch.append(models.Prefetch(query=sparse, using=self.sparse_vector_name,
+                                                   filter=query_filter, limit=max(64, search_limit * 8)))
+                options = dict(collection_name=self.collection_name, query_filter=query_filter,
+                               limit=search_limit, with_payload=["node_id"])
                 if len(prefetch) == 1:
-                    response = await asyncio.to_thread(
-                        self.client.query_points,
-                        collection_name=self.collection_name,
-                        query=prefetch[0].query,
-                        using=prefetch[0].using,
-                        query_filter=query_filter,
-                        limit=search_limit,
-                        with_payload=["node_id"],
-                    )
+                    options.update(query=prefetch[0].query, using=prefetch[0].using)
                 else:
-                    response = await asyncio.to_thread(
-                        self.client.query_points,
-                        collection_name=self.collection_name,
-                        prefetch=prefetch,
-                        query=models.FusionQuery(fusion=models.Fusion.RRF),
-                        query_filter=query_filter,
-                        limit=search_limit,
-                        with_payload=["node_id"],
-                    )
+                    options.update(prefetch=prefetch, query=models.FusionQuery(fusion=models.Fusion.RRF))
+                async with guard:
+                    grouped = getattr(self.client, "query_points_groups", None)
+                    if callable(grouped) and not self._is_local_mode:
+                        response = await self._index_io(grouped, group_by="node_id", group_size=1, **options)
+                        response_points = [group.hits[0] for group in response.groups if group.hits]
+                    else:
+                        # Embedded Qdrant implements grouping by overriding
+                        # every prefetch/return limit with the collection size.
+                        # Use bounded candidates and deduplicate below; the next
+                        # round excludes seen nodes, including all their spans.
+                        if self._is_local_mode:
+                            options["limit"] = max(64, search_limit * 8)
+                        response = await self._index_io(self.client.query_points, **options)
+                        response_points = response.points
+                candidates = []
+                for point in response_points:
+                    try:
+                        nid = uuid.UUID(str((point.payload or {}).get("node_id")))
+                    except (ValueError, TypeError):
+                        continue
+                    if nid not in seen:
+                        candidates.append(nid)
+                        seen.add(nid)
+                if not candidates:
+                    exhausted = True
+                    break
+                # SQL IN does not preserve vector order. Intersect, then retain
+                # the ordered Qdrant IDs, rechecking current ACL/tag/archive.
+                live = (
+                    set((await session.execute(eligibility.where(KnowledgeNode.id.in_(candidates)))).scalars().all())
+                    if session is not None else set(candidates)
+                )
+                hits.extend(nid for nid in candidates if nid in live)
+                if len(hits) >= search_limit or (len(response_points) < options["limit"] and fusion != "rrf"):
+                    exhausted = True
+                    break
         except Exception:
-            logger.exception("Docs index search failed")
-            return self._empty_search_result(
-                fallback_reason="qdrant_error",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-                dense_used=dense_used,
-                sparse_used=sparse_used,
-                fusion=fusion,
-            )
-
-        hits: list[uuid.UUID] = []
-        for point in response.points:
-            node_id = (point.payload or {}).get("node_id")
-            if not node_id:
-                continue
-            try:
-                hits.append(uuid.UUID(str(node_id)))
-            except ValueError:
-                continue
-        if user_id is not None and session is None:
-            return self._empty_search_result(
-                fallback_reason="acl_session_required",
-                latency_ms=(time.perf_counter() - started) * 1000.0,
-                dense_used=dense_used,
-                sparse_used=sparse_used,
-                fusion=fusion,
-            )
-        if user_id is not None and session is not None:
-            try:
-                library = await session.get(DocsLibrary, docs_library_id)
-                visibility = docs_readable_node_predicate(
-                    KnowledgeNode,
-                    docs_library_id=docs_library_id,
-                    user_id=user_id,
-                    library_owner_id=getattr(library, "owner_user_id", None),
-                )
-                stmt = select(KnowledgeNode.id).where(
-                    KnowledgeNode.id.in_(hits),
-                    KnowledgeNode.docs_library_id == docs_library_id,
-                    KnowledgeNode.archived_at.is_(None),
-                    visibility,
-                )
-                if project_id is not None:
-                    stmt = stmt.where(KnowledgeNode.project_id == project_id)
-                hits = list((await session.execute(stmt)).scalars().all())
-            except Exception:
-                logger.debug("Docs index ACL filter failed", exc_info=True)
-                return self._empty_search_result(
-                    fallback_reason="acl_filter_failed",
-                    latency_ms=(time.perf_counter() - started) * 1000.0,
-                    dense_used=dense_used,
-                    sparse_used=sparse_used,
-                    fusion=fusion,
-                )
+            logger.debug("Docs index search failed", exc_info=True)
+            return self._empty_search_result(fallback_reason="search_failed")
         return DocsIndexSearchResult(
-            node_ids=hits,
+            node_ids=hits[:search_limit],
             telemetry=DocsIndexSearchTelemetry(
-                dense_used=dense_used,
-                sparse_used=sparse_used,
-                fusion=fusion,
-                candidate_count=len(hits),
-                latency_ms=(time.perf_counter() - started) * 1000.0,
+                dense_used=dense_used, sparse_used=sparse_used, fusion=fusion,
+                candidate_count=len(seen), latency_ms=(time.perf_counter() - started) * 1000.0,
+                fallback_reason=None if exhausted else "candidate_budget",
             ),
         )
 
@@ -771,6 +900,7 @@ _docs_index_service: Optional[DocsIndexService] = None
 _dirty: set[tuple[uuid.UUID, uuid.UUID]] = set()
 _pending_without_loop: set[tuple[uuid.UUID, uuid.UUID]] = set()
 _worker_started = False
+_durable_worker_active = False
 _reindex_worker_backoff_seconds = REINDEX_WORKER_BACKOFF_INITIAL_SECONDS
 _reindex_worker_backoff_until = 0.0
 
@@ -811,6 +941,9 @@ async def search_docs_index_with_telemetry(
     limit: int = 20,
     user_id: Optional[uuid.UUID] = None,
     session: Optional[AsyncSession] = None,
+    allowed_node_ids: Iterable[uuid.UUID] | None = None,
+    tag: str = "",
+    turn_project_id: uuid.UUID | None = None,
 ) -> DocsIndexSearchResult:
     """Entry point used by ``docs_search`` with semantic-lane telemetry."""
     if docs_library_id is None or not docs_rag_enabled():
@@ -823,6 +956,9 @@ async def search_docs_index_with_telemetry(
             limit=limit,
             user_id=user_id,
             session=session,
+            allowed_node_ids=allowed_node_ids,
+            tag=tag,
+            turn_project_id=turn_project_id,
         )
     except Exception:
         logger.debug("search_docs_index failed", exc_info=True)
@@ -837,6 +973,9 @@ async def search_docs_index(
     limit: int = 20,
     user_id: Optional[uuid.UUID] = None,
     session: Optional[AsyncSession] = None,
+    allowed_node_ids: Iterable[uuid.UUID] | None = None,
+    tag: str = "",
+    turn_project_id: uuid.UUID | None = None,
 ) -> list[uuid.UUID]:
     """Entry point used by ``docs_search``. Returns [] when disabled/unavailable."""
     result = await search_docs_index_with_telemetry(
@@ -846,6 +985,9 @@ async def search_docs_index(
         limit=limit,
         user_id=user_id,
         session=session,
+        allowed_node_ids=allowed_node_ids,
+        tag=tag,
+        turn_project_id=turn_project_id,
     )
     return result.node_ids
 
@@ -859,7 +1001,7 @@ def enqueue_docs_reindex(
     Called from inside a Docs mutation transaction, so it must never raise and
     must be a cheap no-op when the Docs index is disabled.
     """
-    if docs_library_id is None or node_id is None:
+    if _durable_worker_active or docs_library_id is None or node_id is None:
         return
     if not docs_rag_enabled():
         return

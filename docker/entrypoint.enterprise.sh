@@ -164,4 +164,27 @@ mkdir -p "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 chown 1000:1000 "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 chmod 0700 "$HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME"
 
+# Resolve the same field-crypto provider chain used by the application before
+# dropping into the long-running process.  Enterprise must fail before any
+# HTTP service becomes reachable when the KMS/keyring command or explicitly
+# permitted local fallback cannot provide a valid 32-byte key.  The target
+# launcher runs the pinned storage-init service before invoking the sentinel so
+# a fresh local-key fallback under the /app/cache bind mount is writable; normal
+# Compose startup has the same service_completed_successfully dependency.
+if ! PYTHONPATH=/app gosu aoitalk python -c 'from src.security.field_crypto import get_data_key; get_data_key()'; then
+    echo "Enterprise field crypto key preflight failed" >&2
+    exit 1
+fi
+
+# Compose uses this internal command during target-side preflight.  It runs
+# through the exact secret-loading/provider-resolver path above, then exits
+# before starting either HTTP service.
+if [ "${1:-}" = "--enterprise-field-crypto-preflight-only" ]; then
+    [ "$#" -eq 1 ] || {
+        echo "Enterprise field crypto preflight sentinel does not accept arguments" >&2
+        exit 1
+    }
+    exit 0
+fi
+
 exec gosu aoitalk python main.py "$@"

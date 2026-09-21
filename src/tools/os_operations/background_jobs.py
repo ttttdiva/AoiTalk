@@ -191,6 +191,11 @@ class BackgroundJob:
     owner_run_id: Optional[str] = None
     repository_identity: Optional[str] = None
     scope_fingerprint: Optional[str] = None
+    # A staged WSL backend may reject the post-process diff even when the
+    # shell itself exits successfully.  Keep that durable outcome attached to
+    # the job so callers can observe fail-closed publication semantics.
+    finalization_error: Optional[str] = None
+    finalization_published: Optional[int] = None
 
     def __post_init__(self) -> None:
         owner_run_id = str(self.owner_run_id or "").strip() or None
@@ -233,6 +238,8 @@ class BackgroundJob:
             "owner_run_id": self.owner_run_id,
             "repository_identity": self.repository_identity,
             "scope_fingerprint": self.scope_fingerprint,
+            "finalization_error": self.finalization_error,
+            "finalization_published": self.finalization_published,
         }
 
 
@@ -348,6 +355,27 @@ class BackgroundJobRegistry:
         if code is not None:
             job.exit_code = code
             job.status = "exited"
+            # ``WslBwrapBackend.spawn`` attaches an exactly-once finalization
+            # state and a watcher.  Wait briefly here so read/list/stop calls
+            # cannot observe an exited process before its staged diff has been
+            # validated and published (or rejected).
+            state = getattr(job.process, "_aoitalk_finalization_state", None)
+            if state is not None:
+                try:
+                    outcome = state.wait(timeout=10)
+                except Exception:
+                    outcome = None
+                if not outcome:
+                    job.finalization_error = "staged publication finalization timed out"
+                elif not outcome.get("success", False):
+                    job.finalization_error = str(
+                        outcome.get("error", "staged publication denied")
+                    )
+                else:
+                    try:
+                        job.finalization_published = int(outcome.get("published", 0))
+                    except (TypeError, ValueError):
+                        job.finalization_published = 0
 
     def _get(self, job_id: str, *, scope: Any | None = None) -> BackgroundJob:
         with self._lock:
@@ -408,12 +436,28 @@ class BackgroundJobRegistry:
             get_current_run_scope = lambda: None  # type: ignore[assignment]
 
         scope = get_current_run_scope()
+        scoped_buffer_bytes = self.buffer_bytes
         scoped_owner_metadata: tuple[str, str, str] | None = None
         if scope is not None:
             # Validate and capture the complete owner tuple before spawning.
             # In particular, an empty/malformed run_id must fail closed rather
             # than being normalised into the legacy ``owner_run_id=None`` path.
             scoped_owner_metadata = self._scope_metadata(scope)
+            try:
+                from ...security.harness_execution_scope import (
+                    get_current_harness_execution_scope,
+                )
+
+                upper = get_current_harness_execution_scope()
+                limits = getattr(upper, "resource_limits", None)
+                scoped_buffer_bytes = min(
+                    self.buffer_bytes,
+                    max(1, int(getattr(limits, "max_output_bytes", self.buffer_bytes))),
+                )
+            except (ImportError, TypeError, ValueError):
+                # A lower scope without a valid upper capability is rejected
+                # by the backend.  Keep the legacy finite cap until then.
+                scoped_buffer_bytes = self.buffer_bytes
         scoped_backend = None
         if scope is not None:
             try:
@@ -515,8 +559,8 @@ class BackgroundJobRegistry:
             cwd=cwd,
             process=process,
             started_at=datetime.now(),
-            stdout_buffer=_RingBuffer(self.buffer_bytes),
-            stderr_buffer=_RingBuffer(self.buffer_bytes),
+            stdout_buffer=_RingBuffer(scoped_buffer_bytes),
+            stderr_buffer=_RingBuffer(scoped_buffer_bytes),
             **(
                 {
                     "owner_run_id": scoped_owner_metadata[0],
@@ -588,6 +632,8 @@ class BackgroundJobRegistry:
             "next_offset": max(stdout_offset, stderr_offset),
             "buffer_overflowed": stdout_dropped or stderr_dropped,
             "started_at": job.started_at.isoformat(),
+            "finalization_error": job.finalization_error,
+            "finalization_published": job.finalization_published,
         }
 
     def write_stdin(
@@ -628,6 +674,12 @@ class BackgroundJobRegistry:
             }
 
         termination_error: Exception | None = None
+        state = getattr(job.process, "_aoitalk_finalization_state", None)
+        if state is not None:
+            try:
+                state.cancel("background job stopped")
+            except Exception:
+                pass
         try:
             terminate_process_tree(job.process)
         except Exception as exc:
@@ -661,6 +713,26 @@ class BackgroundJobRegistry:
                 f"ジョブ {job.job_id} のプロセス終了を確認できませんでした"
                 + (f": {termination_error}" if termination_error else "")
             )
+        # Ensure any WSL staged workspace is finalized before the job becomes
+        # externally observable as stopped.  The backend state is
+        # exactly-once, so this is safe even when its watcher won the race.
+        state = getattr(job.process, "_aoitalk_finalization_state", None)
+        if state is not None:
+            try:
+                outcome = state.wait(timeout=10)
+            except Exception:
+                outcome = None
+            if not outcome:
+                job.finalization_error = "staged publication finalization timed out"
+            elif not outcome.get("success", False):
+                job.finalization_error = str(
+                    outcome.get("error", "staged publication denied")
+                )
+            else:
+                try:
+                    job.finalization_published = int(outcome.get("published", 0))
+                except (TypeError, ValueError):
+                    job.finalization_published = 0
         job.exit_code = exit_code
         job.status = "killed"
         try:
@@ -681,6 +753,8 @@ class BackgroundJobRegistry:
             "status": job.status,
             "exit_code": job.exit_code,
             "message": "ジョブを停止しました。",
+            "finalization_error": job.finalization_error,
+            "finalization_published": job.finalization_published,
         }
 
     def stop(

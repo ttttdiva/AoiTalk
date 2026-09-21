@@ -1,40 +1,23 @@
-﻿# Scripts
+# 開発・運用スクリプト
 
-このディレクトリには現行セットアップ、CI、公開、運用で参照されるスクリプトだけを置きます。
+ここには現在のアプリのセットアップ、検証、配布、再利用可能な保守に必要なCLIを置く。一度限りの修復コード、LLMへの相談文と回答、端末固有のログなどは追跡しない `.local/` に置く。廃止したCLIは専用テスト・参照とともに削除し、互換wrapperとして残さない。
 
-## Enterprise
+| 用途 | 入口 / 参照先 |
+| --- | --- |
+| セットアップ・起動 | ルートの `setup.bat` / `setup.sh`、`run.bat` / `run.sh`。[セットアップガイド](../docs/setup_guide.md) |
+| DB初期化 | `init_db_schema.py`。schemaの正本は `alembic/versions/` |
+| DB確認 | `check_db.py`。接続情報はローカル設定から取得する |
+| Schema整合性 | `check_schema_drift.py`。[スキーマドリフト](../docs/schema_drift_check.md) |
+| API契約 | `generate_openapi.py` → `contracts/openapi/fastapi.json`。[型生成手順](../docs/openapi_typegen.md) |
+| Mobile契約 | `validate_mobile_product_contract.py`。[Mobile Product Contract](../docs/mobile_product_contract.md) |
+| CI確認 | `wait_ci.ps1`。フル検証の定義は `.github/workflows/ci.yml` |
+| 手動フル検証 | `run_canonical_verification.ps1`。明示的な手動実行用で、通常作業のターゲット検証と区別する |
+| Public公開 | ルートの `Publish.bat` → `publish_public.ps1`。[公開手順](../docs/public_publish.md) |
+| Enterprise配布 | ルートの `Enterprise.bat` → `build_enterprise_handoff.ps1`。正本は `README.enterprise.md` |
+| Mobile公開 | `check_mobile_release_gate.ps1`、`build_apk.bat` / `build_apk.sh`、`verify_mobile_apk.ps1`、`publish_latest_json.ps1`。[リリースチェック](../docs/release-checklist.md) |
+| ChatGPT Web Director | `chatgpt_web_director.py` / `chatgpt_web_director.ps1`。[利用手順](../docs/chatgpt_web_director.md) |
+| Project Management CLI | `agent_project_management_tool.py`。既存Agentのツール定義を呼び出す |
 
-- `build_enterprise_handoff.ps1`: **唯一の人間向け入口**。clean tracked sourceから単一
-  `AoiTalk_Enterprise_Handoff_<commit>.zip` を生成し、sanitization/import closure/secret/ZIP検証まで行う。
-- `check_enterprise_python_imports.py`: builderが内部検証に使う非入口 checker。
-- `check_env_contract.ps1`: Enterprise環境の契約確認。
-- `init-db.sql`, `init_db_schema.py`, `setup_env_db.ps1`: PostgreSQLとAlembicの初期化。
+`maintenance/` は運用保守、`migrations/` は明示的なデータ移行、`verification/` は再利用する実環境検証に使用する。各CLIの引数・対象・副作用は実装と `--help` を確認する。これらを通常起動時に一括実行しない。
 
-Enterpriseの手順、HF_TOKENモデル取得、Docker/HTTPS smokeはルートの `README.enterprise.md` だけを正本とします。
-
-## CI・開発
-
-- `check_schema_drift.py`: AlembicとDrizzleのschema drift検査
-- `generate_openapi.py`: FastAPIから`frontend/openapi.json`を生成
-- `python_312_gate.py`: Python 3.12以上の起動条件を検査
-- `merge_ready_prs.ps1`: merge前のchecksとmobile release gateを確認
-- `wait_ci.ps1`: push 後の GitHub Actions 完了待ち。`gh run list --commit` をポーリング。exit: 0=PASS, 1=FAIL, 2=UNAVAILABLE（billing 等）, 3=TIMEOUT。`push: main` または `pull_request` で CI 起動。UNAVAILABLE 時はローカル full CI を自動開始しない（ターゲット検証 PASS なら `COMPLETE_CI_UNAVAILABLE`）。
-- `run_canonical_verification.ps1`: ci.yml 同等のローカル canonical 検証（Windows）。**手動専用** — エージェントは通常作業や CI UNAVAILABLE 時に自動実行しない。各ゲート PASS/FAIL/SKIP、最初の FAIL で fail-fast。`-SkipE2E` は文書化済みの省略オプション。
-
-## 公開
-
-- `publish_public.ps1`: public repositoryへの同期
-- `check_mobile_release_gate.ps1`: mobile差分のrelease要否判定
-- `build_apk.bat`, `build_apk.sh`: APKを`artifacts/releases/mobile/v<version>/`へ生成して公開
-- `verify_mobile_apk.ps1`, `publish_latest_json.ps1`: APK検証と更新metadataの公開
-
-## 運用ツール
-
-暗号化、HTTPS、LLM server、料金backfill、Excel/WBS検査など、現行docs・設定・runtimeから参照される管理ツールを直下に置きます。
-
-- `chatgpt_web_director.py` / `chatgpt_web_director.ps1`: Grok など外部 Operator から AoiTalk の Playwright `ChatGPTWebProvider` 経由で ChatGPT Web へ送受信する CLI。`status` / `send` / `new`。cwd 不問。詳細は `docs/chatgpt_web_director.md`。
-
-## データ移行・保守
-
-- `migrations/`: 現在の配布先で完了確認が必要なデータ移行
-- `maintenance/`: 再実行可能な復旧処理
+コード整理と実データの削除は別の作業である。DB、`data/`、`workspaces/`、証明書や認証情報を一時成果物として扱わない。

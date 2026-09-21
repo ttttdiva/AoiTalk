@@ -1,0 +1,123 @@
+schema_version: 1
+application: aoitalk
+
+database:
+  type: postgres
+  env:
+    host: POSTGRES_HOST
+    port: POSTGRES_PORT
+    database: POSTGRES_DB
+    user: POSTGRES_USER
+    password: POSTGRES_PASSWORD
+    schema: POSTGRES_SCHEMA
+  defaults:
+    host: localhost
+    port: "5432"
+    database: aoitalk_memory
+    user: aoitalk
+    schema: ""
+
+files:
+  - id: workspaces
+    required: true
+    path_env: AOITALK_WORKSPACES_DIR
+    default: workspaces
+    exclude:
+      - "**/node_modules/**"
+      - "**/.venv/**"
+      - "**/venv/**"
+      - "**/__pycache__/**"
+      - "**/.pytest_cache/**"
+      - "**/.mypy_cache/**"
+      - "**/.ruff_cache/**"
+      - "**/.next/**"
+      - "**/dist/**"
+      - "**/build/**"
+      - "**/.runtime/**"
+      - "**/logs/**"
+      - "**/*.log"
+
+  - id: aoitalk_data
+    required: false
+    root_env: AOITALK_DATA_DIR
+    root_default: data
+    relative: "."
+    exclude:
+      - "generated_media/**"
+      - "skill_recordings/**"
+      - "**/__pycache__/**"
+      - "**/.cache/**"
+      - "**/tmp/**"
+      - "**/*.log"
+
+  - id: generated_media
+    required: false
+    default: data/generated_media
+    exclude:
+      - "**/*.tmp"
+      - "**/*.part"
+
+  - id: skill_recordings
+    required: false
+    path_env: AOITALK_SKILL_RECORDINGS_DIR
+    config_key: skill_recording.storage_dir
+    default: data/skill_recordings
+    exclude:
+      - "**/*.tmp"
+      - "**/*.part"
+
+  - id: miotts_refs
+    required: false
+    path_env: AOITALK_MIOTTS_REFS_DIR
+    config_key: miotts.refs_dir
+    default: config/miotts_refs
+
+  - id: miotts_presets
+    required: false
+    path_env: AOITALK_MIOTTS_PRESETS_DIR
+    config_key: miotts.presets_dir
+    default: config/miotts_presets
+
+  - id: comfyui_workflows
+    required: false
+    config_key: comfyui.workflows_dir
+    restore_env: AOITALK_BACKUP_COMFYUI_WORKFLOWS_DIR
+    default: config/comfyui_workflows
+    exclude:
+      - "**/*.tmp"
+      - "**/*.part"
+
+  - id: irodori_refs
+    required: false
+    config_key: irodori_tts.refs_dir
+    restore_env: AOITALK_BACKUP_IRODORI_REFS_DIR
+    default: config/irodori_refs
+
+hard_excludes:
+  - "**/.env"
+  - "**/.env.*"
+  - "**/.runtime-secrets/**"
+  - "**/secrets/**"
+  - "**/api_keys.json"
+  - "**/token.json"
+  - "**/secrets.json"
+  - "**/server_config.json"
+  - "**/dify_config.json"
+  - "**/*_token.json"
+  - "**/*_credentials.json"
+  - "**/.mcp.json"
+  - "**/certs/**"
+  - "**/*.key"
+  - "**/*.pfx"
+  - "**/*.p12"
+  - "**/*.jks"
+  - "**/*.p8"
+  - "**/.git/**"
+  - "**/.git/config"
+  - "**/.git/credentials"
+  - "**/.npmrc"
+  - "**/.pypirc"
+  - "**/.netrc"
+  - "**/credentials.json"
+  - "**/service-account.json"
+  - "**/service_account.json"

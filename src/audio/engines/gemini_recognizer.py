@@ -16,6 +16,7 @@ except ImportError:
 
 from ..base import SpeechRecognizerInterface
 from ...services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     effective_privacy_mode,
     get_privacy_policy_context,
@@ -549,10 +550,6 @@ class GeminiSpeechRecognizer(SpeechRecognizerInterface):
             # Create WAV file from audio data
             wav_data = self._create_wav_data(audio_data, sample_rate, channels, sample_width)
             
-            # Create a file-like object
-            audio_file = io.BytesIO(wav_data)
-            audio_file.name = "audio.wav"
-            
             # Prepare the prompt with strict instructions to reduce hallucinations
             lang = language or self.language
             base_prompt = f"""Please transcribe this audio to text in {lang}. 
@@ -568,23 +565,53 @@ IMPORTANT INSTRUCTIONS:
             if prompt:
                 base_prompt += f" Context: {prompt}"
 
-            protected = self._privacy_gateway.protect_sync(
+            descriptor = EgressDescriptor(
+                action="stt.transcribe",
+                transport="google.generativeai",
+                destination="https://generativelanguage.googleapis.com",
+                provider="gemini",
+                tool="speech_recognition.gemini",
+                model=str(self.model_name or ""),
+            )
+
+            def send_transcription(protected_payload: Any) -> Any:
+                """Upload only the gateway-approved prompt/media payload."""
+
+                if not isinstance(protected_payload, Mapping):
+                    raise RuntimeError("privacy protection returned no transcription payload")
+                outbound_prompt = str(protected_payload.get("prompt") or "")
+                outbound_audio = protected_payload.get("media")
+                if not isinstance(outbound_audio, (bytes, bytearray)):
+                    raise RuntimeError("privacy protection returned no audio payload")
+                outbound_file = io.BytesIO(bytes(outbound_audio))
+                outbound_file.name = "audio.wav"
+                uploaded_file = genai.upload_file(outbound_file, mime_type="audio/wav")
+                try:
+                    return self.model.generate_content([
+                        outbound_prompt,
+                        uploaded_file,
+                    ])
+                finally:
+                    try:
+                        uploaded_file.delete()
+                    except Exception:
+                        pass
+
+            # Upload and transcribe inside one synchronous privacy
+            # transaction.  The review projection contains only a media
+            # descriptor/digest; raw bytes are rehydrated for this sender
+            # only after an explicit approval.
+            response = self._privacy_gateway.execute_sync(
                 {"prompt": base_prompt, "media": wav_data},
                 provider="gemini",
+                descriptor=descriptor,
+                sender=send_transcription,
+                base_url="https://generativelanguage.googleapis.com",
                 source_kind="audio_transcription",
+                model=str(self.model_name or ""),
             )
-            if isinstance(protected.payload, dict):
-                base_prompt = str(protected.payload.get("prompt") or base_prompt)
-            
-            # Upload and transcribe
-            uploaded_file = genai.upload_file(audio_file, mime_type="audio/wav")
-            
+
             try:
-                response = self.model.generate_content([
-                    base_prompt,
-                    uploaded_file
-                ])
-                
                 if response.text:
                     result = response.text.strip()
                     print(f"[GeminiRecognizer] Transcription result: '{result}'")
@@ -613,17 +640,16 @@ IMPORTANT INSTRUCTIONS:
                         usage_context=usage_context,
                     )
 
-                    return cleaned_result
+                    return self._privacy_gateway.restore(cleaned_result)
                 else:
                     print("[GeminiRecognizer] No transcription result")
                     return None
-                    
+
             finally:
-                # Clean up uploaded file
-                try:
-                    uploaded_file.delete()
-                except:
-                    pass
+                # The uploaded provider file is deleted by the sender
+                # closure; this finally only closes the response-processing
+                # scope kept for compatibility with the original adapter.
+                pass
                     
         except Exception as e:
             print(f"[GeminiRecognizer] Recognition error: {type(e).__name__}: {e}")

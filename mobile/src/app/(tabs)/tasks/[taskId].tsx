@@ -1,3 +1,4 @@
+import { ScopeSwitcher } from "../../../components/scope-switcher";
 import React, {
   useCallback,
   useEffect,
@@ -154,7 +155,7 @@ export default function TaskDetailScreen() {
   const { taskId } = useLocalSearchParams<{ taskId: string }>();
   const router = useRouter();
   const { isAuthenticated } = useAuth();
-  const online = useNetworkStore((state) => state.online);
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const { projects, refreshProjects } = useProject();
   const [task, setTask] = useState<Task | null>(null);
   const [activeEntry, setActiveEntry] = useState<TimeEntry | null>(null);
@@ -163,7 +164,6 @@ export default function TaskDetailScreen() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [taskMenuVisible, setTaskMenuVisible] = useState(false);
   const [statusMenuVisible, setStatusMenuVisible] = useState(false);
-  const [projectMenuVisible, setProjectMenuVisible] = useState(false);
   const [tagMenuVisible, setTagMenuVisible] = useState(false);
   const [assigneeMenuVisible, setAssigneeMenuVisible] = useState(false);
   const [timerElapsed, setTimerElapsed] = useState(0);
@@ -821,7 +821,6 @@ export default function TaskDetailScreen() {
   const handleMoveProject = useCallback(
     async (projectId: string) => {
       if (!taskId || !task || task.project_id === projectId) return;
-      setProjectMenuVisible(false);
       try {
         const updated = await tasksRepo.update(taskId, {
           project_id: projectId,
@@ -836,6 +835,7 @@ export default function TaskDetailScreen() {
             ? error.message
             : "プロジェクト変更に失敗しました",
         );
+        throw error;
       }
     },
     [loadTask, task, taskId],
@@ -1144,9 +1144,6 @@ export default function TaskDetailScreen() {
     }
   }, [isAuthenticated, loadTask, online, taskId, triagingAgent]);
 
-  const currentProject = projects.find(
-    (project) => project.id === task?.project_id,
-  );
   const comments: TaskComment[] = task?.comments ?? [];
   const selectedTags = [
     ...(task?.tags ?? []),
@@ -1271,31 +1268,8 @@ export default function TaskDetailScreen() {
       {titleError ? <Text style={styles.errorText}>{titleError}</Text> : null}
 
       <View style={styles.redesignAttributeRow}>
-        <Menu
-          visible={projectMenuVisible}
-          onDismiss={() => setProjectMenuVisible(false)}
-          anchor={
-            <Chip
-              icon="folder-outline"
-              compact
-              onPress={() => setProjectMenuVisible(true)}
-              style={styles.redesignAttributeChip}
-              textStyle={{ color: currentProject?.color || "#cdd6f4" }}
-            >
-              {currentProject?.name || task.project_name || "Project"}
-            </Chip>
-          }
-          contentStyle={styles.menuContent}
-        >
-          {projects.map((project) => (
-            <Menu.Item
-              key={project.id}
-              title={project.name}
-              leadingIcon={project.id === task.project_id ? "check" : undefined}
-              onPress={() => void handleMoveProject(project.id)}
-            />
-          ))}
-        </Menu>
+        <ScopeSwitcher variant="chip" projects={projects} projectId={task.project_id} allowAll={false}
+          onSelectProject={async (id) => { if (id) await handleMoveProject(id); }} />
         <IconButton
           icon="check-circle"
           iconColor={status === "closed" ? "#f5f5f7" : "#a6adc8"}

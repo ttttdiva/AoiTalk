@@ -84,7 +84,7 @@ function isFutureTask(task: Task): boolean {
 function isOverdue(task: Task): boolean {
   if (!task.end_at || task.status === "closed") return false;
   const due = new Date(task.end_at);
-  if (task.all_day || (due.getHours() === 0 && due.getMinutes() === 0)) {
+  if (task.all_day) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const dueDay = new Date(due);

@@ -20,6 +20,11 @@ import {
 } from "@/lib/task-api";
 import { listRemoteTasks, toRemoteTask } from "@/lib/remote-tasks";
 import { resourceId } from "@/lib/remote-resource";
+import {
+  taskBrowseScopeKey,
+  taskBrowseScopeToQuery,
+  type TaskBrowseScope,
+} from "@/lib/task-browse-scope";
 
 export type FetchDataOptions = {
   forceLoading?: boolean;
@@ -132,8 +137,14 @@ export function useTasksData(
   selectedProject?: Project | null,
   selectedSpaceId?: string | null,
   selectedSpace?: Space | null,
+  fetchEnabled = true,
+  browseScope?: TaskBrowseScope | null,
 ) {
-  const [loading, setLoading] = useState(true);
+  // Manual fetch loading belongs to the Tasks scope that started it.
+  // A pending request from an old scope must not keep a newer scope loading.
+  const [manualLoadingScopeKey, setManualLoadingScopeKey] = useState<
+    string | null
+  >(null);
   const hasLoadedTasksRef = useRef(false);
   const remoteProject =
     selectedProject?.source === "remote" ? selectedProject : null;
@@ -203,10 +214,22 @@ export function useTasksData(
   );
   const invalidRemoteSpaceScope =
     selectedSpaceLooksRemote && !hasRemoteSpaceScope && !hasRemoteProjectScope;
+  const browseQuery = useMemo(
+    () => taskBrowseScopeToQuery(browseScope),
+    [browseScope],
+  );
+  const hasBrowseScope = Boolean(browseQuery);
   // タスクのキャッシュ境界を実際の取得スコープと一致させる。
   // local は space 単位、remote は接続先の space/project 単位であり、
   // ヘッダーの selectedProjectId だけが変わっても同じ space のタスク配列を共有する。
-  const tasksSwrKey = isRemote
+  const tasksSwrKey = hasBrowseScope
+    ? [
+        "tasks-page",
+        TASKS_CACHE_VERSION,
+        "browse",
+        taskBrowseScopeKey(browseScope),
+      ].join("/")
+    : isRemote
     ? [
         "tasks-page",
         TASKS_CACHE_VERSION,
@@ -230,13 +253,16 @@ export function useTasksData(
         ].join("/");
   // タグだけが project 単位のデータなので、タスク配列とは別キーで管理する。
   const tagsSwrKey =
-    selectedProjectId && !isRemote
+    selectedProjectId && !isRemote && !hasBrowseScope
       ? ["tasks-page", TASKS_CACHE_VERSION, "tags", selectedProjectId].join("/")
       : null;
+  const activeTasksSwrKey = fetchEnabled ? tasksSwrKey : null;
+  const activeTagsSwrKey = fetchEnabled ? tagsSwrKey : null;
 
   // SWR fetcher。呼び出し時点の最新スコープを閉じ込む（revalidate は最新レンダーの
   // fetcher を使うため、スコープ変更後の fetchData で最新パラメータが反映される）。
   const tasksFetcher = useCallback(async (): Promise<Task[]> => {
+    if (browseQuery) return taskApi.listTasks(browseQuery);
     return isRemote
       ? (
           await listRemoteTasks(
@@ -262,6 +288,7 @@ export function useTasksData(
           selectedSpaceId ? { space_id: selectedSpaceId } : undefined,
         );
   }, [
+    browseQuery,
     invalidRemoteSpaceScope,
     isRemote,
     remoteResourceId,
@@ -284,8 +311,9 @@ export function useTasksData(
   const {
     data: tasksData,
     error: tasksError,
+    isLoading: tasksSwrLoading,
     mutate: mutateTasks,
-  } = useSWR<Task[]>(tasksSwrKey, tasksFetcher, {
+  } = useSWR<Task[]>(activeTasksSwrKey, tasksFetcher, {
     // 取得タイミングは呼び出し側の fetchData に委ねる（自動 revalidation は使わない）。
     // ただし低帯域配慮でキャッシュ（永続化含む）は有効化し、再訪時は前回データを即描画する。
     revalidateOnMount: false,
@@ -303,7 +331,7 @@ export function useTasksData(
     data: tagsData,
     error: tagsError,
     mutate: mutateTags,
-  } = useSWR<Tag[]>(tagsSwrKey, tagsFetcher, {
+  } = useSWR<Tag[]>(activeTagsSwrKey, tagsFetcher, {
     revalidateOnMount: false,
     revalidateOnFocus: false,
     revalidateOnReconnect: true,
@@ -320,7 +348,7 @@ export function useTasksData(
     );
     return Array.from(tagsById.values());
   }, [tasks]);
-  const tags = tagsSwrKey ? (tagsData ?? EMPTY_TAGS) : embeddedTags;
+  const tags = activeTagsSwrKey ? (tagsData ?? EMPTY_TAGS) : embeddedTags;
   // fetchData が「キャッシュ済みデータがあるのに skeleton を出す」のを防ぐための参照。
   // render 中に ref を書かず、commit 後に同期する（値は fetchData 呼び出し時点で十分新しい）。
   const hasDataRef = useRef(false);
@@ -329,7 +357,45 @@ export function useTasksData(
   }, [tasksData]);
   useEffect(() => {
     hasLoadedTasksRef.current = false;
-  }, [tasksSwrKey]);
+  }, [activeTasksSwrKey]);
+  useEffect(() => {
+    if (activeTasksSwrKey === null) return;
+    const tasksSettled =
+      !tasksSwrLoading &&
+      (tasksData !== undefined || tasksError !== undefined);
+    const tagsSettled =
+      activeTagsSwrKey === null ||
+      tagsData !== undefined ||
+      tagsError !== undefined;
+    if (tasksSettled && tagsSettled) {
+      hasLoadedTasksRef.current = true;
+    }
+  }, [
+    activeTagsSwrKey,
+    activeTasksSwrKey,
+    tagsData,
+    tagsError,
+    tasksData,
+    tasksError,
+    tasksSwrLoading,
+  ]);
+  // After readiness the first SWR key is intentionally not auto-fetched
+  // (revalidateOnMount:false); TasksPage starts that fetch from its one-shot
+  // manual effect. Treat an enabled current scope with no data/error yet as
+  // loading during that hand-off.
+  //
+  // After a task-scope change, SWR owns that new key's automatic loading
+  // lifecycle. A manual request still pending for another key is ignored.
+  const currentTasksScopeUnsettled =
+    activeTasksSwrKey !== null &&
+    tasksData === undefined &&
+    tasksError === undefined;
+  const effectiveLoading =
+    !fetchEnabled ||
+    tasksSwrLoading ||
+    currentTasksScopeUnsettled ||
+    (manualLoadingScopeKey !== null &&
+      manualLoadingScopeKey === activeTasksSwrKey);
   // 取得失敗時は SWR が直前の data を保持しつつ error を立てる。
   // 従来の loadError（成功で null / 失敗でメッセージ）と同義。
   const loadError =
@@ -361,7 +427,7 @@ export function useTasksData(
 
   const setTags = useCallback<Dispatch<SetStateAction<Tag[]>>>(
     (action) => {
-      if (!tagsSwrKey) return;
+      if (!activeTagsSwrKey) return;
       void mutateTags(
         (current = EMPTY_TAGS) => {
           const nextTags =
@@ -373,22 +439,26 @@ export function useTasksData(
         { revalidate: false },
       );
     },
-    [mutateTags, tagsSwrKey],
+    [activeTagsSwrKey, mutateTags],
   );
 
   // タスク・タグ取得（従来の loading / loadError / sidebar 通知の挙動を維持）。
   const fetchData = useCallback(
     async (options: FetchDataOptions = {}) => {
+      const requestTasksSwrKey = activeTasksSwrKey;
+
       // キャッシュ済みデータが既にある場合は skeleton を出さず即描画→裏で再検証する。
       const shouldShowLoading =
         (options.forceLoading ?? !hasLoadedTasksRef.current) &&
         !hasDataRef.current;
-      if (shouldShowLoading) setLoading(true);
+      if (shouldShowLoading && requestTasksSwrKey !== null) {
+        setManualLoadingScopeKey(requestTasksSwrKey);
+      }
       // SWR に revalidate を依頼。並行呼び出しは SWR が dedup / stale 破棄し、
       // 失敗時は error フィールドに反映される（bound mutate は reject しない）。
       const [taskResult, tagResult] = await Promise.all([
         mutateTasks(),
-        tagsSwrKey ? mutateTags() : Promise.resolve(EMPTY_TAGS),
+        activeTagsSwrKey ? mutateTags() : Promise.resolve(EMPTY_TAGS),
       ]);
       // 取得成功時のみサイドバーへ通知（従来挙動）。失敗時は result が undefined。
       if (
@@ -399,9 +469,17 @@ export function useTasksData(
         window.dispatchEvent(new Event("task-sidebar-refresh"));
       }
       hasLoadedTasksRef.current = true;
-      setLoading(false);
+
+      // Clear only the manual-loading generation that this request started.
+      // If another scope has since started its own manual fetch, an older
+      // completion must not clear that newer scope's state.
+      if (requestTasksSwrKey !== null) {
+        setManualLoadingScopeKey((current) =>
+          current === requestTasksSwrKey ? null : current,
+        );
+      }
     },
-    [mutateTags, mutateTasks, tagsSwrKey],
+    [activeTagsSwrKey, activeTasksSwrKey, mutateTags, mutateTasks],
   );
 
   const upsertTaskLocally = useCallback(
@@ -555,7 +633,7 @@ export function useTasksData(
     setTasks,
     tags,
     setTags,
-    loading,
+    loading: effectiveLoading,
     loadError,
     fetchData,
     hasLoadedTasksRef,

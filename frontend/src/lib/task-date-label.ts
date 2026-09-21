@@ -3,6 +3,7 @@
 import {
   getDateOnlyDatePrefix,
   getIsoDatePrefix,
+  hasExplicitTimeComponent,
   parseLocalDateTime,
 } from "@/lib/date-time";
 
@@ -55,11 +56,11 @@ export function formatTaskDateLabel(
     (target.getTime() - today.getTime()) / (1000 * 60 * 60 * 24),
   );
 
-  const hasTime = !(
-    options?.allDay ||
-    dateOnlyPrefix ||
-    (date.getHours() === 0 && date.getMinutes() === 0)
-  );
+  const hasTime =
+    !options?.allDay &&
+    (hasExplicitTimeComponent(value) ||
+      (!dateOnlyPrefix &&
+        (date.getHours() !== 0 || date.getMinutes() !== 0)));
 
   let dateLabel: string;
   if (diffDays === 0) dateLabel = "Today";

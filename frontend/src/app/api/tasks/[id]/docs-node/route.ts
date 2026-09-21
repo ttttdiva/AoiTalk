@@ -1,11 +1,12 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, eq, isNull, max } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, max } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeNodes,
   knowledgeNodeSupertags,
   knowledgeSupertags,
   tasks,
+  projects,
 } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import {
@@ -13,22 +14,25 @@ import {
   cleanOptionalString,
   ensureProjectDocsWorkspace,
   ensureProjectWritable,
+  getKnowledgeNodeDescendantIds,
   serializeNode,
   syncKnowledgeNodeReferenceEdges,
   upsertKnowledgeSearchIndex,
 } from "@/lib/server/knowledge-docs-utils";
-import { fetchPythonApi } from "@/lib/server/python-api-proxy";
-import { insertDocsNode, updateDocsNode } from "@/lib/server/docs-node-writer";
+import { insertDocsNode, updateDocsNode, updateDocsNodesByIds } from "@/lib/server/docs-node-writer";
 import {
   ensureProjectInformationHierarchyNode,
   isDefaultInboxProject,
+  lockProjectInformationAdvisory,
 } from "@/lib/server/project-information-hierarchy";
-
-async function assertPythonOk(response: Response, action: string) {
-  if (response.ok) return;
-  const detail = await response.text().catch(() => "");
-  throw new Error(`${action} failed: ${response.status} ${detail}`);
-}
+import {
+  assertTaskDocsNodeLinkAllowed,
+  assertTaskDocsNodeLinkAllowedInTransaction,
+  assertTaskProjectAccessInTransaction,
+  TaskDocsNodeInvariantError,
+  TaskProjectAccessInvariantError,
+} from "@/lib/server/task-docs-node-invariant";
+import { lockTaskProjectIds } from "@/lib/server/project-move-dependency-invariant";
 
 export async function POST(
   _request: NextRequest,
@@ -70,13 +74,22 @@ export async function POST(
       { status: 409 },
     );
   }
-  const projectNode = await ensureProjectInformationHierarchyNode({
-    docsLibraryId: workspace.id,
-    userId: user.id,
-    project: projectAccess.project,
-  });
-
   if (task.knowledgeNodeId) {
+    try {
+      const link = await assertTaskDocsNodeLinkAllowed(
+        task.knowledgeNodeId,
+        String(task.projectId),
+        user,
+      );
+      if (link.workspace.id !== workspace.id) {
+        throw new TaskDocsNodeInvariantError("別Docs LibraryのnodeはこのProjectへ移動できません");
+      }
+    } catch (error) {
+      if (error instanceof TaskDocsNodeInvariantError) {
+        return NextResponse.json({ detail: error.message }, { status: error.status });
+      }
+      throw error;
+    }
     const [linkedNode] = await db
       .select()
       .from(knowledgeNodes)
@@ -89,12 +102,106 @@ export async function POST(
       )
       .limit(1);
     if (linkedNode) {
-      const repaired = await updateDocsNode(db, linkedNode.id, {
-        parentId: projectNode.id,
-        rootPageId: projectNode.rootPageId ?? projectNode.id,
-        updatedBy: user.id,
-        updatedAt: new Date(),
-      });
+      let repaired: typeof linkedNode;
+      try {
+        repaired = await db.transaction(async (tx) => {
+        // Match every task/dependency writer's advisory -> Project -> Task
+        // order before entering the canonical hierarchy repair.
+        await lockTaskProjectIds(tx, [task.projectId]);
+        await lockProjectInformationAdvisory(tx, task.projectId);
+        const [lockedProject] = await tx
+          .select()
+          .from(projects)
+          .where(eq(projects.id, task.projectId))
+          .limit(1)
+          .for("update");
+        if (!lockedProject || lockedProject.deletedAt || lockedProject.isCompleted) {
+          throw new Error("完了/削除済みProjectのDocs nodeは修復できません");
+        }
+        await assertTaskProjectAccessInTransaction(tx, [task.projectId], user);
+        // Re-resolve the canonical hierarchy while the Project row is held;
+        // the preflight projectNode may have been repaired/reparented before
+        // this transaction acquired its lock.
+        const lockedProjectNode = await ensureProjectInformationHierarchyNode({
+          docsLibraryId: workspace.id,
+          userId: user.id,
+          project: lockedProject,
+          client: tx,
+        });
+        const [lockedTask] = await tx
+          .select({
+            knowledgeNodeId: tasks.knowledgeNodeId,
+            projectId: tasks.projectId,
+          })
+          .from(tasks)
+          .where(eq(tasks.id, task.id))
+          .for("update")
+          .limit(1);
+        if (!lockedTask || lockedTask.knowledgeNodeId !== linkedNode.id) {
+          throw new Error("タスクのDocs node bindingが同時変更されたため修復できません");
+        }
+        if (String(lockedTask.projectId) !== String(lockedProject.id)) {
+          throw new TaskDocsNodeInvariantError(
+            "タスクのProjectが同時変更されたためDocs nodeを修復できません",
+          );
+        }
+        let [lockedNode] = await tx
+          .select()
+          .from(knowledgeNodes)
+          .where(and(eq(knowledgeNodes.id, linkedNode.id), eq(knowledgeNodes.docsLibraryId, workspace.id)))
+          .limit(1);
+        if (!lockedNode) throw new Error("既存のDocs nodeが見つかりません");
+        // Lock the complete bound-node closure in deterministic order before
+        // the managed-policy walk and bulk denormalizer update.  A concurrent
+        // generic move otherwise can hold a child while this repair holds the
+        // root (or vice versa), producing a 40P01 cycle and stale descendants.
+        const descendants = await getKnowledgeNodeDescendantIds(tx, workspace.id, lockedNode.id);
+        const closureIds = Array.from(new Set([lockedNode.id, ...descendants])).sort();
+        await tx
+          .select({ id: knowledgeNodes.id })
+          .from(knowledgeNodes)
+          .where(
+            and(
+              eq(knowledgeNodes.docsLibraryId, workspace.id),
+              inArray(knowledgeNodes.id, closureIds),
+            ),
+          )
+          .orderBy(asc(knowledgeNodes.id))
+          .for("update");
+        [lockedNode] = await tx
+          .select()
+          .from(knowledgeNodes)
+          .where(and(eq(knowledgeNodes.id, linkedNode.id), eq(knowledgeNodes.docsLibraryId, workspace.id)))
+          .limit(1)
+          .for("update");
+        if (!lockedNode) throw new Error("既存のDocs nodeが同時に削除されました");
+        await assertTaskDocsNodeLinkAllowedInTransaction(
+          tx,
+          lockedNode.id,
+          String(lockedTask.projectId),
+          user,
+        );
+        const repairedNode = await updateDocsNode(tx, lockedNode.id, {
+          parentId: lockedProjectNode.id,
+          rootPageId: lockedProjectNode.rootPageId ?? lockedProjectNode.id,
+          projectId: lockedProject.id,
+          updatedBy: user.id,
+          updatedAt: new Date(),
+        });
+        await updateDocsNodesByIds(tx, descendants, {
+          rootPageId: repairedNode.rootPageId,
+          projectId: lockedTask.projectId,
+          updatedBy: user.id,
+          updatedAt: new Date(),
+        });
+        return repairedNode;
+        });
+      } catch (error) {
+        if (error instanceof TaskDocsNodeInvariantError || error instanceof TaskProjectAccessInvariantError) {
+          return NextResponse.json({ detail: error.message }, { status: error.status });
+        }
+        throw error;
+      }
       return NextResponse.json({ node: serializeNode(repaired), created: false });
     }
   }
@@ -116,30 +223,67 @@ export async function POST(
     );
   }
 
-  const parentId = projectNode.id;
-  const rootPageId = projectNode.rootPageId ?? projectNode.id;
-  const bodyText = cleanOptionalString(task.description, 200000) ?? "";
-  const node = await db.transaction(async (tx) => {
+  let node: typeof knowledgeNodes.$inferSelect;
+  try {
+    node = await db.transaction(async (tx) => {
+    await lockTaskProjectIds(tx, [task.projectId]);
+    await lockProjectInformationAdvisory(tx, task.projectId);
+    const [lockedProject] = await tx
+      .select()
+      .from(projects)
+      .where(eq(projects.id, task.projectId))
+      .limit(1)
+      .for("update");
+    if (!lockedProject || lockedProject.deletedAt || lockedProject.isCompleted) {
+      throw new Error("完了/削除済みProjectのDocs nodeは作成できません");
+    }
+    await assertTaskProjectAccessInTransaction(tx, [task.projectId], user);
+    // Resolve and lock the canonical Project hierarchy in this same
+    // transaction. The earlier projectNode snapshot can become stale after a
+    // repair/reparent and must never be used as a new note's parent.
+    const lockedProjectNode = await ensureProjectInformationHierarchyNode({
+      docsLibraryId: workspace.id,
+      userId: user.id,
+      project: lockedProject,
+      client: tx,
+    });
+    const [lockedTask] = await tx
+      .select()
+      .from(tasks)
+      .where(eq(tasks.id, task.id))
+      .for("update")
+      .limit(1);
+    if (!lockedTask || lockedTask.knowledgeNodeId) {
+      throw new Error("タスクのDocs node bindingが同時変更されたため作成できません");
+    }
+    if (String(lockedTask.projectId) !== String(lockedProject.id)) {
+      throw new TaskDocsNodeInvariantError(
+        "タスクのProjectが同時変更されたためDocs nodeを作成できません",
+      );
+    }
+    const lockedParentId = lockedProjectNode.id;
+    const lockedRootPageId = lockedProjectNode.rootPageId ?? lockedProjectNode.id;
+    const lockedBodyText = cleanOptionalString(lockedTask.description, 200000) ?? "";
     const [maxRow] = await tx
       .select({ maxSort: max(knowledgeNodes.sortOrder) })
       .from(knowledgeNodes)
       .where(
         and(
           eq(knowledgeNodes.docsLibraryId, workspace.id),
-          parentId ? eq(knowledgeNodes.parentId, parentId) : isNull(knowledgeNodes.parentId),
+          lockedParentId ? eq(knowledgeNodes.parentId, lockedParentId) : isNull(knowledgeNodes.parentId),
         ),
       );
 
-    const created = await insertDocsNode(tx, {
+      const created = await insertDocsNode(tx, {
         docsLibraryId: workspace.id,
-        parentId,
-        rootPageId,
-        projectId: task.projectId,
-        title: task.title,
-        description: task.description ?? "",
+        parentId: lockedParentId,
+        rootPageId: lockedRootPageId,
+        projectId: lockedProject.id,
+        title: lockedTask.title,
+        description: lockedTask.description ?? "",
         bodyJson: {
           format: "task_note",
-          task_id: task.id,
+          task_id: lockedTask.id,
         },
         nodeType: "node",
         displayProps: { show_checkbox: true },
@@ -158,13 +302,13 @@ export async function POST(
       createdBy: user.id,
     });
     await upsertKnowledgeSearchIndex(tx, finalNode, finalNode.title);
-    if (bodyText) {
+    if (lockedBodyText) {
       const detailNode = await insertDocsNode(tx, {
         docsLibraryId: workspace.id,
         parentId: finalNode.id,
         rootPageId: finalNode.rootPageId ?? finalNode.id,
-        projectId: task.projectId,
-        title: bodyText,
+        projectId: lockedProject.id,
+        title: lockedBodyText,
         bodyJson: { format: "doc_block", block_type: "paragraph" },
         nodeType: "node",
         sortOrder: 1,
@@ -175,35 +319,49 @@ export async function POST(
     }
     await syncKnowledgeNodeReferenceEdges(tx, finalNode, user.id);
     await appendKnowledgeRevision(tx, finalNode, user.id, "タスクをDocsノート化");
-    return finalNode;
-  });
-
-  try {
-    const response = await fetchPythonApi(`/api/tasks/${task.id}`, {
-      method: "PATCH",
+    await assertTaskDocsNodeLinkAllowedInTransaction(
+      tx,
+      finalNode.id,
+      String(lockedTask.projectId),
       user,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        knowledge_node_id: node.id,
-        task_metadata: {
-          ...(task.taskMetadata && typeof task.taskMetadata === "object" && !Array.isArray(task.taskMetadata)
-            ? task.taskMetadata
-            : {}),
-          source: task.source,
-          knowledge_node_id: node.id,
-        },
-      }),
-    });
-    await assertPythonOk(response, "Task Docs note link");
-  } catch (error) {
-    await db.delete(knowledgeNodes).where(eq(knowledgeNodes.id, node.id));
-    return NextResponse.json(
-      {
-        detail: "Docs nodeは作成されましたが、タスク連携に失敗したため取り消しました",
-        error: error instanceof Error ? error.message : String(error),
-      },
-      { status: 502 },
     );
+    const existingMetadata =
+      lockedTask.taskMetadata
+      && typeof lockedTask.taskMetadata === "object"
+      && !Array.isArray(lockedTask.taskMetadata)
+        ? lockedTask.taskMetadata
+        : {};
+    const [boundTask] = await tx
+      .update(tasks)
+      .set({
+        knowledgeNodeId: finalNode.id,
+        taskMetadata: {
+          ...existingMetadata,
+          source: lockedTask.source,
+          knowledge_node_id: finalNode.id,
+        },
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(tasks.id, lockedTask.id),
+          isNull(tasks.knowledgeNodeId),
+          isNull(tasks.deletedAt),
+        ),
+      )
+      .returning();
+    if (!boundTask) {
+      throw new TaskDocsNodeInvariantError(
+        "タスクのDocs node bindingが同時変更されたため作成できません",
+      );
+    }
+    return finalNode;
+    });
+  } catch (error) {
+    if (error instanceof TaskDocsNodeInvariantError || error instanceof TaskProjectAccessInvariantError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    throw error;
   }
 
   return NextResponse.json({ node: serializeNode(node), created: true }, { status: 201 });

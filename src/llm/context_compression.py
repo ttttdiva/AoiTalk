@@ -24,7 +24,12 @@ SEARCH_TOOLS = {
     "x_search",
     "grok_x_search",
     "knowledge_search",
+    "knowledge_query",
     "search_past_chats",
+}
+STRUCTURED_QUERY_TOOLS = {
+    "knowledge_query",
+    "docs_query",
 }
 FILE_PREVIEW_TOOLS = {
     "read_file",
@@ -190,8 +195,27 @@ def model_tool_result_payload(
     policy = context_compression_policy(config, max_chars=max_chars)
     clipper = legacy_clip or _legacy_clip
     raw = str(output or "")
+    if tool_name in {"docs_overview", "docs_search", "docs_read"}:
+        protocol = _compress_docs_protocol(raw, max_chars or policy.max_chars)
+        if protocol is not None:
+            return CompressionResult(text=protocol, original_chars=len(raw), compressed_chars=len(protocol),
+                                     strategy="docs_protocol")
+    if tool_name == "docs_read":
+        document = _compress_docs_document_page(raw, max_chars or policy.max_chars)
+        if document is not None:
+            return CompressionResult(
+                text=document, original_chars=len(raw), compressed_chars=len(document),
+                strategy="docs_document_page",
+            )
     if not policy.enabled:
-        text = clipper(raw, max_chars)
+        # Exact query metadata is a tool contract, including when optional
+        # context compression is disabled. Never byte-clip a structured total.
+        text = (
+            _compress_structured_query(raw, user_input, max_chars)
+            if tool_name in STRUCTURED_QUERY_TOOLS
+            and max_chars and max_chars > 0 and len(raw) > max_chars
+            else clipper(raw, max_chars)
+        )
         return CompressionResult(
             text=text,
             original_chars=len(raw),
@@ -223,13 +247,27 @@ def compress_tool_result_for_model(
     clipper = legacy_clip or _legacy_clip
     target_chars = max(1, max_chars or policy.max_chars)
     raw = str(output or "")
+    # Document pages contain exact source spans. Generic JSON ranking, URL
+    # stripping or head/tail clipping would silently lose content and the
+    # continuation contract, even when optional compression is disabled.
+    if tool_name == "docs_read":
+        document = _compress_docs_document_page(raw, target_chars)
+        if document is not None:
+            return CompressionResult(
+                text=document, original_chars=len(raw), compressed_chars=len(document),
+                strategy="docs_document_page",
+            )
     source = raw
     stripped_data_url = False
 
     if policy.strip_data_urls:
         source, stripped_data_url = _strip_data_urls(source)
 
-    fallback = clipper(source, target_chars)
+    fallback = (
+        _compress_structured_query(source, user_input, target_chars)
+        if tool_name in STRUCTURED_QUERY_TOOLS and len(source) > target_chars
+        else clipper(source, target_chars)
+    )
     protected = _protected_reason(tool_name, source, policy)
     if protected:
         return CompressionResult(
@@ -256,6 +294,9 @@ def compress_tool_result_for_model(
     elif tool_name in FILE_LISTING_TOOLS and _strategy_enabled(policy, "file_listing"):
         candidate = _compress_json_like(source, user_input, target_chars)
         strategy = "file_listing"
+    elif tool_name in STRUCTURED_QUERY_TOOLS:
+        candidate = _compress_structured_query(source, user_input, target_chars)
+        strategy = "structured_query"
     elif tool_name in SEARCH_TOOLS and _strategy_enabled(policy, "search"):
         candidate = _compress_search_output(source, user_input, target_chars)
         strategy = "search"
@@ -277,6 +318,72 @@ def compress_tool_result_for_model(
         source=source,
         strategy=strategy,
     )
+
+
+def _compress_docs_document_page(raw: str, max_chars: int) -> str | None:
+    try:
+        page = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(page, dict) or page.get("schema") != "docs_read_projection.v1":
+        return None
+    if len(raw) <= max_chars:
+        return raw
+    if page.get("write_token") or page.get("view") == "edit":
+        # Edit pagination is server-enforced.  Never synthesize a public
+        # fingerprint/offset cursor or expose a write lease alongside source
+        # content that was silently omitted from model context.  The prior
+        # request token lets the model replay the same durable checkpoint.
+        return json.dumps({"success": False, "error_code": "docs_edit_context_budget",
+            "retry_target": page.get("root_id"), "retry_view": "edit",
+            "retry_cursor": page.get("request_cursor", ""),
+            "requires_larger_context_budget": True}, separators=(",", ":"))
+    from ..services.docs_read_projection import _cursor
+
+    segments = page.get("segments", [])
+    if not isinstance(segments, list):
+        return None
+    kept = list(segments)
+    while True:
+        end = page["page_start"] + len(kept)
+        reduced = {**page, "segments": kept, "page_end": end, "has_more": True,
+                   "next_cursor": _cursor(page["read_fingerprint"], end),
+                   "model_context_omitted_segments": len(segments) - len(kept)}
+        if not kept:
+            reduced["requires_larger_context_budget"] = True
+        rendered = json.dumps(reduced, ensure_ascii=False, separators=(",", ":"))
+        if len(rendered) <= max_chars or not kept:
+            # Never clip the remaining cursor/coverage envelope into invalid
+            # JSON. A very small model budget cannot safely carry this view.
+            return rendered
+        kept.pop()
+
+
+def _compress_docs_protocol(raw: str, max_chars: int) -> str | None:
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(value, dict) or value.get("schema") not in {"docs_coverage.v1", "docs_retrieval.v1", "docs_neighborhood.v1"}:
+        return None
+    if len(raw) <= max_chars:
+        return raw
+    if value["schema"] == "docs_coverage.v1":
+        # Replaying this cursor at a smaller page budget restores the server
+        # checkpoint. Never show the advance cursor without its evidence.
+        return json.dumps({"success": False, "error_code": "docs_coverage_context_budget",
+            "run_id": value["run_id"], "retry_cursor": value["request_cursor"],
+            "retry_page_chars": max(6000, max_chars - 1000),
+            "requires_larger_context_budget": max_chars < 7000}, separators=(",", ":"))
+    if value["schema"] == "docs_neighborhood.v1":
+        return json.dumps({"schema": "docs_neighborhood.v1", "root_id": value["root_id"],
+            "links": value.get("links", [])[:10], "coverage_complete": False,
+            "model_context_omitted": True, "next_action": "Read linked IDs explicitly with view='record'"},
+            ensure_ascii=False, separators=(",", ":"))
+    compact = {"schema": "docs_retrieval.v1", "hit_ids": value.get("hit_ids", []),
+               "coverage_complete": False, "model_context_omitted": True,
+               "next_action": "Use docs_read(view='record') on the hit IDs for complete content"}
+    return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
 def _protected_reason(
@@ -349,6 +456,129 @@ def _compress_json_like(text: str, user_input: str, max_chars: int) -> str:
     if len(dumped) <= max_chars:
         return dumped
     return _compress_head_tail_text(dumped, max_chars, label="json")
+
+
+def _compress_structured_query(text: str, user_input: str, max_chars: int) -> str:
+    """Keep source-reported query aggregates distinct from displayed rows."""
+
+    if len(text) <= max_chars:
+        return text
+    value = _parse_structured(text)
+    if not isinstance(value, dict):
+        # Only the producer's fixed-position metadata line establishes exact
+        # group counts. Rendered titles/fields may contain arbitrary newlines,
+        # including text that looks like a count header.
+        # JSON permits Unicode line separators inside strings; only the
+        # producer's literal newline delimits the metadata envelope.
+        lines = text.split("\n")
+        if lines and re.match(r"^count=\d+\s+total_matches=", lines[0]):
+            if len(lines) > 1 and lines[1].startswith("query_metadata="):
+                try:
+                    metadata = json.loads(lines[1][len("query_metadata="):])
+                except (TypeError, ValueError):
+                    metadata = None
+                if isinstance(metadata, dict):
+                    envelope = {
+                        key: metadata[key] for key in (
+                            "total_matches", "returned", "offset", "has_more",
+                            "next_offset", "truncated", "order_by", "order", "group_by",
+                        ) if key in metadata
+                    }
+                    groups = metadata.get("group_counts")
+                    if isinstance(groups, dict):
+                        envelope["groups"] = [
+                            {"key": key, "count": count} for key, count in groups.items()
+                        ]
+                        envelope["group_total"] = len(groups)
+                    envelope["items"] = [
+                        {"excerpt": line[:400], "excerpt_truncated": len(line) > 400}
+                        for line in lines[2:] if line.strip()
+                    ]
+                    return _compress_structured_query(
+                        json.dumps(envelope, ensure_ascii=False), user_input, max_chars
+                    )
+            # Compatibility results without machine metadata have only one
+            # trustworthy total header. Quote every later line as evidence.
+            notice = "[Document excerpts only; group totals unavailable in this context.]"
+            selected = [lines[0], notice]
+            if len("\n".join(selected)) > max_chars:
+                counts = re.findall(r"(?:^|\s)((?:count|total_matches)=\S+)", lines[0])
+                compact_header = " ".join(counts)
+                return compact_header if len(compact_header) <= max_chars else ""
+            for line in lines[1:]:
+                excerpt = "> " + line[:400]
+                if len("\n".join([*selected, excerpt])) > max_chars:
+                    break
+                selected.append(excerpt)
+            return "\n".join(selected)
+        return _compress_head_tail_text(text, max_chars, label="structured_query")
+
+    if not any(key in value for key in ("count", "total_matches", "total_count")):
+        return _compress_json_like(text, user_input, max_chars)
+
+    def dump(item: Any) -> str:
+        return json.dumps(item, ensure_ascii=False, separators=(",", ":"), default=str)
+
+    # Input property order must never decide whether a total survives. Keep
+    # source pagination fields unchanged; model context is a separate window.
+    metadata_keys = (
+        "operation", "count", "total_matches", "total_count", "returned",
+        "returned_count", "truncated", "has_more", "limit", "offset",
+        "next_offset", "next_cursor", "order_by", "order", "group_by",
+        "group_total", "total_groups", "group_semantics", "date_from", "date_to",
+    )
+    result = {key: value[key] for key in metadata_keys if key in value}
+    failed = value.get("success") is False or bool(value.get("error"))
+    if failed:
+        result["success"] = False
+        result["error"] = "Query failed; source totals may be unavailable."
+    totals = [value[key] for key in ("total_matches", "total_count") if key in value]
+    if not totals:
+        totals = [value.get("count")]
+    notice = {
+        "rows_are_context_bounded": True,
+        "source_counts_are_authoritative": not failed and all(
+            isinstance(total, int) and not isinstance(total, bool) and total >= 0
+            for total in totals
+        ),
+        "do_not_infer_count_from_displayed_rows": True,
+    }
+    result["_aoitalk_query_context"] = notice
+    row_keys = [key for key in ("groups", "items", "documents") if isinstance(value.get(key), list)]
+    for key in row_keys:
+        result[key] = []
+        result[f"{key}_omitted"] = len(value[key])
+
+    if len(dump(result)) > max_chars:
+        # Very small budgets still retain the authoritative counts before any
+        # descriptive metadata. If even this cannot fit, return no partial JSON.
+        result = {key: value[key] for key in ("count", "total_matches", "total_count", "group_total", "total_groups") if key in value}
+        if failed:
+            result["success"] = False
+            result["error"] = "Query failed"
+        if len(dump({**result, "rows_omitted": True})) <= max_chars:
+            result["rows_omitted"] = True
+        if len(dump(result)) > max_chars:
+            return "null" if max_chars >= 4 else ""
+        return dump(result)
+
+    # Keep query order (especially timelines) and complete rows. Alias arrays
+    # advance together, so items/documents cannot describe different pages.
+    aliases = "items" in row_keys and "documents" in row_keys and value["items"] == value["documents"]
+    for key in row_keys:
+        if aliases and key == "documents":
+            continue
+        keys = ["items", "documents"] if aliases and key == "items" else [key]
+        for index, row in enumerate(value[key]):
+            for alias in keys:
+                result[alias].append(row)
+                result[f"{alias}_omitted"] = len(value[alias]) - index - 1
+            if len(dump(result)) > max_chars:
+                for alias in keys:
+                    result[alias].pop()
+                    result[f"{alias}_omitted"] += 1
+                break
+    return dump(result)
 
 
 def _compress_search_output(text: str, user_input: str, max_chars: int) -> str:

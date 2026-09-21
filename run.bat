@@ -5,6 +5,8 @@ title AoiTalk
 cd /d "%~dp0"
 if not defined AOITALK_PROFILE set "AOITALK_PROFILE=personal"
 if not defined AIVTUBER_ENV set "AIVTUBER_ENV=personal"
+rem The Windows Personal launcher is the trusted owner of the local Hydrus loopback endpoint.
+if not defined AOITALK_NATIVE_LOCAL set "AOITALK_NATIVE_LOCAL=1"
 if not defined AOITALK_WEB_PORT set "AOITALK_WEB_PORT=3000"
 if not defined AOITALK_NEXT_PORT set "AOITALK_NEXT_PORT=3002"
 if not defined AOITALK_CADDY_PORT set "AOITALK_CADDY_PORT=6002"

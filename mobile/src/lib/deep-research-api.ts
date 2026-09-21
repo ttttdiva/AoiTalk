@@ -6,7 +6,26 @@ export type DeepResearchStatus =
   | "running"
   | "completed"
   | "failed"
-  | "cancelled";
+  | "cancelled"
+  | "interrupted";
+
+export type DeepResearchErrorCode =
+  | "scope_missing"
+  | "scope_revoked"
+  | "privacy_protection_failed"
+  | "queue_full"
+  | "planning_timeout"
+  | "engine_timeout"
+  | "synthesis_timeout"
+  | "deadline"
+  | "process_restarted"
+  | "cancelled"
+  | "provider_failed"
+  | "provider_invalid"
+  | "egress_unreachable"
+  | "credential_missing"
+  | "internal_error"
+  | (string & {});
 
 export type DeepResearchEvent = {
   timestamp: string;
@@ -19,8 +38,12 @@ export type DeepResearchEvent = {
 export type DeepResearchJob = {
   id: string;
   user_id: string;
+  session_id?: string | null;
+  actor_user_id?: string | null;
   query: string;
   status: DeepResearchStatus;
+  interrupted?: boolean;
+  error_code?: DeepResearchErrorCode | null;
   progress: number;
   mode: "quick" | "detailed" | "report" | string;
   created_at: string;
@@ -50,7 +73,9 @@ export type StartDeepResearchRequest = {
   questions_per_iteration: number;
   max_results_per_query: number;
   engines: string[];
-  include_local_rag: boolean;
+  include_local_knowledge: boolean;
+  /** Conversation scope is validated by the server before execution. */
+  session_id?: string | null;
   project_id?: string | null;
 };
 
@@ -75,6 +100,14 @@ export const deepResearchApi = {
     return fetchApi(
       `/api/deep-research/jobs/${encodeURIComponent(jobId)}`,
       {},
+      CHAT_TIMEOUT,
+    );
+  },
+
+  cancelJob(jobId: string): Promise<DeepResearchJob> {
+    return fetchApi(
+      `/api/deep-research/jobs/${encodeURIComponent(jobId)}/cancel`,
+      { method: "POST" },
       CHAT_TIMEOUT,
     );
   },

@@ -9,10 +9,11 @@ import re
 import json
 import logging
 import time
+import inspect
 from collections.abc import Mapping
 from types import SimpleNamespace
 from ..base import LLMKeywordDetector, KeywordDetectionResult, KeywordAction
-from ....services.outbound_privacy_service import OutboundPrivacyGateway
+from ....services.outbound_privacy_service import EgressDescriptor, OutboundPrivacyGateway
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +297,22 @@ class SpeechRateDetector(LLMKeywordDetector):
                 else:
                     import openai
 
-                    client = openai.OpenAI()
+                    client_factory = openai.OpenAI
+                    client_kwargs: dict[str, Any] = {}
+                    try:
+                        parameters = inspect.signature(client_factory).parameters.values()
+                        supports_max_retries = any(
+                            parameter.name == "max_retries"
+                            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+                            for parameter in parameters
+                        )
+                    except (TypeError, ValueError):
+                        supports_max_retries = True
+                    if supports_max_retries:
+                        # The gateway owns review/retry semantics.  Disable
+                        # implicit SDK replays of a reviewed payload.
+                        client_kwargs["max_retries"] = 0
+                    client = client_factory(**client_kwargs)
                     config_getter = getattr(self.config, "get", None)
 
                     def _config_value(key: str, default: Any = None) -> Any:
@@ -344,27 +360,35 @@ class SpeechRateDetector(LLMKeywordDetector):
                         session_id=str(getattr(self.usage_context, "current_session_id", "") or ""),
                         user_id=str(getattr(self.usage_context, "session_user_id", "") or ""),
                     )
-                    protected = gateway.protect_sync(
-                        {"input": prompt},
-                        provider="openai",
-                        source_kind="speech_rate_detector",
-                    )
-                    request_input = str(
-                        protected.payload.get("input", prompt)
-                        if isinstance(protected.payload, Mapping)
-                        else prompt
-                    )
                     started = time.monotonic()
                     request_kwargs: dict[str, Any] = {
                         "model": model,
-                        "input": request_input,
+                        "input": prompt,
                     }
                     if effort:
                         request_kwargs["reasoning"] = {
                             "effort": effort,
                             "summary": "auto",
                         }
-                    completion = client.responses.create(**request_kwargs)
+                    base_url = str(getattr(client, "base_url", "") or "")
+                    descriptor = EgressDescriptor(
+                        action="model.generate",
+                        transport="openai.responses",
+                        destination=base_url,
+                        provider="openai",
+                        tool="speech_rate_detector",
+                        model=model,
+                    )
+
+                    completion = gateway.execute_sync(
+                        request_kwargs,
+                        provider="openai",
+                        descriptor=descriptor,
+                        sender=lambda outbound: client.responses.create(**outbound),
+                        base_url=base_url,
+                        source_kind="speech_rate_detector",
+                        model=model,
+                    )
                     _record_speech_usage(
                         completion,
                         usage_context=self.usage_context or self.llm_client,

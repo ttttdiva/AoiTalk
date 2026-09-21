@@ -2,6 +2,7 @@
 TTS engine manager
 """
 import asyncio
+import logging
 import platform
 import re
 import threading
@@ -21,6 +22,11 @@ from .irodori_config import (
     resolve_irodori_checkpoint,
 )
 from .yomi_linter import get_yomi_preflight_service
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+
+logger = logging.getLogger(__name__)
+
 IrodoriTTSEngine = None
 
 # Windows-only TTS engines (require pythonnet, pywin32, etc.)
@@ -35,23 +41,39 @@ if _WINDOWS_ENGINES_AVAILABLE:
     try:
         from .engines.voiceroid_engine import VoiceroidEngine, resolve_voiceroid_voice_id
     except ImportError as e:
-        print(f"[TTSManager] VOICEROID engine not available: {e}")
+        logger.warning(
+            "VOICEROID engine is unavailable: %s",
+            e,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         VoiceroidEngine = None
         resolve_voiceroid_voice_id = None
     
     try:
         from .engines.aivoice_engine import AIVoiceEngine
     except ImportError as e:
-        print(f"[TTSManager] A.I.VOICE engine not available: {e}")
+        logger.warning(
+            "A.I.VOICE engine is unavailable: %s",
+            e,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         AIVoiceEngine = None
     
     try:
         from .engines.cevio_engine import CevioEngine
     except ImportError as e:
-        print(f"[TTSManager] CeVIO engine not available: {e}")
+        logger.warning(
+            "CeVIO engine is unavailable: %s",
+            e,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         CevioEngine = None
 else:
-    print(f"[TTSManager] Running on {platform.system()} - Windows-only TTS engines disabled")
+    logger.info(
+        "Running on %s; Windows-only TTS engines disabled",
+        platform.system(),
+        extra=FILE_ONLY_LOG_EXTRA,
+    )
 
 
 class TTSEngineBase(ABC):
@@ -472,7 +494,12 @@ class TTSManager:
         Returns:
             Initialized VoicevoxEngine or None
         """
-        engine = VoicevoxEngine(engine_path)
+        # Pass the manager's effective configuration into the engine so every
+        # local HTTP transport is still evaluated by the outbound privacy
+        # gateway (``local_only`` remains fail-closed for accidental remote
+        # retargeting).  Request-scoped user/project context is resolved by
+        # the engine at send time.
+        engine = VoicevoxEngine(engine_path, config=self.config)
         
         # Start engine process
         if not await asyncio.to_thread(engine.start_engine):
@@ -495,7 +522,10 @@ class TTSManager:
             Initialized VoiceroidEngine or None
         """
         if VoiceroidEngine is None:
-            print("[TTSManager] VOICEROID engine is not available on this platform")
+            logger.warning(
+                "VOICEROID engine is unavailable on this platform",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             return None
             
         engine = VoiceroidEngine()
@@ -537,7 +567,10 @@ class TTSManager:
             Initialized AIVoiceEngine or None
         """
         if AIVoiceEngine is None:
-            print("[TTSManager] A.I.VOICE engine is not available on this platform")
+            logger.warning(
+                "A.I.VOICE engine is unavailable on this platform",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             return None
             
         engine = AIVoiceEngine(aivoice_path) if aivoice_path else AIVoiceEngine()
@@ -555,7 +588,10 @@ class TTSManager:
             Initialized CevioEngine or None
         """
         if CevioEngine is None:
-            print("[TTSManager] CeVIO engine is not available on this platform")
+            logger.warning(
+                "CeVIO engine is unavailable on this platform",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             return None
             
         engine = CevioEngine()
@@ -581,7 +617,16 @@ class TTSManager:
         port = aivisspeech_settings.get('port', 10101)
         use_gpu = aivisspeech_settings.get('use_gpu', False)
         
-        engine = AivisSpeechEngine(engine_path, host=host, port=port, use_gpu=use_gpu)
+        # Keep the configured privacy policy available to the adapter; a
+        # missing config would otherwise create a default direct-mode
+        # gateway and bypass project/session policy enforcement.
+        engine = AivisSpeechEngine(
+            engine_path,
+            host=host,
+            port=port,
+            use_gpu=use_gpu,
+            config=self.config,
+        )
         
         # Start engine process
         if not await asyncio.to_thread(engine.start_engine):
@@ -594,20 +639,37 @@ class TTSManager:
         
         # Get available speakers for debugging (non-blocking)
         try:
-            print(f"[TTSManager] スピーカー情報を取得中...")
+            logger.info(
+                "Retrieving AivisSpeech speaker information",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             # Create a task with timeout to avoid blocking
             speakers_task = asyncio.create_task(engine.get_speakers())
             try:
                 speakers = await asyncio.wait_for(speakers_task, timeout=5.0)
                 if speakers:
-                    print(f"[TTSManager] AivisSpeech initialized with {len(speakers)} speakers")
+                    logger.info(
+                        "AivisSpeech initialized with %s speakers",
+                        len(speakers),
+                        extra=FILE_ONLY_LOG_EXTRA,
+                    )
                 else:
-                    print(f"[TTSManager] スピーカー情報の取得に失敗しました")
+                    logger.warning(
+                        "AivisSpeech speaker information was unavailable",
+                        extra=FILE_ONLY_LOG_EXTRA,
+                    )
             except asyncio.TimeoutError:
-                print(f"[TTSManager] スピーカー情報取得がタイムアウトしました")
+                logger.warning(
+                    "AivisSpeech speaker information request timed out",
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
                 speakers_task.cancel()
         except Exception as e:
-            print(f"[TTSManager] スピーカー情報取得エラー: {e}")
+            logger.warning(
+                "AivisSpeech speaker information request failed: %s",
+                e,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
             
         return engine
         

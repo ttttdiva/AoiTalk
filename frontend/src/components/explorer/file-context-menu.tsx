@@ -383,8 +383,9 @@ export function FileContextMenu({
         isDirectory: false,
       };
     });
-    await deleteTargets(targets, { onDeleted: clearSelection });
+    const deletion = deleteTargets(targets, { onDeleted: clearSelection });
     onClose();
+    await deletion;
   };
 
   const canPaste =

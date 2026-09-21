@@ -6,17 +6,21 @@ pull-only local caches on mobile.
 
 from __future__ import annotations
 
+import base64
+import binascii
+import hashlib
 import json
 import logging
 import os
 import secrets
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -104,6 +108,29 @@ SYNC_PULL_LIMITS = {
     **DOCS_PULL_LIMITS,
 }
 
+# General (non-Docs) pulls used to return every changed entity in one response.
+# Conversation message metadata can be several megabytes per row, so the
+# legacy 5,000-row cap still produces an unsafe response for mobile's JSON
+# parser.  The additive protocol below keeps legacy clients unchanged while
+# allowing newer clients to consume a bounded keyset page at a time.
+GENERAL_SYNC_PAGINATION_VERSION = 1
+GENERAL_SYNC_PAGE_LIMITS = {
+    "projects": 100,
+    "tasks": 100,
+    "task_occurrences": 100,
+    "time_entries": 100,
+    "conversation_sessions": 100,
+    # A conversation message may contain a large model transcript/tool result;
+    # keep this page deliberately smaller than the other general tables.
+    # Live device data contains multi-megabyte metadata rows; 16 keeps the
+    # UTF-16/JSON parse peak below the Android Java-heap growth limit even when
+    # a page happens to cluster the largest transcripts.
+    "conversation_messages": 16,
+    "record_tables": 100,
+    "record_fields": 100,
+    "record_rows": 100,
+}
+
 
 class SyncOperation(BaseModel):
     op_id: str
@@ -137,6 +164,10 @@ class SyncPullPayload(BaseModel):
     # and legacy v2 mobile clients retain their existing request contract.
     docs_snapshot_token: Optional[str] = None
     docs_scope_revision: Optional[str] = None
+    # Additive general-table keyset pagination.  Kept separate from the Docs
+    # cursor envelope so each protocol can evolve independently.
+    general_cursors: dict[str, str] = Field(default_factory=dict)
+    general_snapshot_token: Optional[str] = None
 
 
 async def _read_pull_docs_digests(request: Request) -> dict[str, str]:
@@ -246,6 +277,52 @@ async def _read_pull_docs_scope_id(request: Request) -> Optional[str]:
         return None
     try:
         return SyncPullPayload.model_validate_json(raw).docs_scope_id
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _read_pull_general_cursors(request: Request) -> dict[str, str]:
+    """Read general-table cursors from the query string (JSON object)."""
+
+    from_query = request.query_params.get("general_cursors")
+    if from_query:
+        try:
+            return SyncPullPayload.model_validate(
+                {"general_cursors": json.loads(from_query)}
+            ).general_cursors
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=400, detail="Invalid general sync cursors"
+            ) from exc
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return {}
+    if not raw:
+        return {}
+    try:
+        return SyncPullPayload.model_validate_json(raw).general_cursors
+    except Exception:  # noqa: BLE001
+        # Preserve the legacy GET/body fallback semantics.  A malformed or
+        # unrelated body must not break an otherwise valid pull; query
+        # parameters remain strict because they explicitly opt into v1.
+        return {}
+
+
+async def _read_pull_general_snapshot_token(request: Request) -> Optional[str]:
+    """Read the opaque general snapshot token from the query string."""
+
+    from_query = request.query_params.get("general_snapshot_token")
+    if from_query:
+        return from_query
+    try:
+        raw = await request.body()
+    except Exception:  # noqa: BLE001
+        return None
+    if not raw:
+        return None
+    try:
+        return SyncPullPayload.model_validate_json(raw).general_snapshot_token
     except Exception:  # noqa: BLE001
         return None
 
@@ -446,10 +523,9 @@ def _split_changes(rows: list[Any]) -> dict[str, Any]:
     changes = []
     tombstones = []
     for row in rows:
-        payload = row.to_dict()
         deleted_at = getattr(row, "deleted_at", None)
         if deleted_at is None:
-            changes.append(payload)
+            changes.append(row.to_dict())
         else:
             tombstone = {"id": str(row.id), "deleted_at": _iso(deleted_at)}
             deletion_batch_id = getattr(row, "deletion_batch_id", None)
@@ -457,6 +533,296 @@ def _split_changes(rows: list[Any]) -> dict[str, Any]:
                 tombstone["deletion_batch_id"] = str(deletion_batch_id)
             tombstones.append(tombstone)
     return {"changes": changes, "tombstones": tombstones, "cursor": None}
+
+
+def _general_scope_fingerprint(user_id: UUID, project_ids: list[UUID]) -> str:
+    """Return a deterministic ACL scope binding for one general pull run."""
+
+    material = "|".join(
+        [str(user_id), *(str(project_id) for project_id in sorted(project_ids, key=str))]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _GeneralSnapshotDetails:
+    snapshot_at: datetime
+    scope: Optional[str]
+    watermark: Optional[datetime]
+    stable: bool
+
+
+def _encode_general_snapshot_token(
+    server_time: datetime,
+    scope_fingerprint: Optional[str] = None,
+    *,
+    watermark: Optional[datetime] = None,
+    stable: bool = False,
+) -> str:
+    """Encode the immutable boundary and replay watermark for one run.
+
+    The token is intentionally opaque to clients.  It carries no authority by
+    itself; it pins the query upper bound so rows created/updated while a
+    multi-page pull is in flight are picked up by the next run instead of
+    moving between pages.  ``stable=False`` means this protocol has not
+    established a commit-ordered boundary.  General v1 intentionally sets it
+    to false for every run because application timestamps are assigned before
+    the first database write; the client must therefore replay from
+    ``since=null`` after every bounded traversal.
+    """
+
+    payload = {
+        "v": GENERAL_SYNC_PAGINATION_VERSION,
+        "server_time": server_time.isoformat(),
+        "nonce": secrets.token_urlsafe(12),
+        "stable": bool(stable),
+        "watermark": watermark.isoformat() if watermark is not None else None,
+    }
+    if scope_fingerprint:
+        payload["scope"] = scope_fingerprint
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    return encoded.rstrip("=")
+
+
+def _decode_general_snapshot_details(
+    value: Optional[str],
+) -> Optional[_GeneralSnapshotDetails]:
+    if not value:
+        return None
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode((value + padding).encode("ascii")).decode(
+                "utf-8"
+            )
+        )
+    except (
+        ValueError,
+        TypeError,
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise ValueError("Invalid general sync snapshot token") from exc
+    if not isinstance(payload, dict) or payload.get("v") != GENERAL_SYNC_PAGINATION_VERSION:
+        raise ValueError("Invalid general sync snapshot token")
+    server_time = payload.get("server_time")
+    if not isinstance(server_time, str) or not payload.get("nonce"):
+        raise ValueError("Invalid general sync snapshot token")
+    parsed = _parse_datetime(server_time, "general_snapshot_token")
+    if parsed is None:
+        raise ValueError("Invalid general sync snapshot token")
+    # A client must not be able to pin a run arbitrarily far in the future.
+    # Small clock skew is harmless; a future boundary would otherwise turn a
+    # continuation into an unbounded full pull.
+    if parsed > datetime.utcnow():
+        raise ValueError("Invalid general sync snapshot token")
+    scope = payload.get("scope")
+    if scope is not None and (
+        not isinstance(scope, str)
+        or len(scope) != hashlib.sha256().digest_size * 2
+        or any(character not in "0123456789abcdef" for character in scope.lower())
+    ):
+        raise ValueError("Invalid general sync snapshot token")
+    # Tokens issued by the first v1 build had no stability metadata.  They are
+    # intentionally treated as unsafe and therefore force replay at
+    # completion instead of trusting a potentially truncated watermark.
+    stable = payload.get("stable") is True
+    raw_watermark = payload.get("watermark")
+    if raw_watermark is None:
+        watermark = None
+    elif isinstance(raw_watermark, str):
+        watermark = _parse_datetime(raw_watermark, "general_snapshot_watermark")
+        if watermark is None or watermark > parsed:
+            raise ValueError("Invalid general sync snapshot token")
+    else:
+        raise ValueError("Invalid general sync snapshot token")
+    if not stable:
+        watermark = None
+    return _GeneralSnapshotDetails(parsed, scope, watermark, stable)
+
+
+def _decode_general_snapshot_metadata(
+    value: Optional[str],
+) -> Optional[tuple[datetime, Optional[str]]]:
+    details = _decode_general_snapshot_details(value)
+    return (details.snapshot_at, details.scope) if details is not None else None
+
+
+def _decode_general_snapshot_token(value: Optional[str]) -> Optional[datetime]:
+    metadata = _decode_general_snapshot_metadata(value)
+    return metadata[0] if metadata is not None else None
+
+
+def _encode_general_cursor(
+    table: str, event_at: datetime, entity_id: Any
+) -> str:
+    payload = {
+        "v": GENERAL_SYNC_PAGINATION_VERSION,
+        "table": table,
+        "event_at": event_at.isoformat(),
+        "id": str(entity_id),
+    }
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+
+
+def _decode_general_cursor(
+    value: Optional[str], table: str
+) -> Optional[tuple[datetime, UUID]]:
+    if not value:
+        return None
+    try:
+        padding = "=" * (-len(value) % 4)
+        payload = json.loads(
+            base64.urlsafe_b64decode((value + padding).encode("ascii")).decode(
+                "utf-8"
+            )
+        )
+    except (
+        ValueError,
+        TypeError,
+        UnicodeEncodeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise ValueError("Invalid general sync cursor") from exc
+    if (
+        not isinstance(payload, dict)
+        or payload.get("v") != GENERAL_SYNC_PAGINATION_VERSION
+        or payload.get("table") != table
+        or not isinstance(payload.get("event_at"), str)
+        or not isinstance(payload.get("id"), str)
+    ):
+        raise ValueError("Invalid general sync cursor")
+    event_at = _parse_datetime(payload["event_at"], "general_cursor")
+    if event_at is None:
+        raise ValueError("Invalid general sync cursor")
+    try:
+        entity_id = UUID(payload["id"])
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid general sync cursor") from exc
+    return event_at, entity_id
+
+
+def _general_event_expression(model: Any) -> Any:
+    """Return the timestamp used for stable general-pull ordering."""
+
+    updated_at = getattr(model, "updated_at", None)
+    created_at = getattr(model, "created_at", None)
+    deleted_at = getattr(model, "deleted_at", None)
+    if updated_at is None and created_at is None and deleted_at is None:
+        raise ValueError("General sync model has no timestamp column")
+    # ``updated_at`` is the authoritative mutation clock used by the legacy
+    # pull path.  A small legacy slice has NULL updated_at, so fall back to
+    # created_at for those rows only.  Tombstones still win over the base row.
+    # Keeping this COALESCE policy in lockstep with _row_general_event_at is
+    # important: some historical rows have a local-time created_at that is
+    # newer than their UTC updated_at, and treating created_at as a second
+    # mutation clock would make the emitted cursor differ from SQL ordering.
+    if updated_at is not None and created_at is not None:
+        base_event_at = func.coalesce(updated_at, created_at)
+    else:
+        base_event_at = updated_at if updated_at is not None else created_at
+    # A handful of imported legacy messages have neither timestamp.  Give
+    # them a deterministic lower-bound key instead of letting SQL NULL
+    # ordering silently drop them from a full pull.  _general_page_statement
+    # explicitly keeps this null-timestamp slice visible even when since is
+    # already advanced; such rows are rare and are safely idempotent locally.
+    if base_event_at is not None:
+        base_event_at = func.coalesce(base_event_at, literal(datetime.min))
+    else:
+        base_event_at = literal(datetime.min)
+    if deleted_at is None:
+        return base_event_at
+    return func.greatest(base_event_at, deleted_at)
+
+
+def _general_page_statement(
+    stmt: Any,
+    model: Any,
+    *,
+    table: str,
+    since: Optional[datetime],
+    snapshot_at: datetime,
+    cursor: Optional[str],
+    limit: int,
+    event_expression: Any | None = None,
+) -> Any:
+    event_at = (
+        event_expression
+        if event_expression is not None
+        else _general_event_expression(model)
+    )
+    stmt = stmt.where(event_at <= snapshot_at)
+    if since:
+        since_filter = event_at > since
+        updated_column = getattr(model, "updated_at", None)
+        created_column = getattr(model, "created_at", None)
+        deleted_column = getattr(model, "deleted_at", None)
+        null_timestamp_columns = [
+            column
+            for column in (updated_column, created_column, deleted_column)
+            if column is not None
+        ]
+        if null_timestamp_columns:
+            # Keep rows whose entire timestamp tuple is NULL visible on every
+            # run.  Their deterministic datetime.min key prevents cursor
+            # livelock; the mobile upsert remains idempotent until a later
+            # server mutation supplies a real timestamp.
+            null_timestamp = and_(*[column.is_(None) for column in null_timestamp_columns])
+            stmt = stmt.where(or_(since_filter, null_timestamp))
+        else:
+            stmt = stmt.where(since_filter)
+    decoded = _decode_general_cursor(cursor, table)
+    if decoded:
+        cursor_time, cursor_id = decoded
+        stmt = stmt.where(
+            or_(
+                event_at < cursor_time,
+                and_(event_at == cursor_time, model.id < cursor_id),
+            )
+        )
+    return stmt.order_by(event_at.desc(), model.id.desc()).limit(limit + 1)
+
+
+def _row_event_at(row: Any, *fields: str) -> Optional[datetime]:
+    values = [getattr(row, field, None) for field in fields]
+    values = [value for value in values if value is not None]
+    return max(values) if values else None
+
+
+def _row_general_event_at(row: Any) -> Optional[datetime]:
+    """Match _general_event_expression's updated/created/deleted ordering."""
+
+    base = getattr(row, "updated_at", None) or getattr(row, "created_at", None)
+    deleted_at = getattr(row, "deleted_at", None)
+    values = [value for value in (base, deleted_at) if value is not None]
+    return max(values) if values else datetime.min
+
+
+def _general_page_payload(
+    rows: list[Any],
+    *,
+    table: str,
+    limit: int,
+    splitter,
+    event_getter,
+) -> dict[str, Any]:
+    page = rows[:limit]
+    payload = splitter(page)
+    next_cursor = None
+    if len(rows) > limit and page:
+        event_at = event_getter(page[-1])
+        if event_at is not None:
+            next_cursor = _encode_general_cursor(table, event_at, page[-1].id)
+    payload["cursor"] = next_cursor
+    return payload
 
 
 def _conversation_session_payload(row: ConversationSession) -> dict[str, Any]:
@@ -563,21 +929,54 @@ def _conversation_user_ids(user_id: UUID) -> list[str]:
 
 
 async def _pull_projects(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
     stmt = select(Project).where(Project.id.in_(project_ids))
-    if since:
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            Project,
+            table="projects",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["projects"],
+        )
+    elif since:
         stmt = stmt.where(
             or_(Project.updated_at > since, Project.deleted_at > since)
         )
     result = await session.execute(stmt)
-    return _split_changes(list(result.scalars().all()))
+    rows = list(result.scalars().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="projects",
+            limit=GENERAL_SYNC_PAGE_LIMITS["projects"],
+            splitter=_split_changes,
+            event_getter=_row_general_event_at,
+        )
+    return _split_changes(rows)
 
 
 async def _pull_tasks(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -591,11 +990,145 @@ async def _pull_tasks(
         )
         .where(Task.project_id.in_(project_ids))
     )
-    if since:
-        stmt = stmt.where(or_(Task.updated_at > since, Task.deleted_at > since))
-    stmt = stmt.order_by(Task.updated_at.desc()).limit(SYNC_PULL_LIMITS["tasks"])
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            Task,
+            table="tasks",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["tasks"],
+        )
+    else:
+        if since:
+            stmt = stmt.where(or_(Task.updated_at > since, Task.deleted_at > since))
+        stmt = stmt.order_by(Task.updated_at.desc()).limit(SYNC_PULL_LIMITS["tasks"])
     result = await session.execute(stmt)
-    payload = _split_changes(list(result.scalars().unique().all()))
+    rows = list(result.scalars().unique().all())
+    if not general_pagination:
+        payload = _split_changes(rows)
+    else:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+
+        # A purged task has no row left to return from the ordinary Task
+        # query.  Merge the bounded deletion-ledger stream with the bounded
+        # live-row stream before choosing the page boundary.  Both streams use
+        # the same (event_at, UUID) descending key, so a cursor advances past
+        # *all* task lifecycle events instead of silently ending after the
+        # first 100 live rows.  The two streams are intentionally kept as
+        # independent records: mobile tombstone application is idempotent and
+        # compares server timestamps, while retaining both records avoids
+        # needing to materialize the unbounded ledger to de-duplicate it.
+        task_limit = GENERAL_SYNC_PAGE_LIMITS["tasks"]
+        ledger_stmt = select(ContentDeletionEvent).where(
+            ContentDeletionEvent.entity_type == "task",
+            ContentDeletionEvent.project_id.in_(project_ids),
+            ContentDeletionEvent.action.in_(
+                ("deleted", "purged", "permanent_deleted")
+            ),
+            ContentDeletionEvent.event_at <= general_snapshot_at,
+        )
+        if since:
+            ledger_stmt = ledger_stmt.where(ContentDeletionEvent.event_at > since)
+        decoded_cursor = _decode_general_cursor(general_cursor, "tasks")
+        if decoded_cursor:
+            cursor_time, cursor_id = decoded_cursor
+            ledger_stmt = ledger_stmt.where(
+                or_(
+                    ContentDeletionEvent.event_at < cursor_time,
+                    and_(
+                        ContentDeletionEvent.event_at == cursor_time,
+                        ContentDeletionEvent.id < cursor_id,
+                    ),
+                )
+            )
+        ledger_stmt = ledger_stmt.order_by(
+            ContentDeletionEvent.event_at.desc(),
+            ContentDeletionEvent.id.desc(),
+        ).limit(task_limit + 1)
+        ledger_result = await session.execute(ledger_stmt)
+        ledger_events = list(ledger_result.scalars().all())
+
+        stream: list[tuple[datetime, UUID, str, Any]] = []
+        for row in rows:
+            event_at = _row_general_event_at(row)
+            if event_at is not None:
+                stream.append((event_at, UUID(str(row.id)), "row", row))
+        for event in ledger_events:
+            if event.event_at is not None:
+                stream.append((event.event_at, UUID(str(event.id)), "ledger", event))
+        stream.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+        page = stream[:task_limit]
+        changes = []
+        tombstones = []
+        # If a retained Task row and its deletion-ledger event share the same
+        # timestamp, prefer the row as the canonical current state.  This
+        # avoids a UUID tie-break putting a stale tombstone ahead of an active
+        # restored row; timestamp-based mobile LWW then converges correctly for
+        # any pair that lands in this bounded page.
+        winners: dict[str, tuple[datetime, UUID, str, Any]] = {}
+        for record in page:
+            entity_id = (
+                str(record[3].id)
+                if record[2] == "row"
+                else str(record[3].entity_id)
+            )
+            previous = winners.get(entity_id)
+            if (
+                previous is None
+                or record[0] > previous[0]
+                or (
+                    record[0] == previous[0]
+                    and record[2] == "row"
+                    and previous[2] == "ledger"
+                )
+            ):
+                winners[entity_id] = record
+        for _event_at, _cursor_id, source, item in page:
+            entity_id = str(item.id) if source == "row" else str(item.entity_id)
+            winner = winners.get(entity_id)
+            if winner is None or winner[3] is not item:
+                continue
+            if source == "row":
+                if getattr(item, "deleted_at", None) is None:
+                    changes.append(item.to_dict())
+                else:
+                    tombstone = {
+                        "id": entity_id,
+                        "deleted_at": _iso(item.deleted_at),
+                    }
+                    deletion_batch_id = getattr(item, "deletion_batch_id", None)
+                    if deletion_batch_id:
+                        tombstone["deletion_batch_id"] = str(deletion_batch_id)
+                    tombstones.append(tombstone)
+            else:
+                # A ledger event can contain a malformed/non-UUID entity id
+                # from older integrations.  It is still safe to expose its
+                # opaque tombstone; the mobile cache validates IDs at apply.
+                tombstones.append(
+                    {
+                        "id": entity_id,
+                        "deleted_at": _iso(item.event_at),
+                        "deletion_batch_id": (
+                            str(item.batch_id) if item.batch_id is not None else None
+                        ),
+                    }
+                )
+
+        payload = {
+            "changes": changes,
+            "tombstones": tombstones,
+            "cursor": None,
+        }
+        if len(stream) > task_limit and page:
+            event_at, cursor_id, _source, _item = page[-1]
+            payload["cursor"] = _encode_general_cursor("tasks", event_at, cursor_id)
+        return payload
 
     # A purged task no longer has a row for the ordinary table query.  Keep
     # the append-only deletion ledger as the durable sync source so a client
@@ -608,8 +1141,26 @@ async def _pull_tasks(
     )
     if since:
         ledger_stmt = ledger_stmt.where(ContentDeletionEvent.event_at > since)
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        ledger_stmt = ledger_stmt.where(
+            ContentDeletionEvent.event_at <= general_snapshot_at
+        )
+        decoded_cursor = _decode_general_cursor(general_cursor, "tasks")
+        if decoded_cursor:
+            cursor_time, cursor_id = decoded_cursor
+            ledger_stmt = ledger_stmt.where(
+                or_(
+                    ContentDeletionEvent.event_at < cursor_time,
+                    and_(
+                        ContentDeletionEvent.event_at == cursor_time,
+                        ContentDeletionEvent.id < cursor_id,
+                    ),
+                )
+            )
     ledger_stmt = ledger_stmt.order_by(
-        ContentDeletionEvent.event_at.desc()
+        ContentDeletionEvent.event_at.desc(), ContentDeletionEvent.id.desc()
     ).limit(SYNC_PULL_LIMITS["tasks"])
     ledger_result = await session.execute(ledger_stmt)
     latest_by_id: dict[str, ContentDeletionEvent] = {}
@@ -639,7 +1190,13 @@ async def _pull_tasks(
 
 
 async def _pull_occurrences(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -654,19 +1211,47 @@ async def _pull_occurrences(
         )
         .where(Task.project_id.in_(project_ids))
     )
-    if since:
-        stmt = stmt.where(
-            or_(TaskOccurrence.updated_at > since, TaskOccurrence.deleted_at > since)
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            TaskOccurrence,
+            table="task_occurrences",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["task_occurrences"],
         )
-    stmt = stmt.order_by(TaskOccurrence.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["task_occurrences"]
-    )
+    else:
+        if since:
+            stmt = stmt.where(
+                or_(TaskOccurrence.updated_at > since, TaskOccurrence.deleted_at > since)
+            )
+        stmt = stmt.order_by(TaskOccurrence.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["task_occurrences"]
+        )
     result = await session.execute(stmt)
-    return _split_changes(list(result.scalars().unique().all()))
+    rows = list(result.scalars().unique().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="task_occurrences",
+            limit=GENERAL_SYNC_PAGE_LIMITS["task_occurrences"],
+            splitter=_split_changes,
+            event_getter=_row_general_event_at,
+        )
+    return _split_changes(rows)
 
 
 async def _pull_time_entries(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_changes([])
@@ -680,41 +1265,139 @@ async def _pull_time_entries(
         )
         .where(Task.project_id.in_(project_ids))
     )
-    if since:
-        stmt = stmt.where(or_(TimeEntry.updated_at > since, TimeEntry.deleted_at > since))
-    stmt = stmt.order_by(TimeEntry.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["time_entries"]
-    )
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            TimeEntry,
+            table="time_entries",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["time_entries"],
+        )
+    else:
+        if since:
+            stmt = stmt.where(or_(TimeEntry.updated_at > since, TimeEntry.deleted_at > since))
+        stmt = stmt.order_by(TimeEntry.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["time_entries"]
+        )
     result = await session.execute(stmt)
-    return _split_changes(list(result.scalars().unique().all()))
+    rows = list(result.scalars().unique().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="time_entries",
+            limit=GENERAL_SYNC_PAGE_LIMITS["time_entries"],
+            splitter=_split_changes,
+            event_getter=_row_general_event_at,
+        )
+    return _split_changes(rows)
 
 
 async def _pull_conversation_sessions(
-    session: AsyncSession, user_id: UUID, since: Optional[datetime]
+    session: AsyncSession,
+    user_id: UUID,
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     visible_user_ids = _conversation_user_ids(user_id)
     stmt = select(ConversationSession).where(
         ConversationSession.user_id.in_(visible_user_ids)
     )
-    if since:
-        stmt = stmt.where(
-            or_(
-                ConversationSession.last_activity > since,
-                ConversationSession.last_read_at > since,
-                ConversationSession.deleted_at > since,
-            )
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        # ``GREATEST`` is NULL-tolerant on PostgreSQL and keeps the SQL cursor
+        # timestamp identical to the Python event getter below, including
+        # session-start rows whose last-activity/read timestamps are absent.
+        session_event = func.greatest(
+            ConversationSession.last_activity,
+            ConversationSession.last_read_at,
+            ConversationSession.session_start,
+            ConversationSession.deleted_at,
         )
-    stmt = stmt.order_by(ConversationSession.last_activity.desc()).limit(
-        SYNC_PULL_LIMITS["conversation_sessions"]
-    )
+        stmt = _general_page_statement(
+            stmt,
+            ConversationSession,
+            table="conversation_sessions",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"],
+            event_expression=session_event,
+        )
+    else:
+        if since:
+            stmt = stmt.where(
+                or_(
+                    ConversationSession.last_activity > since,
+                    ConversationSession.last_read_at > since,
+                    ConversationSession.deleted_at > since,
+                )
+            )
+        stmt = stmt.order_by(ConversationSession.last_activity.desc()).limit(
+            SYNC_PULL_LIMITS["conversation_sessions"]
+        )
     result = await session.execute(stmt)
+    rows = list(result.scalars().all())
+    page_rows = (
+        rows[: GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"]]
+        if general_pagination
+        else rows
+    )
     changes = []
     tombstones = []
-    for row in result.scalars().all():
+    for row in page_rows:
         if row.deleted_at is None:
             changes.append(_conversation_session_payload(row))
         else:
             tombstones.append({"id": str(row.id), "deleted_at": _iso(row.deleted_at)})
+
+    payload: dict[str, Any] = {
+        "changes": changes,
+        "tombstones": tombstones,
+        "cursor": None,
+    }
+    if general_pagination:
+        payload = _general_page_payload(
+            rows,
+            table="conversation_sessions",
+            limit=GENERAL_SYNC_PAGE_LIMITS["conversation_sessions"],
+            splitter=lambda page: {
+                "changes": [
+                    _conversation_session_payload(row)
+                    for row in page
+                    if row.deleted_at is None
+                ],
+                "tombstones": [
+                    {"id": str(row.id), "deleted_at": _iso(row.deleted_at)}
+                    for row in page
+                    if row.deleted_at is not None
+                ],
+                "cursor": None,
+            },
+            event_getter=lambda row: _row_event_at(
+                row, "last_activity", "last_read_at", "session_start", "deleted_at"
+            ),
+        )
+        # Authoritative reconciliation is safe only on the terminal page;
+        # reconciling against a partial page would delete valid local rows.
+        if payload.get("cursor") is None:
+            active_ids_result = await session.execute(
+                select(ConversationSession.id).where(
+                    ConversationSession.user_id.in_(visible_user_ids),
+                    ConversationSession.deleted_at.is_(None),
+                )
+            )
+            payload["authoritative_ids"] = [
+                str(item) for item in active_ids_result.scalars().all()
+            ]
+        return payload
 
     active_ids_result = await session.execute(
         select(ConversationSession.id).where(
@@ -722,17 +1405,18 @@ async def _pull_conversation_sessions(
             ConversationSession.deleted_at.is_(None),
         )
     )
-    authoritative_ids = [str(item) for item in active_ids_result.scalars().all()]
-    return {
-        "changes": changes,
-        "tombstones": tombstones,
-        "cursor": None,
-        "authoritative_ids": authoritative_ids,
-    }
+    payload["authoritative_ids"] = [str(item) for item in active_ids_result.scalars().all()]
+    return payload
 
 
 async def _pull_conversation_messages(
-    session: AsyncSession, user_id: UUID, since: Optional[datetime]
+    session: AsyncSession,
+    user_id: UUID,
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     stmt = (
         select(ConversationMessage)
@@ -742,69 +1426,175 @@ async def _pull_conversation_messages(
         )
         .where(ConversationSession.user_id.in_(_conversation_user_ids(user_id)))
     )
-    if since:
-        stmt = stmt.where(
-            or_(
-                ConversationMessage.updated_at > since,
-                ConversationMessage.deleted_at > since,
-            )
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            ConversationMessage,
+            table="conversation_messages",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["conversation_messages"],
         )
-    stmt = stmt.order_by(ConversationMessage.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["conversation_messages"]
-    )
+    else:
+        if since:
+            stmt = stmt.where(
+                or_(
+                    ConversationMessage.updated_at > since,
+                    ConversationMessage.deleted_at > since,
+                )
+            )
+        stmt = stmt.order_by(ConversationMessage.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["conversation_messages"]
+        )
     result = await session.execute(stmt)
-    return _split_changes(list(result.scalars().unique().all()))
+    rows = list(result.scalars().unique().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="conversation_messages",
+            limit=GENERAL_SYNC_PAGE_LIMITS["conversation_messages"],
+            splitter=_split_changes,
+            event_getter=_row_general_event_at,
+        )
+    return _split_changes(rows)
 
 
 async def _pull_record_tables(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_record_changes([], _record_table_payload)
     stmt = select(RecordTable).where(RecordTable.project_id.in_(project_ids))
-    if since:
-        stmt = stmt.where(
-            or_(RecordTable.updated_at > since, RecordTable.deleted_at > since)
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            RecordTable,
+            table="record_tables",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_tables"],
         )
-    stmt = stmt.order_by(RecordTable.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["record_tables"]
-    )
+    else:
+        if since:
+            stmt = stmt.where(
+                or_(RecordTable.updated_at > since, RecordTable.deleted_at > since)
+            )
+        stmt = stmt.order_by(RecordTable.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["record_tables"]
+        )
     result = await session.execute(stmt)
-    return _split_record_changes(list(result.scalars().all()), _record_table_payload)
+    rows = list(result.scalars().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="record_tables",
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_tables"],
+            splitter=lambda page: _split_record_changes(page, _record_table_payload),
+            event_getter=_row_general_event_at,
+        )
+    return _split_record_changes(rows, _record_table_payload)
 
 
 async def _pull_record_fields(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_record_changes([], _record_field_payload)
     stmt = select(RecordField).join(RecordTable).where(
         RecordTable.project_id.in_(project_ids)
     )
-    if since:
-        stmt = stmt.where(
-            or_(RecordField.updated_at > since, RecordField.deleted_at > since)
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            RecordField,
+            table="record_fields",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_fields"],
         )
-    stmt = stmt.order_by(RecordField.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["record_fields"]
-    )
+    else:
+        if since:
+            stmt = stmt.where(
+                or_(RecordField.updated_at > since, RecordField.deleted_at > since)
+            )
+        stmt = stmt.order_by(RecordField.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["record_fields"]
+        )
     result = await session.execute(stmt)
-    return _split_record_changes(list(result.scalars().all()), _record_field_payload)
+    rows = list(result.scalars().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="record_fields",
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_fields"],
+            splitter=lambda page: _split_record_changes(page, _record_field_payload),
+            event_getter=_row_general_event_at,
+        )
+    return _split_record_changes(rows, _record_field_payload)
 
 
 async def _pull_record_rows(
-    session: AsyncSession, project_ids: list[UUID], since: Optional[datetime]
+    session: AsyncSession,
+    project_ids: list[UUID],
+    since: Optional[datetime],
+    *,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if not project_ids:
         return _split_record_changes([], _record_row_payload)
     stmt = select(RecordRow).where(RecordRow.project_id.in_(project_ids))
-    if since:
-        stmt = stmt.where(or_(RecordRow.updated_at > since, RecordRow.deleted_at > since))
-    stmt = stmt.order_by(RecordRow.updated_at.desc()).limit(
-        SYNC_PULL_LIMITS["record_rows"]
-    )
+    if general_pagination:
+        if general_snapshot_at is None:
+            raise ValueError("General sync snapshot is missing")
+        stmt = _general_page_statement(
+            stmt,
+            RecordRow,
+            table="record_rows",
+            since=since,
+            snapshot_at=general_snapshot_at,
+            cursor=general_cursor,
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_rows"],
+        )
+    else:
+        if since:
+            stmt = stmt.where(or_(RecordRow.updated_at > since, RecordRow.deleted_at > since))
+        stmt = stmt.order_by(RecordRow.updated_at.desc()).limit(
+            SYNC_PULL_LIMITS["record_rows"]
+        )
     result = await session.execute(stmt)
-    return _split_record_changes(list(result.scalars().all()), _record_row_payload)
+    rows = list(result.scalars().all())
+    if general_pagination:
+        return _general_page_payload(
+            rows,
+            table="record_rows",
+            limit=GENERAL_SYNC_PAGE_LIMITS["record_rows"],
+            splitter=lambda page: _split_record_changes(page, _record_row_payload),
+            event_getter=_row_general_event_at,
+        )
+    return _split_record_changes(rows, _record_row_payload)
 
 
 async def _pull_table(
@@ -824,6 +1614,9 @@ async def _pull_table(
     docs_scope_revision: Optional[str] = None,
     docs_project_id: Optional[UUID] = None,
     docs_accessible_project_ids: Optional[list[UUID]] = None,
+    general_pagination: bool = False,
+    general_cursor: Optional[str] = None,
+    general_snapshot_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     if table in DOCS_SYNC_TABLES:
         if docs_docs_library_id is None:
@@ -849,23 +1642,97 @@ async def _pull_table(
             scope_revision=docs_scope_revision,
         )
     if table == "projects":
-        return await _pull_projects(session, project_ids, since)
+        payload = await _pull_projects(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
+        # Sync retains management/Docs visibility. The mobile operational
+        # selectors and task aggregates must use participation, not that ACL.
+        participating_ids = {
+            str(project_id)
+            for project_id in await ProjectRepository.get_participating_project_ids(
+                session, user_id
+            )
+        }
+        for project in payload["changes"]:
+            project["is_participating"] = str(project["id"]) in participating_ids
+        return payload
     if table == "tasks":
-        return await _pull_tasks(session, project_ids, since)
+        return await _pull_tasks(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "task_occurrences":
-        return await _pull_occurrences(session, project_ids, since)
+        return await _pull_occurrences(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "time_entries":
-        return await _pull_time_entries(session, project_ids, since)
+        return await _pull_time_entries(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "conversation_sessions":
-        return await _pull_conversation_sessions(session, user_id, since)
+        return await _pull_conversation_sessions(
+            session,
+            user_id,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "conversation_messages":
-        return await _pull_conversation_messages(session, user_id, since)
+        return await _pull_conversation_messages(
+            session,
+            user_id,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "record_tables":
-        return await _pull_record_tables(session, project_ids, since)
+        return await _pull_record_tables(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "record_fields":
-        return await _pull_record_fields(session, project_ids, since)
+        return await _pull_record_fields(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table == "record_rows":
-        return await _pull_record_rows(session, project_ids, since)
+        return await _pull_record_rows(
+            session,
+            project_ids,
+            since,
+            general_pagination=general_pagination,
+            general_cursor=general_cursor,
+            general_snapshot_at=general_snapshot_at,
+        )
     if table in LEGACY_STORY_TABLES:
         return await pull_story_table(
             table,
@@ -1321,7 +2188,7 @@ async def _apply_project_operation(
         await ProjectRepository.delete_project(
             session,
             project_id,
-            delete_library=True,
+            delete_workspace=True,
             workspace_root=workspace_root,
         )
         return {"id": str(project_id), "deleted_at": datetime.utcnow().isoformat()}
@@ -1335,6 +2202,16 @@ async def _apply_project_operation(
                 session, project_id=project_id, user_id=user_id, permission="write"
             )
             _ensure_not_stale(existing.updated_at, operation.base_updated_at)
+            if (
+                "name" in values
+                and existing.is_completed
+                and str(values["name"] or "").strip()
+                != str(existing.name or "").strip()
+            ):
+                raise TaskManagementError(
+                    "完了済みProjectの名前は変更できません。再開してから変更してください",
+                    status_code=409,
+                )
             if "space_id" in values and values["space_id"] is not None:
                 from ..services.space_access import can_write_space
 
@@ -1351,12 +2228,25 @@ async def _apply_project_operation(
             updated = await ProjectRepository.update_project(
                 session,
                 project_id,
+                commit=("name" not in values),
                 **{
                     key: value
                     for key, value in values.items()
                     if value is not None or key == "space_id"
                 },
             )
+            if updated is not None and "name" in values:
+                from ..services.project_information_docs import (
+                    ensure_project_information_doc,
+                    is_default_inbox_project,
+                )
+                if not is_default_inbox_project(updated) and not updated.is_completed:
+                    await ensure_project_information_doc(
+                        session,
+                        project=updated,
+                        user_id=user_id,
+                    )
+                await session.commit()
             return updated.to_dict() if updated else {"id": str(project_id)}
         space_id = values.get("space_id")
         if space_id is not None:
@@ -1388,22 +2278,25 @@ async def _apply_project_operation(
             ),
             storage_quota_mb=int(values["storage_quota_mb"] or 1000),
             project_metadata=values["project_metadata"] or {},
+            commit=False,
         )
         # Sync create is another Project creation path. Seed the canonical
-        # information node after the repository's internal commit; failures
-        # remain retryable by the Project tab's idempotent ensure endpoint.
+        # information node in the same transaction so a successful Project
+        # response can never leave a missing/partially-created canonical root.
         from ..services.project_information_docs import (
             ensure_project_information_doc,
             is_default_inbox_project,
         )
-        if not is_default_inbox_project(created):
+        # Completed Projects retain any existing canonical rows for cleanup,
+        # but must not bootstrap a fresh active identity during sync create.
+        if not is_default_inbox_project(created) and not created.is_completed:
             await ensure_project_information_doc(
                 session,
                 project=created,
                 user_id=user_id,
             )
-            await session.commit()
-            await session.refresh(created)
+        await session.commit()
+        await session.refresh(created)
         return created.to_dict()
 
     if operation.action == "update":
@@ -1433,7 +2326,34 @@ async def _apply_project_operation(
                     raise TaskManagementError("Space access denied", status_code=403)
         if "name" in update_values and not update_values["name"]:
             update_values.pop("name")
-        updated = await ProjectRepository.update_project(session, project_id, **update_values)
+        if (
+            "name" in update_values
+            and existing.is_completed
+            and str(update_values["name"] or "").strip()
+            != str(existing.name or "").strip()
+        ):
+            raise TaskManagementError(
+                "完了済みProjectの名前は変更できません。再開してから変更してください",
+                status_code=409,
+            )
+        updated = await ProjectRepository.update_project(
+            session,
+            project_id,
+            commit=("name" not in update_values),
+            **update_values,
+        )
+        if updated is not None and "name" in update_values:
+            from ..services.project_information_docs import (
+                ensure_project_information_doc,
+                is_default_inbox_project,
+            )
+            if not is_default_inbox_project(updated) and not updated.is_completed:
+                await ensure_project_information_doc(
+                    session,
+                    project=updated,
+                    user_id=user_id,
+                )
+            await session.commit()
         return updated.to_dict() if updated else {"id": str(project_id)}
 
     raise TaskManagementError("Unsupported project sync action", status_code=400)
@@ -1579,6 +2499,9 @@ def create_sync_router(
         docs_snapshot_token: Optional[str] = None,
         docs_scope_revision: Optional[str] = None,
         docs_reconcile: bool = True,
+        general_pagination: bool = False,
+        general_cursors: Optional[str] = None,
+        general_snapshot_token: Optional[str] = None,
         _auth=Depends(require_auth_dependency),
     ):
         user_id, _ = await _get_current_user(request)
@@ -1588,6 +2511,11 @@ def create_sync_router(
         body_scope_revision = await _read_pull_docs_scope_revision(request)
         body_project_id = await _read_pull_project_id(request)
         body_docs_scope_id = await _read_pull_docs_scope_id(request)
+        parsed_general_cursors = await _read_pull_general_cursors(request)
+        requested_general_snapshot_token = (
+            general_snapshot_token
+            or await _read_pull_general_snapshot_token(request)
+        )
         # Query parameters win, matching the existing digest/cursor readers;
         # GET bodies remain a test/tooling fallback for composite Docs scopes.
         project_id = project_id or body_project_id
@@ -1612,14 +2540,89 @@ def create_sync_router(
         unsupported = [table for table in requested if table not in SYNC_TABLES]
         if unsupported:
             raise HTTPException(status_code=400, detail=f"Unsupported tables: {unsupported}")
+        unsupported_general = [
+            table
+            for table in parsed_general_cursors
+            if table not in GENERAL_SYNC_PAGE_LIMITS
+        ]
+        if unsupported_general:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported general sync cursors: {unsupported_general}",
+            )
+        general_requested = general_pagination and any(
+            table in GENERAL_SYNC_PAGE_LIMITS for table in requested
+        )
 
         session = await get_db_manager().get_session()
         server_time = datetime.utcnow()
         try:
             since_dt = _parse_datetime(since, "since")
+            general_snapshot_at: Optional[datetime] = None
+            general_snapshot_scope: Optional[str] = None
+            # Application timestamps are assigned before the first database
+            # write and therefore cannot prove commit ordering.  General v1
+            # deliberately keeps the wall-clock page boundary only for
+            # bounded traversal; completion never acknowledges it as an
+            # incremental watermark.  Every completed run replays from
+            # ``since=null`` on the next request, which is lossless even when
+            # a writer obtains its XID after page 1 has advanced.
+            general_snapshot_stable = False
+            general_watermark: Optional[datetime] = None
+            if general_requested:
+                try:
+                    snapshot_details = _decode_general_snapshot_details(
+                        requested_general_snapshot_token
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400, detail=str(exc)
+                    ) from exc
+                if snapshot_details is None:
+                    general_snapshot_at = server_time
+                else:
+                    general_snapshot_at = snapshot_details.snapshot_at
+                    general_snapshot_scope = snapshot_details.scope
+                    # Never trust client-supplied stability metadata.  The
+                    # current protocol intentionally has no safe incremental
+                    # watermark; the token's timestamp is only a page bound.
+                    general_snapshot_stable = False
+                    general_watermark = None
+                    # Continuation pages must echo the original snapshot
+                    # boundary and replay watermark.
+                    server_time = general_snapshot_at
+                    general_snapshot_token = requested_general_snapshot_token
             await ProjectRepository.ensure_user_inbox_setup(session, user_id)
             await session.commit()
             project_ids = await _accessible_project_ids(session, user_id)
+            if general_requested:
+                current_general_scope = _general_scope_fingerprint(user_id, project_ids)
+                if requested_general_snapshot_token:
+                    # A general cursor is only meaningful for the exact ACL
+                    # projection that produced it.  Recomputing the project
+                    # set on every page prevents an access grant/revocation
+                    # between pages from silently skipping rows before the
+                    # final lastPulledAt watermark is committed.
+                    if general_snapshot_scope != current_general_scope:
+                        raise HTTPException(
+                            status_code=409,
+                            detail="General sync scope changed; restart pull",
+                        )
+                else:
+                    if parsed_general_cursors:
+                        raise HTTPException(
+                            status_code=400,
+                            detail="General sync cursor requires a snapshot token; restart pull",
+                        )
+                    general_snapshot_scope = current_general_scope
+                    if general_snapshot_at is None:
+                        general_snapshot_at = server_time
+                    general_snapshot_token = _encode_general_snapshot_token(
+                        general_snapshot_at,
+                        general_snapshot_scope,
+                        watermark=general_watermark,
+                        stable=general_snapshot_stable,
+                    )
             # Docs テーブルが要求された場合のみ library を解決する。
             docs_docs_library_id: Optional[UUID] = None
             docs_project_id: Optional[UUID] = None
@@ -1937,6 +2940,7 @@ def create_sync_router(
             ) or legacy_docs_without_revision
             pulled = {}
             for table in requested:
+                table_is_general = general_requested and table in GENERAL_SYNC_PAGE_LIMITS
                 try:
                     pulled[table] = await _pull_table(
                         table,
@@ -1954,24 +2958,48 @@ def create_sync_router(
                         docs_scope_revision=current_docs_scope_revision,
                         docs_project_id=docs_project_id,
                         docs_accessible_project_ids=docs_scope_project_ids,
+                        general_pagination=table_is_general,
+                        general_cursor=(
+                            parsed_general_cursors.get(table)
+                            if table_is_general
+                            else None
+                        ),
+                        general_snapshot_at=(
+                            general_snapshot_at if table_is_general else None
+                        ),
                     )
                 except (ValueError, TypeError) as exc:
                     raise HTTPException(status_code=400, detail=str(exc)) from exc
-                if table not in DOCS_SYNC_TABLES:
+                if table not in DOCS_SYNC_TABLES and not table_is_general:
                     pulled[table]["cursor"] = server_time.isoformat()
+            general_has_more = general_requested and any(
+                table in GENERAL_SYNC_PAGE_LIMITS and bool(payload.get("cursor"))
+                for table, payload in pulled.items()
+            )
+            docs_has_more = docs_pagination and any(
+                table in DOCS_SYNC_TABLES and payload.get("cursor")
+                for table, payload in pulled.items()
+            )
             response = {
                 "tables": pulled,
                 "server_time": server_time.isoformat(),
-                "has_more": docs_pagination and any(
-                    table in DOCS_SYNC_TABLES and payload.get("cursor")
-                    for table, payload in pulled.items()
-                ),
+                "has_more": bool(docs_has_more or general_has_more),
             }
             if docs_pagination:
                 response["docs_pagination_version"] = 2
                 response["docs_scope_digest"] = current_docs_scope_digest
                 response["docs_snapshot_token"] = docs_snapshot_token
                 response["docs_scope_revision"] = current_docs_scope_revision
+            if general_requested:
+                response["general_pagination_version"] = GENERAL_SYNC_PAGINATION_VERSION
+                response["general_snapshot_token"] = general_snapshot_token
+                # ``server_time`` remains the immutable page boundary.  The
+                # replay watermark is separate: an unstable run (one that
+                # observed an in-flight transaction before page 1) returns
+                # null so Mobile deliberately replays from a full bootstrap
+                # on the next run rather than risking a late-commit omission.
+                response["general_watermark"] = _iso(general_watermark)
+                response["general_has_more"] = bool(general_has_more)
             if docs_scopes:
                 response["docs_scopes"] = docs_scopes
             return response

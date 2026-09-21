@@ -20,14 +20,21 @@ import contextvars
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import select
 
 from .core import tool
-from ..services.docs_acl import apply_docs_visibility
+from ..services.agent_run_service import get_current_agent_run_id
+from ..llm.generation_cancellation import (
+    GenerationCancelled,
+    GenerationMutationBlocked,
+    GenerationInterrupted,
+    PlanningInteractionTerminated,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +44,7 @@ DOCS_READ_TOOL_NAMES = {
     "docs_search",
     "docs_read",
     "docs_query",
+    "docs_overview",
 }
 
 DOCS_MUTATION_TOOL_NAMES = {
@@ -45,6 +53,7 @@ DOCS_MUTATION_TOOL_NAMES = {
     "docs_ensure_inbox",
     "docs_create_nodes",
     "docs_update_node",
+    "docs_mutate",
     "inbox_update_item",
     "docs_move_node",
     "docs_archive_node",
@@ -85,6 +94,19 @@ def _assert_generation_mutation_allowed() -> None:
         # package is intentionally unavailable; production runtime always has
         # the guard module.
         return
+
+
+async def _fence_docs_agent_run(session) -> None:
+    """A persisted stop/restart settlement must also fence late remote tools."""
+    run_id = get_current_agent_run_id()
+    if not run_id:
+        return
+    from ..memory.models import AgentRun
+    status = await session.scalar(select(AgentRun.status).where(
+        AgentRun.id == UUID(str(run_id)),
+    ).with_for_update())
+    if status not in {"running", "queued"}:
+        raise GenerationMutationBlocked("Docs mutation blocked by settled AgentRun")
 
 
 def _record_generation_docs_resolution(
@@ -146,7 +168,29 @@ def _record_generation_docs_resolution(
         return
 
 
-def _docs_error_envelope(exc: Exception) -> str:
+_SAFE_DOCS_DIAGNOSTIC_TOKEN_RE = re.compile(r"[^a-z0-9_.-]+")
+_SAFE_DOCS_EXCEPTION_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
+
+
+def _safe_docs_diagnostic_token(value: Any, fallback: str) -> str:
+    text = str(value or "").strip().casefold()
+    normalized = _SAFE_DOCS_DIAGNOSTIC_TOKEN_RE.sub("_", text).strip("._-")
+    return (normalized or fallback)[:128]
+
+
+def _safe_docs_exception_type(exc: Exception) -> str:
+    name = type(exc).__name__
+    if _SAFE_DOCS_EXCEPTION_TYPE_RE.fullmatch(name):
+        return name
+    return "Exception"
+
+
+def _docs_error_envelope(
+    exc: Exception,
+    *,
+    operation: str = "docs",
+    stage: str = "execution",
+) -> str:
     """Return a short, machine-readable Docs tool failure envelope.
 
     Raw database/traceback text is intentionally kept out of the LLM-facing
@@ -154,11 +198,55 @@ def _docs_error_envelope(exc: Exception) -> str:
     retry storms while technical diagnostics remain in the server logs.
     """
 
+    # Generation steering/termination is control flow, not a tool failure.
+    # Preserve it even when a synchronous Docs boundary catches Exception.
+    if isinstance(exc, (GenerationInterrupted, PlanningInteractionTerminated)) or (
+        isinstance(exc, GenerationCancelled)
+        and not isinstance(exc, GenerationMutationBlocked)
+    ):
+        raise exc
+
+    safe_operation = _safe_docs_diagnostic_token(operation, "docs")
+    safe_stage = _safe_docs_diagnostic_token(stage, "execution")
+    exception_type = _safe_docs_exception_type(exc)
     message = str(exc or "").strip()
     lowered = message.casefold()
-    if isinstance(exc, PermissionError) or "権限" in message or "denied" in lowered:
+    from ..services.docs_consistency import DocsConflict, DocsContractUnavailable
+    if isinstance(exc, GenerationMutationBlocked):
+        code = "docs_mutation_blocked"
+        user_message = "Stopped or settled AgentRun cannot commit Docs changes."
+        retryable = False
+    elif isinstance(exc, DocsContractUnavailable):
+        code = "docs_contract_unavailable"
+        user_message = "Docs consistency migration or trigger validation is required before this operation."
+        retryable = False
+    elif isinstance(exc, DocsConflict):
+        code = "docs_conflict"
+        if getattr(exc, "retryable", False):
+            user_message = (
+                "Concurrent Docs/domain writer conflict; retry the same operation_id "
+                "or read view='edit' again."
+            )
+            retryable = True
+        else:
+            user_message = (
+                "Docs corpus/scope changed or the cursor is stale; restart docs_overview with current sources."
+                if operation == "docs_overview" else
+                "Docs changed, the edit lease expired, or operation_id is already bound; read view='edit' again and use a new operation_id."
+            )
+            retryable = False
+    elif isinstance(exc, PermissionError) and "system-managed" in lowered:
+        code = "docs_managed_domain"
+        user_message = "Use the owning Inbox/Mail/Memory tool for this managed document; generic Docs mutation is not allowed."
+        retryable = False
+    elif isinstance(exc, PermissionError) or "権限" in message or "denied" in lowered:
         code = "docs_access_denied"
-        user_message = "Docsへのアクセス権限がありません。"
+        if "project access denied" in lowered:
+            user_message = "project access denied"
+        elif "authenticated docs user context is required" in lowered:
+            user_message = "Authenticated Docs user context is required for mutation."
+        else:
+            user_message = "Docsへのアクセス権限がありません。"
         retryable = False
     elif "ambiguous" in lowered or "曖昧" in message:
         code = "docs_ambiguous_target"
@@ -166,18 +254,68 @@ def _docs_error_envelope(exc: Exception) -> str:
         retryable = False
     elif "not found" in lowered or "見つかりません" in message:
         code = "docs_not_found"
-        user_message = "指定されたDocsノードが見つかりません。"
+        if "node not found" in lowered:
+            user_message = "node not found in the authorized Docs scope."
+        else:
+            user_message = "指定されたDocsノードが見つかりません。"
+        retryable = False
+    elif isinstance(exc, ValueError):
+        # User-supplied mutation/search values are deterministic validation
+        # failures, not implementation faults. Keep them structured and
+        # prevent them from consuming the runtime failure breaker budget.
+        code = "docs_validation"
+        if "document_json" in lowered:
+            user_message = (
+                "document_json と expected_revision を確認してください。"
+            )
+        elif "docs root is not initialized" in lowered:
+            user_message = (
+                "Docs root is not initialized; call "
+                "patch_project_information_doc first."
+            )
+        elif "managed docs parents" in lowered:
+            user_message = "managed Docs parents cannot be modified."
+        elif "project uuid cannot be used" in lowered:
+            user_message = (
+                "Project UUID cannot be used as a Docs node id; use the "
+                "canonical Docs node id instead."
+            )
+        elif "specific authorized project" in lowered:
+            user_message = (
+                "Mutation tools require a specific authorized Project; "
+                "wildcard project is not allowed."
+            )
+        elif "project access denied" in lowered:
+            user_message = "project access denied"
+        else:
+            user_message = "Docsの入力を確認してください。"
         retryable = False
     else:
         code = "docs_access_internal"
         user_message = "Docsの内部処理に失敗しました。"
         retryable = False
+
+    diagnostic_code = (
+        f"{safe_operation}.{safe_stage}.{exception_type.casefold()}"
+    )[:240]
+    logger.warning(
+        "Docs tool failure: operation=%s stage=%s error_code=%s "
+        "diagnostic_code=%s exception_type=%s",
+        safe_operation,
+        safe_stage,
+        code,
+        diagnostic_code,
+        exception_type,
+    )
     return _json(
         {
             "success": False,
             "error": user_message,
             "error_code": code,
             "retryable": retryable,
+            "failure_stage": safe_stage,
+            "diagnostic_code": diagnostic_code,
+            "exception_type": exception_type,
         }
     )
 
@@ -194,6 +332,115 @@ def _parse_json_object(value: str, *, field_name: str) -> dict[str, Any]:
 
 def _parse_csv(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def _docs_query_turn_project_id() -> Any:
+    """Return the selected turn Project UUID for email-tree filtering."""
+
+    from ..services.turn_context import get_turn_context
+
+    raw_project_id = str(get_turn_context().project_id or "").strip()
+    if not raw_project_id or raw_project_id == "*":
+        return None
+    try:
+        return UUID(raw_project_id)
+    except (TypeError, ValueError):
+        return None
+
+
+def _docs_query_page(raw: Any, *, fallback_nodes: Any = None, offset: int = 0) -> dict[str, Any]:
+    """Normalize metadata pages while keeping legacy service doubles usable."""
+
+    if isinstance(raw, dict):
+        raw_nodes = raw.get("nodes")
+        if raw_nodes is None:
+            raw_nodes = raw.get("items")
+        nodes = list(raw_nodes or ())
+        total_matches = raw.get("total_matches")
+        returned = raw.get("returned", len(nodes))
+        group_counts = raw.get("group_counts", {})
+    else:
+        raw_nodes = getattr(raw, "nodes", None)
+        if raw_nodes is None:
+            raw_nodes = fallback_nodes if fallback_nodes is not None else raw
+        nodes = list(raw_nodes or ())
+        total_matches = getattr(raw, "total_matches", None)
+        returned = getattr(raw, "returned", len(nodes))
+        group_counts = getattr(raw, "group_counts", {})
+    try:
+        total_matches = int(total_matches)
+    except (TypeError, ValueError):
+        total_matches = None
+    try:
+        returned = max(0, int(returned))
+    except (TypeError, ValueError):
+        returned = len(nodes)
+    if returned != len(nodes):
+        # The rows are authoritative for the page exposed to the caller.  A
+        # service page may have been post-filtered by a compatibility boundary.
+        returned = len(nodes)
+        total_matches = None
+    if total_matches is not None and total_matches < returned:
+        total_matches = None
+    if not isinstance(group_counts, dict):
+        group_counts = {}
+    if total_matches is None:
+        group_counts = {}
+    has_more = total_matches > offset + returned if total_matches is not None else None
+    return {
+        "nodes": nodes,
+        "total_matches": total_matches,
+        "returned": returned,
+        "truncated": total_matches > returned if total_matches is not None else None,
+        "has_more": has_more,
+        "offset": offset,
+        "next_offset": offset + returned if has_more and returned else None,
+        "group_counts": {
+            str(key): max(0, int(value))
+            for key, value in group_counts.items()
+            if str(key).strip()
+        },
+    }
+
+
+def _docs_query_group_value(values: dict[str, Any], requested: str) -> str:
+    wanted = str(requested or "").strip().casefold()
+    for name, value in values.items():
+        if str(name).casefold() == wanted:
+            return str(value or "")
+    return ""
+
+
+async def _docs_query_node_group_value(
+    service: Any,
+    node: Any,
+    *,
+    requested: str,
+    user_id: UUID,
+    turn_project_id: UUID | None = None,
+) -> str:
+    """Resolve display rows by field name or stable field system key."""
+
+    canonical_resolver = getattr(service, "_node_group_value", None)
+    if callable(canonical_resolver):
+        return await canonical_resolver(
+            node, group_by=requested, user_id=user_id, turn_project_id=turn_project_id
+        )
+    values = await service.get_node_field_values(node, user_id=user_id)
+    value = _docs_query_group_value(values, requested)
+    if value:
+        return value
+    resolver = getattr(service, "resolve_node_fields", None)
+    if callable(resolver):
+        fields_by_ref = await resolver(node)
+        field = (
+            fields_by_ref.get(str(requested or "").strip().casefold())
+            if isinstance(fields_by_ref, dict)
+            else None
+        )
+        if field is not None:
+            return _docs_query_group_value(values, getattr(field, "name", ""))
+    return ""
 
 
 _PROJECT_DOCS_ROOT_ERROR = (
@@ -391,6 +638,8 @@ async def _resolve_operator_user_id(session, *, require_context: bool = False) -
             user = None
         if user is None:
             raise ValueError("Authenticated Docs user was not found.")
+        if getattr(user, "is_active", True) is False:
+            raise PermissionError("Authenticated Docs user is inactive.")
         return user.id
     if require_context:
         raise PermissionError("Authenticated Docs user context is required for mutation.")
@@ -561,7 +810,9 @@ async def _email_node_allowed_in_turn(session, node) -> bool:
     while current is not None and current.id not in seen:
         seen.add(current.id)
         ancestor_ids.append(current.id)
-        if str(current.system_key or "").startswith("project_mail"):
+        if str(current.docs_library_id) != str(node.docs_library_id):
+            break
+        if str(current.system_key or "").strip().startswith("project_mail"):
             return False
         current = await session.get(KnowledgeNode, current.parent_id) if current.parent_id else None
 
@@ -570,6 +821,7 @@ async def _email_node_allowed_in_turn(session, node) -> bool:
         .join(KnowledgeSupertag, KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id)
         .where(
             KnowledgeNodeSupertag.node_id.in_(ancestor_ids),
+            KnowledgeSupertag.docs_library_id == node.docs_library_id,
             KnowledgeSupertag.system_key == "email",
         )
         .limit(1)
@@ -585,6 +837,8 @@ async def _semantic_docs_hits(
     *,
     session=None,
     user_id: UUID | None = None,
+    allowed_node_ids: set[UUID] | None = None,
+    tag: str = "",
 ) -> tuple[list[UUID], Any]:
     """Return semantic node ids and lane telemetry, or ([], None) when unavailable."""
     if not str(query or "").strip():
@@ -599,10 +853,44 @@ async def _semantic_docs_hits(
             limit=limit,
             session=session,
             user_id=user_id,
+            allowed_node_ids=allowed_node_ids,
+            tag=tag,
+            turn_project_id=_docs_query_turn_project_id(),
         )
         return result.node_ids, result.telemetry
     except Exception:
         return [], None
+
+
+def _fuse_docs_hits(lexical, semantic, *, query: str, limit: int):
+    """Rank fusion with deterministic identity/title lookup precedence."""
+    rows, scores = {}, {}
+    for lane in (lexical, semantic):
+        seen = set()
+        for rank, node in enumerate(lane, 1):
+            if node.id in seen:
+                continue
+            seen.add(node.id)
+            rows[node.id] = node
+            scores[node.id] = scores.get(node.id, 0.0) + 1.0 / (60 + rank)
+    text = str(query or "").strip().casefold()
+    prefix = text.replace("-", "")
+    is_id = len(prefix) >= 8 and all(char in "0123456789abcdef" for char in prefix)
+    def key(node):
+        exact = (is_id and str(node.id).replace("-", "").startswith(prefix)) or (
+            bool(text) and str(node.title or "").casefold() == text
+        )
+        return (not exact, -scores[node.id], str(node.id))
+    return sorted(rows.values(), key=key)[:max(1, min(int(limit or 20), 100))]
+
+
+def _docs_edit_binding(actor_id, project_obj):
+    from ..services.turn_context import get_turn_context
+    from ..services.docs_consistency import scope_binding
+    context = get_turn_context()
+    return scope_binding(actor_id=actor_id, project_id=getattr(project_obj, "id", None),
+                         include_project_context=context.include_project_context,
+                         strict_scope=getattr(context, "strict_project_scope", False))
 
 
 def _project_context_scope_requested(project_ref: str = "") -> bool:
@@ -661,44 +949,6 @@ async def _resolve_context_docs_scope(
     return scope
 
 
-async def _search_docs_scope_with_tag(
-    service: Any,
-    *,
-    docs_scope: Any,
-    query: str,
-    tag: str,
-    limit: int,
-    user_id: UUID,
-) -> list[Any]:
-    """Run the legacy tag-aware search inside an already resolved scope."""
-
-    global_limit = min(int(limit or 0), 100)
-    if global_limit <= 0:
-        return []
-    per_library_limit = min(global_limit, 20)
-    candidates: list[Any] = []
-    for library_id in getattr(docs_scope, "allowed_library_ids", ()):
-        candidates.extend(
-            await service.search(
-                docs_library_id=library_id,
-                query=query,
-                tag=tag,
-                limit=per_library_limit,
-                user_id=user_id,
-            )
-        )
-    merger = getattr(service, "_merge_scoped_nodes", None)
-    if merger is None:
-        # Real DocsGraphService always exposes the merger.  A missing method
-        # on an integration double must fail closed instead of returning a
-        # broad, unfiltered candidate list.
-        return []
-    return merger(
-        candidates=candidates,
-        docs_scope=docs_scope,
-        limit=global_limit,
-    )
-
 
 def _scope_node_ids(scope: Any) -> set[UUID]:
     """Normalize the allowed canonical/related IDs from a DocsScope."""
@@ -756,18 +1006,25 @@ def build_docs_direct_tools() -> list:
         from ..services.turn_context import get_turn_context
         from ..services.work_intake_docs_service import WorkIntakeDocsService
 
+        failure_stage = {"value": "argument_resolution"}
+
         async def _search_inbox_items():
+            failure_stage["value"] = "argument_resolution"
             clean_query = str(query or "").strip()
             if not clean_query:
                 raise ValueError("Inbox項目を検索する語句を入力してください。")
             requested_limit = max(1, min(int(limit or 5), 20))
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(
                     session,
                     require_context=True,
                 )
+                failure_stage["value"] = "node_resolution"
                 ranked = await WorkIntakeDocsService(session).search_items(
                     user_id=user_id,
                     query=clean_query,
@@ -780,6 +1037,7 @@ def build_docs_direct_tools() -> list:
                 )
                 context = get_turn_context()
                 message_ref = context.message_id or context.client_message_id
+                failure_stage["value"] = "render"
                 matches: list[dict[str, Any]] = []
                 visible_limit = (
                     requested_limit
@@ -823,20 +1081,26 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_search_inbox_items()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="inbox_search_items",
+                stage=failure_stage["value"],
+            )
 
     @tool
-    def docs_search(query: str, project: str = "", tag: str = "", limit: int = 20) -> str:
+    def docs_search(query: str, project: str = "", tag: str = "", limit: int = 20, expand: bool = False) -> str:
         """Search AoiTalk Docs (the internal outliner of notes, project info, and tasks).
 
         Hybrid keyword + semantic search over Docs nodes. Returns compact lines:
         `short_id | title | #tags | project | ⤷ parent`. Use `docs_read` to open a
-        hit in full. This searches Docs only; use `search_past_chats` for past
+        hit with view='document' for canonical content. Set expand=true for an authorized local section around hits. This searches Docs only; use `search_past_chats` for past
         conversations.
         """
         from ..memory.database import get_database_manager
         from ..memory.models import KnowledgeNode
         from ..services.docs_graph_service import DocsGraphService
+
+        failure_stage = {"value": "argument_resolution"}
 
         async def _search():
             import time
@@ -845,12 +1109,16 @@ def build_docs_direct_tools() -> list:
             from ..rag.docs_index import docs_rag_enabled
 
             started = time.perf_counter()
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(
                     session, require_context=True
                 )
+                failure_stage["value"] = "node_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project(
                     session, service, project, user_id
@@ -868,76 +1136,44 @@ def build_docs_direct_tools() -> list:
                         session, service, user_id, project_obj
                     )
                 if docs_scope is not None:
-                    # The scoped graph wrapper applies the resolved node IDs
-                    # after each library search.  Do not run the legacy
-                    # semantic lane here: its index payload has no scope
-                    # contract and could otherwise re-introduce an out-of-
-                    # scope hit.  Telemetry records the intentional skip.
-                    if str(tag or "").strip():
-                        lexical = await _search_docs_scope_with_tag(
-                            service,
-                            docs_scope=docs_scope,
-                            query=query,
-                            tag=tag,
-                            limit=limit,
-                            user_id=user_id,
-                        )
-                    else:
-                        lexical = await service.search_with_scope(
-                            query=query,
-                            docs_scope=docs_scope,
-                            limit=limit,
-                        )
-                    semantic_ids, index_telemetry = [], None
+                    lexical = await service.search_with_scope(
+                        query=query, docs_scope=docs_scope, tag=tag, limit=limit, user_id=user_id,
+                        turn_project_id=_docs_query_turn_project_id(),
+                    )
+                    libraries = docs_scope.allowed_library_ids
+                    allowed_ids = _scope_node_ids(docs_scope)
                 else:
                     lexical = await service.search(
-                        docs_library_id=library.id,
-                        query=query,
-                        project_id=project_id,
-                        tag=tag,
-                        limit=limit,
-                        user_id=user_id,
+                        docs_library_id=library.id, query=query, project_id=project_id,
+                        tag=tag, limit=limit, user_id=user_id,
+                        turn_project_id=_docs_query_turn_project_id(),
                     )
-                    semantic_ids, index_telemetry = await _semantic_docs_hits(
-                        library.id,
-                        query,
-                        project_id,
-                        limit,
-                        session=session,
-                        user_id=user_id,
+                    libraries, allowed_ids = [library.id], None
+                semantic_nodes = []
+                semantic_ids = []
+                index_telemetry = None
+                for library_id in libraries:
+                    ids, lane_telemetry = await _semantic_docs_hits(
+                        library_id, query, project_id if docs_scope is None else None, limit,
+                        session=session, user_id=user_id, allowed_node_ids=allowed_ids, tag=tag,
                     )
-                merged = list(lexical)
-                if semantic_ids and docs_scope is None:
-                    seen = {node.id for node in merged}
-                    extra_ids = [nid for nid in semantic_ids if nid not in seen]
-                    if extra_ids:
-                        extra_stmt = select(KnowledgeNode).where(
-                            KnowledgeNode.id.in_(extra_ids),
-                            KnowledgeNode.docs_library_id == library.id,
-                            *(
-                                [KnowledgeNode.project_id == project_id]
-                                if project_id is not None
-                                else []
-                            ),
-                            KnowledgeNode.archived_at.is_(None),
-                        )
-                        extra_stmt = apply_docs_visibility(
-                            extra_stmt,
-                            docs_library_id=library.id,
-                            user_id=user_id,
-                            library_owner_id=getattr(library, "owner_user_id", None),
-                            node_model=KnowledgeNode,
-                        )
-                        extra_result = await session.execute(extra_stmt)
-                        by_id = {n.id: n for n in extra_result.scalars().all()}
-                        ordered_extra = [by_id[nid] for nid in extra_ids if nid in by_id]
-                        merged = ordered_extra + merged
-                merged = [
-                    node
-                    for node in merged
-                    if await _email_node_allowed_in_turn(session, node)
-                ]
-                merged = merged[: max(1, min(int(limit or 20), 100))]
+                    index_telemetry = lane_telemetry or index_telemetry
+                    if not ids:
+                        continue
+                    # Re-authorize/filter the canonical rows at hydration, then
+                    # preserve the semantic order rather than the SQL IN order.
+                    statement, _ = await service._build_structured_query_statement(
+                        docs_library_id=library_id, node_ids=ids, user_id=user_id,
+                        project_id=project_id if docs_scope is None else None,
+                        tags=[tag] if tag else [], turn_project_id=_docs_query_turn_project_id(),
+                    )
+                    by_id = {node.id: node for node in (await session.execute(statement)).scalars().all()}
+                    semantic_nodes.extend(by_id[nid] for nid in ids if nid in by_id)
+                    semantic_ids.extend(nid for nid in ids if nid in by_id)
+                failure_stage["value"] = "render"
+                permitted_lexical = [node for node in lexical if await _email_node_allowed_in_turn(session, node)]
+                permitted_semantic = [node for node in semantic_nodes if await _email_node_allowed_in_turn(session, node)]
+                merged = _fuse_docs_hits(permitted_lexical, permitted_semantic, query=query, limit=limit)
                 _record_generation_docs_resolution([node.id for node in merged])
                 telemetry = build_docs_search_telemetry(
                     query=query,
@@ -949,42 +1185,94 @@ def build_docs_direct_tools() -> list:
                     docs_rag_enabled=docs_rag_enabled(),
                 )
                 logger.debug("docs_search telemetry %s", telemetry.as_dict())
-                return await service.format_search_results(merged, user_id=user_id)
+                render_scope = {"include_parent_titles": docs_scope is None} if hasattr(
+                    service, "_query_reference_visible"
+                ) else {}
+                if expand:
+                    from ..services.docs_retrieval_context import expand_docs_hits
+                    return json.dumps(await expand_docs_hits(service, merged, actor_id=user_id,
+                        scope_ids=allowed_ids, turn_project_id=_docs_query_turn_project_id()),
+                        ensure_ascii=False, separators=(",", ":"))
+                return await service.format_search_results(merged, user_id=user_id, **render_scope)
             finally:
                 await session.close()
 
         try:
             return _run_async(_search())
         except Exception as exc:
-            return _docs_error_envelope(exc)
+            return _docs_error_envelope(
+                exc,
+                operation="docs_search",
+                stage=failure_stage["value"],
+            )
 
     @tool
-    def docs_read(target: str, project: str = "", depth: int = 8) -> str:
-        """Read a Docs node in full: header, description, fields, backlinks, and outline.
+    def docs_read(
+        target: str,
+        project: str = "",
+        depth: int = 8,
+        project_id: str = "",
+        view: str = "outline",
+        cursor: str = "",
+        page_chars: int = 12000,
+    ) -> str:
+        """Read Docs using a compact outline or a paged canonical document view.
 
-        `target` is a node id/prefix/title, 'today', or a project name. This is the
-        detail view for a `docs_search` hit — it returns the node's description,
-        current field values, nodes that reference it (backlinks), and its child
-        outline down to `depth`.
+        `target` is a node id/prefix/title, 'today', or a project name.
+        `project` is the canonical public Project selector. `project_id` is a
+        compatibility alias with identical semantics and callers should prefer
+        `project`; supplying both is accepted only when the values match.
+
+        Use view='document' to understand content: it includes descendant typed
+        Markdown/code, descriptions and fields with full node IDs. Follow
+        next_cursor with the same target/project/depth until has_more=false.
+        coverage_complete describes the bounded projection, not pages already
+        read; coverage_reasons disclose missing depth/nodes. read_fingerprint
+        is NOT a write revision. view='edit' uses a durable server-side
+        checkpoint: next_cursor is opaque, must be the exact next token, and
+        retrying the same request replays the prior page without advancing.
+        It additionally issues a short-lived write_token for docs_mutate only
+        on the final complete page; finish reading its pages before proposing
+        changes. view='record' reads only this node and its own Fields.
+        view='neighborhood' reads a bounded authorized graph neighborhood for
+        multi-hop questions; links do not grant access to their targets.
+        The default outline is a compact navigation
+        view, not full text. Inbox revision remains on the outline view.
         """
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "argument_resolution"}
+
         async def _read():
+            failure_stage["value"] = "argument_resolution"
+            if view not in {"outline", "document", "record", "edit", "neighborhood"}:
+                raise ValueError("view must be outline, document, record or edit")
+            if cursor and view not in {"document", "record", "edit"}:
+                raise ValueError("cursor requires view=document, record or edit")
+            project_ref = str(project or "").strip()
+            project_id_ref = str(project_id or "").strip()
+            if project_ref and project_id_ref and project_ref != project_id_ref:
+                raise ValueError("project and project_id must match when both are provided")
+            effective_project = project_ref or project_id_ref
+
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(
                     session, require_context=True
                 )
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project(
-                    session, service, project, user_id
+                    session, service, effective_project, user_id
                 )
                 docs_scope = await _resolve_context_docs_scope(
                     session,
                     project_obj,
-                    project_ref=project,
+                    project_ref=effective_project,
                     user_id=user_id,
                 )
                 library = None
@@ -993,6 +1281,7 @@ def build_docs_direct_tools() -> list:
                         session, service, user_id, project_obj
                     )
 
+                failure_stage["value"] = "node_resolution"
                 if docs_scope is not None:
                     allowed_ids = _scope_node_ids(docs_scope)
                     target_text = str(target or "").strip()
@@ -1036,6 +1325,8 @@ def build_docs_direct_tools() -> list:
                                     query=target_text,
                                     docs_scope=docs_scope,
                                     limit=100,
+                                    user_id=user_id,
+                                    turn_project_id=_docs_query_turn_project_id(),
                                 )
                                 if str(getattr(node, "title", "")).casefold()
                                 == target_text.casefold()
@@ -1090,8 +1381,85 @@ def build_docs_direct_tools() -> list:
                         user_id=user_id,
                     )
 
+                failure_stage["value"] = "content_read"
                 if not await _email_node_allowed_in_turn(session, root):
                     raise PermissionError("project-bound Docs tools cannot access another project's email")
+
+                if view == "neighborhood":
+                    from ..services.docs_neighborhood import read_docs_neighborhood
+                    return json.dumps(await read_docs_neighborhood(service, root, user_id,
+                        scope_ids=_scope_node_ids(docs_scope) if docs_scope is not None else None,
+                        turn_project_id=_docs_query_turn_project_id()), ensure_ascii=False, separators=(",", ":"))
+                if view in {"document", "record", "edit"}:
+                    from ..services.docs_read_projection import build_docs_read_projection
+
+                    if view == "edit":
+                        from ..services.docs_consistency import DocsContractUnavailable, contract_available
+                        if not await contract_available(session):
+                            raise DocsContractUnavailable("Docs Agent consistency migration is required")
+                        from ..services.docs_edit_read_session import (
+                            DocsEditReadSessionService,
+                            edit_read_scope_binding,
+                        )
+                        turn_project_id = _docs_query_turn_project_id()
+                        allowed_node_ids = (
+                            _scope_node_ids(docs_scope) if docs_scope is not None else None
+                        )
+                        mutation_binding = _docs_edit_binding(user_id, project_obj)
+                        session_binding = edit_read_scope_binding(
+                            actor_id=user_id,
+                            root_id=root.id,
+                            library_id=root.docs_library_id,
+                            depth=depth,
+                            page_chars=page_chars,
+                            turn_project_id=turn_project_id,
+                            allowed_node_ids=allowed_node_ids,
+                            context_binding=mutation_binding,
+                        )
+                        payload = await DocsEditReadSessionService(session).read_page(
+                            graph=service,
+                            root=root,
+                            actor_id=user_id,
+                            allowed_node_ids=allowed_node_ids,
+                            turn_project_id=turn_project_id,
+                            depth=depth,
+                            page_chars=page_chars,
+                            cursor=cursor,
+                            scope_binding=session_binding,
+                            mutation_binding=mutation_binding,
+                        )
+                        await session.commit()
+                    else:
+                        payload = await build_docs_read_projection(
+                            service, root, user_id,
+                            allowed_node_ids=_scope_node_ids(docs_scope) if docs_scope is not None else None,
+                            turn_project_id=_docs_query_turn_project_id(), depth=depth,
+                            cursor=cursor, page_chars=page_chars, include_manifest=False,
+                            record_only=view == "record",
+                        )
+                    result = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                    if view == "edit":
+                        # The durable edit-read session deliberately stores no
+                        # canonical body/plaintext response.  Keep continuation
+                        # evidence equally metadata-only; the model receives
+                        # the full page through the tool result itself.
+                        continuation = {
+                            key: payload.get(key)
+                            for key in (
+                                "schema", "view", "root_id", "read_fingerprint",
+                                "page_start", "page_end", "has_more", "next_cursor",
+                                "request_cursor", "coverage_complete", "coverage_reasons",
+                                "write_token_status", "write_revision",
+                            )
+                            if key in payload
+                        }
+                        _record_generation_docs_resolution(
+                            [root.id],
+                            context=[json.dumps(continuation, ensure_ascii=False, separators=(",", ":"))],
+                        )
+                    else:
+                        _record_generation_docs_resolution([root.id], context=[result])
+                    return result
 
                 if docs_scope is not None:
                     async def _scoped_node_allowed(node: Any) -> bool:
@@ -1109,7 +1477,10 @@ def build_docs_direct_tools() -> list:
                 else:
                     ancestors = await service.ancestor_titles(root, user_id=user_id)
                     node_filter = lambda node: _email_node_allowed_in_turn(session, node)
-                fields = await service.get_node_field_values(root, user_id=user_id)
+                field_scope = {"turn_project_id": _docs_query_turn_project_id()} if hasattr(
+                    service, "_query_reference_visible"
+                ) else {}
+                fields = await service.get_node_field_values(root, user_id=user_id, **field_scope)
                 backlinks = [
                     node
                     for node in await service.get_backlinks(root, user_id=user_id)
@@ -1122,7 +1493,9 @@ def build_docs_direct_tools() -> list:
                     user_id=user_id,
                 )
 
+                failure_stage["value"] = "render"
                 sections: list[str] = []
+                sections.append('read_metadata={"view":"outline","full_document":false,"content_view":"document"}')
                 header = f"# {root.title}  ({str(root.id)[:8]})"
                 sections.append(header)
                 if str(root.system_key or "").startswith("project_inbox_item:"):
@@ -1157,7 +1530,67 @@ def build_docs_direct_tools() -> list:
         try:
             return _run_async(_read())
         except Exception as exc:
-            return _docs_error_envelope(exc)
+            return _docs_error_envelope(
+                exc,
+                operation="docs_read",
+                stage=failure_stage["value"],
+            )
+
+    @tool
+    def docs_overview(project: str = "", filters_json: str = "", run_id: str = "", cursor: str = "",
+                      max_nodes: int = 10000, page_chars: int = 12000) -> str:
+        """Enumerate and read a version-bound Docs corpus with durable coverage.
+
+        Start with no run_id/cursor; then pass returned run_id/next_cursor with
+        the same Project selector. Retry the same cursor after a lost response;
+        it replays the page. All source/permission changes invalidate the run.
+        filters_json supports tags, text (title filter, not a semantic census),
+        field_filters, date_from/date_to, order_by, order. Dates are node dates,
+        not proof of business event dates. max_nodes caps selected records;
+        budget_limited or incomplete_records forbid corpus-wide conclusions.
+        coverage counts delivered source records, not model understanding.
+        """
+        from ..memory.database import get_database_manager
+        from ..services.docs_scope import DocsScopeMode, resolve_docs_scope
+        from ..services.docs_coverage_service import DocsCoverageService
+        from ..services.docs_graph_service import DocsGraphService
+
+        async def run():
+            session = await get_database_manager().get_session()
+            try:
+                actor = await _resolve_operator_user_id(session, require_context=True)
+                graph = DocsGraphService(session)
+                selected = await _resolve_authorized_project(session, graph, project, actor)
+                binding = _docs_edit_binding(actor, selected)
+                controller = DocsCoverageService(session)
+                if not run_id:
+                    if cursor:
+                        raise ValueError("A continuation cursor requires its overview run_id")
+                    scope = await _resolve_context_docs_scope(session, selected, project_ref=project, user_id=actor)
+                    if scope is None:
+                        scope = await resolve_docs_scope(session=session, actor_user_id=actor,
+                            project_id=selected.id if selected else None,
+                            mode=DocsScopeMode.CURRENT_PROJECT if selected else DocsScopeMode.ACCESSIBLE)
+                    state = await controller.start(actor_id=actor, scope=scope, binding=binding,
+                        filters=_parse_json_object(filters_json, field_name="filters_json") if filters_json else {},
+                        max_nodes=max_nodes)
+                    identifier, continuation = state.id, state.state["next_cursor"]
+                    await session.commit()
+                else:
+                    identifier, continuation = UUID(run_id), cursor
+                result = await controller.read_page(run_id=identifier, actor_id=actor,
+                    binding=binding, cursor=continuation, page_chars=page_chars)
+                await session.commit()
+                return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+        try:
+            return _run_async(run())
+        except Exception as exc:
+            return _docs_error_envelope(exc, operation="docs_overview", stage="coverage")
 
     @tool
     def docs_query(
@@ -1167,20 +1600,38 @@ def build_docs_direct_tools() -> list:
         fields_json: str = "",
         group_by: str = "",
         limit: int = 20,
+        date_from: str = "",
+        date_to: str = "",
+        order_by: Literal["updated_at", "created_at", "day_date"] = "updated_at",
+        order: Literal["asc", "desc"] = "desc",
+        offset: int = 0,
     ) -> str:
         """Structured Docs query. AND over comma-separated `tags`, optional field equality.
 
         `fields_json` is a JSON object of field name -> expected value (e.g.
         `{"status": "done"}`). `group_by` is a field name that buckets the rows and
-        adds per-group counts. Returns a count header then compact rows.
+        adds exact per-group counts. Returns a bounded page with returned and
+        pre-limit total metadata, then compact rows.
+        `date_from`/`date_to` are ISO bounds on `order_by` (default updated_at).
+        Date-only upper bounds include the whole day; timestamp bounds are UTC
+        instants. day_date accepts dates only. NULLs sort last, UUID breaks ties.
+        `offset` skips matching rows, `limit` is 1..200 (larger values cap at 200).
+        Counts cover all matching rows before offset/limit. Legacy totals may be unknown.
+        Continue with `offset=next_offset` while `has_more=true`. These dates
+        describe node creation/update or daily notes, not a business event date.
         """
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "database_manager"}
+
         async def _query():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(
                     session, require_context=True
                 )
@@ -1196,77 +1647,189 @@ def build_docs_direct_tools() -> list:
                 )
                 library = None
                 if docs_scope is None:
+                    failure_stage["value"] = "workspace_resolution"
                     library = await _resolve_docs_tool_workspace(
                         session, service, user_id, project_obj
                     )
+                failure_stage["value"] = "document_validation"
                 field_filters = _parse_json_object(fields_json, field_name="fields_json")
+                turn_project_id = _docs_query_turn_project_id()
+                query_page: dict[str, Any] | None = None
                 if docs_scope is not None:
-                    nodes = await service.query_with_scope(
-                        docs_scope=docs_scope,
-                        tags=_parse_csv(tags),
-                        text=text,
-                        limit=limit,
-                    )
-                    # ``query_with_scope`` intentionally exposes only the
-                    # scope lanes.  Field values are therefore filtered after
-                    # the ACL-bounded result, never by a broad project-id
-                    # predicate that could admit an unrelated node.
-                    if field_filters:
-                        filtered_nodes = []
-                        expected = {
-                            str(key): str(value)
-                            for key, value in field_filters.items()
-                        }
-                        for node in nodes:
-                            values = await service.get_node_field_values(
-                                node, user_id=user_id
-                            )
-                            normalized_values = {
-                                str(key).casefold(): str(value)
-                                for key, value in values.items()
+                    failure_stage["value"] = "search"
+                    result_method = getattr(service, "query_with_scope_result", None)
+                    if callable(result_method):
+                        query_page = _docs_query_page(
+                            await result_method(
+                                docs_scope=docs_scope,
+                                tags=_parse_csv(tags),
+                                text=text,
+                                field_filters={
+                                    str(key): str(value)
+                                    for key, value in field_filters.items()
+                                },
+                                group_by=group_by,
+                                limit=limit,
+                                user_id=user_id,
+                                turn_project_id=turn_project_id,
+                                date_from=date_from, date_to=date_to,
+                                order_by=order_by, order=order, offset=offset,
+                            ), offset=offset,
+                        )
+                        nodes = query_page["nodes"]
+                    else:
+                        if date_from or date_to or order_by != "updated_at" or order != "desc" or offset:
+                            raise ValueError("Legacy Docs queries do not support timeline or pagination controls")
+                        nodes = await service.query_with_scope(
+                            docs_scope=docs_scope,
+                            tags=_parse_csv(tags),
+                            text=text,
+                            limit=limit,
+                        )
+                        # Legacy service doubles do not expose exact metadata.
+                        # Preserve their field post-filter and expose a truthful
+                        # bounded page until the metadata API is available.
+                        if field_filters:
+                            filtered_nodes = []
+                            expected = {
+                                str(key): str(value)
+                                for key, value in field_filters.items()
                             }
-                            if all(
-                                normalized_values.get(key.casefold(), "").casefold()
-                                == value.casefold()
-                                for key, value in expected.items()
-                            ):
-                                filtered_nodes.append(node)
-                        nodes = filtered_nodes
+                            for node in nodes:
+                                values = await service.get_node_field_values(
+                                    node, user_id=user_id
+                                )
+                                normalized_values = {
+                                    str(key).casefold(): str(value)
+                                    for key, value in values.items()
+                                }
+                                if all(
+                                    normalized_values.get(key.casefold(), "").casefold()
+                                    == value.casefold()
+                                    for key, value in expected.items()
+                                ):
+                                    filtered_nodes.append(node)
+                            nodes = filtered_nodes
                 else:
-                    nodes = await service.query_nodes(
-                        docs_library_id=library.id,
-                        tags=_parse_csv(tags),
-                        text=text,
-                        project_id=project_obj.id if project_obj else None,
-                        field_filters={str(k): str(v) for k, v in field_filters.items()},
-                        limit=limit,
-                        user_id=user_id,
-                    )
-                nodes = [
-                    node
-                    for node in nodes
+                    failure_stage["value"] = "search"
+                    result_method = getattr(service, "query_nodes_result", None)
+                    if callable(result_method):
+                        query_page = _docs_query_page(
+                            await result_method(
+                                docs_library_id=library.id,
+                                tags=_parse_csv(tags),
+                                text=text,
+                                project_id=project_obj.id if project_obj else None,
+                                field_filters={
+                                    str(key): str(value)
+                                    for key, value in field_filters.items()
+                                },
+                                group_by=group_by,
+                                limit=limit,
+                                user_id=user_id,
+                                turn_project_id=turn_project_id,
+                                date_from=date_from, date_to=date_to,
+                                order_by=order_by, order=order, offset=offset,
+                            ), offset=offset,
+                        )
+                        nodes = query_page["nodes"]
+                    else:
+                        if date_from or date_to or order_by != "updated_at" or order != "desc" or offset:
+                            raise ValueError("Legacy Docs queries do not support timeline or pagination controls")
+                        nodes = await service.query_nodes(
+                            docs_library_id=library.id,
+                            tags=_parse_csv(tags),
+                            text=text,
+                            project_id=project_obj.id if project_obj else None,
+                            field_filters={
+                                str(k): str(v) for k, v in field_filters.items()
+                            },
+                            limit=limit,
+                            user_id=user_id,
+                        )
+                safe_nodes = [
+                    node for node in nodes
                     if await _email_node_allowed_in_turn(session, node)
                 ]
+                if query_page is None or len(safe_nodes) != len(nodes):
+                    # A defensive rejection means the aggregate's scope is no
+                    # longer trustworthy. Never infer corrected totals by
+                    # subtracting only the rejected rows of this bounded page.
+                    query_page = _docs_query_page(safe_nodes, offset=offset)
+                nodes = safe_nodes
                 _record_generation_docs_resolution([node.id for node in nodes])
-                header = f"count={len(nodes)}"
+                failure_stage["value"] = "render"
+                total_matches = query_page["total_matches"]
+                returned = len(nodes)
+                def metadata(value):
+                    if value is None:
+                        return "unknown"
+                    return str(value).lower()
+                def one_line(value):
+                    return str(value).replace("\r", "\\r").replace("\n", "\\n")
+                # Keep ``count`` as the historical returned-row count; the
+                # exact pre-limit count is exposed separately.
+                header = (
+                    f"count={returned} total_matches={metadata(total_matches)} "
+                    f"returned={returned} truncated={metadata(query_page['truncated'])} "
+                    f"has_more={metadata(query_page['has_more'])} offset={offset} "
+                    f"order_by={order_by} order={order}"
+                )
+                next_offset = query_page["next_offset"]
+                header += " next_offset=" + (
+                    str(next_offset) if next_offset is not None else
+                    "null" if query_page["has_more"] is False else "unknown"
+                )
+                exact_groups = query_page.get("group_counts", {})
+                machine_metadata = "query_metadata=" + json.dumps(
+                    {"total_matches": total_matches, "returned": returned,
+                     "offset": offset, "group_counts": exact_groups or {},
+                     "has_more": query_page["has_more"], "next_offset": next_offset,
+                     "truncated": query_page["truncated"], "order_by": order_by, "order": order,
+                     **({"group_by": group_by.strip()} if group_by.strip() else {})},
+                    ensure_ascii=False, separators=(",", ":"),
+                )
+                render_scope = {"include_parent_titles": docs_scope is None} if hasattr(
+                    service, "_query_reference_visible"
+                ) else {}
                 if not group_by.strip():
-                    return header + "\n" + await service.format_search_results(
-                        nodes, user_id=user_id
+                    return header + "\n" + machine_metadata + "\n" + await service.format_search_results(
+                        nodes, user_id=user_id, **render_scope
                     )
 
-                # Group rows by the requested field's current value.
+                # Group the bounded rows for rendering, while using the
+                # service's pre-limit group totals for exact aggregation.
                 groups: dict[str, list] = {}
                 for node in nodes:
-                    values = await service.get_node_field_values(node, user_id=user_id)
-                    key = values.get(group_by.strip()) or "(none)"
+                    key = await _docs_query_node_group_value(
+                        service,
+                        node,
+                        requested=group_by,
+                        user_id=user_id,
+                        turn_project_id=turn_project_id,
+                    ) or "(none)"
                     groups.setdefault(key, []).append(node)
-                blocks = [f"{header} group_by={group_by.strip()}"]
-                for key in sorted(groups):
-                    members = groups[key]
-                    blocks.append(f"\n[{key}] count={len(members)}")
-                    blocks.append(
-                        await service.format_search_results(members, user_id=user_id)
+                blocks = [f"{header} group_by={one_line(group_by.strip())}", machine_metadata]
+                for key in sorted(set(groups) | set(exact_groups)):
+                    members = groups.get(key, [])
+                    group_total = exact_groups.get(key)
+                    group_returned = len(members)
+                    group_truncated = group_total > group_returned if group_total is not None else None
+                    group_more = group_truncated if offset == 0 else (
+                        False if query_page["has_more"] is False else None
                     )
+                    blocks.append(
+                        f"[{one_line(key)}] count={group_total if group_total is not None else group_returned} "
+                        f"total_matches={metadata(group_total)} returned={group_returned} "
+                        f"truncated={metadata(group_truncated)} "
+                        f"has_more={metadata(group_more)}"
+                    )
+                    if members:
+                        blocks.append(
+                            await service.format_search_results(
+                                members, user_id=user_id, **render_scope
+                            )
+                        )
                 return "\n".join(blocks)
             finally:
                 await session.close()
@@ -1274,7 +1837,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _run_async(_query())
         except Exception as exc:
-            return _docs_error_envelope(exc)
+            return _docs_error_envelope(
+                exc,
+                operation="docs_query",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_ensure_inbox() -> str:
@@ -1283,11 +1850,17 @@ def build_docs_direct_tools() -> list:
         from ..memory.models import KnowledgeNode, DocsLibrary
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "database_manager"}
+
         async def _ensure():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 ensure_library = getattr(service, "ensure_library", None)
                 if ensure_library is None:
@@ -1295,6 +1868,7 @@ def build_docs_direct_tools() -> list:
                 if ensure_library is None:
                     raise AttributeError("Docs service has no library resolver")
                 library = await ensure_library(user_id)
+                failure_stage["value"] = "node_resolution"
                 await session.execute(
                     select(DocsLibrary)
                     .where(DocsLibrary.id == library.id)
@@ -1312,6 +1886,7 @@ def build_docs_direct_tools() -> list:
                 node = result.scalar_one_or_none()
                 created = False
                 if node is None:
+                    failure_stage["value"] = "mutation"
                     node = await service.create_node(
                         docs_library_id=library.id,
                         user_id=user_id,
@@ -1319,6 +1894,7 @@ def build_docs_direct_tools() -> list:
                     )
                     created = True
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 return {
                     "success": True,
@@ -1336,7 +1912,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_ensure()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_ensure_inbox",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_create_nodes(parent: str, outline_text: str, project: str = "") -> str:
@@ -1354,12 +1934,23 @@ def build_docs_direct_tools() -> list:
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        # _run_async runs the coroutine in a copied context; capture the
+        # durable run id before crossing that boundary for atomic receipts.
+        agent_run_id = get_current_agent_run_id()
+        failure_stage = {"value": "database_manager"}
+
         async def _create():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
+            atomic_prepared = None
+            approved_execution = None
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
                 project_ref = _reject_wildcard_mutation_project_ref(project)
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project_for_write(
                     session, service, project_ref, user_id
@@ -1380,6 +1971,7 @@ def build_docs_direct_tools() -> list:
                     user_id=user_id,
                     required="write",
                 )
+                failure_stage["value"] = "authorization_scope"
                 await _assert_generic_mutation_allowed(
                     session, parent_node, "docs_create_nodes"
                 )
@@ -1387,6 +1979,54 @@ def build_docs_direct_tools() -> list:
                     [parent_node.id],
                     pending_destination_parent_id=parent_node.id,
                 )
+                # Reserve the approved-plan receipt before any node creation.
+                # Non-plan calls intentionally keep the existing commit path.
+                if agent_run_id:
+                    failure_stage["value"] = "approval_receipt"
+                    try:
+                        from ..services.planning_runtime import (
+                            get_active_approved_action_execution,
+                        )
+                    except ImportError:
+                        get_active_approved_action_execution = None
+                    if get_active_approved_action_execution is not None:
+                        approved_execution = get_active_approved_action_execution(
+                            "docs_create_nodes"
+                        )
+                        if approved_execution is None:
+                            # Never fall back to a direct side effect while an
+                            # approved cursor exists but its call binding is
+                            # missing or mismatched.
+                            from ..services.planning_runtime import (
+                                get_approved_action_directive,
+                            )
+
+                            if get_approved_action_directive() is not None:
+                                raise ValueError(
+                                    "approved action binding unavailable"
+                                )
+                if approved_execution is not None:
+                    from ..services.agent_run_service import AgentRunService
+
+                    atomic_prepared = await AgentRunService().prepare_approved_mutation_receipt(
+                        session,
+                        run_id=agent_run_id or "",
+                        tool_name="docs_create_nodes",
+                        tool_call_id=str(
+                            approved_execution.get("call_id") or ""
+                        ).strip(),
+                        arguments=dict(approved_execution.get("arguments") or {}),
+                        metadata=approved_execution,
+                    )
+                    if not atomic_prepared.owned:
+                        from ..services.agent_run_service import (
+                            approved_mutation_receipt_result,
+                        )
+
+                        return approved_mutation_receipt_result(
+                            atomic_prepared.receipt
+                        )
+                failure_stage["value"] = "mutation"
                 nodes = await service.create_nodes_from_outline(
                     docs_library_id=library.id,
                     user_id=user_id,
@@ -1394,21 +2034,42 @@ def build_docs_direct_tools() -> list:
                     outline_text=outline_text,
                     project_id=project_obj.id if project_obj else parent_node.project_id,
                 )
-                _assert_generation_mutation_allowed()
-                await session.commit()
-                return {
+                result = {
                     "success": True,
                     "created": [
                         {
                             "id": str(node.id),
                             "short_id": str(node.id)[:8],
                             "title": node.title,
+                            "parent_id": (
+                                str(node.parent_id)
+                                if node.parent_id is not None
+                                else None
+                            ),
                             "created_at": node.created_at,
                             "updated_at": node.updated_at,
                         }
                         for node in nodes
                     ],
                 }
+                if atomic_prepared is not None:
+                    failure_stage["value"] = "approval_receipt"
+                    from ..services.agent_run_service import AgentRunService
+
+                    result_text = _json(result)
+                    await AgentRunService().finalize_approved_mutation_receipt(
+                        session,
+                        atomic_prepared,
+                        arguments=dict(approved_execution.get("arguments") or {}),
+                        result=result_text,
+                        success=True,
+                        mutation_confirmed=True,
+                        metadata=approved_execution,
+                    )
+                _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
+                await session.commit()
+                return result
             except Exception:
                 await session.rollback()
                 raise
@@ -1418,7 +2079,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_create()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_create_nodes",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_attach_workspace_file(
@@ -1444,38 +2109,68 @@ def build_docs_direct_tools() -> list:
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "authorization_scope"}
+
         try:
             _reject_wildcard_mutation_project_ref(project)
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_attach_workspace_file",
+                stage=failure_stage["value"],
+            )
 
         resolved, path_error = _authorized_workspace_path(file_path, "読み取り")
         if path_error or not resolved:
-            return _json(path_error or {"success": False, "error": "file path could not be resolved"})
+            path_exception: Exception
+            if path_error:
+                path_exception = PermissionError(
+                    "workspace path is not authorized"
+                )
+            else:
+                path_exception = ValueError(
+                    "workspace path could not be resolved"
+                )
+            return _docs_error_envelope(
+                path_exception,
+                operation="docs_attach_workspace_file",
+                stage="workspace_resolution",
+            )
         target = Path(resolved)
         if not target.is_file():
-            return _json({"success": False, "error": "library file was not found"})
+            return _docs_error_envelope(
+                FileNotFoundError("workspace file was not found"),
+                operation="docs_attach_workspace_file",
+                stage="workspace_resolution",
+            )
         workspace_root = _get_user_files_root().resolve()
         try:
             relative_path = target.resolve().relative_to(workspace_root).as_posix()
         except ValueError:
-            return _json({"success": False, "error": "library file path is outside the authorized root"})
+            return _docs_error_envelope(
+                PermissionError("workspace file is outside the authorized root"),
+                operation="docs_attach_workspace_file",
+                stage="workspace_resolution",
+            )
         if any(character in relative_path for character in ("|", "]", "\r", "\n")):
-            return _json(
-                {
-                    "success": False,
-                    "error": "library file path contains unsupported Docs link characters",
-                }
+            return _docs_error_envelope(
+                ValueError("workspace file path contains unsupported characters"),
+                operation="docs_attach_workspace_file",
+                stage="workspace_resolution",
             )
 
         clean_label = (str(label or "").strip() or target.name).replace("]", "").replace("|", "")[:200]
 
         async def _attach():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
                 project_ref = _reject_wildcard_mutation_project_ref(project)
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project_for_write(
                     session,
@@ -1489,6 +2184,7 @@ def build_docs_direct_tools() -> list:
                 parent_ref = _resolve_project_docs_parent_ref(
                     parent, project_obj, default="project"
                 )
+                failure_stage["value"] = "node_resolution"
                 parent_node = await _resolve_docs_tool_node(
                     service,
                     docs_library_id=_node_library_scope(
@@ -1509,6 +2205,7 @@ def build_docs_direct_tools() -> list:
                     if parent_node.project_id not in {None, project_obj.id}:
                         raise PermissionError("Docs parent does not belong to the selected Project")
 
+                failure_stage["value"] = "mutation"
                 stable_input = f"{parent_node.id}\0{relative_path.casefold()}"
                 system_key = (
                     "workspace_file_reference:"
@@ -1529,6 +2226,7 @@ def build_docs_direct_tools() -> list:
                     source_refs=[{"type": "workspace_file", "path": relative_path}],
                 )
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 return {
                     "success": True,
@@ -1545,9 +2243,14 @@ def build_docs_direct_tools() -> list:
                 await session.close()
 
         try:
+            failure_stage["value"] = "database_manager"
             return _json(_run_async(_attach()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_attach_workspace_file",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_place_workspace_file(
@@ -1573,6 +2276,8 @@ def build_docs_direct_tools() -> list:
         """
         from .file_explorer.file_explorer_tools import _copy_workspace_item_impl
 
+        failure_stage = {"value": "authorization_scope"}
+
         try:
             _run_async(
                 _preflight_project_workspace_placement(
@@ -1582,46 +2287,104 @@ def build_docs_direct_tools() -> list:
                 )
             )
         except Exception as exc:
-            return _json(
-                {
-                    "success": False,
-                    "stage": "authorization",
-                    "error": str(exc),
-                }
+            failure = json.loads(
+                _docs_error_envelope(
+                    exc,
+                    operation="docs_place_workspace_file",
+                    stage="authorization",
+                )
             )
+            # Preserve the historical composition key while keeping the
+            # diagnostic fields in the shared safe envelope.
+            failure["stage"] = "authorization"
+            return _json(failure)
 
-        copy_result = _copy_workspace_item_impl(src=src, dest=dest)
+        failure_stage["value"] = "copy"
+        try:
+            copy_result = _copy_workspace_item_impl(src=src, dest=dest)
+        except Exception as exc:
+            return _docs_error_envelope(
+                exc,
+                operation="docs_place_workspace_file",
+                stage=failure_stage["value"],
+            )
         if not isinstance(copy_result, dict) or not copy_result.get("success"):
-            return _json({"success": False, "stage": "copy", "copy": copy_result})
+            failure = json.loads(
+                _docs_error_envelope(
+                    RuntimeError("workspace copy failed"),
+                    operation="docs_place_workspace_file",
+                    stage="copy",
+                )
+            )
+            failure["stage"] = "copy"
+            return _json(failure)
         placed_path = str(copy_result.get("new_path") or "").strip()
         if not placed_path:
-            return _json(
-                {
-                    "success": False,
-                    "stage": "copy",
-                    "error": "copy result did not include new_path",
-                    "copy": copy_result,
-                }
+            failure = json.loads(
+                _docs_error_envelope(
+                    RuntimeError("workspace copy did not return a destination"),
+                    operation="docs_place_workspace_file",
+                    stage="copy",
+                )
             )
-        attach_raw = docs_attach_workspace_file.function(
-            parent=parent,
-            file_path=placed_path,
-            label=label,
-            project=project,
-        )
+            failure["stage"] = "copy"
+            return _json(failure)
+        try:
+            attach_raw = docs_attach_workspace_file.function(
+                parent=parent,
+                file_path=placed_path,
+                label=label,
+                project=project,
+            )
+        except Exception as exc:
+            return _docs_error_envelope(
+                exc,
+                operation="docs_place_workspace_file",
+                stage="mutation",
+            )
         try:
             attach_result = json.loads(attach_raw)
         except (TypeError, json.JSONDecodeError):
-            attach_result = {"success": False, "error": str(attach_raw)}
+            attach_result = json.loads(
+                _docs_error_envelope(
+                    RuntimeError("Docs attach returned an invalid response"),
+                    operation="docs_place_workspace_file",
+                    stage="mutation",
+                )
+            )
+        if not isinstance(attach_result, dict):
+            attach_result = json.loads(
+                _docs_error_envelope(
+                    RuntimeError("Docs attach returned an invalid response"),
+                    operation="docs_place_workspace_file",
+                    stage="mutation",
+                )
+            )
         if not attach_result.get("success"):
+            failure_stage["value"] = "mutation"
+            # ``docs_attach_workspace_file`` normally already returns the
+            # envelope.  Rebuild a bounded failure here anyway because this
+            # composition boundary must remain safe if an integration double
+            # or legacy implementation returns arbitrary nested error text.
+            safe_attach_result = json.loads(
+                _docs_error_envelope(
+                    RuntimeError("Docs attach failed"),
+                    operation="docs_place_workspace_file",
+                    stage="mutation",
+                )
+            )
             return _json(
                 {
                     "success": False,
                     "partial_success": True,
                     "stage": "docs",
                     "file_path": placed_path,
-                    "copy": copy_result,
-                    "docs": attach_result,
+                    "copy": {
+                        "success": True,
+                        "created": bool(copy_result.get("created")),
+                        "new_path": placed_path,
+                    },
+                    "docs": safe_attach_result,
                 }
             )
         return _json(
@@ -1630,10 +2393,84 @@ def build_docs_direct_tools() -> list:
                 "created": bool(copy_result.get("created"))
                 or bool(attach_result.get("created")),
                 "file_path": placed_path,
-                "copy": copy_result,
-                "docs": attach_result,
+                "copy": {
+                    "success": True,
+                    "created": bool(copy_result.get("created")),
+                    "new_path": placed_path,
+                },
+                "docs": {
+                    key: attach_result[key]
+                    for key in (
+                        "success",
+                        "created",
+                        "node_id",
+                        "parent_id",
+                        "title",
+                        "file_path",
+                    )
+                    if key in attach_result
+                },
             }
         )
+
+    @tool
+    def docs_mutate(target: str, write_token: str, operation_id: str, changes_json: str, project: str = "") -> str:
+        """Atomically apply a high-level Docs changeset, preserving existing IDs.
+
+        Read the section with docs_read(view='edit') and finish its content
+        pages first. Use its write_token, full root UUID as target, and a new
+        operation UUID. Retry the SAME operation_id with identical arguments
+        after an uncertain response. Conflicts require a fresh edit read and
+        a new operation ID. No implicit replacement/deletion of omitted nodes.
+
+        changes_json: {"intent":"revise_section"|"upsert_record"|"reorganize_subtree",
+        "operations":[...]}. Operations: update(node_id,title?,description?,content?);
+        create(ref="local:name",parent_id,title,block_type?,content?);
+        set_fields(node_id,values={Field UUID:value}); add_tag/remove_tag(node_id,tag_id);
+        move(node_id,parent_id,leave_reference?); archive(node_id). New local
+        references may be used by later operations. Maximum 100 operations.
+        Managed Inbox/Mail/Memory must use their existing owning domain tools.
+        """
+        from ..memory.database import get_database_manager
+        from ..services.docs_mutation_service import DocsMutationService
+
+        async def apply():
+            payload = _parse_json_object(changes_json, field_name="changes_json")
+            root_id, lease_id, request_id = UUID(target), UUID(write_token), UUID(operation_id)
+            session = await get_database_manager().get_session()
+            try:
+                actor = await _resolve_operator_user_id(session, require_context=True)
+                graph = DocsMutationService(session).docs
+                selected = await _resolve_authorized_project_for_write(
+                    session, graph, _reject_wildcard_mutation_project_ref(project), actor,
+                )
+                root = await _resolve_docs_tool_node(
+                    graph, docs_library_id=None, ref=str(root_id),
+                    project_id=selected.id if selected else None, user_id=actor, required="write",
+                )
+                result = await DocsMutationService(session).apply(
+                    actor_id=actor, root_id=root.id, write_token=lease_id,
+                    operation_id=request_id, changeset=payload, binding=_docs_edit_binding(actor, selected),
+                    before_commit=_assert_generation_mutation_allowed,
+                )
+                await _fence_docs_agent_run(session)
+                _assert_generation_mutation_allowed()
+                await session.commit()
+                return _json({**result, "committed": True})
+            except BaseException:
+                await session.rollback()
+                raise
+            finally:
+                await session.close()
+        try:
+            return _run_async(apply())
+        except Exception as exc:
+            original = getattr(exc, "orig", exc)
+            sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+            if sqlstate in {"40001", "40P01", "55P03"}:
+                return _json({"success": False, "error_code": "docs_conflict", "retryable": True,
+                              "error": "Concurrent transaction conflict; retry the same operation_id or read again"})
+            return _docs_error_envelope(exc, operation="docs_mutate", stage="mutation")
 
     @tool
     def docs_update_node(
@@ -1663,15 +2500,22 @@ def build_docs_direct_tools() -> list:
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "argument_resolution"}
+
         async def _update():
+            failure_stage["value"] = "argument_resolution"
             values = _parse_json_object(fields_json, field_name="fields_json") if fields_json.strip() else {}
             add_list = _parse_csv(add_tags)
             remove_list = _parse_csv(remove_tags)
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
                 project_ref = _reject_wildcard_mutation_project_ref()
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project_for_write(
                     session, service, project_ref, user_id
@@ -1706,6 +2550,7 @@ def build_docs_direct_tools() -> list:
                     user_id=user_id,
                     required="write",
                 )
+                failure_stage["value"] = "authorization_scope"
                 await _assert_generic_mutation_allowed(
                     session, node, "docs_update_node"
                 )
@@ -1715,6 +2560,7 @@ def build_docs_direct_tools() -> list:
                 node_library_id = getattr(node, "docs_library_id", None) or library.id
                 changed: dict[str, Any] = {}
 
+                failure_stage["value"] = "mutation"
                 if title.strip() or description.strip():
                     await service.update_node(
                         node=node,
@@ -1752,6 +2598,7 @@ def build_docs_direct_tools() -> list:
                     changed["fields"] = updated
 
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 return {
                     "success": True,
@@ -1770,7 +2617,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_update()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_update_node",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def inbox_update_item(
@@ -1815,11 +2666,15 @@ def build_docs_direct_tools() -> list:
         )
         from ..services.inbox_item_resolution import verify_inbox_resolution_token
 
+        failure_stage = {"value": "argument_resolution"}
+
         async def _update_inbox():
+            failure_stage["value"] = "argument_resolution"
             context = get_turn_context()
             item_id = UUID(str(node_id).strip())
             resolved = None
             if str(resolution_token or "").strip():
+                failure_stage["value"] = "authorization_scope"
                 if not context.user_id:
                     raise PermissionError(
                         "resolution tokenの検証には認証済みユーザーが必要です。"
@@ -1862,9 +2717,12 @@ def build_docs_direct_tools() -> list:
                 source_refs.append(
                     {"type": "conversation_client_message", "id": context.client_message_id}
                 )
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(
                     session, require_context=True
                 )
@@ -1876,6 +2734,7 @@ def build_docs_direct_tools() -> list:
                     permission="write",
                 )
                 item = await session.get(KnowledgeNode, item_id)
+                failure_stage["value"] = "document_validation"
                 if (
                     item is None
                     or getattr(item, "project_id", project_id) != project_id
@@ -1904,6 +2763,7 @@ def build_docs_direct_tools() -> list:
                 result_title = str(getattr(item, "title", "") or "Inbox項目")
                 document_replaced = False
                 if document_json.strip():
+                    failure_stage["value"] = "document_validation"
                     if not expected_revision.strip():
                         raise ValueError(
                             "document_jsonで更新する場合は、直前のdocs_readが返した"
@@ -1941,6 +2801,7 @@ def build_docs_direct_tools() -> list:
                         payload,
                         allowed_source_keys=source_keys,
                     )
+                    failure_stage["value"] = "mutation"
                     replaced = await WorkIntakeDocsService(session).replace_document(
                         item_id=item_id,
                         project_id=project_id,
@@ -1970,6 +2831,7 @@ def build_docs_direct_tools() -> list:
                 )
                 created_task: dict[str, Any] | None = None
                 if ensure_task and task is None:
+                    failure_stage["value"] = "mutation"
                     created_task = await task_service.create_task(
                         session,
                         user_id=user_id,
@@ -2009,6 +2871,7 @@ def build_docs_direct_tools() -> list:
                         commit=False,
                     )
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 if created_task is not None:
                     await task_service._broadcast("task_created", created_task)
@@ -2031,7 +2894,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_update_inbox()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="inbox_update_item",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_move_node(node_id: str, new_parent: str, leave_reference: bool = False) -> str:
@@ -2039,12 +2906,18 @@ def build_docs_direct_tools() -> list:
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "database_manager"}
+
         async def _move():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
                 project_ref = _reject_wildcard_mutation_project_ref()
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project_for_write(
                     session, service, project_ref, user_id
@@ -2073,12 +2946,14 @@ def build_docs_direct_tools() -> list:
                     user_id=user_id,
                     required="write",
                 )
+                failure_stage["value"] = "authorization_scope"
                 await _assert_generic_mutation_allowed(
                     session, node, "docs_move_node"
                 )
                 await _assert_generic_mutation_allowed(
                     session, parent, "docs_move_node"
                 )
+                failure_stage["value"] = "mutation"
                 await service.move_node(
                     node=node,
                     new_parent=parent,
@@ -2086,6 +2961,7 @@ def build_docs_direct_tools() -> list:
                     leave_reference=leave_reference,
                 )
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 return {
                     "success": True,
@@ -2103,7 +2979,11 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_move()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_move_node",
+                stage=failure_stage["value"],
+            )
 
     @tool
     def docs_archive_node(node_id: str) -> str:
@@ -2111,12 +2991,18 @@ def build_docs_direct_tools() -> list:
         from ..memory.database import get_database_manager
         from ..services.docs_graph_service import DocsGraphService
 
+        failure_stage = {"value": "database_manager"}
+
         async def _archive():
+            failure_stage["value"] = "database_manager"
             db = get_database_manager()
+            failure_stage["value"] = "open_session"
             session = await db.get_session()
             try:
+                failure_stage["value"] = "authorization_scope"
                 user_id = await _resolve_operator_user_id(session, require_context=True)
                 project_ref = _reject_wildcard_mutation_project_ref()
+                failure_stage["value"] = "workspace_resolution"
                 service = DocsGraphService(session)
                 project_obj = await _resolve_authorized_project_for_write(
                     session, service, project_ref, user_id
@@ -2138,8 +3024,10 @@ def build_docs_direct_tools() -> list:
                     session, node, "docs_archive_node"
                 )
                 # node だけ archive すると、outline から消えたのに検索へ残る孤児ができる。
+                failure_stage["value"] = "mutation"
                 await service.archive_subtree(root=node, user_id=user_id)
                 _assert_generation_mutation_allowed()
+                failure_stage["value"] = "commit"
                 await session.commit()
                 return {
                     "success": True,
@@ -2157,19 +3045,61 @@ def build_docs_direct_tools() -> list:
         try:
             return _json(_run_async(_archive()))
         except Exception as exc:
-            return _json({"success": False, "error": str(exc)})
+            return _docs_error_envelope(
+                exc,
+                operation="docs_archive_node",
+                stage=failure_stage["value"],
+            )
 
-    return [
+    tools = [
         inbox_search_items,
         docs_search,
         docs_read,
         docs_query,
+        docs_overview,
         docs_ensure_inbox,
         docs_create_nodes,
         docs_attach_workspace_file,
         docs_place_workspace_file,
         docs_update_node,
+        docs_mutate,
         inbox_update_item,
         docs_move_node,
         docs_archive_node,
     ]
+
+    # `project` is the canonical Docs Project selector. `project_id` is only
+    # a narrow compatibility alias at the common tool boundary. docs_read's
+    # Python callable retains its historical keyword for direct legacy callers,
+    # but it must not become a second independent canonical argument.
+    for definition in tools:
+        if definition.name == "docs_query":
+            for param in definition.parameters:
+                if param.name == "order_by":
+                    param.enum = ["updated_at", "created_at", "day_date"]
+                elif param.name == "order":
+                    param.enum = ["asc", "desc"]
+                elif param.name == "offset":
+                    param.schema = {"type": "integer", "minimum": 0}
+                elif param.name == "limit":
+                    param.schema = {"type": "integer", "minimum": 1}
+        if definition.name == "docs_read":
+            definition.parameters = [
+                param
+                for param in definition.parameters
+                if param.name != "project_id"
+            ]
+            for param in definition.parameters:
+                if param.name == "view":
+                    param.enum = ["outline", "document", "record", "edit", "neighborhood"]
+                elif param.name == "depth":
+                    param.schema = {"type": "integer", "minimum": 0, "maximum": 32}
+                elif param.name == "page_chars":
+                    param.schema = {"type": "integer", "minimum": 4096, "maximum": 32000}
+        if any(param.name == "project" for param in definition.parameters):
+            definition.add_argument_alias(
+                "project_id",
+                "project",
+            )
+
+    return tools

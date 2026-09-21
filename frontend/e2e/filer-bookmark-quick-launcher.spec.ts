@@ -26,6 +26,8 @@ const dailyPath = `${rootPath}/daily`;
 const toolPath = `${rootPath}/tool`;
 const wikiPath = `${rootPath}/wiki`;
 const textPath = `${rootPath}/notes.txt`;
+const workFirstFilePath = `${workPath}/first.txt`;
+const workSecondFilePath = `${workPath}/second.txt`;
 
 type Bookmark = {
   id: string;
@@ -142,6 +144,33 @@ async function mockQuickLauncherApis(page: import("@playwright/test").Page) {
               },
             ],
             total_items: 1,
+          },
+        });
+        return;
+      }
+      if (requestedPath === workPath) {
+        await route.fulfill({
+          json: {
+            ...common,
+            parent_path: rootPath,
+            can_go_up: true,
+            files: [
+              {
+                name: "first.txt",
+                path: workFirstFilePath,
+                type: "text/plain",
+                size: 12,
+                extension: ".txt",
+              },
+              {
+                name: "second.txt",
+                path: workSecondFilePath,
+                type: "text/plain",
+                size: 12,
+                extension: ".txt",
+              },
+            ],
+            total_items: 2,
           },
         });
         return;
@@ -444,6 +473,51 @@ test.describe("Files bookmark quick launcher", () => {
     await expect(page.getByRole("menuitem", { name: /^wiki/ })).toBeFocused();
     await page.keyboard.press("Enter");
     await listWiki;
+  });
+
+  test("Alt+A Enter navigation restores Files focus for ArrowDown and ArrowUp selection", async ({ page }) => {
+    await page.goto("/filer");
+
+    const canvas = page.locator('[data-shell-region="files-canvas"]');
+    const trigger = page.getByTestId("files-bookmark-quick-launcher-trigger");
+    const menu = page.getByTestId("files-bookmark-quick-launcher-menu");
+    const firstFile = page.locator(`[data-explorer-item-path="${workFirstFilePath}"]`);
+    const secondFile = page.locator(`[data-explorer-item-path="${workSecondFilePath}"]`);
+    const listWork = page.waitForRequest((request) => {
+      const url = new URL(request.url());
+      return (
+        url.pathname === "/api/python-proxy/explorer/list" &&
+        request.method() === "GET" &&
+        url.searchParams.get("path") === workPath
+      );
+    });
+
+    await openQuickLauncher(page);
+    const workItem = page.getByRole("menuitem", { name: /^work/ });
+    await page.keyboard.press("ArrowDown");
+    await expect(workItem).toBeFocused();
+    await page.keyboard.press("Enter");
+    await listWork;
+
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+    await expect(menu).not.toBeVisible();
+    await expect(canvas).toBeFocused();
+    await expect(firstFile).toHaveClass(/border-primary/);
+    await expect(firstFile).toHaveClass(/outline-primary/);
+
+    await page.keyboard.press("ArrowDown");
+    await expect(canvas).toBeFocused();
+    await expect(firstFile).not.toHaveClass(/outline-primary/);
+    await expect(secondFile).toHaveClass(/border-primary/);
+    await expect(secondFile).toHaveClass(/outline-primary/);
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
+
+    await page.keyboard.press("ArrowUp");
+    await expect(canvas).toBeFocused();
+    await expect(firstFile).toHaveClass(/border-primary/);
+    await expect(firstFile).toHaveClass(/outline-primary/);
+    await expect(secondFile).not.toHaveClass(/outline-primary/);
+    await expect(trigger).toHaveAttribute("aria-expanded", "false");
   });
 
   test("ArrowRight opens AI submenu and ArrowLeft returns to root menu", async ({ page }) => {

@@ -92,6 +92,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
                   setAuthMode("authenticated");
                   await saveAuthMode("authenticated");
                 }
+              }).catch(() => {
+                // 通信断・サーバー再起動等では復元した認証を維持する。
+                // 次の同期がrefreshを再試行するため、未処理のrejectにしない。
               });
             }
           } else {

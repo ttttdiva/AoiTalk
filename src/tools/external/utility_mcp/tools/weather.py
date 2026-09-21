@@ -5,6 +5,8 @@ from __future__ import annotations
 import datetime
 import random
 from typing import TYPE_CHECKING
+from collections.abc import Mapping
+from types import SimpleNamespace
 
 import requests
 from .....services.outbound_privacy_service import (
@@ -39,6 +41,60 @@ def register(mcp: FastMCP, api_key: str):
             session_id=str(getattr(turn, "session_id", None) or ""),
             session_context=inherited.session_context,
             project_metadata=inherited.project_metadata,
+        )
+
+    def _descriptor(destination: str):
+        try:
+            from .....services.outbound_privacy_service import EgressDescriptor
+
+            return EgressDescriptor(
+                action="weather_query",
+                transport="requests.get",
+                destination=destination,
+                provider="openweather",
+                tool="get_weather_info",
+                model="",
+            )
+        except ImportError:  # pragma: no cover - old stripped embeds
+            return SimpleNamespace(
+                action="weather_query",
+                transport="requests.get",
+                destination=destination,
+                provider="openweather",
+                tool="get_weather_info",
+                model="",
+            )
+
+    def _request(gateway, *, base_url: str, location: str):
+        execute_sync = getattr(gateway, "execute_sync", None)
+        if not callable(execute_sync):
+            raise PrivacyError("outbound privacy gateway does not support execution")
+
+        def send(protected_payload):
+            if not isinstance(protected_payload, Mapping):
+                raise PrivacyError("privacy protection returned no protected payload")
+            safe_location = str(protected_payload.get("q") or "").strip()
+            if not safe_location:
+                raise PrivacyError("privacy protection returned no protected location")
+            return requests.get(
+                base_url,
+                params={
+                    "q": safe_location,
+                    "appid": api_key,
+                    "units": "metric",
+                    "lang": "ja",
+                },
+                timeout=5,
+                allow_redirects=False,
+            )
+
+        return execute_sync(
+            {"q": location},
+            provider="openweather",
+            descriptor=_descriptor(base_url),
+            sender=send,
+            base_url=base_url,
+            source_kind="weather_query_mcp",
         )
 
     @mcp.tool()
@@ -93,49 +149,34 @@ def register(mcp: FastMCP, api_key: str):
                     unique_locations.append(loc)
             location_to_try = unique_locations
 
+            try:
+                gateway = _gateway()
+            except Exception:
+                return "天気情報の取得はプライバシー保護により停止しました。"
+
             response = None
             for loc in location_to_try:
                 try:
-                    protected = _gateway().protect_sync(
-                        {"q": loc},
-                        provider="openweather",
+                    response = _request(
+                        gateway,
                         base_url=base_url,
-                        source_kind="weather_query_mcp",
+                        location=loc,
                     )
-                    safe_location = (
-                        str(protected.payload.get("q") or loc)
-                        if isinstance(protected.payload, dict)
-                        else loc
-                    )
-                except Exception as exc:
-                    return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
-                params = {
-                    "q": safe_location,
-                    "appid": api_key,
-                    "units": "metric",
-                    "lang": "ja"
-                }
-                response = requests.get(base_url, params=params, timeout=5)
+                except Exception:
+                    return "天気情報の取得はプライバシー保護により停止しました。"
                 if response.status_code == 200:
                     break
 
             if response is None or response.status_code != 200:
                 try:
-                    protected = _gateway().protect_sync(
-                        {"q": f"{location_to_try[0]},JP"},
-                        provider="openweather",
+                    last_try = f"{location_to_try[0]},JP"
+                    response = _request(
+                        gateway,
                         base_url=base_url,
-                        source_kind="weather_query_mcp",
+                        location=last_try,
                     )
-                    last_try = (
-                        str(protected.payload.get("q") or f"{location_to_try[0]},JP")
-                        if isinstance(protected.payload, dict)
-                        else f"{location_to_try[0]},JP"
-                    )
-                except Exception as exc:
-                    return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
-                params["q"] = last_try
-                response = requests.get(base_url, params=params, timeout=5)
+                except Exception:
+                    return "天気情報の取得はプライバシー保護により停止しました。"
 
             response.raise_for_status()
             data = response.json()

@@ -5,7 +5,8 @@
 ## 現在のモデルと vendored runtime
 
 - 既定 checkpoint: `Aratako/Irodori-TTS-v4.1-Small`
-- キャラクター selector: `v4.1-small`（既定） / `v3-voice-design`
+- キャラクター selector: `v4.1-small`（既定） / `v4.1-anime` / `v3-voice-design`
+- v4.1 Anime checkpoint: `phasefield-audio/Irodori-TTS-v4.1-Anime`
 - v3 VoiceDesign checkpoint: `Aratako/Irodori-TTS-600M-v3-VoiceDesign`
 - codec: `Aratako/Semantic-DACVAE-Japanese-32dim`
 - runtime: `src/vendor/irodori_tts/` に同梱（実行時に `D:/tool/Irodori-TTS` などの外部 checkout は参照しません）
@@ -17,6 +18,7 @@ v4.1 は text・参照音声・caption を一つの checkpoint で扱い、durat
 
 - [Irodori-TTS upstream](https://github.com/Aratako/Irodori-TTS)
 - [Irodori-TTS-v4.1-Small model card](https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small)
+- [Irodori-TTS-v4.1-Anime model card](https://huggingface.co/phasefield-audio/Irodori-TTS-v4.1-Anime)
 - [Semantic-DACVAE-Japanese-32dim model card](https://huggingface.co/Aratako/Semantic-DACVAE-Japanese-32dim)
 - [DACVAE upstream](https://github.com/facebookresearch/dacvae)
 
@@ -111,13 +113,13 @@ tts_settings:
 
 ```json
 {
-  "irodori_model": "v3-voice-design",
+  "irodori_model": "v4.1-anime",
   "caption": "明るく親しみやすく話す",
   "irodori_reference_assets": []
 }
 ```
 
-`irodori_model` から具体的な checkpoint への解決はバックエンドが一元管理します。既存の `hf_checkpoint`、ローカル checkpoint、`voice_design_checkpoint` がある場合は互換性のため selector より優先されます。モデルを v4.1 → v3 → v4.1 と切り替えても、プロセス内の単一 runtime cache が要求された checkpoint をロードし直します。
+`irodori_model` から具体的な checkpoint への解決はバックエンドが一元管理します。`v4.1-anime` は `phasefield-audio/Irodori-TTS-v4.1-Anime` に解決されます。既存の `hf_checkpoint`、ローカル checkpoint、`voice_design_checkpoint` がある場合は互換性のため selector より優先されます。モデルを Anime / v4.1 Small / v3 VoiceDesign 間で切り替えても、プロセス内の単一 runtime cache が要求された checkpoint をロードし直します。
 
 既存の v3 VoiceDesign を明示的に使う場合は、checkpoint だけを置き換えます。明示値を既定 v4.1 へ上書きする処理はありません。
 

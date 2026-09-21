@@ -2,6 +2,7 @@ import * as FileSystem from "expo-file-system/legacy";
 import { Directory, Paths } from "expo-file-system";
 import { fetchApi, getBaseUrl } from "./api-client";
 import { getToken, getTokenAuthScope } from "./auth";
+import { projectApi } from "./project-api";
 import {
   downloadFileToDevice,
   type FilesDownloadResult,
@@ -174,14 +175,131 @@ function getServerChildPath(parentPath: string, name: string): string {
   return `${trimmedParent}/${trimmedName}`;
 }
 
+export type ProjectFilesPath = {
+  projectId: string;
+  relativePath: string;
+  rootPath: string;
+};
+
+/** Parse the canonical server project namespace (`_projects/project_<uuid>`).
+ *
+ * The generic explorer API also accepts user-owned paths.  Keep the two
+ * namespaces distinguishable at this boundary so project mutations can never
+ * accidentally be sent to a user-scoped endpoint.  Absolute paths and paths
+ * with malformed project prefixes return null and are handled fail-closed by
+ * mutation callers.
+ */
+export function parseProjectFilesPath(path: string): ProjectFilesPath | null {
+  if (/^[\\/]|^[A-Za-z]:[\\/]/.test(path)) return null;
+  const normalized = path
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  const match = normalized.match(
+    /^_projects\/project_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\/(.*))?$/i,
+  );
+  if (!match) return null;
+  const projectId = match[1];
+  const relativePath = match[2] ?? "";
+  // Traversal/control segments must never be handed to a project endpoint.
+  if (
+    /[\u0000-\u001f\u007f]/.test(relativePath) ||
+    relativePath.split("/").some((segment) => segment === ".." || segment === ".")
+  ) {
+    return null;
+  }
+  return {
+    projectId,
+    relativePath,
+    rootPath: `_projects/project_${projectId}`,
+  };
+}
+
+export function isProjectFilesNamespacePath(path: string): boolean {
+  const normalized = path
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  return normalized === "_projects" || normalized.startsWith("_projects/");
+}
+
+export function canRouteServerFileTransfer(
+  sourcePath: string,
+  destinationPath: string,
+): boolean {
+  const sourceProject = parseProjectFilesPath(sourcePath);
+  const destinationProject = parseProjectFilesPath(destinationPath);
+  const sourceUsesProjectNamespace = isProjectFilesNamespacePath(sourcePath);
+  const destinationUsesProjectNamespace = isProjectFilesNamespacePath(destinationPath);
+  if (!sourceUsesProjectNamespace && !destinationUsesProjectNamespace) return true;
+  return Boolean(
+    sourceProject &&
+      sourceProject.relativePath &&
+      destinationProject &&
+      sourceProject.projectId.toLowerCase() === destinationProject.projectId.toLowerCase(),
+  );
+}
+
+function resolveProjectMutationPath(
+  path: string,
+  operation: string,
+  options: { allowRoot?: boolean } = {},
+): ProjectFilesPath | null {
+  const projectPath = parseProjectFilesPath(path);
+  if (projectPath) {
+    if (!options.allowRoot && !projectPath.relativePath) {
+      throw new Error(`プロジェクトルート自体は${operation}できません`);
+    }
+    return projectPath;
+  }
+  if (isProjectFilesNamespacePath(path)) {
+    throw new Error(
+      `プロジェクトファイルの${operation}には _projects/project_<uuid> 形式のパスが必要です`,
+    );
+  }
+  return null;
+}
+
+function toProjectFilesPath(
+  projectPath: ProjectFilesPath,
+  relativePath: string,
+): string {
+  const normalized = relativePath
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "");
+  if (normalized.split("/").some((segment) => segment === ".." || segment === ".")) {
+    throw new Error("サーバーから不正なプロジェクトパスが返されました");
+  }
+  return normalized ? `${projectPath.rootPath}/${normalized}` : projectPath.rootPath;
+}
+
+function projectResultPath(
+  payload: Record<string, unknown>,
+  key: string,
+): string | undefined {
+  const value = payload[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function splitProjectFilePath(projectPath: ProjectFilesPath): {
+  directory: string;
+  filename: string;
+} {
+  const separator = projectPath.relativePath.lastIndexOf("/");
+  const directory = separator >= 0 ? projectPath.relativePath.slice(0, separator) : "";
+  const filename = separator >= 0
+    ? projectPath.relativePath.slice(separator + 1)
+    : projectPath.relativePath;
+  if (!filename) throw new Error("保存するプロジェクトファイル名がありません");
+  return { directory, filename };
+}
+
 function projectRelativeDirectory(parentPath: string, projectId: string): string {
-  const normalized = parentPath.replace(/\\/g, "/").replace(/^\/+/, "");
-  const projectRoot = `_projects/project_${projectId}`;
-  if (!normalized || normalized === projectRoot) return "";
-  if (!normalized.startsWith(`${projectRoot}/`)) {
+  const projectPath = resolveProjectMutationPath(parentPath, "アップロード", {
+    allowRoot: true,
+  });
+  if (!projectPath || projectPath.projectId.toLowerCase() !== projectId.toLowerCase()) {
     throw new Error("現在のフォルダーは選択中プロジェクトの領域ではありません");
   }
-  return normalized.slice(projectRoot.length + 1);
+  return projectPath.relativePath;
 }
 
 function getExtension(name: string): string {
@@ -420,10 +538,42 @@ async function saveLocalTextFile(path: string, content: string): Promise<void> {
   await FileSystem.writeAsStringAsync(path, content);
 }
 
+async function saveServerProjectTextFile(
+  projectPath: ProjectFilesPath,
+  content: string,
+): Promise<void> {
+  const { directory, filename } = splitProjectFilePath(projectPath);
+  const tempRoot = FileSystem.cacheDirectory || FileSystem.documentDirectory;
+  if (!tempRoot) {
+    throw new Error("プロジェクトファイル保存用キャッシュを利用できません");
+  }
+  const tempUri = joinLocalUri(
+    tempRoot,
+    `filer-project-save-${Date.now()}-${Math.random().toString(16).slice(2)}.txt`,
+  );
+  await FileSystem.writeAsStringAsync(tempUri, content);
+  try {
+    // The canonical project upload endpoint replaces an existing file, so it
+    // provides the overwrite semantics required by the text editor.
+    await projectApi.uploadFile(
+      projectPath.projectId,
+      { uri: tempUri, name: filename, mimeType: "text/plain" },
+      directory,
+    );
+  } finally {
+    await FileSystem.deleteAsync(tempUri, { idempotent: true }).catch(() => {});
+  }
+}
+
 async function saveServerTextFile(
   path: string,
   content: string,
 ): Promise<void> {
+  const projectPath = resolveProjectMutationPath(path, "保存");
+  if (projectPath) {
+    await saveServerProjectTextFile(projectPath, content);
+    return;
+  }
   await fetchApi("/api/explorer/save", {
     method: "PUT",
     body: JSON.stringify({ path, content, encoding: "utf-8" }),
@@ -454,8 +604,53 @@ async function createLocalFolder(
   parentPath: string,
   name: string,
 ): Promise<string> {
-  const nextPath = joinLocalUri(parentPath, name, true);
-  await FileSystem.makeDirectoryAsync(nextPath, { intermediates: true });
+  // Folder names are a single local path segment.  Validate before joining
+  // so a slash, traversal segment, or control character cannot turn a folder
+  // create into an unintended nested/out-of-root write.
+  const normalizedName = normalizeLocalEntryName(name);
+  const rawParentUri = parentPath || (await ensureLocalWorkspace("user"));
+  const parentUri = rawParentUri.endsWith("/")
+    ? rawParentUri
+    : `${rawParentUri}/`;
+  const rootUri = getLocalRootUri("user");
+  if (!parentUri.startsWith(rootUri)) {
+    throw new Error("ローカルの保存先が不正です");
+  }
+  for (const segment of parentUri.slice(rootUri.length).split("/")) {
+    if (!segment) continue;
+    let decodedSegment: string;
+    try {
+      decodedSegment = decodeURIComponent(segment);
+    } catch {
+      throw new Error("ローカルの保存先が不正です");
+    }
+    if (decodedSegment === "." || decodedSegment === "..") {
+      throw new Error("ローカルの保存先が不正です");
+    }
+  }
+
+  const parentInfo = await FileSystem.getInfoAsync(parentUri);
+  if (!parentInfo.exists || !parentInfo.isDirectory) {
+    throw new Error("親ディレクトリが存在しません");
+  }
+
+  const nextPath = joinLocalEncodedUri(parentUri, normalizedName, true);
+  if ((await FileSystem.getInfoAsync(nextPath)).exists) {
+    throw new Error("同じ名前の項目が既に存在します");
+  }
+
+  try {
+    // The parent is checked above; do not create missing/intermediate
+    // directories as a side effect of a folder creation request.
+    await FileSystem.makeDirectoryAsync(nextPath, { intermediates: false });
+  } catch (error) {
+    // A concurrent create may win after the existence check.  Normalize that
+    // case to the same duplicate error exposed by the server endpoints.
+    if ((await FileSystem.getInfoAsync(nextPath)).exists) {
+      throw new Error("同じ名前の項目が既に存在します");
+    }
+    throw error;
+  }
   return nextPath;
 }
 
@@ -518,10 +713,51 @@ async function uploadServerProjectFile(
   }
 }
 
+async function uploadServerExplorerFile(
+  parentPath: string,
+  file: FilesUploadInput,
+): Promise<void> {
+  const baseUrl = await getBaseUrl();
+  const token = await getToken();
+  const formData = new FormData();
+  formData.append("file", {
+    uri: file.uri,
+    name: file.name,
+    type: file.mimeType || inferMimeType(file.name) || "application/octet-stream",
+  } as unknown as Blob);
+
+  const response = await fetch(
+    `${baseUrl}/api/explorer/upload?path=${encodeURIComponent(parentPath)}`,
+    {
+      method: "POST",
+      headers: token ? { Authorization: `Bearer ${token}` } : undefined,
+      body: formData,
+    },
+  );
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Upload failed: ${response.status} ${text.slice(0, 300)}`);
+  }
+}
+
 async function createServerFolder(
   parentPath: string,
   name: string,
 ): Promise<string> {
+  const projectPath = resolveProjectMutationPath(parentPath, "フォルダー作成", {
+    allowRoot: true,
+  });
+  if (projectPath) {
+    const payload = await projectApi.createFolder(projectPath.projectId, {
+      path: projectPath.relativePath,
+      name,
+    });
+    const createdPath = projectResultPath(payload, "path");
+    return toProjectFilesPath(
+      projectPath,
+      createdPath ?? getServerChildPath(projectPath.relativePath, name),
+    );
+  }
   const payload = await fetchApi<{ success?: boolean; path?: string }>(
     "/api/explorer/mkdir",
     {
@@ -555,12 +791,16 @@ function getLocalDirectoryPrefix(path: string): string {
 /**
  * Validate and normalize a local file/folder name before it is joined to a URI.
  *
- * Names are deliberately treated as a single path segment.  A local rename
- * must not accidentally turn `a/b` into a nested move, and an empty segment
- * would otherwise resolve to the parent directory.  The remote endpoint keeps
- * its existing validation/contract and does not use this helper.
+ * Names are deliberately treated as a single path segment.  Local create and
+ * rename operations must not accidentally turn `a/b` into a nested move, and
+ * an empty segment would otherwise resolve to the parent directory.  The
+ * remote endpoint keeps its existing validation/contract and does not use
+ * this helper.
  */
 export function normalizeLocalEntryName(name: string): string {
+  if (typeof name !== "string") {
+    throw new Error("名前を入力してください");
+  }
   if (/[\u0000-\u001f\u007f-\u009f]/.test(name)) {
     throw new Error("名前に制御文字を含めることはできません");
   }
@@ -648,6 +888,16 @@ async function renameServerEntry(
   path: string,
   newName: string,
 ): Promise<string> {
+  const projectPath = resolveProjectMutationPath(path, "名前変更");
+  if (projectPath) {
+    const payload = await projectApi.renameFile(
+      projectPath.projectId,
+      projectPath.relativePath,
+      newName,
+    );
+    const nextPath = projectResultPath(payload, "new_path");
+    return nextPath ? toProjectFilesPath(projectPath, nextPath) : path;
+  }
   const payload = await fetchApi<{ success?: boolean; new_path?: string }>(
     "/api/explorer/rename",
     {
@@ -695,6 +945,18 @@ async function moveServerEntry(
   path: string,
   destinationPath: string,
 ): Promise<string> {
+  const projectTransfer = resolveProjectTransferPaths(path, destinationPath, "移動");
+  if (projectTransfer) {
+    const payload = await projectApi.moveFile(
+      projectTransfer.projectPath.projectId,
+      projectTransfer.sourceRelativePath,
+      projectTransfer.destinationRelativePath,
+    );
+    const nextPath = projectResultPath(payload, "new_path");
+    return nextPath
+      ? toProjectFilesPath(projectTransfer.projectPath, nextPath)
+      : path;
+  }
   const payload = await fetchApi<{ success?: boolean; new_path?: string }>(
     "/api/explorer/move",
     {
@@ -703,6 +965,38 @@ async function moveServerEntry(
     },
   );
   return payload.new_path || path;
+}
+
+function resolveProjectTransferPaths(
+  sourcePath: string,
+  destinationPath: string,
+  operation: "移動" | "コピー",
+): {
+  projectPath: ProjectFilesPath;
+  sourceRelativePath: string;
+  destinationRelativePath: string;
+} | null {
+  const sourceProject = resolveProjectMutationPath(sourcePath, operation);
+  const destinationProject = resolveProjectMutationPath(
+    destinationPath,
+    operation,
+    { allowRoot: true },
+  );
+  if (!sourceProject && !destinationProject) return null;
+  if (
+    !sourceProject ||
+    !destinationProject ||
+    sourceProject.projectId.toLowerCase() !== destinationProject.projectId.toLowerCase()
+  ) {
+    throw new Error(
+      `プロジェクトファイルの${operation}は同一プロジェクト内のみ対応しています`,
+    );
+  }
+  return {
+    projectPath: sourceProject,
+    sourceRelativePath: sourceProject.relativePath,
+    destinationRelativePath: destinationProject.relativePath,
+  };
 }
 
 async function copyLocalDirectory(sourcePath: string, targetPath: string) {
@@ -760,6 +1054,18 @@ async function copyServerEntry(
   path: string,
   destinationPath: string,
 ): Promise<string> {
+  const projectTransfer = resolveProjectTransferPaths(path, destinationPath, "コピー");
+  if (projectTransfer) {
+    const payload = await projectApi.copyFile(
+      projectTransfer.projectPath.projectId,
+      projectTransfer.sourceRelativePath,
+      projectTransfer.destinationRelativePath,
+    );
+    const nextPath = projectResultPath(payload, "new_path");
+    return nextPath
+      ? toProjectFilesPath(projectTransfer.projectPath, nextPath)
+      : path;
+  }
   const payload = await fetchApi<{ success?: boolean; new_path?: string }>(
     "/api/explorer/copy",
     {
@@ -775,6 +1081,11 @@ async function deleteLocalEntry(path: string): Promise<void> {
 }
 
 async function deleteServerEntry(path: string): Promise<void> {
+  const projectPath = resolveProjectMutationPath(path, "削除");
+  if (projectPath) {
+    await projectApi.deleteFile(projectPath.projectId, projectPath.relativePath);
+    return;
+  }
   await fetchApi(`/api/explorer/delete?path=${encodeURIComponent(path)}`, {
     method: "DELETE",
   });
@@ -954,15 +1265,23 @@ export const filesApi = {
     source: FilesSource,
     parentPath: string,
     file: FilesUploadInput,
-    options?: { projectId?: string | null },
+    _options?: { projectId?: string | null },
   ) {
     if (source === "local") {
       return uploadLocalFile(parentPath, file);
     }
-    if (!options?.projectId) {
-      throw new Error("サーバーへアップロードするにはプロジェクト選択が必要です");
+
+    // Route by the canonical path namespace, never by stale UI project state.
+    // Malformed _projects paths fail closed instead of reaching explorer upload.
+    const projectPath = resolveProjectMutationPath(parentPath, "アップロード", {
+      allowRoot: true,
+    });
+    if (projectPath) {
+      await uploadServerProjectFile(projectPath.projectId, parentPath, file);
+      return null;
     }
-    await uploadServerProjectFile(options.projectId, parentPath, file);
+
+    await uploadServerExplorerFile(parentPath, file);
     return null;
   },
 

@@ -240,7 +240,19 @@ class MCPManagementService:
             await plugin.client.remove_server(server_name)
             logger.debug("サーバー '%s' のセッションを削除しました", server_name)
         except Exception as e:
-            logger.warning("セッション削除中にエラー（続行します）: %s", e)
+            # A restart must never open a replacement transport while the old
+            # one may still be alive.  ``remove_server`` awaits the complete
+            # server scope close; if it reports a cleanup failure, abort the
+            # restart and leave the caller an explicit error instead of
+            # proceeding into an overlapping connection.
+            msg = f"サーバー '{server_name}' の切断に失敗しました: {e}"
+            logger.error(msg)
+            return {
+                "success": False,
+                "name": server_name,
+                "status": "error",
+                "error": msg,
+            }
 
         # 2. プラットフォーム固有設定を解決
         shared_env = {}

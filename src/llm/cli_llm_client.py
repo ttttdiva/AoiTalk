@@ -29,13 +29,20 @@ from ..services.project_context import (
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
-from ..services.turn_context import get_turn_context
+from .manager_parts.context_building import strip_project_context_bundle
+from ..services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    get_turn_context,
+)
 from ..services.outbound_privacy_service import (
-    current_effective_privacy_mode,
-    effective_privacy_mode,
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
 )
 from .context_snapshot import (
+    capture_context_manifest_before_context_clear,
     component,
+    context_manifest_metadata,
     context_bundle_components,
     reconcile_snapshot,
     sanitized_snapshot_series,
@@ -82,6 +89,7 @@ from ..reasoning import ReasoningManager
 
 # Unified tool registry and adapters
 from ..tools.adapters import CLIAdapter
+from ..tools.registry import ToolRegistry
 from .generation_policy import (
     DEFAULT_GENERATION_POLICY,
     GenerationProfile,
@@ -141,6 +149,11 @@ CLI_REVIEW_ISOLATION_UNAVAILABLE = (
     "陽性リストへ確実に限定できないため、モデル実行を停止しました。"
     "REVIEW対応のAPIまたはローカルproviderを選択してください。"
 )
+CLI_HELP_ISOLATION_UNAVAILABLE = (
+    "AoiTalk Helpは、選択中のCLI providerが内蔵ツール・MCP・"
+    "ネイティブセッションを完全に無効化できることを確認できないため利用できません。"
+    "APIまたは検証済みのツール無効化対応ローカルproviderを選択してください。"
+)
 
 _PLAIN_TEXT_MODEL_OVERRIDE_UNSET = object()
 
@@ -191,7 +204,19 @@ class CLILLMClient:
             raise ValueError("Config is required for CLILLMClient")
 
         self.config = config
-        self.character_name = config.default_character
+        self._lightweight_ephemeral_client = bool(
+            config.get("runtime.lightweight_ephemeral_client", False)
+        )
+        self._target_tools_enabled = (
+            not self._lightweight_ephemeral_client
+            and config.get("runtime.target_enable_tools", True) is not False
+        )
+        self._privacy_gateway = OutboundPrivacyGateway(config)
+        self.character_name = (
+            "Assistant"
+            if self._lightweight_ephemeral_client
+            else config.default_character
+        )
         self.model_name = config.get('llm_model', 'cli')
 
         # CLI backend (Antigravity/Claude/Codex/Grok Build)
@@ -211,7 +236,11 @@ class CLILLMClient:
         logger.info(f"[CLILLMClient] Using {self.cli_backend.get_provider_name()}")
 
         # Character configuration
-        self.character_config = config.get_character_config(self.character_name)
+        self.character_config = (
+            {}
+            if self._lightweight_ephemeral_client
+            else config.get_character_config(self.character_name)
+        )
 
         # Session context
         self.session_user_id: str = "default_user"
@@ -254,7 +283,14 @@ class CLILLMClient:
 
         # Memory manager (ConversationMemoryManager)
         self.memory_manager = None
-        self._memory_enabled = get_config_value('memory', {}).get('enabled', True)
+        # Only the explicit Project Overview lightweight contract suppresses
+        # the normal CLI runtime initialization. A request-local/session
+        # client is otherwise the same CLI client as before this workstream.
+        self._memory_enabled = (
+            False
+            if self._lightweight_ephemeral_client
+            else get_config_value('memory', {}).get('enabled', True)
+        )
 
         if self._memory_enabled:
             try:
@@ -266,12 +302,6 @@ class CLILLMClient:
                     'llm_model', memory_config.llm_model
                 )
                 memory_settings = get_config_value('memory', {})
-                memory_config.embedding_model = memory_settings.get(
-                    'embedding_model', memory_config.embedding_model
-                )
-                memory_config.preload_embedding_model = memory_settings.get(
-                    'preload_embedding_model', memory_config.preload_embedding_model
-                )
                 memory_config.enable_search = memory_settings.get(
                     'enable_search', memory_config.enable_search
                 )
@@ -284,7 +314,11 @@ class CLILLMClient:
         # Claude Code: --mcp-config で実行時渡し
         # Antigravity CLI / Codex CLI: 各CLIの設定ファイルで事前設定が必要
         self._mcp_servers: dict = {}
-        if not Features.is_enterprise() and config.get('mcp_enabled', False):
+        if (
+            self._target_tools_enabled
+            and not Features.is_enterprise()
+            and config.get('mcp_enabled', False)
+        ):
             self._mcp_servers = config.get('mcp', {}).get('servers', {})
             if self._mcp_servers:
                 mcp_args = self.cli_backend.get_mcp_args(self._mcp_servers)
@@ -302,7 +336,10 @@ class CLILLMClient:
         # Reasoning manager
         self.reasoning_manager = None
         reasoning_config = get_config_value('reasoning', {})
-        if reasoning_config.get('enabled', False):
+        if (
+            not self._lightweight_ephemeral_client
+            and reasoning_config.get('enabled', False)
+        ):
             self.reasoning_manager = ReasoningManager(self, reasoning_config)
             logger.info(
                 f"[CLILLMClient] 推論モード初期化完了 "
@@ -310,12 +347,15 @@ class CLILLMClient:
             )
 
         # Tool registry
-        self._tool_registry = build_runtime_tool_registry_for_client(
-            build_runtime_tool_registry,
-            self.config,
-            client=self,
-        )
-        ensure_load_tool_pack_tool(self._tool_registry, self)
+        if self._target_tools_enabled:
+            self._tool_registry = build_runtime_tool_registry_for_client(
+                build_runtime_tool_registry,
+                self.config,
+                client=self,
+            )
+            ensure_load_tool_pack_tool(self._tool_registry, self)
+        else:
+            self._tool_registry = ToolRegistry()
         logger.info(
             f"[CLILLMClient] Initialized: character={self.character_name}, "
             f"backend={self.cli_backend.get_provider_name()}, "
@@ -340,7 +380,69 @@ class CLILLMClient:
                 )
 
     def _get_session_user_id(self) -> str:
-        return self.session_user_id or "default_user"
+        # Lightweight test doubles and legacy embeddings may construct the
+        # client without running the full initializer.  Keep the privacy
+        # boundary fail-closed while still giving those callers a stable
+        # default actor instead of raising during gateway synchronization.
+        return str(getattr(self, "session_user_id", None) or "default_user")
+
+    def _sync_privacy_gateway(self) -> OutboundPrivacyGateway:
+        """Keep the CLI egress gate aligned with the active session/turn."""
+
+        user_id = str(self._get_session_user_id() or "default_user")
+        session_id = str(getattr(self, "current_session_id", None) or "")
+        gateway = getattr(self, "_privacy_gateway", None)
+        turn = get_turn_context()
+        if bool(getattr(turn, "suppress_automatic_context", False)):
+            # Direct CLI callers may invoke this synchronizer after the outer
+            # generation method has installed a fresh Help gateway.  Keep that
+            # isolated alias table instead of replacing it with the client's
+            # ordinary session/project policy.
+            isolated_user_id = str(
+                getattr(turn, "user_id", None) or user_id
+            )
+            isolated_session_id = str(
+                getattr(turn, "session_id", None) or session_id
+            )
+            if (
+                not bool(getattr(gateway, "_aoitalk_help_isolated", False))
+                or not isinstance(gateway, OutboundPrivacyGateway)
+                or gateway.user_id != isolated_user_id
+                or gateway.session_id != isolated_session_id
+            ):
+                gateway = OutboundPrivacyGateway(
+                    getattr(self, "config", None),
+                    user_id=isolated_user_id,
+                    session_id=isolated_session_id,
+                    session_context={},
+                    project_metadata={},
+                )
+                setattr(gateway, "_aoitalk_help_isolated", True)
+                self._privacy_gateway = gateway
+            else:
+                gateway.update_policy_context(
+                    session_context={},
+                    project_metadata={},
+                )
+            return gateway
+        if (
+            gateway is None
+            or gateway.user_id != user_id
+            or gateway.session_id != session_id
+        ):
+            self._privacy_gateway = OutboundPrivacyGateway(
+                getattr(self, "config", None),
+                user_id=user_id,
+                session_id=session_id,
+                session_context=getattr(self, "_privacy_session_context", None),
+                project_metadata=getattr(self, "_privacy_project_metadata", None),
+            )
+        else:
+            gateway.update_policy_context(
+                session_context=getattr(self, "_privacy_session_context", None),
+                project_metadata=getattr(self, "_privacy_project_metadata", None),
+            )
+        return self._privacy_gateway
 
     def set_character(self, character_name: str):
         self.character_name = character_name
@@ -412,6 +514,12 @@ class CLILLMClient:
         return capabilities if isinstance(capabilities, CLISessionCapabilities) else CLISessionCapabilities()
 
     def _native_chat_session_allowed(self) -> bool:
+        # Reserved controller turns such as AoiTalk Help must always receive
+        # the full stateless bootstrap.  Resuming a provider-managed native
+        # lease would replace that bootstrap with a continuation context and
+        # could replay prior user/project history outside AoiTalk's filters.
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return False
         capabilities = self._get_cli_session_capabilities()
         if not (
             capabilities.native_sessions
@@ -440,12 +548,15 @@ class CLILLMClient:
             or self.model_name
             or "cli"
         )
-        try:
-            user_custom_instructions = get_user_custom_instructions_sync(
-                self._get_session_user_id()
-            )
-        except Exception:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             user_custom_instructions = None
+        else:
+            try:
+                user_custom_instructions = get_user_custom_instructions_sync(
+                    self._get_session_user_id()
+                )
+            except Exception:
+                user_custom_instructions = None
         policy = get_client_generation_policy(self)
         fingerprint = fingerprint_settings(
             {
@@ -512,7 +623,14 @@ class CLILLMClient:
         tool_results_text: str,
     ) -> str:
         """Return only new tool results for a provider-managed conversation."""
-        story_chat_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        story_chat_context = (
+            None
+            if suppress_automatic_context
+            else self._get_story_chat_context_sync()
+        )
         task_instruction = (
             "シナリオ進行の応答を続けてください。"
             if story_chat_context
@@ -553,33 +671,15 @@ class CLILLMClient:
         return lock
 
     def _ensure_cli_privacy_direct(self) -> None:
-        """Fail closed for every direct CLI backend invocation.
+        """Refresh the central CLI boundary before every invocation.
 
-        ``generate_response`` performs the same check at its turn boundary,
-        but plain-text helpers and internal tracked calls are also callable by
-        docs/tools integrations.  Keeping the guard at the central execution
-        seam prevents those paths from bypassing the privacy policy.
+        Older code rejected protected mode because it had no masking seam.
+        The tracked invocation below now performs the full transaction, so a
+        protected/local-only policy is evaluated there rather than bypassed
+        or silently downgraded at this compatibility guard.
         """
 
-        provider_name = str(
-            getattr(getattr(self, "cli_backend", None), "get_provider_name", lambda: "cli")()
-            or "cli"
-        ).strip().lower()
-        session_context = getattr(self, "_privacy_session_context", {})
-        project_metadata = getattr(self, "_privacy_project_metadata", {})
-        if (
-            effective_privacy_mode(
-                getattr(self, "config", None),
-                session_context=session_context or None,
-                project_metadata=project_metadata or None,
-            )
-            != "direct"
-            or current_effective_privacy_mode(getattr(self, "config", None))
-            != "direct"
-        ):
-            raise RuntimeError(
-                f"外部CLI provider ({provider_name}) は保護/ローカル限定モードでは使用できません。"
-            )
+        self._sync_privacy_gateway()
 
     def _execute_prompt_tracked(self, *args: Any, **kwargs: Any):
         """Serialize access to the mutable CLI backend/runtime state."""
@@ -588,6 +688,9 @@ class CLILLMClient:
 
     def _execute_prompt_tracked_locked(self, *args: Any, **kwargs: Any):
         """CLI実行と、その構造化usageの永続化を一体で行う。"""
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         self._ensure_cli_privacy_direct()
         # A trusted coding run must not let a lightweight/custom backend skip
         # the CLIBackendBase WSL+bwrap seam.  Ordinary (unscoped) chat keeps
@@ -628,7 +731,12 @@ class CLILLMClient:
         system_context = kwargs.get("system_context", "")
         mcp_args = kwargs.get("extra_args") or []
         parts = []
-        rendered_bundle, bundle_parts = context_bundle_components(getattr(self, "_current_context_bundle", None))
+        # Mirror prompt construction's OFF projection in the trace as well;
+        # a retained bundle from a previous Project turn must not appear in a
+        # later user/session-only request snapshot.
+        rendered_bundle, bundle_parts = context_bundle_components(
+            self._context_bundle_for_turn()
+        )
         reduced_system_context = str(system_context)
         if rendered_bundle:
             reduced_system_context = reduced_system_context.replace(rendered_bundle, "", 1)
@@ -672,12 +780,13 @@ class CLILLMClient:
                 ),
             )
         )
-        self._cli_native_session_info = {
-            "provider": self.cli_backend.get_provider_name(),
-            "mode": native_mode,
-            "recreated": native_recreated,
-            "native_session_id_masked": mask_native_session_id(native_id_for_snapshot),
-        }
+        if not suppress_automatic_context:
+            self._cli_native_session_info = {
+                "provider": self.cli_backend.get_provider_name(),
+                "mode": native_mode,
+                "recreated": native_recreated,
+                "native_session_id_masked": mask_native_session_id(native_id_for_snapshot),
+            }
         request_snapshot = snapshot(
             provider=self.cli_backend.get_provider_name().lower().replace(" ", "-"),
             model=str(
@@ -690,14 +799,99 @@ class CLILLMClient:
             request_index=len(self._last_context_snapshots),
             request_kind="cli.execute_prompt",
         )
-        self._last_context_snapshots.append(request_snapshot)
-        self._last_context_snapshots = self._last_context_snapshots[-8:]
+        if not suppress_automatic_context:
+            self._last_context_snapshots.append(request_snapshot)
+            self._last_context_snapshots = self._last_context_snapshots[-8:]
         consume_usage = getattr(self.cli_backend, "consume_last_usage", None)
         success = False
         output = ""
         usage: Optional[dict[str, Any]] = None
         try:
-            success, output = self.cli_backend.execute_prompt(*args, **kwargs)
+            gateway = self._sync_privacy_gateway()
+            provider_name = str(
+                self.cli_backend.get_provider_name() or "cli"
+            ).strip().lower().replace(" ", "-")
+            request_payload = {
+                "prompt": str(prompt or ""),
+                "system_context": str(system_context or ""),
+                "extra_args": list(mcp_args) if isinstance(mcp_args, (list, tuple)) else [],
+            }
+
+            def send_cli_request(final_payload: Any):
+                if not isinstance(final_payload, dict):
+                    raise PrivacyError("CLI outbound payload is malformed")
+                final_prompt = final_payload.get("prompt")
+                final_system_context = final_payload.get("system_context")
+                final_extra_args = final_payload.get("extra_args")
+                if not isinstance(final_prompt, str) or not isinstance(final_system_context, str):
+                    raise PrivacyError("CLI prompt payload is malformed")
+                if not isinstance(final_extra_args, list) or not all(
+                    isinstance(item, str) for item in final_extra_args
+                ):
+                    raise PrivacyError("CLI extra arguments are malformed")
+                call_kwargs = dict(kwargs)
+                call_args = list(args)
+                if call_args:
+                    # The tracked helper accepts both a positional prompt and
+                    # a keyword prompt for legacy callers.  Replace the
+                    # positional value instead of passing duplicate prompt
+                    # arguments into the backend.
+                    call_args[0] = final_prompt
+                    call_kwargs.pop("prompt", None)
+                else:
+                    call_kwargs["prompt"] = final_prompt
+                call_kwargs["system_context"] = final_system_context
+                call_kwargs["extra_args"] = final_extra_args
+                # Tell provider-specific wrappers (Claude legacy format,
+                # transient retry loops, etc.) that this is already inside a
+                # single privacy transaction.  They must not emit a hidden
+                # second provider request after approval.
+                had_marker = hasattr(self.cli_backend, "_aoitalk_egress_transaction")
+                previous_marker = getattr(
+                    self.cli_backend, "_aoitalk_egress_transaction", False
+                )
+                setattr(self.cli_backend, "_aoitalk_egress_transaction", True)
+                try:
+                    return self.cli_backend.execute_prompt(*call_args, **call_kwargs)
+                finally:
+                    if had_marker:
+                        setattr(
+                            self.cli_backend,
+                            "_aoitalk_egress_transaction",
+                            previous_marker,
+                        )
+                    else:
+                        try:
+                            delattr(self.cli_backend, "_aoitalk_egress_transaction")
+                        except AttributeError:
+                            pass
+
+            success, output = gateway.execute_sync(
+                request_payload,
+                provider=provider_name,
+                descriptor=EgressDescriptor(
+                    action="model.generate",
+                    transport="cli.subprocess",
+                    destination=provider_name,
+                    provider=provider_name,
+                    tool="llm.cli",
+                    model=str(
+                        snapshot_model
+                        or getattr(self.cli_backend, "_model", None)
+                        or getattr(self, "model_name", "cli")
+                    ),
+                ),
+                base_url=None,
+                source_kind="cli_prompt",
+                model=str(
+                    snapshot_model
+                    or getattr(self.cli_backend, "_model", None)
+                    or getattr(self, "model_name", "cli")
+                ),
+                sender=send_cli_request,
+            )
+            if isinstance(output, str):
+                output = gateway.restore(output)
         finally:
             try:
                 usage = consume_usage() if callable(consume_usage) else None
@@ -708,8 +902,9 @@ class CLILLMClient:
                 )
                 usage = None
 
-            self._last_cli_usage = dict(usage or {})
-            if usage:
+            if not suppress_automatic_context:
+                self._last_cli_usage = dict(usage or {})
+            if usage and not suppress_automatic_context:
                 if not self._agent_run_usage:
                     self._agent_run_usage = {
                         key: int(value)
@@ -735,7 +930,7 @@ class CLILLMClient:
                     request_snapshot, usage.get("input_tokens")
                 )
 
-            if success and usage:
+            if success and usage and not suppress_automatic_context:
                 try:
                     from ..services.token_tracking_service import get_token_tracking_service
 
@@ -796,6 +991,12 @@ class CLILLMClient:
             metadata["agent_run_usage"] = dict(self._agent_run_usage)
         if self._cli_native_session_info:
             metadata["cli_native_session"] = dict(self._cli_native_session_info)
+        manifest = context_manifest_metadata(
+            self,
+            allow_snapshot_only=True,
+        )
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
         return metadata
 
     def check_and_summarize_history(self, history_manager=None) -> None:
@@ -835,6 +1036,10 @@ class CLILLMClient:
             raise
         except Exception as e:
             logger.error(f"[CLILLMClient] Error: {e}", exc_info=True)
+            if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+                # Help answers must be grounded in the Guide; a character or
+                # CLI fallback would fabricate content after a provider error.
+                raise
             if self.config.get("free_team.propagate_errors", False):
                 raise
             personality = self.character_config.get('personality', {}) if self.character_config else {}
@@ -877,7 +1082,48 @@ class CLILLMClient:
         max_tokens: Optional[int] = None,
     ) -> str:
         """Core synchronous generation logic"""
-        self._ensure_cli_privacy_direct()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            capability = getattr(
+                self.cli_backend,
+                "supports_isolated_tool_free_invocation",
+                False,
+            )
+            try:
+                capability = capability() if callable(capability) else capability
+            except Exception:
+                capability = False
+            if not bool(capability):
+                # Fail closed before provider/session/tool setup.  In
+                # particular, do not let a CLI-native MCP config or user-level
+                # plugin observe the trusted Guide prompt.
+                raise RuntimeError(CLI_HELP_ISOLATION_UNAVAILABLE)
+        isolated_generation_state: dict[str, Any] = {}
+        if suppress_automatic_context:
+            # This method is also callable without TerminalMode.  Preserve
+            # compatibility metadata that the normal outer snapshot would
+            # otherwise roll back for a reused client.
+            for name in (
+                "_last_context_snapshots",
+                "_last_cli_usage",
+                "_agent_run_usage",
+                "_last_turn_tool_rounds_exhausted",
+                "_last_turn_tool_loop_failed",
+                "_cli_native_session_info",
+                "_current_context_bundle",
+                "_privacy_project_metadata",
+            ):
+                if not hasattr(self, name):
+                    continue
+                value = getattr(self, name)
+                if isinstance(value, list):
+                    isolated_generation_state[name] = list(value)
+                elif isinstance(value, dict):
+                    isolated_generation_state[name] = dict(value)
+                else:
+                    isolated_generation_state[name] = value
         provider_name = str(self.cli_backend.get_provider_name() or "").strip().lower()
         self._last_context_snapshots = []
         self._last_cli_usage = {}
@@ -891,7 +1137,48 @@ class CLILLMClient:
                 "[CLILLMClient] REVIEW generation blocked because native CLI "
                 "tool isolation cannot be guaranteed"
             )
+            if suppress_automatic_context:
+                # This early compatibility rejection happens before the main
+                # try/finally below.  Restore the ordinary direct-call
+                # diagnostics that were snapshotted above before returning.
+                for name, value in isolated_generation_state.items():
+                    try:
+                        setattr(self, name, value)
+                    except Exception:
+                        continue
             return CLI_REVIEW_ISOLATION_UNAVAILABLE
+        isolated_privacy_gateway_previous = None
+        isolated_privacy_gateway = None
+        if suppress_automatic_context:
+            # Direct CLI callers do not pass through TerminalMode's provider
+            # snapshot.  Use a fresh alias table for this Guide-only request;
+            # the exact ordinary gateway is restored in the method finally.
+            isolated_privacy_gateway_previous = getattr(
+                self, "_privacy_gateway", None
+            )
+            try:
+                turn = get_turn_context()
+                isolated_privacy_gateway = OutboundPrivacyGateway(
+                    getattr(self, "config", None),
+                    user_id=(
+                        str(getattr(turn, "user_id", None) or "")
+                        or str(getattr(self, "session_user_id", None) or "")
+                    ),
+                    session_id=(
+                        str(getattr(turn, "session_id", None) or "")
+                        or str(getattr(self, "current_session_id", None) or "")
+                    ),
+                    session_context={},
+                    project_metadata={},
+                )
+                setattr(isolated_privacy_gateway, "_aoitalk_help_isolated", True)
+                self._privacy_gateway = isolated_privacy_gateway
+            except Exception as exc:
+                # Help is a hard privacy boundary.  Never continue with the
+                # ordinary CLI gateway if the isolated alias table cannot be
+                # constructed; native tools/MCP must not observe this turn.
+                raise RuntimeError(CLI_HELP_ISOLATION_UNAVAILABLE) from exc
+        self._ensure_cli_privacy_direct()
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
         generation_policy_token = set_current_generation_policy(
@@ -916,24 +1203,16 @@ class CLILLMClient:
                 and isinstance((project_context or {}).get("metadata"), dict)
                 else {}
             )
-            if (
-                effective_privacy_mode(
-                    self.config,
-                    session_context=getattr(self, "_privacy_session_context", {}) or None,
-                    project_metadata=self._privacy_project_metadata or None,
-                )
-                != "direct"
-                or current_effective_privacy_mode(self.config) != "direct"
-            ):
-                raise RuntimeError(
-                    f"外部CLI provider ({provider_name}) は保護/ローカル限定モードでは使用できません。"
-                )
             self._current_context_bundle = self._build_context_bundle_sync(
                 user_input, project_context
             )
 
             # Reasoning mode check
-            if self.reasoning_manager:
+            # Reserved controller turns (notably AoiTalk Help) must not enter
+            # the legacy reasoning manager.  That manager may issue nested
+            # provider calls through this client and would reintroduce
+            # ordinary history/tools outside the isolated Help contract.
+            if self.reasoning_manager and not suppress_automatic_context:
                 try:
                     if self.reasoning_manager.is_reasoning_required(
                         user_input, self._get_available_tools()
@@ -1027,14 +1306,22 @@ class CLILLMClient:
             )
             if project_context_read_block:
                 bootstrap_system_context = f"{bootstrap_system_context}\n\n{project_context_read_block}"
-            tool_hint_context = build_tool_hint_context_sync(
-                user_input=user_input,
-                registry=filtered_registry_for_client(
-                    self,
-                    self._tool_registry,
-                ),
-                policy=get_client_generation_policy(self),
-                log_prefix="CLILLMClient",
+            # Help/controller turns are grounded only by the server-verified
+            # Guide.  Do not derive vocabulary or tool hints from the user
+            # utterance (even with an empty registry), because that helper can
+            # surface Docs/Inbox/Workspace names outside the Guide subtree.
+            tool_hint_context = (
+                ""
+                if suppress_automatic_context
+                else build_tool_hint_context_sync(
+                    user_input=user_input,
+                    registry=filtered_registry_for_client(
+                        self,
+                        self._tool_registry,
+                    ),
+                    policy=get_client_generation_policy(self),
+                    log_prefix="CLILLMClient",
+                )
             )
             prompt = compose_tool_hint_user_message(
                 prompt,
@@ -1052,7 +1339,15 @@ class CLILLMClient:
             )
             snapshot_components = []
             get_all_history = getattr(self.history_manager, "get_all", None)
-            history = get_all_history() if callable(get_all_history) else list(getattr(self.history_manager, "history", []) or [])
+            history = (
+                []
+                if suppress_automatic_context
+                else (
+                    get_all_history()
+                    if callable(get_all_history)
+                    else list(getattr(self.history_manager, "history", []) or [])
+                )
+            )
             if history and not (
                 native_lease is not None and native_lease.action == "resume"
             ):
@@ -1070,7 +1365,11 @@ class CLILLMClient:
             # MCP args (CLI-native delegation)
             mcp_args = (
                 self.cli_backend.get_mcp_args(self._mcp_servers)
-                if self._mcp_servers and not is_review_generation(self)
+                if (
+                    self._mcp_servers
+                    and not suppress_automatic_context
+                    and not is_review_generation(self)
+                )
                 else None
             )
 
@@ -1278,6 +1577,22 @@ class CLILLMClient:
                     raise RuntimeError(safe_cli_output or "CLI execution failed")
                 return f"エラーが発生しました: {safe_cli_output}"
 
+            # Reserved controller turns (notably AoiTalk Help) are a single
+            # provider call.  Never feed a provider-emitted tool marker into
+            # the CLI tool-loop parser: an unknown marker could otherwise
+            # trigger follow-up provider calls despite the empty registry.
+            if suppress_automatic_context:
+                response = str(cli_output or "")
+                self._last_turn_tool_rounds_exhausted = False
+                self._last_turn_tool_loop_failed = False
+                self._emit_stream_event_sync(
+                    stream_callback,
+                    "stream_end",
+                    {"content": response},
+                )
+                logger.info(f"[CLILLMClient] Response generated: {len(response)} chars")
+                return response
+
             turn_result = run_cli_tool_call_loop(
                 original_input=user_input,
                 initial_output=cli_output,
@@ -1302,6 +1617,7 @@ class CLILLMClient:
                 max_rounds=self._cli_tool_round_limit(user_input),
                 max_tool_result_chars=self._cli_tool_result_max_chars(),
                 config=self.config,
+                client=self,
                 user_input=user_input,
                 event_callback=event_callback,
                 final_response_check=combined_final_response_check(
@@ -1400,9 +1716,10 @@ class CLILLMClient:
             )
 
             # Update history
-            self.history_manager.add_message("user", user_input)
-            self.history_manager.add_message("assistant", response)
-            self.check_and_summarize_history()
+            if not suppress_automatic_context:
+                self.history_manager.add_message("user", user_input)
+                self.history_manager.add_message("assistant", response)
+                self.check_and_summarize_history()
 
             # Save to memory (async operations run in a new loop)
             self._save_to_memory(user_input, response)
@@ -1422,9 +1739,17 @@ class CLILLMClient:
             reset_current_user_input(tool_policy_token)
             if project_token is not None:
                 reset_runtime_project_context(project_token)
+            capture_context_manifest_before_context_clear(self)
             self._current_context_bundle = None
             if image_cleanup is not None:
                 image_cleanup()
+            if isolated_privacy_gateway is not None:
+                self._privacy_gateway = isolated_privacy_gateway_previous
+            for name, value in isolated_generation_state.items():
+                try:
+                    setattr(self, name, value)
+                except Exception:
+                    continue
 
     def _run_streamed_with_callback(self, *args, **kwargs):
         """Capability marker: CLI clients emit progress through stream_callback."""
@@ -1440,6 +1765,9 @@ class CLILLMClient:
         event_callback: Any,
         user_input: str,
     ) -> str:
+        # Help/controller turns must not start a second (review) provider call.
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return ""
         success, cli_output = self._execute_prompt_tracked(
             prompt=prompt,
             cwd=self._cli_execution_cwd(user_input),
@@ -1468,6 +1796,7 @@ class CLILLMClient:
             max_rounds=self._cli_tool_round_limit(user_input),
             max_tool_result_chars=self._cli_tool_result_max_chars(),
             config=self.config,
+            client=self,
             user_input=user_input,
             event_callback=event_callback,
             final_response_check=combined_final_response_check(
@@ -1661,9 +1990,13 @@ class CLILLMClient:
         return max(1, min(value, MAX_CLI_TOOL_ROUND_LIMIT))
 
     def _should_include_cli_project_context(self, user_input: str | None) -> bool:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return False
         return project_context_enabled_for_client(self, default=False)
 
     def _requires_cli_project_context_read(self, user_input: str | None) -> bool:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return False
         return (
             project_context_enabled_for_client(self, default=False)
             and bool(self.current_project_id or self.current_session_id)
@@ -1771,14 +2104,24 @@ class CLILLMClient:
         cancellation_handle = get_current_generation_cancellation()
         if cancellation_handle and cancellation_handle.cancel_requested.is_set():
             raise GenerationCancelled("CLI generation cancelled")
-        context_bundle = self._context_bundle_for_turn()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        context_bundle = (
+            None if suppress_automatic_context else self._context_bundle_for_turn()
+        )
         context = {
-            'available_tools': self._get_available_tools(),
-            'conversation_history': self.history_manager.get_all(),
+            'available_tools': [] if suppress_automatic_context else self._get_available_tools(),
+            'conversation_history': (
+                [] if suppress_automatic_context else self.history_manager.get_all()
+            ),
             'character_name': self.character_name,
             'project_context': sanitize_project_context_for_chat(
                 get_runtime_project_context()
-            ) if self._should_include_cli_project_context(user_input) else None,
+            )
+            if not suppress_automatic_context
+            and self._should_include_cli_project_context(user_input)
+            else None,
             'runtime_context': (
                 context_bundle.render_for_prompt()
                 if context_bundle
@@ -1796,16 +2139,11 @@ class CLILLMClient:
         """Hide stale selected-Project layers when Project Context is OFF."""
 
         bundle = getattr(self, "_current_context_bundle", None)
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if bundle is None or project_context_enabled_for_client(self):
             return bundle
-        return replace(
-            bundle,
-            project_context_block="",
-            project_information_block="",
-            agent_memory_block="",
-            project_pack_block="",
-            task_context_block="",
-        )
+        return strip_project_context_bundle(bundle)
 
     def _run_async_in_new_loop(self, coro):
         """Run a coroutine in a new event loop (thread-safe)"""
@@ -1838,7 +2176,27 @@ class CLILLMClient:
         try:
             return loop.run_until_complete(cancellation_aware_result())
         finally:
-            loop.close()
+            # ``coro`` may create owned background work (conversation-memory
+            # indexing/summarization is one example).  A short-lived loop must
+            # not be closed with pending tasks still attached: cancellation
+            # is requested and every task is awaited while the loop is alive,
+            # so task finalizers and exception retrieval complete deterministically.
+            if not loop.is_closed():
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    loop.run_until_complete(
+                        asyncio.gather(*pending, return_exceptions=True)
+                    )
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                except Exception:
+                    logger.debug(
+                        "[CLILLMClient] Ephemeral loop async-generator shutdown failed",
+                        exc_info=True,
+                    )
+                loop.close()
             asyncio.set_event_loop(None)
 
     def _make_stream_event_callback(self, stream_callback: Any):
@@ -1898,6 +2256,12 @@ class CLILLMClient:
 
     def _save_to_memory(self, user_input: str, response: str):
         """Save conversation to memory manager (runs async in background)"""
+        # Trusted turn boundaries such as Help and Project Steward deliberately
+        # suppress automatic context. Never copy their hidden prompt or answer
+        # into the global/no-session memory store, even if a legacy caller did
+        # not set ``external_persistence_enabled`` on the client first.
+        if get_turn_context().suppress_automatic_context:
+            return
         if getattr(self, "external_persistence_enabled", False):
             return
         if not self.memory_manager:
@@ -1906,6 +2270,10 @@ class CLILLMClient:
         try:
             user_id = self.session_user_id
             character_name = self.character_name
+            assistant_metadata: Dict[str, Any] = {}
+            manifest = context_manifest_metadata(self)
+            if manifest is not None:
+                assistant_metadata["context_manifest"] = manifest
 
             async def _save():
                 if not self.memory_manager.is_initialized():
@@ -1922,6 +2290,7 @@ class CLILLMClient:
                         session_id=self.current_session_id,
                         role="assistant",
                         content=response,
+                        metadata=assistant_metadata or None,
                     )
                 else:
                     await self.memory_manager.add_message(
@@ -1937,6 +2306,7 @@ class CLILLMClient:
                         character_name=character_name,
                         role="assistant",
                         content=response,
+                        metadata=assistant_metadata or None,
                         llm_client=self,
                     )
 
@@ -2031,6 +2401,12 @@ class CLILLMClient:
             "explanation or Markdown fences, and return only the requested "
             "JSON object."
         )
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Low-level plain/title helpers can be called directly during a
+            # trusted Help turn.  Do not let a caller-supplied instruction (or
+            # a stale provider prompt) become a second authority beside the
+            # canonical Guide system prompt.
+            system = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         # Check before creating a worker so a protected/local-only call cannot
         # even enter the CLI execution queue.  The tracked seam repeats this
         # guard for direct/internal callers.
@@ -2150,6 +2526,8 @@ class CLILLMClient:
         Returns True if MCP servers are configured and the backend supports
         runtime MCP args (currently only Claude Code).
         """
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return False
         return bool(self._mcp_servers) and (
             bool(self.cli_backend.get_mcp_args(self._mcp_servers))
         )
@@ -2177,12 +2555,21 @@ class CLILLMClient:
         各CLI backendが対応する入力形式へ変換して渡す。
         """
         parts = []
-        story_chat_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        story_chat_context = (
+            None
+            if suppress_automatic_context
+            else self._get_story_chat_context_sync()
+        )
 
         # System instructions (セクションヘッダなし — Geminiが誤解しないように)
-        if story_chat_context:
+        if suppress_automatic_context:
+            parts.append(AOITALK_HELP_ISOLATED_SYSTEM_PROMPT)
+        elif story_chat_context:
             parts.append(story_chat_context.prompt)
-        elif self.custom_system_prompt:
+        elif self.custom_system_prompt and not suppress_automatic_context:
             parts.append(self.custom_system_prompt)
         else:
             instructions = build_unified_instructions(
@@ -2190,8 +2577,12 @@ class CLILLMClient:
                 config=self.config,
                 include_mcp_info=False,
                 include_static_tool_reference=False,
-                custom_instructions=get_user_custom_instructions_sync(
-                    self.session_user_id
+                # Help is grounded only by the server-verified Guide. Do not
+                # read or inject mutable per-user custom instructions here.
+                custom_instructions=(
+                    None
+                    if suppress_automatic_context
+                    else get_user_custom_instructions_sync(self.session_user_id)
                 ),
             )
             parts.append(instructions)
@@ -2199,16 +2590,22 @@ class CLILLMClient:
         context_bundle = self._context_bundle_for_turn()
         context_builder_block = (
             context_bundle.render_for_prompt()
-            if not story_chat_context and context_bundle
+            if not suppress_automatic_context
+            and not story_chat_context
+            and context_bundle
             else ""
         )
         if context_builder_block:
             parts.append(f"\n{context_builder_block}")
 
-        include_project_context = self._should_include_cli_project_context(user_input)
+        include_project_context = (
+            False
+            if suppress_automatic_context
+            else self._should_include_cli_project_context(user_input)
+        )
         project_context = (
             None
-            if story_chat_context or not include_project_context
+            if suppress_automatic_context or story_chat_context or not include_project_context
             else get_runtime_project_context()
         )
         if project_context and not context_builder_block:
@@ -2217,7 +2614,11 @@ class CLILLMClient:
             )
 
         # Conversation history
-        context_text = self.history_manager.get_context_as_text()
+        context_text = (
+            ""
+            if suppress_automatic_context
+            else self.history_manager.get_context_as_text()
+        )
         if context_text:
             parts.append(f"\n会話履歴:\n{context_text}")
 
@@ -2245,12 +2646,21 @@ class CLILLMClient:
             )
             return "\n".join(parts)
 
-        # Tool information
-        tool_prompt = build_cli_tool_context(
-            user_input=user_input,
-            registry=filtered_registry_for_client(self, self._tool_registry),
-            force_project_tools=include_project_context,
-            loaded_pack_ids=effective_tool_pack_session(self).loaded,
+        # Tool information.  A reserved controller turn gets no tool-context
+        # selection at all; an empty registry is not enough because selection
+        # can still inspect the utterance and loaded-pack state.
+        tool_prompt = (
+            ""
+            if suppress_automatic_context
+            else build_cli_tool_context(
+                user_input=user_input,
+                registry=filtered_registry_for_client(
+                    self,
+                    self._tool_registry,
+                ),
+                force_project_tools=include_project_context,
+                loaded_pack_ids=effective_tool_pack_session(self).loaded,
+            )
         )
         if tool_prompt:
             parts.append(f"\n利用可能なツール:\n{tool_prompt}")
@@ -2261,7 +2671,8 @@ class CLILLMClient:
             "以下のユーザー発話に、キャラクターとして直接答えてください。"
         )
 
-        parts.append(self._build_tool_execution_contract_prompt())
+        if not suppress_automatic_context:
+            parts.append(self._build_tool_execution_contract_prompt())
         return "\n".join(parts)
 
     def _build_tool_execution_contract_prompt(self) -> str:
@@ -2286,7 +2697,14 @@ class CLILLMClient:
         parts = [
             "# ツール実行結果",
         ]
-        story_chat_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        story_chat_context = (
+            None
+            if suppress_automatic_context
+            else self._get_story_chat_context_sync()
+        )
         if story_chat_context:
             parts.extend([story_chat_context.prompt, ""])
         task_instruction = (
@@ -2325,12 +2743,18 @@ class CLILLMClient:
     def _build_context_bundle_sync(
         self, user_input: str, project_context: Optional[dict[str, Any]]
     ) -> Optional[ContextBundle]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if self._get_story_chat_context_sync():
             return None
         include_project_context = self._should_include_cli_project_context(user_input)
         try:
+            try:
+                context_builder = ContextBuilder(manifest_config=self.config)
+            except TypeError:
+                context_builder = ContextBuilder()
             return self._run_async_in_new_loop(
-                ContextBuilder().build_context(
+                context_builder.build_context(
                     user_id=self._get_session_user_id(),
                     message=user_input,
                     project_id=self.current_project_id if include_project_context else None,
@@ -2339,7 +2763,6 @@ class CLILLMClient:
                     project_context=project_context if include_project_context else None,
                     include_project_context=include_project_context,
                     include_project_information=False,
-                    include_project_pack=False,
                     include_task_context=False,
                     project_context_mode="minimal",
                 )
@@ -2351,6 +2774,8 @@ class CLILLMClient:
             return None
 
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if not self.current_project_id and not self.current_session_id:
             return None
 
@@ -2371,6 +2796,8 @@ class CLILLMClient:
             return None
 
     def _get_story_chat_context_sync(self):
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if not self.current_session_id:
             return None
         return run_story_chat_context_sync(
@@ -2379,9 +2806,20 @@ class CLILLMClient:
         )
 
     def _get_available_tools(self) -> List[str]:
-        story_chat_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            return []
+        story_chat_context = (
+            self._get_story_chat_context_sync()
+        )
         if not story_chat_context:
-            return filter_tools_for_client(self, self._tool_registry.get_names())
+            return filter_tools_for_client(
+                self,
+                self._tool_registry.get_names(),
+                **({"story_context": None} if suppress_automatic_context else {}),
+            )
         apply_story_pack_auto_load(self, story_chat_context)
         return [
             name

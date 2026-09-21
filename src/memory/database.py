@@ -4,6 +4,7 @@ Database configuration and setup for memory management
 
 import os
 import asyncio
+import logging
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote_plus
@@ -13,8 +14,13 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 from sqlalchemy.pool import NullPool
 from .migrations import run_migrations
-from .config import MemoryConfig
+from .config import MemoryConfig, postgres_search_path
 from ..utils.windows_optimization import get_windows_optimizer
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
+from ..utils.startup_console import safe_startup_reason
+
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseManager:
@@ -69,6 +75,14 @@ class DatabaseManager:
             # asyncpgの場合、timeoutパラメータを使用
             if "timeout" not in connect_args:
                 connect_args["timeout"] = 30
+
+        # A configured worktree schema is a strict isolation boundary. Merge
+        # it into platform-specific settings without adding ``public`` as a
+        # fallback.
+        search_path = postgres_search_path(self.config.postgres_schema)
+        if search_path is not None:
+            server_settings = connect_args.setdefault("server_settings", {})
+            server_settings["search_path"] = search_path
         
         self.engine = create_async_engine(
             self.database_url,
@@ -104,6 +118,17 @@ class DatabaseManager:
                 'connect_timeout': 30,  # Windows環境では30秒に延長
                 'options': '-c tcp_keepalives_idle=600 -c tcp_keepalives_interval=30 -c tcp_keepalives_count=3'
             }
+
+        # psycopg2 receives PostgreSQL session settings through the ``options``
+        # connection argument.  Append rather than replace the Windows
+        # keepalive options above, and leave the legacy empty mapping untouched
+        # when schema isolation is disabled.
+        if search_path is not None:
+            search_option = f"-c search_path={search_path}"
+            existing_options = sync_connect_args.get("options")
+            sync_connect_args["options"] = (
+                f"{existing_options} {search_option}" if existing_options else search_option
+            )
         
         self.sync_engine = create_engine(
             self.sync_database_url,
@@ -121,12 +146,15 @@ class DatabaseManager:
         )
         
         self._initialized = False
+        self.last_error: str | None = None
         self._initialize_lock = asyncio.Lock()
 
     async def initialize(self, force: bool = False, max_retries: int = 10, retry_delay: float = 2.0) -> bool:
         """Initialize the database once, serializing concurrent callers."""
         if self._initialized and not force:
             return True
+
+        self.last_error = None
         async with self._initialize_lock:
             if self._initialized and not force:
                 return True
@@ -162,20 +190,29 @@ class DatabaseManager:
         
         # Use retry logic for Docker environment
         if is_docker:
-            print("[DatabaseManager] Docker environment detected, using connection retry logic")
+            logger.info(
+                "Docker environment detected; using database connection retries",
+            )
             for attempt in range(max_retries):
                 try:
                     migrated = await asyncio.to_thread(
-                        run_migrations, self.sync_database_url
+                        run_migrations,
+                        self.sync_database_url,
+                        self.config.postgres_schema,
                     )
                     if not migrated:
                         raise RuntimeError("Alembic migration runner returned false")
 
                     self._initialized = True
-                    print(f"[DatabaseManager] PostgreSQL database initialized (attempt {attempt + 1}/{max_retries})")
+                    logger.info(
+                        "PostgreSQL database initialized (attempt %s/%s)",
+                        attempt + 1,
+                        max_retries,
+                    )
                     return True
                     
                 except Exception as e:
+                    self.last_error = safe_startup_reason(e, limit=180)
                     error_msg = str(e).lower()
                     is_retryable = (
                         "connection refused" in error_msg or
@@ -183,52 +220,74 @@ class DatabaseManager:
                         "timeout" in error_msg or
                         "host" in error_msg
                     )
-                    
+
                     if is_retryable and attempt < max_retries - 1:
-                        print(f"[DatabaseManager] Connection attempt {attempt + 1}/{max_retries} failed: {e}")
-                        print(f"[DatabaseManager] Retrying in {retry_delay} seconds...")
+                        logger.warning(
+                            "PostgreSQL connection attempt %s/%s failed; retrying in %ss",
+                            attempt + 1,
+                            max_retries,
+                            retry_delay,
+                            exc_info=True,
+                            extra=FILE_ONLY_LOG_EXTRA,
+                        )
                         await asyncio.sleep(retry_delay)
                     else:
-                        print(f"[DatabaseManager] PostgreSQL initialization failed after {attempt + 1} attempts: {e}")
-                        import traceback
-                        print(f"[DatabaseManager] Traceback: {traceback.format_exc()}")
+                        logger.error(
+                            "PostgreSQL initialization failed after %s attempt(s)",
+                            attempt + 1,
+                            exc_info=True,
+                            extra=FILE_ONLY_LOG_EXTRA,
+                        )
                         return False
             
             return False
         
         # Non-Docker environment - original logic
         try:
-            migrated = await asyncio.to_thread(run_migrations, self.sync_database_url)
+            migrated = await asyncio.to_thread(
+                run_migrations,
+                self.sync_database_url,
+                self.config.postgres_schema,
+            )
             if not migrated:
                 raise RuntimeError("Alembic migration runner returned false")
-            
+
             self._initialized = True
-            if not self._initialized or force:
-                print("[DatabaseManager] PostgreSQL database initialized")
+            logger.info(
+                "PostgreSQL database initialized",
+            )
             return True
-            
+
         except Exception as e:
-            import traceback
             error_msg = str(e)
-            
+            self.last_error = safe_startup_reason(e, limit=180)
+
             # PostgreSQL-specific error handling
             if platform.system() == "Windows":
                 if "TimeoutError" in error_msg or "timeout" in error_msg.lower():
-                    print("[DatabaseManager] Database connection failed - PostgreSQL connection timeout")
-                    print("[DatabaseManager] This is a known issue on Windows. Possible solutions:")
-                    print("[DatabaseManager]   1. Ensure PostgreSQL service is running")
-                    print("[DatabaseManager]   2. Try connecting with: psql -h 127.0.0.1 -p 5432 -U postgres")
-                    print("[DatabaseManager]   3. Check Windows Firewall settings")
-                    print("[DatabaseManager]   4. Verify PostgreSQL is listening on 127.0.0.1:5432")
+                    logger.warning(
+                        "PostgreSQL connection timed out during initialization",
+                        exc_info=True,
+                        extra=FILE_ONLY_LOG_EXTRA,
+                    )
                 elif "Connection refused" in error_msg:
-                    print("[DatabaseManager] Database connection failed - Connection refused")
-                    print("[DatabaseManager] PostgreSQL is not accepting connections on port 5432")
+                    logger.warning(
+                        "PostgreSQL refused the connection during initialization",
+                        exc_info=True,
+                        extra=FILE_ONLY_LOG_EXTRA,
+                    )
                 else:
-                    print(f"[DatabaseManager] PostgreSQL initialization failed: {e}")
-                    print(f"[DatabaseManager] Traceback: {traceback.format_exc()}")
+                    logger.error(
+                        "PostgreSQL initialization failed",
+                        exc_info=True,
+                        extra=FILE_ONLY_LOG_EXTRA,
+                    )
             else:
-                print(f"[DatabaseManager] PostgreSQL initialization failed: {e}")
-                print(f"[DatabaseManager] Traceback: {traceback.format_exc()}")
+                logger.error(
+                    "PostgreSQL initialization failed",
+                    exc_info=True,
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
             
             return False
     
@@ -261,11 +320,20 @@ class DatabaseManager:
             if hasattr(self, 'engine') and self.engine:
                 # Close all connections in the pool immediately
                 await asyncio.wait_for(self.engine.dispose(), timeout=2.0)
-                print("[DatabaseManager] Database connections closed")
+                logger.info(
+                    "Database connections closed",
+                )
         except asyncio.TimeoutError:
-            print("[DatabaseManager] Database close timeout, forcing shutdown")
+            logger.warning(
+                "Database close timed out; forcing shutdown",
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
         except Exception as e:
-            print(f"[DatabaseManager] Error closing database: {e}")
+            logger.warning(
+                "Database close failed; forcing shutdown",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
         finally:
             # Force cleanup
             try:
@@ -328,5 +396,9 @@ async def get_db_session() -> AsyncSession:
         db_manager = get_database_manager()
         return await db_manager.get_session()
     except Exception as e:
-        print(f"[DatabaseManager] Error getting session: {e}")
+        logger.error(
+            "Unable to open a database session",
+            exc_info=True,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         raise

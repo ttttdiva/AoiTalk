@@ -42,7 +42,11 @@ import {
   taskValueCompletion,
   taskValuePreview,
 } from "@/components/tasks/task-form-utils";
-import { toTaskDatePayloadValue } from "@/lib/date-time";
+import {
+  hasExplicitTimeComponent,
+  toLocalDateTimeInputValue,
+  toTaskDatePayloadValue,
+} from "@/lib/date-time";
 
 const TAG_PRESET_COLORS = [
   "#ef4444",
@@ -307,7 +311,13 @@ export function CreateTaskDialog({
   // ダイアログが開いた時にデフォルト値をセット
   useEffect(() => {
     if (open) {
-      if (defaultStartAt) setStartAt(defaultStartAt);
+      if (defaultStartAt) {
+        setStartAt(
+          toLocalDateTimeInputValue(defaultStartAt, {
+            allDay: defaultAllDay,
+          }) ?? defaultStartAt,
+        );
+      }
       if (defaultAllDay !== undefined) setAllDay(defaultAllDay);
     }
   }, [open, defaultStartAt, defaultAllDay]);
@@ -725,8 +735,16 @@ export function CreateTaskDialog({
             <TaskDatePicker
               startAt={startAt || null}
               endAt={endAt || null}
-              onStartAtChange={(v) => setStartAt(v || "")}
-              onEndAtChange={(v) => setEndAt(v || "")}
+              onStartAtChange={(v) => {
+                const nextStartAt = v || "";
+                setStartAt(nextStartAt);
+                if (hasExplicitTimeComponent(nextStartAt)) setAllDay(false);
+              }}
+              onEndAtChange={(v) => {
+                const nextEndAt = v || "";
+                setEndAt(nextEndAt);
+                if (hasExplicitTimeComponent(nextEndAt)) setAllDay(false);
+              }}
               allDay={allDay}
             />
           </div>

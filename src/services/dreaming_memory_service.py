@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import logging
+import math
 import re
 import uuid
+from collections.abc import Mapping
 from datetime import datetime
 from difflib import SequenceMatcher
 from typing import Any, Dict, Iterable, List, Optional
@@ -98,16 +100,26 @@ def _normalize_memory_type(value: Any) -> str:
 
 def _coerce_confidence(value: Any, default: float = 0.75) -> float:
     try:
+        if isinstance(value, bool):
+            raise ValueError("boolean confidence is invalid")
         confidence = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        confidence = default
+    if not math.isfinite(confidence):
         confidence = default
     return min(1.0, max(0.0, confidence))
 
 
 def _coerce_importance(value: Any, default: int = 5) -> int:
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, float) and (
+        not math.isfinite(value) or not value.is_integer()
+    ):
+        return default
     try:
         importance = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         importance = default
     return min(10, max(1, importance))
 
@@ -336,13 +348,24 @@ def _normalize_candidate(
         "evidence_source": "user_input" if evidence_span else None,
         "operation": action,
     }
-    structured_data.update(
-        {
-            str(key): value
-            for key, value in (item.get("structured_data") or {}).items()
-            if isinstance(key, str)
-        }
+    # Provider JSON is not a free-form metadata store.  Keep only the small
+    # fields needed by the review/cross-path identity contract and normalize
+    # the Project semantic key from its explicit top-level extractor field.
+    raw_structured = item.get("structured_data")
+    nested_semantic_key = (
+        raw_structured.get("semantic_key")
+        if isinstance(raw_structured, Mapping)
+        else None
     )
+    semantic_key = item.get("semantic_key")
+    if not isinstance(semantic_key, str) or not semantic_key.strip():
+        semantic_key = nested_semantic_key
+    if isinstance(semantic_key, str) and semantic_key.strip():
+        structured_data["semantic_key"] = semantic_key.strip()[:200]
+    if isinstance(raw_structured, Mapping):
+        section_hint = raw_structured.get("section_hint")
+        if isinstance(section_hint, str) and section_hint.strip():
+            structured_data["section_hint"] = section_hint.strip()[:120]
 
     return {
         "action": action,

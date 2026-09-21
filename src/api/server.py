@@ -8,11 +8,15 @@ WebChatServer 本体（合成クラス）。実際の振る舞いは server_part
 """
 
 import ipaddress
+import inspect
+import os
 import re
 from urllib.parse import urlsplit
+from sqlalchemy import select
 
 from .server_shared import *  # noqa: F401,F403
 from ..features import Features
+from ..runtime import AsyncResourceScope
 from src.utils.startup_timing import get_startup_timer
 from .server_parts import (
     AuthMixin,
@@ -115,6 +119,9 @@ class WebChatServer(
 
         # Heartbeat runner reference
         self._heartbeat_runner = None
+        self._heartbeat_execution_dispatcher = None
+        self._agent_work_coordinator = None
+        self._agent_work_coordinator_started = False
         self._task_notification_worker = None
         try:
             from ..heartbeat.runner import get_heartbeat_runner
@@ -124,8 +131,32 @@ class WebChatServer(
             )
             if heartbeat_config.get("enabled", True):
                 self._heartbeat_runner = get_heartbeat_runner()
+                if self._heartbeat_runner is not None:
+                    set_privacy_config = getattr(
+                        self._heartbeat_runner, "set_privacy_config", None
+                    )
+                    if callable(set_privacy_config):
+                        set_privacy_config(config)
         except Exception as e:
             logger.warning(f"Heartbeat runner initialization skipped: {e}")
+        # FastAPI lifespan owns the resources started by the hook queues
+        # below.  Keep the legacy lists as the registration surface used by
+        # route modules, while retaining enough metadata to roll back only
+        # hooks whose corresponding startup completed successfully.
+        self._lifespan_scope: AsyncResourceScope | None = None
+        # Alias retained for lifecycle introspection and consistency with
+        # other resource-owning services.
+        self._resource_scope: AsyncResourceScope | None = None
+        self._lifespan_run_count = 0
+        self._lifespan_shutdown_complete = False
+        self._lifespan_startup_failed = False
+        self._lifespan_dispatch_started = False
+        self._lifespan_heartbeat_started = False
+        self._lifespan_notification_worker_started = False
+        self._lifespan_startup_tasks: dict[asyncio.Task[Any], tuple[Any, Any | None]] = {}
+        self._lifespan_scheduled_shutdown_ids: set[int] = set()
+        self._lifespan_started_shutdown_ids: set[int] = set()
+        self._lifecycle_startup_shutdown_pairs: dict[int, Any] = {}
         self._startup_background_tasks: list[Any] = []
         self._shutdown_background_tasks: list[Any] = []
         self._content_retention_worker = None
@@ -133,11 +164,9 @@ class WebChatServer(
             from ..services.content_retention_worker import ContentRetentionWorker
 
             self._content_retention_worker = ContentRetentionWorker()
-            self._startup_background_tasks.append(
-                self._content_retention_worker.start
-            )
-            self._shutdown_background_tasks.append(
-                self._content_retention_worker.stop
+            self._register_lifecycle_pair(
+                self._content_retention_worker.start,
+                self._content_retention_worker.stop,
             )
         except Exception as exc:
             # Retention housekeeping is intentionally optional during a
@@ -147,6 +176,7 @@ class WebChatServer(
         self._mage_vl_preload_factory: Any = None
         self._mage_vl_preload_task: asyncio.Task[Any] | None = None
         self._register_mage_vl_lifecycle()
+        self._register_docs_index_lifecycle()
         self._conversation_dispatch_tasks: set[Any] = set()
         self._conversation_dispatch_recovery_task: Any | None = None
         self._conversation_dispatch_shutting_down = False
@@ -159,45 +189,105 @@ class WebChatServer(
         @asynccontextmanager
         async def lifespan(app: FastAPI):
             """Lifespan event handler for startup/shutdown"""
-            # Startup
-            with _startup_timer.phase("startup.web.lifespan.on_startup"):
-                await self._on_startup()
-            with _startup_timer.phase("startup.web.lifespan.dispatch_recovery"):
-                await self._start_conversation_dispatch_recovery()
-            # Start heartbeat runner
-            if self._heartbeat_runner:
+            scope = AsyncResourceScope("web-chat-server")
+            self._lifespan_scope = scope
+            self._resource_scope = scope
+            self._lifespan_shutdown_complete = False
+            self._lifespan_startup_failed = False
+            self._lifespan_dispatch_started = False
+            self._lifespan_heartbeat_started = False
+            self._lifespan_notification_worker_started = False
+            if self._lifespan_run_count and not self._startup_background_tasks:
+                templates = getattr(
+                    self,
+                    "_startup_background_task_templates",
+                    (),
+                )
+                self._startup_background_tasks.extend(templates)
+            if self._lifespan_run_count and not self._shutdown_background_tasks:
+                templates = getattr(
+                    self,
+                    "_shutdown_background_task_templates",
+                    (),
+                )
+                self._shutdown_background_tasks.extend(templates)
+            self._lifespan_startup_tasks.clear()
+            self._lifespan_scheduled_shutdown_ids.clear()
+            self._lifespan_started_shutdown_ids.clear()
+
+            # A FastAPI test/runtime may reuse the same app for another
+            # lifespan after a clean shutdown.  Re-register the retained
+            # callback owner before startup; CharacterSwitchManager itself
+            # de-duplicates an already-active callback.
+            manager = getattr(self, "_character_switch_manager", None)
+            callback = getattr(
+                self,
+                "_character_switch_callback",
+                getattr(self, "_on_character_switch", None),
+            )
+            register = getattr(manager, "register_callback", None)
+            if callable(register) and callback is not None:
                 try:
-                    with _startup_timer.phase("startup.web.lifespan.heartbeat_start"):
-                        await self._heartbeat_runner.start()
-                    logger.info("Heartbeat runner started")
-                except Exception as e:
-                    logger.error(f"Heartbeat runner start failed: {e}")
-            if self._task_notification_worker:
-                try:
-                    with _startup_timer.phase("startup.web.lifespan.notification_worker_start"):
-                        await self._task_notification_worker.start()
-                except Exception as e:
-                    logger.error(f"Task notification worker start failed: {e}")
-            yield
-            # Shutdown
-            await self._stop_conversation_dispatch_recovery()
-            if self._task_notification_worker:
-                try:
-                    await self._task_notification_worker.stop()
-                except Exception as e:
-                    logger.error(f"Task notification worker stop failed: {e}")
-            if self._heartbeat_runner:
-                try:
-                    await self._heartbeat_runner.stop()
-                except Exception as e:
-                    logger.error(f"Heartbeat runner stop failed: {e}")
-            pending_shutdown_tasks = list(self._shutdown_background_tasks)
-            self._shutdown_background_tasks.clear()
-            for task_factory in pending_shutdown_tasks:
-                try:
-                    await task_factory()
+                    register(callback)
                 except Exception as exc:
-                    logger.exception("Shutdown task failed: %s", exc)
+                    logger.warning("Character switch callback re-registration failed: %s", exc)
+
+            # Keep shutdown order explicit.  The dispatch service may still
+            # need the notification/heartbeat infrastructure while it drains,
+            # so a generic AsyncExitStack LIFO order would be unsafe here.
+            scope.add_async_cleanup(self._shutdown_lifespan_resources)
+            # The callback is registered during server construction, before
+            # this lifespan exists.  Release it through the scope so startup
+            # rollback cannot leave a process-global CharacterSwitchManager
+            # retaining this server instance.
+            scope.add_cleanup(self._release_character_switch_callback)
+            startup_succeeded = False
+            try:
+                # Startup order intentionally mirrors the historical
+                # composition root.
+                with _startup_timer.phase("startup.web.lifespan.on_startup"):
+                    await self._on_startup()
+                with _startup_timer.phase("startup.web.lifespan.dispatch_recovery"):
+                    # Treat a dispatch start attempt as owned before awaiting
+                    # it: implementations may allocate resources and then
+                    # raise, and their idempotent stop path must still run on
+                    # startup rollback.
+                    self._lifespan_dispatch_started = True
+                    await self._start_conversation_dispatch_recovery()
+                # Start heartbeat runner
+                if self._heartbeat_runner:
+                    try:
+                        self._lifespan_heartbeat_started = True
+                        with _startup_timer.phase("startup.web.lifespan.heartbeat_start"):
+                            await self._heartbeat_runner.start()
+                        logger.info("Heartbeat runner started")
+                    except Exception as e:
+                        logger.error(f"Heartbeat runner start failed: {e}")
+                if self._task_notification_worker:
+                    try:
+                        self._lifespan_notification_worker_started = True
+                        with _startup_timer.phase("startup.web.lifespan.notification_worker_start"):
+                            await self._task_notification_worker.start()
+                    except Exception as e:
+                        logger.error(f"Task notification worker start failed: {e}")
+                startup_succeeded = True
+                yield
+            except BaseException:
+                # ``scope.aclose`` below cancels/awaits every startup task and
+                # invokes the explicit resource cleanup callback.  Marking the
+                # phase as failed lets that callback skip hooks whose start
+                # coroutine never completed.
+                self._lifespan_startup_failed = not startup_succeeded
+                raise
+            finally:
+                try:
+                    await scope.aclose()
+                finally:
+                    if self._lifespan_scope is scope:
+                        self._lifespan_scope = None
+                    if self._resource_scope is scope:
+                        self._resource_scope = None
+                    self._lifespan_run_count += 1
 
         self.app = FastAPI(title="AoiTalk Web Interface", lifespan=lifespan)
 
@@ -213,6 +303,13 @@ class WebChatServer(
 
         # キャラクター切り替え通知の登録
         self._register_character_switch_callback()
+        if not getattr(self, "_character_switch_manager", None):
+            try:
+                # Compatibility fallback for older mixins that do not retain
+                # their callback owner themselves.
+                self._character_switch_manager = CharacterSwitchManager()
+            except Exception:
+                self._character_switch_manager = None
 
         # Add CORS middleware
         # allow_credentials=True と allow_origins=["*"] の併用は CORS 仕様上無効なため、
@@ -248,6 +345,93 @@ class WebChatServer(
                     f"Failed to initialize database manager for login logging: {e}"
                 )
 
+        # Verification requests carry a server-signed run identity.  Establish
+        # the durable run before dispatching the endpoint and bind the context
+        # for the lifetime of the request so every Project/Task/User writer can
+        # attach provenance in the same transaction.  A partial or forged
+        # header set is rejected here; ordinary requests remain completely
+        # unaffected.  The middleware deliberately does not trust request
+        # bodies or query parameters for provenance.
+        from ..services.verification_provenance import (
+            VerificationProvenanceError,
+            VerificationProvenanceService,
+        )
+        from ..verification.context import (
+            context_from_run,
+            reset_current_verification_context,
+            set_current_verification_context,
+            verify_verification_headers,
+        )
+
+        @self.app.middleware("http")
+        async def _verification_provenance_middleware(request: Request, call_next):
+            try:
+                context = verify_verification_headers(request.headers)
+            except (TypeError, ValueError) as exc:
+                return JSONResponse(
+                    {"detail": "Invalid verification provenance headers", "code": "verification_headers_invalid"},
+                    status_code=400,
+                )
+            if context is None:
+                return await call_next(request)
+
+            manager = self._db_manager
+            if manager is None or not callable(getattr(manager, "get_session", None)):
+                return JSONResponse(
+                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
+                    status_code=503,
+                )
+
+            session = None
+            token = None
+            try:
+                session = await manager.get_session()
+                run = await VerificationProvenanceService().start_run(
+                    session,
+                    run_id=context.run_id,
+                    source=context.source,
+                    harness=context.harness,
+                    commit=True,
+                )
+                # A completed run cannot be reused to create new domain rows.
+                # Cleanup/preview retries are read/maintenance operations and
+                # are allowed through without rebinding a write context.
+                if run.status != "running":
+                    path = request.url.path.rstrip("/")
+                    if path != "/api/admin/verification-data" and not path.startswith(
+                        "/api/admin/verification-data/"
+                    ):
+                        return JSONResponse(
+                            {"detail": "Verification run is no longer active", "code": "verification_run_closed"},
+                            status_code=409,
+                        )
+                    return await call_next(request)
+
+                # Bind the durable row's canonical attribution/timestamp,
+                # rather than reusing mutable header text for entity markers.
+                token = set_current_verification_context(context_from_run(run))
+                return await call_next(request)
+            except VerificationProvenanceError:
+                if session is not None and callable(getattr(session, "rollback", None)):
+                    await session.rollback()
+                return JSONResponse(
+                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
+                    status_code=503,
+                )
+            except Exception:
+                if session is not None and callable(getattr(session, "rollback", None)):
+                    await session.rollback()
+                logger.exception("Failed to establish verification provenance context")
+                return JSONResponse(
+                    {"detail": "Verification provenance is unavailable", "code": "verification_unavailable"},
+                    status_code=503,
+                )
+            finally:
+                if token is not None:
+                    reset_current_verification_context(token)
+                if session is not None and callable(getattr(session, "close", None)):
+                    await session.close()
+
         # Auth settings (depends on _db_manager for DB auth)
         (
             self.auth_enabled,
@@ -273,6 +457,9 @@ class WebChatServer(
         self.manager = ConnectionManager()
         self.manager.set_authorization_checker(self._websocket_connection_allowed)
         self.manager.set_admin_role_checker(self._websocket_is_admin_user)
+
+        # Install the durable Heartbeat execution callback before lifespan start.
+        self._configure_heartbeat_execution()
 
         from .trpg_play_connection_manager import TrpgPlayConnectionManager
 
@@ -301,6 +488,7 @@ class WebChatServer(
                 self._db_manager,
                 broadcaster=self.manager.broadcast,
                 poll_interval_seconds=self._extract_task_notification_poll_interval(),
+                config=self.config,
             )
 
         # Callbacks
@@ -340,6 +528,18 @@ class WebChatServer(
         self._llm_client = None
         self._current_llm_mode = "fast"  # 'fast' or 'thinking'
         self._ollama_model_manager = OllamaModelManager(config)
+        from ..services.local_llm_runtime_manager import ManagedLocalRuntimeManager
+
+        self._local_llm_runtime_manager = ManagedLocalRuntimeManager(config)
+
+        self._project_overview_worker = None
+        self._register_project_overview_lifecycle()
+
+        self._knowledge_capture_worker = None
+        self._register_knowledge_capture_lifecycle()
+
+        self._dreaming_memory_worker = None
+        self._register_dreaming_memory_lifecycle()
 
         # Setup routes
         self._setup_routes()
@@ -347,6 +547,11 @@ class WebChatServer(
         # Register project routes if available
         if PROJECT_ROUTES_AVAILABLE and create_project_router:
             self._register_project_routes()
+
+        # Register the Project Overview API independently from the base
+        # Project CRUD router.
+        if PROJECT_OVERVIEW_ROUTES_AVAILABLE and create_project_overview_router:
+            self._register_project_overview_routes()
 
         # Register Project-scoped Docs candidate review routes immediately
         # after the base Project routes.  These endpoints intentionally do
@@ -357,14 +562,73 @@ class WebChatServer(
         ):
             self._register_project_docs_candidate_routes()
 
-        # Register ProjectContextPack projection status/rebuild routes after
-        # the base Project routes.  They expose metadata only and are
-        # intentionally independent from the canonical Docs candidate queue.
+        # Register Resolution Knowledge Capture independently from the legacy
+        # Docs candidate queue.  Its optional import boundary keeps startup
+        # available during a rolling deployment where the new domain services
+        # are not present yet.
+        if KNOWLEDGE_CAPTURE_ROUTES_AVAILABLE and create_knowledge_capture_router:
+            self._register_knowledge_capture_routes()
+
+        # Register the authenticated Engagement Operations kernel after the
+        # project-scoped routes so its service can enforce the same ACL model.
+        if OPERATIONS_ROUTES_AVAILABLE and create_operations_router:
+            self._register_operations_routes()
+
+        # MediaOps is intentionally adjacent to, but independent from, the
+        # EngagementOps Trusted Kernel.
         if (
-            PROJECT_CONTEXT_PACK_ROUTES_AVAILABLE
-            and create_project_context_pack_router
+            MEDIA_OPERATIONS_ROUTES_AVAILABLE
+            and create_media_operations_router
         ):
-            self._register_project_context_pack_routes()
+            self._register_media_operations_routes()
+
+        if (
+            MEDIA_OPERATIONS_SETUP_ROUTES_AVAILABLE
+            and create_media_operations_setup_router
+        ):
+            self._register_media_operations_setup_routes()
+
+        if (
+            MEDIA_OPERATIONS_RESEARCH_ROUTES_AVAILABLE
+            and create_media_operations_research_router
+        ):
+            self._register_media_operations_research_routes()
+
+        if (
+            MEDIA_OPERATIONS_GENERATION_ROUTES_AVAILABLE
+            and create_media_operations_generation_router
+        ):
+            self._register_media_operations_generation_routes()
+
+        if (
+            MEDIA_OPERATIONS_AUTOMATION_ROUTES_AVAILABLE
+            and create_media_operations_automation_router
+        ):
+            self._register_media_operations_automation_routes()
+
+        if (
+            MEDIA_OPERATIONS_CONTENT_ROUTES_AVAILABLE
+            and create_media_operations_content_router
+        ):
+            self._register_media_operations_content_routes()
+
+        if (
+            MEDIA_OPERATIONS_METRICS_ROUTES_AVAILABLE
+            and create_media_operations_metrics_router
+        ):
+            self._register_media_operations_metrics_routes()
+
+        if (
+            MEDIA_OPERATIONS_LEARNING_ROUTES_AVAILABLE
+            and create_media_operations_learning_router
+        ):
+            self._register_media_operations_learning_routes()
+
+        if (
+            MEDIA_OPERATIONS_OVERVIEW_ROUTES_AVAILABLE
+            and create_media_operations_overview_router
+        ):
+            self._register_media_operations_overview_routes()
 
         # Register Knowledge Workspace routes if available
         if KNOWLEDGE_ROUTES_AVAILABLE and create_knowledge_router:
@@ -410,6 +674,76 @@ class WebChatServer(
         if DOCS_ROUTES_AVAILABLE and create_docs_router:
             self._register_docs_routes()
 
+        # Meeting-processing is an authenticated server-to-server backend.
+        # Keep all runtime dependencies behind the composition root so the
+        # route's readiness response reflects the actual durable worker rather
+        # than a second, request-scoped implementation.  Constructors are
+        # intentionally lazy: Whisper/torch/model weights are not imported or
+        # loaded during server startup.
+        self._meeting_processing_storage = None
+        self._meeting_processing_whisper = None
+        self._meeting_processing_local_llm = None
+        self._meeting_processing_docs = None
+        self._meeting_processing_worker = None
+        if (
+            MEETING_PROCESSING_ROUTES_AVAILABLE
+            and create_meeting_processing_router
+        ):
+            try:
+                from ..services.meeting_docs_service import MeetingDocsService
+                from ..services.meeting_local_llm_service import MeetingLocalLlmService
+                from ..services.meeting_processing_storage import MeetingAudioStorage
+                from ..services.meeting_processing_worker import MeetingProcessingWorker
+                from ..services.meeting_whisper_service import MeetingWhisperService
+
+                meeting_workspace_root = self._resolve_workspace_root()
+                self._meeting_processing_storage = MeetingAudioStorage(
+                    meeting_workspace_root,
+                    defer_staging_cleanup=True,
+                )
+                self._meeting_processing_whisper = MeetingWhisperService(self.config)
+                self._meeting_processing_local_llm = MeetingLocalLlmService(self.config)
+                self._meeting_processing_docs = MeetingDocsService(
+                    workspace_root=meeting_workspace_root,
+                    get_db_manager=lambda: self._db_manager,
+                )
+                self._meeting_processing_worker = MeetingProcessingWorker(
+                    lambda: self._db_manager,
+                    config=self.config,
+                    workspace_root=meeting_workspace_root,
+                    storage=self._meeting_processing_storage,
+                    whisper=self._meeting_processing_whisper,
+                    local_llm=self._meeting_processing_local_llm,
+                    docs=self._meeting_processing_docs,
+                )
+                self._register_lifecycle_pair(
+                    self._meeting_processing_worker.start,
+                    self._meeting_processing_worker.stop,
+                )
+            except Exception as exc:
+                # Keep the API surface available while failing closed on
+                # /ready and /jobs when an optional runtime dependency cannot
+                # be constructed in this process.
+                logger.warning(
+                    "Meeting-processing worker registration skipped: %s", exc,
+                    exc_info=True,
+                )
+
+            self.app.include_router(
+                create_meeting_processing_router(
+                    db_manager=self._db_manager,
+                    resolve_long_lived_token=(
+                        self._get_user_info_from_long_lived_token
+                    ),
+                    readiness_provider=(
+                        self._meeting_processing_worker.readiness_snapshot
+                        if self._meeting_processing_worker is not None
+                        else None
+                    ),
+                    storage=self._meeting_processing_storage,
+                )
+            )
+
         # Register authenticated per-user X Cookie management routes.
         if X_COOKIE_ROUTES_AVAILABLE and create_x_cookie_router:
             self._register_x_cookie_routes()
@@ -452,6 +786,236 @@ class WebChatServer(
 
         # Register the frontend catch-all last so it does not shadow API routers.
         self._register_frontend_catchall()
+        # Keep immutable registration templates so a test/runtime that reuses
+        # the same FastAPI app for another lifespan can start and stop the
+        # same owned workers again.  The queues remain the canonical entries;
+        # per-lifespan scope state tracks which hooks were scheduled.
+        self._startup_background_task_templates = list(
+            self._startup_background_tasks
+        )
+        self._shutdown_background_task_templates = list(
+            self._shutdown_background_tasks
+        )
+
+    def _register_lifecycle_pair(self, startup: Any, shutdown: Any) -> None:
+        """Register a startup/shutdown pair while preserving legacy queues.
+
+        Several route modules append directly to the public hook lists.  This
+        helper is used for pairs owned by the composition root so rollback can
+        identify the matching shutdown callback without changing those module
+        interfaces.
+        """
+
+        startup_tasks = getattr(self, "_startup_background_tasks", None)
+        if not isinstance(startup_tasks, list):
+            startup_tasks = []
+            self._startup_background_tasks = startup_tasks
+        shutdown_tasks = getattr(self, "_shutdown_background_tasks", None)
+        if not isinstance(shutdown_tasks, list):
+            shutdown_tasks = []
+            self._shutdown_background_tasks = shutdown_tasks
+        startup_tasks.append(startup)
+        shutdown_tasks.append(shutdown)
+        pairs = getattr(self, "_lifecycle_startup_shutdown_pairs", None)
+        if not isinstance(pairs, dict):
+            pairs = {}
+            self._lifecycle_startup_shutdown_pairs = pairs
+        pairs[id(startup)] = shutdown
+
+    def _release_character_switch_callback(self) -> None:
+        """Unregister the server callback from the process-global manager."""
+
+        manager = getattr(self, "_character_switch_manager", None)
+        callback = getattr(
+            self,
+            "_character_switch_callback",
+            getattr(self, "_on_character_switch", None),
+        )
+        if manager is None or callback is None:
+            return
+        unregister = getattr(manager, "unregister_callback", None)
+        if not callable(unregister):
+            return
+        try:
+            unregister(callback)
+        except Exception as exc:
+            logger.warning("Character switch callback cleanup failed: %s", exc)
+        finally:
+            self._character_switch_callback_registered = False
+
+    def _lifecycle_shutdown_for_startup(self, startup: Any) -> Any | None:
+        """Best-effort matching for hooks registered by route modules.
+
+        Composition-root registrations use an explicit identity map.  For
+        legacy route modules that still append to both lists independently,
+        match bound methods by owner first, then the conventional
+        ``start_*``/``stop_*`` names.  Unknown startup-only hooks remain
+        task-owned and are cancelled by ``AsyncResourceScope``.
+        """
+
+        pairs = getattr(self, "_lifecycle_startup_shutdown_pairs", None)
+        if isinstance(pairs, dict):
+            shutdown = pairs.get(id(startup))
+            if shutdown is not None:
+                return shutdown
+
+        shutdown_tasks = getattr(self, "_shutdown_background_tasks", None)
+        if not isinstance(shutdown_tasks, list):
+            return None
+        owner = getattr(startup, "__self__", None)
+        if owner is not None:
+            for candidate in shutdown_tasks:
+                if getattr(candidate, "__self__", None) is owner:
+                    return candidate
+
+        startup_name = str(getattr(startup, "__name__", "") or "")
+        candidate_names: list[str] = []
+        if startup_name.startswith("start_"):
+            candidate_names.append(f"stop_{startup_name[6:]}")
+        elif startup_name == "start":
+            candidate_names.extend(("stop", "close", "shutdown", "cleanup"))
+        for candidate in shutdown_tasks:
+            if str(getattr(candidate, "__name__", "") or "") in candidate_names:
+                return candidate
+        return None
+
+    def _spawn_lifespan_task(
+        self,
+        coro: Any,
+        *,
+        name: str,
+        startup_factory: Any | None = None,
+    ) -> asyncio.Task[Any]:
+        """Spawn a task owned by the current lifespan scope.
+
+        ``_on_startup`` is also called directly by a few integrations/tests;
+        retain a safe fallback for that path while the FastAPI lifespan uses
+        ``AsyncResourceScope`` for cancellation and exception retrieval.
+        """
+
+        scope = getattr(self, "_lifespan_scope", None)
+        if isinstance(scope, AsyncResourceScope):
+            task = scope.spawn(coro, name=name)
+        else:
+            try:
+                task = asyncio.create_task(coro, name=name)
+            except Exception:
+                close = getattr(coro, "close", None)
+                if callable(close):
+                    close()
+                raise
+
+        if startup_factory is not None:
+            stop_hook = self._lifecycle_shutdown_for_startup(startup_factory)
+            startup_tasks = getattr(self, "_lifespan_startup_tasks", None)
+            if not isinstance(startup_tasks, dict):
+                startup_tasks = {}
+                self._lifespan_startup_tasks = startup_tasks
+            startup_tasks[task] = (startup_factory, stop_hook)
+            if stop_hook is not None:
+                scheduled_ids = getattr(
+                    self,
+                    "_lifespan_scheduled_shutdown_ids",
+                    None,
+                )
+                if isinstance(scheduled_ids, set):
+                    # A startup hook may partially acquire a resource before
+                    # raising.  Mark the paired stop as eligible immediately
+                    # so rollback does not depend on a successful task result.
+                    scheduled_ids.add(id(stop_hook))
+
+            def _startup_done(completed: asyncio.Task[Any]) -> None:
+                metadata = startup_tasks.pop(completed, None)
+                if metadata is None or completed.cancelled():
+                    return
+                try:
+                    error = completed.exception()
+                except BaseException:
+                    return
+                if error is not None:
+                    logger.error(
+                        "Lifespan startup task failed (%s): %s",
+                        name,
+                        error,
+                    )
+                    return
+                shutdown = metadata[1]
+                if shutdown is not None:
+                    started_ids = getattr(
+                        self,
+                        "_lifespan_started_shutdown_ids",
+                        None,
+                    )
+                    if isinstance(started_ids, set):
+                        started_ids.add(id(shutdown))
+
+            task.add_done_callback(_startup_done)
+        return task
+
+    async def _shutdown_lifespan_resources(self) -> None:
+        """Release every server-owned lifespan resource in dependency order."""
+
+        if getattr(self, "_lifespan_shutdown_complete", False):
+            return
+        self._lifespan_shutdown_complete = True
+        rollback = bool(getattr(self, "_lifespan_startup_failed", False))
+
+        # Preserve the established order: dispatch first, then notification,
+        # heartbeat, and finally the hook queue.  Each callback is isolated so
+        # one failure never prevents the remaining resources from closing.
+        if not rollback or getattr(self, "_lifespan_dispatch_started", False):
+            try:
+                await self._stop_conversation_dispatch_recovery()
+            except BaseException as exc:
+                logger.exception("Conversation dispatch shutdown failed: %s", exc)
+
+        coordinator = getattr(self, "_agent_work_coordinator", None)
+        if coordinator is not None and (
+            not rollback or getattr(self, "_agent_work_coordinator_started", False)
+        ):
+            try:
+                await coordinator.stop()
+            except BaseException as exc:
+                logger.error("Common AgentWork coordinator stop failed: %s", exc)
+            finally:
+                self._agent_work_coordinator_started = False
+
+        notification_worker = getattr(self, "_task_notification_worker", None)
+        if notification_worker and (
+            not rollback
+            or getattr(self, "_lifespan_notification_worker_started", False)
+        ):
+            try:
+                await notification_worker.stop()
+            except BaseException as exc:
+                logger.error(f"Task notification worker stop failed: {exc}")
+
+        heartbeat_runner = getattr(self, "_heartbeat_runner", None)
+        if heartbeat_runner and (
+            not rollback or getattr(self, "_lifespan_heartbeat_started", False)
+        ):
+            try:
+                await heartbeat_runner.stop()
+            except BaseException as exc:
+                logger.error(f"Heartbeat runner stop failed: {exc}")
+
+        shutdown_queue = getattr(self, "_shutdown_background_tasks", None)
+        # Keep the registration queues as the server's canonical startup
+        # contract.  A WebChatServer/TestClient can be started more than once
+        # during its lifetime; consuming the lists here would silently omit
+        # resources on the second lifespan.  The per-lifespan scope and flags
+        # still make each invocation idempotent.
+        pending_shutdown_tasks = list(shutdown_queue or [])
+        scheduled_ids = getattr(self, "_lifespan_scheduled_shutdown_ids", set())
+        for shutdown in pending_shutdown_tasks:
+            if rollback and id(shutdown) not in scheduled_ids:
+                continue
+            try:
+                result = shutdown()
+                if inspect.isawaitable(result):
+                    await result
+            except BaseException as exc:
+                logger.exception("Shutdown task failed: %s", exc)
 
     def _register_mage_vl_lifecycle(self) -> None:
         """Register lazy Mage-VL warmup and owned-process cleanup."""
@@ -479,34 +1043,410 @@ class WebChatServer(
                     pass
                 except Exception as exc:
                     logger.warning("Mage-VL事前ロードの終了処理に失敗しました: %s", exc)
+                finally:
+                    if self._mage_vl_preload_task is preload_task:
+                        self._mage_vl_preload_task = None
             await shutdown_mage_vl_services()
 
         self._mage_vl_preload_factory = _preload_mage_vl
-        self._startup_background_tasks.append(_preload_mage_vl)
-        self._shutdown_background_tasks.append(_shutdown_mage_vl)
+        self._register_lifecycle_pair(_preload_mage_vl, _shutdown_mage_vl)
 
-        async def _flush_docs_reindex_on_startup() -> None:
+    def _register_docs_index_lifecycle(self) -> None:
+        """Pair the durable Docs index worker with this server lifespan."""
+        from ..services.docs_index_worker import DocsIndexWorker
+        from ..memory.database import get_db_session
+
+        async def session_factory():
+            manager = getattr(self, "_db_manager", None)
+            return await manager.get_session() if manager is not None else await get_db_session()
+
+        self._docs_index_worker = DocsIndexWorker(session_factory)
+        self._register_lifecycle_pair(self._docs_index_worker.start, self._docs_index_worker.stop)
+
+    def _register_project_overview_lifecycle(self) -> None:
+        """Register the durable Project Overview refresh worker."""
+
+        if getattr(self, "_project_overview_worker", None) is not None:
+            return
+        if self._db_manager is None:
+            logger.warning(
+                "Project Overview worker registration skipped: database unavailable"
+            )
+            return
+
+        try:
+            from ..services.project_overview_worker import ProjectOverviewWorker
+
+            self._project_overview_worker = ProjectOverviewWorker(
+                config=self.config,
+                db_manager=self._db_manager,
+                config_loader=self._load_project_overview_config_snapshot,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Project Overview worker registration skipped: %s",
+                exc,
+            )
+            self._project_overview_worker = None
+            return
+
+        self._register_lifecycle_pair(
+            self._project_overview_worker.start,
+            self._project_overview_worker.stop,
+        )
+
+    def _register_knowledge_capture_lifecycle(self) -> None:
+        """Register the optional Knowledge Capture worker.
+
+        The worker owns only durable polling/claim/recovery orchestration;
+        candidate research and Docs publication remain in their domain
+        services.  Keep construction behind the availability and database
+        gates so an older checkout still boots normally.
+        """
+
+        if not KNOWLEDGE_CAPTURE_WORKER_AVAILABLE or self._db_manager is None:
+            if KNOWLEDGE_CAPTURE_WORKER_AVAILABLE:
+                logger.warning(
+                    "Knowledge Capture worker registration skipped: database unavailable"
+                )
+            return
+
+        try:
+            self._knowledge_capture_worker = KnowledgeCaptureWorker(
+                self._db_manager,
+                config=self.config,
+            )
+        except TypeError:
+            # Preserve compatibility with a rolling-deploy worker that uses a
+            # keyword-only db_manager constructor.
             try:
-                from ..rag.docs_index import flush_pending_docs_reindex
-
-                await flush_pending_docs_reindex()
+                self._knowledge_capture_worker = KnowledgeCaptureWorker(
+                    db_manager=self._db_manager,
+                    config=self.config,
+                )
             except Exception as exc:
-                logger.debug("Docs reindex startup flush skipped: %s", exc)
+                logger.warning(
+                    "Knowledge Capture worker registration skipped: %s",
+                    exc,
+                )
+                self._knowledge_capture_worker = None
+                return
+        except Exception as exc:
+            logger.warning(
+                "Knowledge Capture worker registration skipped: %s",
+                exc,
+            )
+            self._knowledge_capture_worker = None
+            return
 
-        self._startup_background_tasks.append(_flush_docs_reindex_on_startup)
+        start = getattr(self._knowledge_capture_worker, "start", None)
+        stop = getattr(self._knowledge_capture_worker, "stop", None)
+        if not callable(start) or not callable(stop):
+            logger.warning(
+                "Knowledge Capture worker registration skipped: start/stop unavailable"
+            )
+            self._knowledge_capture_worker = None
+            return
+        self._register_lifecycle_pair(start, stop)
+        logger.info("Knowledge Capture worker registered")
+
+    async def _load_project_overview_config_snapshot(self) -> Any:
+        """Load DB-backed Project Automation settings for one worker claim."""
+
+        from ..app_config_store import (
+            AppConfigSnapshotUnavailable,
+            load_app_config_snapshot_sync,
+        )
+
+        try:
+            return await asyncio.to_thread(
+                load_app_config_snapshot_sync,
+                bootstrap_config=self.config,
+            )
+        except AppConfigSnapshotUnavailable:
+            logger.warning(
+                "Project Overview config snapshot unavailable: exception_type=%s",
+                AppConfigSnapshotUnavailable.__name__,
+            )
+            raise
+        except Exception as exc:
+            # A worker must never route a Project Overview request through a
+            # stale startup Config after the DB-backed snapshot fails.  Keep
+            # the public signal stable and secret-free while retaining the
+            # exception type in server logs only.
+            logger.warning(
+                "Project Overview config snapshot unavailable: exception_type=%s",
+                type(exc).__name__,
+            )
+            raise AppConfigSnapshotUnavailable() from exc
+
+    def _register_dreaming_memory_lifecycle(self) -> None:
+        """Register the optional Dreaming consolidator without eager LLM use.
+
+        Dreaming runs only when the process has an active chat client.  The
+        worker therefore receives a factory rather than a client instance and
+        resolves it on each user run.  Imports stay local so a rolling deploy
+        with the new worker/migration not yet installed can still start the
+        web server and serve the legacy memory endpoints.
+        """
+        if getattr(self, "_dreaming_memory_worker", None) is not None:
+            return
+
+        worker_type = None
+        try:
+            from ..services.dreaming_memory_worker import DreamingMemoryWorker
+
+            worker_type = DreamingMemoryWorker
+        except ImportError:
+            # Keep the historical module layout as a rolling-deploy fallback,
+            # but make both candidates literal so the Enterprise import-closure
+            # checker can prove the complete internal dependency set.
+            try:
+                from ..services.dreaming_consolidation_service import DreamingMemoryWorker
+
+                worker_type = DreamingMemoryWorker
+            except (ImportError, AttributeError):
+                worker_type = None
+            except Exception as exc:
+                logger.warning("Dreaming Memory worker import skipped: %s", exc)
+                return
+        except Exception as exc:
+            logger.warning("Dreaming Memory worker import skipped: %s", exc)
+            return
+        if worker_type is None:
+            return
+
+        owned_background_client: dict[str, Any] = {"client": None}
+
+        def _llm_client_factory(*args: Any, **kwargs: Any) -> Any:
+            del args
+            client = getattr(self, "_llm_client", None)
+            if client is None:
+                client = owned_background_client.get("client")
+                if client is None:
+                    try:
+                        from ..llm.manager import create_llm_client
+
+                        client = create_llm_client(self.config)
+                        owned_background_client["client"] = client
+                    except Exception:
+                        logger.warning("Dreaming owned LLM client creation unavailable")
+                        return None
+            # Reuse the same detached per-turn state reset as Scoped Memory
+            # jobs.  This prevents consolidation usage/tool/history snapshots
+            # from being appended to the foreground conversation client.
+            try:
+                from ..services.scoped_memory_job_service import _scoped_memory_llm_client
+
+                isolated = _scoped_memory_llm_client(
+                    client,
+                    user_id=kwargs.get("user_id"),
+                    session_id=kwargs.get("session_id"),
+                    session_context=dict(kwargs.get("session_context") or {}),
+                    project_metadata=dict(kwargs.get("project_metadata") or {}),
+                )
+                return isolated if isolated is not client else None
+            except Exception:
+                # Never hand the foreground client to a background worker if
+                # isolation cannot be established.  Returning ``None`` lets
+                # the worker record a retryable LLM-unavailable run instead
+                # of leaking usage/tool/history state across users.
+                logger.warning("Dreaming LLM client isolation unavailable")
+                return None
+
+        kwargs: dict[str, Any] = {
+            "service": None,
+            "config": self.config,
+            "llm_client_factory": _llm_client_factory,
+            "interval_seconds": self._dreaming_poll_interval_seconds(),
+        }
+        try:
+            import inspect
+
+            parameters = inspect.signature(worker_type).parameters
+            if not any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+            self._dreaming_memory_worker = worker_type(**kwargs)
+        except Exception as exc:
+            logger.warning("Dreaming Memory worker registration skipped: %s", exc)
+            self._dreaming_memory_worker = None
+            return
+        self._register_lifecycle_pair(
+            self._dreaming_memory_worker.start,
+            self._dreaming_memory_worker.stop,
+        )
+
+        async def _cleanup_owned_dreaming_client() -> None:
+            client = owned_background_client.get("client")
+            owned_background_client["client"] = None
+            if client is None or client is getattr(self, "_llm_client", None):
+                return
+            for name in ("aclose", "close", "shutdown", "cleanup"):
+                hook = getattr(client, name, None)
+                if callable(hook):
+                    try:
+                        result = hook()
+                        if inspect.isawaitable(result):
+                            await result
+                    except Exception:
+                        logger.debug("Dreaming owned LLM client cleanup failed", exc_info=True)
+                    break
+
+        self._shutdown_background_tasks.append(_cleanup_owned_dreaming_client)
+
+    def _dreaming_poll_interval_seconds(self) -> float:
+        """Read Dreaming's idle poll interval with a safe five-minute default."""
+        default_interval = 5 * 60.0
+        try:
+            configured = os.getenv("AOITALK_DREAMING_POLL_INTERVAL_SECONDS")
+            if configured:
+                value = float(configured)
+                return value if value > 0 else default_interval
+            if hasattr(self.config, "get"):
+                value = self.config.get(
+                    "web_interface.memory.dreaming_interval_seconds",
+                    default_interval,
+                )
+            elif isinstance(self.config, dict):
+                value = (
+                    self.config.get("web_interface", {})
+                    .get("memory", {})
+                    .get("dreaming_interval_seconds", default_interval)
+                )
+            else:
+                value = default_interval
+            value = float(value)
+            return value if value > 0 else default_interval
+        except Exception:
+            return default_interval
 
     async def _on_startup(self):
         """Startup event handler - ensures admin user exists"""
+        agent_work_ready = False
+        if not Features.validate_dependencies():
+            errors = Features.dependency_errors()
+            logger.error("Feature dependency validation failed: %s", errors)
+            if Features.is_enterprise():
+                raise RuntimeError("invalid Enterprise feature dependency configuration")
+        # Build the single durable AgentWork coordinator before Heartbeat or
+        # Agent Harness startup hooks run.  Feature gates are checked here and
+        # inside the coordinator, so Enterprise/stale config cannot start a
+        # hidden queue.  Heartbeat only wakes discovery; long execution is
+        # owned by this coordinator.
+        if self._db_manager is not None and Features.autonomous_agent_runtime():
+            try:
+                from ..services.agent_work_runtime import AgentWorkCoordinator
+                from ..services.task_work_source import TaskWorkSource
+                from ..services.task_execution_adapter import TaskExecutionAdapter
+                from ..services.actor_principal import ActorPrincipal
+
+                if self._agent_work_coordinator is None:
+                    self._agent_work_coordinator = AgentWorkCoordinator(
+                        self._db_manager,
+                        config=self.config,
+                        task_executor=getattr(self, "_agent_task_executor", None),
+                        execution_actor=ActorPrincipal.service("aoitalk.system"),
+                        enabled=True,
+                    )
+                self._agent_work_coordinator.server_owned = True
+                if Features.virtual_company():
+                    from ..services.ai_employee_platform import register_ai_employee_work
+
+                    register_ai_employee_work(self._agent_work_coordinator, self.ai_employee_services)
+                if getattr(self._agent_work_coordinator, "execution_actor", None) is None:
+                    self._agent_work_coordinator.execution_actor = ActorPrincipal.service(
+                        "aoitalk.system"
+                    )
+                task_executor = getattr(self, "_agent_task_executor", None)
+                # A plain Task WorkSource is only executable through an
+                # explicitly injected TaskManagementService callback.  Do not
+                # fabricate a human User principal or advertise a mutation
+                # lane that would immediately dead-letter every task.
+                if (Features.virtual_company() or Features.code_agent()) and callable(task_executor):
+                    self._agent_work_coordinator.register_source(TaskWorkSource())
+                    self._agent_work_coordinator.register_adapter(
+                        TaskExecutionAdapter(task_executor)
+                    )
+                # Materialize the harness once before recovery/startup.  Its
+                # CodeAgentExecutionAdapter is otherwise created lazily on
+                # the first API request, which could let a poller claim a
+                # code-agent item with no registered adapter.
+                harness_router = getattr(self, "_agent_harness_router", None)
+                eager_harness = getattr(
+                    harness_router,
+                    "agent_harness_get_orchestrator",
+                    None,
+                )
+                if Features.code_agent() and callable(eager_harness):
+                    try:
+                        await eager_harness()
+                    except Exception:
+                        logger.warning(
+                            "Code-agent adapter eager registration failed",
+                            exc_info=True,
+                        )
+                with _startup_timer.phase("startup.web.lifespan.agent_work_recovery"):
+                    await self._agent_work_coordinator.recover_stale()
+                    if Features.virtual_company() and Features.voice_input():
+                        # Only expired phone sessions beyond their absolute
+                        # lifetime are classified; another worker's live call
+                        # is never interrupted and no provider command retries.
+                        await self.ai_employee_services.telephony.recover_interrupted_calls()
+                agent_work_ready = True
+            except Exception as exc:
+                logger.warning("Common AgentWork coordinator startup skipped: %s", exc)
+                if Features.is_enterprise() or os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {"1", "true", "yes", "on"}:
+                    raise RuntimeError("Common AgentWork coordinator failed to start") from exc
         pending_background_tasks = list(self._startup_background_tasks)
-        self._startup_background_tasks.clear()
         with _startup_timer.phase("startup.web.lifespan.background_schedule"):
             for task_factory in pending_background_tasks:
                 try:
-                    task = asyncio.create_task(task_factory())
+                    startup_coro = task_factory()
+                    if not inspect.isawaitable(startup_coro):
+                        raise TypeError(
+                            f"startup hook {task_factory!r} did not return an awaitable"
+                        )
+                    task_name = str(
+                        getattr(task_factory, "__name__", "startup") or "startup"
+                    )
+                    task = self._spawn_lifespan_task(
+                        startup_coro,
+                        name=f"aoitalk-web-startup:{task_name}",
+                        startup_factory=task_factory,
+                    )
                     if task_factory is self._mage_vl_preload_factory:
                         self._mage_vl_preload_task = task
                 except Exception as exc:
                     logger.error(f"Failed to schedule startup background task: {exc}")
+
+        # AgentRun provider tasks and human-interaction Futures are process
+        # local; they cannot be resumed safely after a restart.  Reconcile any
+        # stale running run before dispatch recovery so its terminal audit is
+        # visible to callers, while queued outbox rows remain recoverable.
+        try:
+            from ..services.agent_run_service import AgentRunService
+
+            if self._db_manager is not None:
+                with _startup_timer.phase(
+                    "startup.web.lifespan.agent_run_reconciliation"
+                ):
+                    reconciliation = await AgentRunService(
+                        self._db_manager
+                    ).reconcile_stale_runs_after_restart()
+                if reconciliation.get("reconciled") or reconciliation.get("closed_edges"):
+                    logger.info(
+                        "AgentRun startup reconciliation: runs=%s edges=%s",
+                        reconciliation.get("reconciled", 0),
+                        reconciliation.get("closed_edges", 0),
+                    )
+        except Exception as exc:
+            # Normal profiles keep startup available if the optional database
+            # is down; enterprise/database-required startup will fail later at
+            # its existing bootstrap gate.
+            logger.warning("AgentRun startup reconciliation skipped: %s", exc)
 
         # Story Studio jobs must not remain ``running`` after a process restart.
         # Mark them interrupted before normal request handling resumes so the UI
@@ -562,7 +1502,10 @@ class WebChatServer(
                 except Exception as exc:
                     logger.warning("OpenRouter料金表の更新に失敗しました: %s", exc)
 
-            asyncio.create_task(_refresh_openrouter_pricing())
+            self._spawn_lifespan_task(
+                _refresh_openrouter_pricing(),
+                name="aoitalk-web-startup:refresh-openrouter-pricing",
+            )
         except Exception as exc:
             logger.error(f"Failed to sync pricing catalog: {exc}")
 
@@ -606,6 +1549,29 @@ class WebChatServer(
                         )
                         await session.commit()
 
+                # WS01 deployment-wide Organization bootstrap.  This is an
+                # additive singleton and does not add tenancy columns to
+                # existing Space/Project/Task rows.  The service's fixed-key
+                # uniqueness and transaction-safe replay handle concurrent
+                # startup processes.
+                try:
+                    from ..services.agent_identity_service import OrganizationService
+
+                    with _startup_timer.phase(
+                        "startup.web.lifespan.organization_bootstrap"
+                    ):
+                        await OrganizationService(self._db_manager).bootstrap()
+                    logger.info("Organization singleton bootstrap complete")
+                except Exception as organization_error:
+                    logger.exception(
+                        "Failed to bootstrap Organization singleton: %s",
+                        organization_error,
+                    )
+                    if require_database:
+                        raise RuntimeError(
+                            "Organization singleton bootstrap failed; refusing to start"
+                        ) from organization_error
+
             except Exception as e:
                 logger.exception(f"Failed to ensure admin exists: {e}")
                 if require_database:
@@ -623,6 +1589,39 @@ class WebChatServer(
                     "Enterprise admin bootstrap could not obtain a database session"
                 ) from e
 
+        # The Guide is a canonical, user-owned Docs subtree rather than a
+        # lazy first-request side effect.  Backfill every existing account in
+        # isolated transactions before notification workers can dispatch a
+        # request.  Required-database profiles fail closed if any account
+        # cannot be repaired; optional profiles remain available and retry on
+        # the next startup while retaining the per-user error log above.
+        try:
+            from ..services.aoitalk_guide import backfill_aoitalk_guides
+
+            with _startup_timer.phase("startup.web.lifespan.aoitalk_guide_backfill"):
+                guide_backfill = await backfill_aoitalk_guides(self._db_manager)
+            guide_failures = int((guide_backfill or {}).get("failed", 0) or 0)
+            if guide_failures:
+                message = (
+                    "AoiTalk Guide backfill failed for "
+                    f"{guide_failures}/{int((guide_backfill or {}).get('users', 0) or 0)} users"
+                )
+                if require_database:
+                    raise RuntimeError(message)
+                logger.warning(message)
+            else:
+                logger.info(
+                    "AoiTalk Guide backfill complete: users=%s ensured=%s",
+                    (guide_backfill or {}).get("users", 0),
+                    (guide_backfill or {}).get("ensured", 0),
+                )
+        except Exception as exc:
+            logger.exception("AoiTalk Guide backfill failed: %s", exc)
+            if require_database:
+                raise RuntimeError(
+                    "Enterprise AoiTalk Guide backfill failed; refusing to start"
+                ) from exc
+
         if self._task_notification_worker:
             try:
                 with _startup_timer.phase("startup.web.lifespan.notification_worker_sync"):
@@ -630,10 +1629,126 @@ class WebChatServer(
             except Exception as exc:
                 logger.error(f"Task startup sync failed: {exc}")
 
+        # All startup hooks (including Agent Harness adapter binding) have now
+        # had a scheduling turn.  Start the one common coordinator last so no
+        # work can be claimed before its adapters are registered.
+        coordinator = getattr(self, "_agent_work_coordinator", None)
+        if coordinator is not None and Features.autonomous_agent_runtime() and agent_work_ready:
+            if Features.media_operations_autonomy():
+                try:
+                    await self._register_media_agent_work_lanes(coordinator)
+                except Exception as exc:
+                    logger.warning("Media AgentWork lane registration skipped: %s", exc)
+            await coordinator.start(
+                poll_interval_seconds=self._agent_work_poll_interval_seconds()
+            )
+            self._agent_work_coordinator_started = True
+
+    async def _register_media_agent_work_lanes(self, coordinator: Any) -> None:
+        """Register MediaOps WorkSources/adapters on the shared coordinator."""
+
+        if not Features.media_operations_autonomy():
+            return
+        session = await self._db_manager.get_session()
+        try:
+            from ..memory.models import User
+            admin = (
+                await session.execute(
+                    select(User)
+                    .where(User.is_active.is_(True), User.role == "admin")
+                    .order_by(User.created_at)
+                    .limit(1)
+                )
+            ).scalars().first()
+            if admin is None:
+                return
+            # Legacy MediaOps services use owner_user_id for ACL joins.  This
+            # is a server-owned human context projection; the true Agent ID
+            # remains in WorkItem/AgentRun/origin fields and is never written
+            # into a User FK.
+            actor = {
+                "id": str(admin.id),
+                "user_id": str(admin.id),
+                "actor_type": "human",
+                "is_agent": False,
+                "role": "admin",
+                "_autonomous_discovery": True,
+            }
+            from ..services.agent_authority import AgentAuthorityResolver
+            from ..services.media_work_sources import register_media_work_sources
+            from ..services.media_execution_adapters import register_media_execution_adapters
+            from ..services.media_operations_research_service import MediaOperationsResearchService
+            from ..services.media_operations_generation_service import MediaOperationsGenerationService
+            from ..services.media_operations_content_service import MediaOperationsContentService
+            from ..services.media_operations_metrics_service import MediaOperationsMetricsService
+            from ..services.media_operations_learning_service import MediaOperationsLearningService
+            from ..services.operations_service import OperationsService
+
+            resolver = AgentAuthorityResolver(self._db_manager, config=self.config)
+            async def media_actor_resolver(work_item: Any = None, *, session: Any = None, **_: Any) -> Any:
+                """Resolve the owning human context for one Media source.
+
+                Legacy Media ledgers retain ``owner_user_id``.  The resolver
+                uses that explicit owner for ACL joins while Agent identity
+                and origin remain in the common WorkItem/AgentRun rows.
+                """
+                if session is None:
+                    return None
+                raw = work_item if isinstance(work_item, dict) else vars(work_item) if work_item is not None else {}
+                persona_id = raw.get("persona_id")
+                if persona_id is None and isinstance(raw.get("metadata"), dict):
+                    payload = raw["metadata"].get("payload")
+                    if isinstance(payload, dict):
+                        persona_id = payload.get("persona_id")
+                if persona_id is None:
+                    return None
+                try:
+                    from ..memory.models import Persona
+                    persona = await session.get(Persona, persona_id)
+                except Exception:
+                    return None
+                owner_id = getattr(persona, "owner_user_id", None) if persona is not None else None
+                if owner_id is None:
+                    return None
+                try:
+                    owner = await session.get(User, owner_id)
+                except Exception:
+                    return None
+                if owner is None or getattr(owner, "is_active", True) is False:
+                    return None
+                return {"id": str(owner_id), "user_id": str(owner_id), "actor_type": "human", "is_agent": False}
+            kwargs = {
+                "authority_resolver": resolver.resolve,
+                "actor": actor,
+                "feature_checker": Features.media_operations_autonomy,
+                "research_service": MediaOperationsResearchService(),
+                "generation_service": MediaOperationsGenerationService(),
+                "publication_service": MediaOperationsContentService(),
+                "metrics_service": MediaOperationsMetricsService(),
+                "learning_service": MediaOperationsLearningService(),
+            }
+            register_media_work_sources(coordinator, **kwargs)
+            register_media_execution_adapters(
+                coordinator,
+                research_service=kwargs["research_service"],
+                generation_service=kwargs["generation_service"],
+                operations_service=OperationsService(),
+                metrics_service=kwargs["metrics_service"],
+                learning_service=kwargs["learning_service"],
+                authority_resolver=resolver.resolve,
+                actor_resolver=media_actor_resolver,
+                config=self.config,
+                feature_checker=Features.media_operations_autonomy,
+            )
+        finally:
+            await session.close()
+
     def _setup_routes(self):
         """Setup API routes (ドメイン別の registrar モジュールへ委譲)"""
         register_system_routes(self.app, self)
         register_config_routes(self.app, self)
+        from .routes.pc_bridge_routes import register_pc_bridge_routes
+        register_pc_bridge_routes(self.app, self)
         register_chatgpt_web_routes(self.app, self)
         register_yomi_linter_routes(self.app, self)
         register_llm_routes(self.app, self)
@@ -644,8 +1759,15 @@ class WebChatServer(
             register_mobile_command_routes(self.app, self)
         register_conversation_dispatch_routes(self.app, self)
         register_agent_run_routes(self.app, self)
+        if AGENT_WORK_ROUTES_AVAILABLE and create_agent_work_router:
+            self._register_agent_work_routes()
+        if AGENT_IDENTITY_ROUTES_AVAILABLE and create_agent_identity_router:
+            self._register_agent_identity_routes()
         register_live_voice_routes(self.app, self)
         register_voice_session_routes(self.app, self)
+        from .ai_employee_registration import register_ai_employee_routes
+
+        register_ai_employee_routes(self, cookie_auth_dependency(self._enforce_cookie_auth))
         register_file_explorer_routes(self.app, self)
         register_ogp_routes(self.app, self)
         register_document_storage_routes(self.app, self)
@@ -656,10 +1778,58 @@ class WebChatServer(
             register_remote_server_routes(self.app, self)
             register_remote_proxy_routes(self.app, self)
         register_user_admin_routes(self.app, self)
+        register_verification_data_routes(self.app, self)
         register_feedback_routes(self.app, self)
         register_websocket_routes(self.app, self)
         if TRPG_PLAY_WEBSOCKET_ROUTES_AVAILABLE and register_trpg_play_websocket_routes:
             register_trpg_play_websocket_routes(self.app, self)
+
+    def _register_agent_identity_routes(self):
+        """Register the additive WS01 Agent identity/authority API."""
+
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_agent_identity_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+            config=self.config,
+        )
+        self.app.include_router(router)
+        logger.info("Generic Agent identity routes registered")
+
+    def _register_agent_work_routes(self):
+        """Register the common durable AgentWork read/maintenance API."""
+
+        if not AGENT_WORK_ROUTES_AVAILABLE or not create_agent_work_router:
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_agent_work_router(
+            get_db_manager=lambda: self._db_manager,
+            require_auth_dependency=require_auth,
+            is_admin_user=self._is_admin_user,
+            get_coordinator=lambda: self._agent_work_coordinator,
+            get_user_from_request=self._get_user_info_from_request,
+        )
+        self.app.include_router(router)
+        logger.info("Common AgentWork routes registered")
+
+    def _agent_work_poll_interval_seconds(self) -> float:
+        """Return a bounded coordinator poll interval from app config."""
+
+        default = 5.0
+        try:
+            raw = os.getenv("AOITALK_AGENT_WORK_POLL_INTERVAL_SECONDS")
+            if raw:
+                return max(0.05, min(float(raw), 3600.0))
+            if hasattr(self.config, "get"):
+                raw = self.config.get("agent_work.poll_interval_seconds", default)
+            elif isinstance(self.config, dict):
+                raw = self.config.get("agent_work", {}).get("poll_interval_seconds", default)
+            else:
+                raw = default
+            return max(0.05, min(float(raw), 3600.0))
+        except Exception:
+            return default
 
     def _build_cors_origins(self) -> List[str]:
         """CORS の許可オリジン一覧を組み立てる。
@@ -769,6 +1939,19 @@ class WebChatServer(
         self.app.include_router(router)
         logger.info("Project routes registered")
 
+    def _register_project_overview_routes(self):
+        """Register Project Overview routes."""
+
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_project_overview_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+            get_config=self._load_project_overview_config_snapshot,
+        )
+        self.app.include_router(router)
+        logger.info("Project Overview routes registered")
+
     def _register_project_docs_candidate_routes(self):
         """Register the Project Docs candidate review queue routes."""
 
@@ -781,17 +1964,215 @@ class WebChatServer(
         self.app.include_router(router)
         logger.info("Project Docs candidate routes registered")
 
-    def _register_project_context_pack_routes(self):
-        """Register ProjectContextPack projection status/rebuild routes."""
+    def _register_knowledge_capture_routes(self):
+        """Register authenticated Resolution Knowledge Capture routes."""
 
+        if not KNOWLEDGE_CAPTURE_ROUTES_AVAILABLE or not create_knowledge_capture_router:
+            logger.warning("Knowledge Capture routes not available")
+            return
         require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
-        router = create_project_context_pack_router(
+        router = create_knowledge_capture_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+            config=self.config,
+        )
+        self.app.include_router(router)
+        logger.info("Knowledge Capture routes registered")
+
+    def _register_operations_routes(self):
+        """Register the authenticated Engagement Operations API."""
+
+        if not OPERATIONS_ROUTES_AVAILABLE or not create_operations_router:
+            logger.warning("Operations routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_operations_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+            action_registry=self.ai_employee_services.registry,
+        )
+        self.app.include_router(router)
+        logger.info("Engagement Operations routes registered")
+
+    def _register_media_operations_routes(self):
+        """Register the authenticated typed Media Operations API."""
+
+        if (
+            not MEDIA_OPERATIONS_ROUTES_AVAILABLE
+            or not create_media_operations_router
+        ):
+            logger.warning("Media Operations routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_router(
             get_db_manager=lambda: self._db_manager,
             get_user_from_request=self._get_user_info_from_request,
             require_auth_dependency=require_auth,
         )
         self.app.include_router(router)
-        logger.info("ProjectContextPack routes registered")
+        logger.info("Media Operations routes registered")
+
+    def _register_media_operations_setup_routes(self):
+        """Register MediaOps bulk setup and PlatformAccount API."""
+
+        if (
+            not MEDIA_OPERATIONS_SETUP_ROUTES_AVAILABLE
+            or not create_media_operations_setup_router
+        ):
+            logger.warning(
+                "Media Operations setup routes not available"
+            )
+            return
+
+        require_auth = cookie_auth_dependency(
+            self._enforce_cookie_auth
+        )
+        router = create_media_operations_setup_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info(
+            "Media Operations setup routes registered"
+        )
+
+    def _register_media_operations_research_routes(self):
+        """Register MediaOps research evidence and editorial trace API."""
+
+        if (
+            not MEDIA_OPERATIONS_RESEARCH_ROUTES_AVAILABLE
+            or not create_media_operations_research_router
+        ):
+            logger.warning(
+                "Media Operations research routes not available"
+            )
+            return
+
+        require_auth = cookie_auth_dependency(
+            self._enforce_cookie_auth
+        )
+        router = create_media_operations_research_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info(
+            "Media Operations research routes registered"
+        )
+
+    def _register_media_operations_generation_routes(self):
+        """Register the authenticated Generation Studio provenance API."""
+
+        if (
+            not MEDIA_OPERATIONS_GENERATION_ROUTES_AVAILABLE
+            or not create_media_operations_generation_router
+        ):
+            logger.warning(
+                "Media Operations generation routes not available"
+            )
+            return
+
+        require_auth = cookie_auth_dependency(
+            self._enforce_cookie_auth
+        )
+        router = create_media_operations_generation_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info(
+            "Media Operations generation routes registered"
+        )
+
+    def _register_media_operations_automation_routes(self):
+        """Register AoiTalk-owned MediaOps Automation API."""
+        if (
+            not MEDIA_OPERATIONS_AUTOMATION_ROUTES_AVAILABLE
+            or not create_media_operations_automation_router
+        ):
+            logger.warning("Media Operations automation routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_automation_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info("Media Operations automation routes registered")
+
+    def _register_media_operations_content_routes(self):
+        """Register the authenticated ContentVariant/QA/Rights API."""
+        if (
+            not MEDIA_OPERATIONS_CONTENT_ROUTES_AVAILABLE
+            or not create_media_operations_content_router
+        ):
+            logger.warning("Media Operations content routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_content_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info("Media Operations content routes registered")
+
+    def _register_media_operations_metrics_routes(self):
+        """Register the authenticated metrics/experiments/learning API."""
+        if (
+            not MEDIA_OPERATIONS_METRICS_ROUTES_AVAILABLE
+            or not create_media_operations_metrics_router
+        ):
+            logger.warning("Media Operations metrics routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_metrics_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info("Media Operations metrics routes registered")
+
+    def _register_media_operations_learning_routes(self):
+        """Register human-only Learning review/apply commands."""
+        if (
+            not MEDIA_OPERATIONS_LEARNING_ROUTES_AVAILABLE
+            or not create_media_operations_learning_router
+        ):
+            logger.warning("Media Operations learning routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_learning_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info("Media Operations learning routes registered")
+
+    def _register_media_operations_overview_routes(self):
+        """Register the read-only MediaOps Calendar/Results projections."""
+        if (
+            not MEDIA_OPERATIONS_OVERVIEW_ROUTES_AVAILABLE
+            or not create_media_operations_overview_router
+        ):
+            logger.warning("Media Operations overview routes not available")
+            return
+        require_auth = cookie_auth_dependency(self._enforce_cookie_auth)
+        router = create_media_operations_overview_router(
+            get_db_manager=lambda: self._db_manager,
+            get_user_from_request=self._get_user_info_from_request,
+            require_auth_dependency=require_auth,
+        )
+        self.app.include_router(router)
+        logger.info("Media Operations overview routes registered")
 
     def _register_knowledge_routes(self):
         """Register Knowledge Workspace routes"""
@@ -817,6 +2198,24 @@ class WebChatServer(
             config=self.config if hasattr(self, "config") else {},
         )
         self.app.include_router(router)
+        # The Deep Research router owns a bounded worker pool.  Register its
+        # shutdown hook with the composition root as well as the router event
+        # so WebChatServer's custom lifespan always drains/cancels workers,
+        # including runtimes that bypass FastAPI's deprecated router events.
+        manager = getattr(router, "deep_research_manager", None)
+        reopen = getattr(manager, "reopen", None)
+        if callable(reopen):
+            async def _reopen_deep_research_manager() -> None:
+                reopen()
+
+            # The composition root uses a custom lifespan and keeps startup
+            # hooks as reusable templates.  Re-arm the manager here as well
+            # as on the router event so a second lifespan cannot inherit the
+            # previous shutdown's closed flag.
+            self._startup_background_tasks.append(_reopen_deep_research_manager)
+        shutdown = getattr(manager, "shutdown", None)
+        if callable(shutdown):
+            self._shutdown_background_tasks.append(shutdown)
         logger.info("Deep Research routes registered")
 
     def _register_conversation_routes(self):
@@ -848,6 +2247,7 @@ class WebChatServer(
             require_auth=require_auth,
             get_current_user=self._get_user_info_from_request,
             config=self.config if hasattr(self, "config") else None,
+            masking_handler=self._execute_builtin_masking_turn,
         )
         self.app.include_router(router)
         logger.info("Group chat routes registered")
@@ -894,6 +2294,7 @@ class WebChatServer(
             require_auth_dependency=require_auth,
             broadcaster=self.manager.broadcast,
             workspace_root=self._resolve_workspace_root(),
+            config=getattr(self, "config", None),
         )
         self.app.include_router(router)
         logger.info("Task management routes registered")
@@ -906,6 +2307,7 @@ class WebChatServer(
             get_db_manager=lambda: self._db_manager,
             get_user_from_request=self._get_user_info_from_request,
             require_auth_dependency=require_auth,
+            config=getattr(self, "config", None),
         )
         self.app.include_router(router)
         logger.info("Webex Messaging routes registered")
@@ -1025,14 +2427,7 @@ class WebChatServer(
                     workspace_root=self._resolve_workspace_root(),
                 )
                 self._docs_clip_ingest_worker = worker
-                startup_tasks = getattr(self, "_startup_background_tasks", None)
-                if startup_tasks is None:
-                    startup_tasks = self._startup_background_tasks = []
-                shutdown_tasks = getattr(self, "_shutdown_background_tasks", None)
-                if shutdown_tasks is None:
-                    shutdown_tasks = self._shutdown_background_tasks = []
-                startup_tasks.append(worker.start)
-                shutdown_tasks.append(worker.stop)
+                self._register_lifecycle_pair(worker.start, worker.stop)
 
         logger.info("Docs routes registered")
 
@@ -1078,13 +2473,18 @@ class WebChatServer(
             config=self.config if hasattr(self, "config") else {},
             get_db_manager=lambda: self._db_manager,
             is_admin_user=self._is_admin_user,
+            get_coordinator=lambda: self._agent_work_coordinator,
         )
+        self._agent_harness_router = router
         self.app.include_router(router)
         start_hook = getattr(router, "agent_harness_start", None)
         stop_hook = getattr(router, "agent_harness_stop", None)
         if start_hook:
-            self._startup_background_tasks.append(start_hook)
-        if stop_hook:
+            if stop_hook:
+                self._register_lifecycle_pair(start_hook, stop_hook)
+            else:
+                self._startup_background_tasks.append(start_hook)
+        elif stop_hook:
             self._shutdown_background_tasks.append(stop_hook)
         logger.info("Agent harness routes registered")
 

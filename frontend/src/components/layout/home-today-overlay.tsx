@@ -151,10 +151,7 @@ function isOverdueTask(task: Task): boolean {
   const endAt = getTaskDisplayEndAt(task);
   const due = parseDate(endAt);
   if (!due) return false;
-  if (
-    getTaskDisplayAllDay(task) ||
-    (due.getHours() === 0 && due.getMinutes() === 0)
-  ) {
+  if (getTaskDisplayAllDay(task)) {
     return due < startOfToday();
   }
   return due < new Date();

@@ -1,4 +1,4 @@
-import { and, eq, isNull, or } from "drizzle-orm";
+import { and, eq, isNull, ne, or, sql } from "drizzle-orm";
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { knowledgeNodeShares, users } from "@/db/schema";
@@ -80,7 +80,21 @@ export async function POST(
     .select({ id: users.id })
     .from(users)
     .where(
-      and(eq(users.id, userId), or(eq(users.isActive, true), isNull(users.isActive))),
+      and(
+        eq(users.id, userId),
+        or(eq(users.isActive, true), isNull(users.isActive)),
+        ne(users.id, user.id),
+        // Keep direct POSTs aligned with the picker: only the durable,
+        // server-owned artifact ledger can mark a user as disposable.  User
+        // settings are attribution metadata and are not visibility authority.
+        sql`NOT EXISTS (
+          SELECT 1
+          FROM verification_artifact_provenance AS verification_artifact
+          WHERE verification_artifact.entity_type = 'user'
+            AND verification_artifact.entity_id = ${users.id}::text
+            AND verification_artifact.disposable IS TRUE
+        )`,
+      ),
     )
     .limit(1);
   if (!targetUser) {

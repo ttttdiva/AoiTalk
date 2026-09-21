@@ -9,6 +9,8 @@ import inspect
 import logging
 from typing import Any
 
+from .turn_context import get_turn_context
+
 logger = logging.getLogger(__name__)
 
 _SESSION_LLM_DISPATCH_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
@@ -17,11 +19,11 @@ _SESSION_LLM_DISPATCH_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVa
 )
 
 
-async def refresh_session_chat_llm_context(client: Any) -> None:
+async def refresh_session_chat_llm_context(client: Any) -> bool:
     """Reload persisted session context before binding request-time LLM settings."""
     session_id = str(getattr(client, "current_session_id", None) or "").strip()
     if not session_id:
-        return
+        return False
 
     from ..memory.conversation_repository import ConversationRepository
 
@@ -32,7 +34,7 @@ async def refresh_session_chat_llm_context(client: Any) -> None:
         row = await repo.get_session_by_id(session_id)
     if row is None:
         client._privacy_session_context = {}
-        return
+        return False
 
     session_context = row.context if isinstance(row.context, dict) else {}
     client._privacy_session_context = dict(session_context)
@@ -47,6 +49,7 @@ async def refresh_session_chat_llm_context(client: Any) -> None:
         or ""
     )
     restore_session_agent_team_registry(owner_user_id, session_id, settings)
+    return True
 
 
 def invalidate_session_llm_client_cache(client: Any, session_id: str) -> None:
@@ -123,6 +126,7 @@ _GENERATION_RESULT_STATE_DEFAULTS: dict[str, Any] = {
     "_completed_tool_turn_results": {},
     "_last_tool_calls_run_id": None,
     "_last_usage_run_id": None,
+    "_native_completed_agent_run_states": {},
 }
 
 
@@ -327,10 +331,29 @@ async def run_session_aware_generation(
     binding = None
     ephemeral = None
     try:
-        await refresh_session_chat_llm_context(client)
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        # AoiTalk Help is a Guide-only controller turn.  Refreshing the
+        # ConversationSession here would read Project/Story/session settings
+        # before the provider's own suppression guards run and could also
+        # restore Agent Team state from the prior ordinary turn.
+        session_context_available = (
+            False
+            if suppress_automatic_context
+            else await refresh_session_chat_llm_context(client)
+        )
         session_id = getattr(client, "current_session_id", None)
         session_context = getattr(client, "_privacy_session_context", None)
-        if session_id and isinstance(session_context, dict):
+        # False is authoritative "no durable ConversationSession row".
+        # None remains compatible with older test/embedding overrides of the
+        # refresh seam which did not return a status.
+        if (
+            not suppress_automatic_context
+            and session_id
+            and session_context_available is not False
+            and isinstance(session_context, dict)
+        ):
             binding = bind_session_llm_runtime_from_context(
                 session_context,
                 user_id=getattr(client, "session_user_id", None),
@@ -349,6 +372,11 @@ async def run_session_aware_generation(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                if suppress_automatic_context:
+                    # Help must never turn a route-construction failure into
+                    # a provider/local-server diagnostic that is not grounded
+                    # in the canonical Guide.
+                    raise
                 if _session_route_uses_managed_llama_cpp(config):
                     return _local_llm_ensure_user_error(exc)
                 raise
@@ -388,12 +416,13 @@ async def run_session_aware_generation(
             or ""
         ).strip()
 
-        await _update_current_agent_run_runtime_route(
-            provider=actual_provider,
-            model=actual_model,
-            route_source=route_source,
-            reasoning_effort=reasoning_effort or None,
-        )
+        if not suppress_automatic_context:
+            await _update_current_agent_run_runtime_route(
+                provider=actual_provider,
+                model=actual_model,
+                route_source=route_source,
+                reasoning_effort=reasoning_effort or None,
+            )
 
         generation_kwargs = dict(kwargs)
         stream_callback = generation_kwargs.get("stream_callback")
@@ -409,14 +438,20 @@ async def run_session_aware_generation(
             user_input,
             **generation_kwargs,
         )
-        client.current_assistant_message_id = getattr(
-            target, "current_assistant_message_id", None
-        )
-        if session_id and isinstance(session_context, dict):
+        if not suppress_automatic_context:
+            client.current_assistant_message_id = getattr(
+                target, "current_assistant_message_id", None
+            )
+        if (
+            not suppress_automatic_context
+            and session_id
+            and session_context_available is not False
+            and isinstance(session_context, dict)
+        ):
             await _record_generation_last_used_route(client, config, session_context)
         return result
     finally:
-        if ephemeral is not None:
+        if ephemeral is not None and not suppress_automatic_context:
             _copy_generation_result_state(
                 client,
                 ephemeral,

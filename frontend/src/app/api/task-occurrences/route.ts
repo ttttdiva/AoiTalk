@@ -4,18 +4,24 @@ import {
   taskOccurrences,
   tasks,
   projects,
+  taskRecurrenceScheduleSegments,
   taskRecurrenceRules,
   taskTags,
   tags,
 } from "@/db/schema";
-import { eq, and, inArray, gte, lte, isNotNull, isNull } from "drizzle-orm";
+import { eq, and, inArray, isNotNull, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
+import { computeOccurrenceCandidatesInRange } from "@/lib/recurrence-preview";
 import type { RecurrencePreviewConfig } from "@/lib/recurrence-preview";
 import {
   applyOccurrenceDuration,
   getOccurrenceDurationMs,
 } from "@/lib/recurrence-schedule";
+import {
+  applyRecurrenceScheduleSegment,
+  getRecurrenceSegmentEnvelopeMs,
+  type RecurrenceScheduleSegment,
+} from "@/lib/recurrence-schedule-segments";
 import {
   isRecurrenceOverrideSourceKind,
   isRecurrenceSkipSourceKind,
@@ -23,13 +29,15 @@ import {
 } from "@/lib/recurrence-exceptions";
 import { normalizeTaskStatus } from "@/lib/task-status";
 import { estimateOccurrenceCount, parseRrule } from "@/lib/recurrence-rrule";
-import { getParticipatingProjectIds } from "@/lib/server/task-route-utils";
+import {
+  resolveReadScope,
+  TaskBrowseScopeError,
+} from "@/lib/server/task-route-utils";
 import {
   dbTimestampToLocalDate,
   localDateToDbTimestampDate,
   parseDisplayDateAsDbTimestamp,
   serializeDbTimestamp,
-  toDbLocalTimestamp,
   type DbTimestampValue,
 } from "@/lib/server/db-time";
 
@@ -49,8 +57,9 @@ function occurrenceKey(taskId: string, value: DbTimestampValue): string {
   return `${taskId}:${toLocalTimestampKey(value)}`;
 }
 
-function serializeOriginalStartAt(value: string | null): string | null {
-  return serializeDbTimestamp(value) ?? value;
+function serializeOriginalStartAt(value: DbTimestampValue): string | null {
+  const serialized = serializeDbTimestamp(value);
+  return serialized ?? (typeof value === "string" ? value : null);
 }
 
 function serializeOccurrenceTimestamp(
@@ -132,8 +141,6 @@ export async function GET(request: NextRequest) {
   }
 
   const { searchParams } = new URL(request.url);
-  const projectId = searchParams.get("project_id");
-  const spaceId = searchParams.get("space_id");
   const startFrom = searchParams.get("start_from");
   const endTo = searchParams.get("end_to");
 
@@ -168,10 +175,18 @@ export async function GET(request: NextRequest) {
   const rangeEnd = rangeEndDb;
   const now = new Date();
 
-  const scopedProjectIds = await getParticipatingProjectIds(user.id, {
-    projectId,
-    spaceId: projectId ? null : spaceId,
-  });
+  let scopedProjectIds: string[];
+  try {
+    scopedProjectIds = (await resolveReadScope(user, searchParams)).projectIds;
+  } catch (error) {
+    if (error instanceof TaskBrowseScopeError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
   if (scopedProjectIds.length === 0) return NextResponse.json([]);
 
   try {
@@ -183,6 +198,7 @@ export async function GET(request: NextRequest) {
         status: taskOccurrences.status,
         startAt: taskOccurrences.startAt,
         endAt: taskOccurrences.endAt,
+        originalStartAt: taskOccurrences.originalStartAt,
         allDay: taskOccurrences.allDay,
         sourceKind: taskOccurrences.sourceKind,
         isGenerated: taskOccurrences.isGenerated,
@@ -209,8 +225,8 @@ export async function GET(request: NextRequest) {
         and(
           inArray(tasks.projectId, scopedProjectIds),
           isNull(tasks.deletedAt),
-          lte(taskOccurrences.startAt, toDbLocalTimestamp(rangeEndDb)),
-          gte(taskOccurrences.endAt, toDbLocalTimestamp(rangeStartDb)),
+          isNull(taskOccurrences.deletedAt),
+          isNull(projects.deletedAt),
         ),
       );
 
@@ -243,6 +259,7 @@ export async function GET(request: NextRequest) {
         and(
           inArray(tasks.projectId, scopedProjectIds),
           isNull(tasks.deletedAt),
+          isNull(projects.deletedAt),
           isNotNull(tasks.endAt),
         ),
       );
@@ -253,6 +270,78 @@ export async function GET(request: NextRequest) {
         ...recurringTasks.map((row) => row.taskId),
       ]),
     ];
+
+    const segmentRows =
+      taskIds.length === 0
+        ? []
+        : await db
+            .select({
+              taskId: taskRecurrenceScheduleSegments.taskId,
+              effectiveFrom: taskRecurrenceScheduleSegments.effectiveFrom,
+              startOffsetSeconds:
+                taskRecurrenceScheduleSegments.startOffsetSeconds,
+              endOffsetSeconds: taskRecurrenceScheduleSegments.endOffsetSeconds,
+              allDay: taskRecurrenceScheduleSegments.allDay,
+            })
+            .from(taskRecurrenceScheduleSegments)
+            .where(inArray(taskRecurrenceScheduleSegments.taskId, taskIds));
+    const segmentsByTask = new Map<string, RecurrenceScheduleSegment[]>();
+    for (const row of segmentRows) {
+      const segments = segmentsByTask.get(row.taskId) ?? [];
+      segments.push({
+        effectiveFrom: row.effectiveFrom,
+        startOffsetSeconds: row.startOffsetSeconds ?? 0,
+        endOffsetSeconds: row.endOffsetSeconds ?? 0,
+        allDay: row.allDay ?? false,
+      });
+      segmentsByTask.set(row.taskId, segments);
+    }
+    const recurringTaskById = new Map(
+      recurringTasks.map((task) => [task.taskId, task]),
+    );
+    const legacyCanonicalByTask = new Map<string, Map<number, Date>>();
+    for (const task of recurringTasks) {
+      const taskStart = dbTimestampToLocalDate(task.startAt ?? task.endAt);
+      if (!taskStart) continue;
+      const durationMs =
+        task.startAt && task.endAt
+          ? (getOccurrenceDurationMs(task.startAt, task.endAt) ?? 0)
+          : 0;
+      const segmentPadding = getRecurrenceSegmentEnvelopeMs(
+        segmentsByTask.get(task.taskId) ?? [],
+      );
+      const parsed = parseRrule(task.rrule);
+      const candidates = computeOccurrenceCandidatesInRange(
+        taskStart,
+        {
+          freq: parsed.freq,
+          interval: parsed.interval,
+          byDay: parsed.byDay,
+          skipWeekend: task.skipWeekend ?? false,
+          skipHoliday: task.skipHoliday ?? false,
+          skipMode: task.skipMode ?? "shift_forward",
+          endCount: task.endCount ?? null,
+          endDate: task.endDate ? serializeDbTimestamp(task.endDate) : null,
+        },
+        new Date(
+          rangeStart.getTime() - durationMs - segmentPadding - 14 * 86400000,
+        ),
+        new Date(
+          rangeEnd.getTime() + durationMs + segmentPadding + 14 * 86400000,
+        ),
+        20000,
+      );
+      const byActual = new Map<number, Date>();
+      for (const candidate of candidates) {
+        if (!byActual.has(candidate.occurrenceStart.getTime())) {
+          byActual.set(
+            candidate.occurrenceStart.getTime(),
+            candidate.canonicalStart,
+          );
+        }
+      }
+      legacyCanonicalByTask.set(task.taskId, byActual);
+    }
 
     const tagRows =
       taskIds.length === 0
@@ -287,25 +376,107 @@ export async function GET(request: NextRequest) {
 
     const occurrences = new Map<string, OccurrenceResponse>();
     const hiddenOccurrences = new Set<string>();
+    const explicitCanonicalOccurrences = new Set<string>();
+    const removeCanonicalOccurrences = (canonicalKey: string) => {
+      for (const [key, occurrence] of occurrences) {
+        if (
+          occurrence.original_start_at &&
+          occurrenceKey(occurrence.task_id, occurrence.original_start_at) ===
+            canonicalKey
+        ) {
+          occurrences.delete(key);
+        }
+      }
+    };
 
     for (const row of storedRows) {
       const rowStartAt = dbTimestampToLocalDate(row.startAt);
       if (!rowStartAt) continue;
 
-      const originalStartAt = resolveOccurrenceOriginalStartAt(
-        row.sourceKind,
-        rowStartAt,
-      );
+      let originalStartAt = row.originalStartAt
+        ? dbTimestampToLocalDate(row.originalStartAt)
+        : dbTimestampToLocalDate(
+            resolveOccurrenceOriginalStartAt(row.sourceKind, rowStartAt),
+          );
+      if (
+        row.originalStartAt === null &&
+        !isRecurrenceOverrideSourceKind(row.sourceKind) &&
+        !isRecurrenceSkipSourceKind(row.sourceKind)
+      ) {
+        originalStartAt =
+          legacyCanonicalByTask.get(row.taskId)?.get(rowStartAt.getTime()) ??
+          originalStartAt;
+      }
       const originalKey = originalStartAt
         ? occurrenceKey(row.taskId, originalStartAt)
         : null;
 
       if (originalKey && isRecurrenceSkipSourceKind(row.sourceKind)) {
+        // SELECT order is not part of the contract.  If the override row was
+        // seen first, it wins deterministically over the companion skip row.
+        if (explicitCanonicalOccurrences.has(originalKey)) continue;
         hiddenOccurrences.add(originalKey);
+        removeCanonicalOccurrences(originalKey);
         continue;
       }
 
-      const key = occurrenceKey(row.taskId, row.startAt);
+      // A single override owns its canonical occurrence and therefore takes
+      // precedence over a schedule segment.  Keep the canonical key even if
+      // the override's displayed timestamp is outside the requested window;
+      // otherwise dynamic generation would leak the old canonical occurrence.
+      if (originalKey && isRecurrenceOverrideSourceKind(row.sourceKind)) {
+        explicitCanonicalOccurrences.add(originalKey);
+        hiddenOccurrences.delete(originalKey);
+        removeCanonicalOccurrences(originalKey);
+      }
+
+      const isExplicitException =
+        isRecurrenceOverrideSourceKind(row.sourceKind) ||
+        isRecurrenceSkipSourceKind(row.sourceKind);
+      const hasCanonicalIdentity = row.originalStartAt !== null;
+      const segmentResult =
+        !isExplicitException && !hasCanonicalIdentity && originalStartAt
+          ? applyRecurrenceScheduleSegment({
+              canonicalStart: originalStartAt,
+              canonicalEnd: (() => {
+                const task = recurringTaskById.get(row.taskId);
+                const durationMs =
+                  task?.startAt && task.endAt
+                    ? getOccurrenceDurationMs(task.startAt, task.endAt)
+                    : null;
+                return durationMs !== null
+                  ? new Date(originalStartAt.getTime() + durationMs)
+                  : dbTimestampToLocalDate(row.endAt);
+              })(),
+              baseAllDay: row.allDay ?? false,
+              segments: segmentsByTask.get(row.taskId) ?? [],
+            })
+          : null;
+      // Materializers may already have applied the segment to a stored row.
+      // Avoid shifting that row a second time while still remapping stale
+      // canonical rows after a web-only future mutation.
+      const rowAlreadyApplied =
+        segmentResult !== null &&
+        rowStartAt.getTime() === segmentResult.startAt.getTime() &&
+        (row.allDay ?? false) === segmentResult.allDay &&
+        (!segmentResult.endAt ||
+          dbTimestampToLocalDate(row.endAt)?.getTime() ===
+            segmentResult.endAt.getTime());
+      const actualStartAt = rowAlreadyApplied
+        ? rowStartAt
+        : (segmentResult?.startAt ?? rowStartAt);
+      const actualEndAt = rowAlreadyApplied
+        ? dbTimestampToLocalDate(row.endAt)
+        : (segmentResult?.endAt ?? dbTimestampToLocalDate(row.endAt));
+      const actualAllDay = rowAlreadyApplied
+        ? (row.allDay ?? false)
+        : (segmentResult?.allDay ?? row.allDay ?? false);
+      if (!overlapsRange(actualStartAt, actualEndAt, rangeStart, rangeEnd)) {
+        continue;
+      }
+
+      const actualKey = occurrenceKey(row.taskId, actualStartAt);
+      const key = originalKey ?? actualKey;
       occurrences.set(key, {
         id: row.id,
         task_id: row.taskId,
@@ -317,15 +488,12 @@ export async function GET(request: NextRequest) {
           resetStatusTo: row.resetStatusTo,
           triggerStatus: row.triggerStatus,
           sourceKind: row.sourceKind,
-          startAt: rowStartAt,
+          startAt: actualStartAt,
           now,
         }),
-        start_at: serializeOccurrenceTimestamp(
-          row.startAt,
-          row.allDay ?? false,
-        ),
-        end_at: serializeOccurrenceTimestamp(row.endAt, row.allDay ?? false),
-        all_day: row.allDay ?? false,
+        start_at: serializeOccurrenceTimestamp(actualStartAt, actualAllDay),
+        end_at: serializeOccurrenceTimestamp(actualEndAt, actualAllDay),
+        all_day: actualAllDay,
         source_kind: row.sourceKind ?? "task_schedule",
         is_generated: row.isGenerated ?? false,
         original_start_at: serializeOriginalStartAt(originalStartAt),
@@ -347,13 +515,37 @@ export async function GET(request: NextRequest) {
       const durationMs = task.endAt
         ? getOccurrenceDurationMs(baseStart, baseEnd)
         : null;
+      const segments = segmentsByTask.get(task.taskId) ?? [];
+      const segmentEnvelopeMs = getRecurrenceSegmentEnvelopeMs(segments);
+      const generationRangeStart = new Date(
+        rangeStart.getTime() - segmentEnvelopeMs,
+      );
+      const generationRangeEnd = new Date(
+        rangeEnd.getTime() + segmentEnvelopeMs,
+      );
+      const baseApplied = applyRecurrenceScheduleSegment({
+        canonicalStart: baseStartLocal,
+        canonicalEnd: baseEndLocal,
+        baseAllDay: task.allDay ?? false,
+        segments,
+      });
 
       if (
         baseStart &&
-        overlapsRange(baseStartLocal, baseEndLocal, rangeStart, rangeEnd)
+        overlapsRange(
+          baseApplied.startAt,
+          baseApplied.endAt,
+          rangeStart,
+          rangeEnd,
+        )
       ) {
-        const key = occurrenceKey(task.taskId, baseStart);
-        if (!occurrences.has(key) && !hiddenOccurrences.has(key)) {
+        const canonicalBaseKey = occurrenceKey(task.taskId, baseStart);
+        const key = canonicalBaseKey;
+        if (
+          !occurrences.has(key) &&
+          !hiddenOccurrences.has(canonicalBaseKey) &&
+          !explicitCanonicalOccurrences.has(canonicalBaseKey)
+        ) {
           occurrences.set(key, {
             id: `base-${task.taskId}-${toLocalTimestampKey(baseStart)}`,
             task_id: task.taskId,
@@ -364,21 +556,23 @@ export async function GET(request: NextRequest) {
               status: task.status,
               resetStatusTo: task.resetStatusTo,
               triggerStatus: task.triggerStatus,
-              startAt: baseStartLocal,
+              startAt: baseApplied.startAt,
               now,
             }),
             start_at: serializeOccurrenceTimestamp(
-              baseStart,
-              task.allDay ?? false,
+              baseApplied.startAt,
+              baseApplied.allDay,
             ),
             end_at: serializeOccurrenceTimestamp(
-              baseEnd,
-              task.allDay ?? false,
+              baseApplied.endAt,
+              baseApplied.allDay,
             ),
-            all_day: task.allDay ?? false,
+            all_day: baseApplied.allDay,
             source_kind: "task_schedule",
             is_generated: false,
-            original_start_at: serializeDbTimestamp(baseStart),
+            original_start_at: serializeDbTimestamp(
+              baseApplied.originalStartAt,
+            ),
             tags: tagsByTask.get(task.taskId) || [],
             project_color: extractProjectColor(task.projectMetadata),
           });
@@ -399,36 +593,59 @@ export async function GET(request: NextRequest) {
 
       const count = estimateOccurrenceCount(
         baseStartLocal,
-        rangeEnd,
+        generationRangeEnd,
         previewConfig,
       );
       const occurrenceRangeStart =
         durationMs !== null && durationMs > 0
-          ? new Date(rangeStart.getTime() - durationMs)
-          : rangeStart;
-      const upcomingStarts = computeOccurrencesInRange(
+          ? new Date(generationRangeStart.getTime() - durationMs)
+          : generationRangeStart;
+      const upcomingOccurrences = computeOccurrenceCandidatesInRange(
         baseStartLocal,
         previewConfig,
         occurrenceRangeStart,
-        rangeEnd,
+        generationRangeEnd,
         count,
       );
 
-      for (const nextStart of upcomingStarts) {
-        const nextEnd = applyOccurrenceDuration(nextStart, durationMs);
-        if (!overlapsRange(nextStart, nextEnd, rangeStart, rangeEnd)) {
+      for (const {
+        canonicalStart: nextStart,
+        occurrenceStart: shiftedStart,
+      } of upcomingOccurrences) {
+        const canonicalEnd = applyOccurrenceDuration(nextStart, durationMs);
+        const shiftedEnd = applyOccurrenceDuration(shiftedStart, durationMs);
+        const applied = applyRecurrenceScheduleSegment({
+          canonicalStart: nextStart,
+          canonicalEnd,
+          baseStartAt: shiftedStart,
+          baseEndAt: shiftedEnd,
+          baseAllDay: task.allDay ?? false,
+          segments,
+        });
+        if (
+          !overlapsRange(applied.startAt, applied.endAt, rangeStart, rangeEnd)
+        ) {
           continue;
         }
 
-        const nextStartDb = localDateToDbTimestampDate(nextStart) ?? nextStart;
-        const nextEndDb = nextEnd
-          ? (localDateToDbTimestampDate(nextEnd) ?? nextEnd)
+        const canonicalStartDb =
+          localDateToDbTimestampDate(nextStart) ?? nextStart;
+        const actualStartDb =
+          localDateToDbTimestampDate(applied.startAt) ?? applied.startAt;
+        const actualEndDb = applied.endAt
+          ? (localDateToDbTimestampDate(applied.endAt) ?? applied.endAt)
           : null;
-        const key = occurrenceKey(task.taskId, nextStartDb);
-        if (occurrences.has(key) || hiddenOccurrences.has(key)) continue;
+        const canonicalKey = occurrenceKey(task.taskId, canonicalStartDb);
+        const key = canonicalKey;
+        if (
+          occurrences.has(key) ||
+          hiddenOccurrences.has(canonicalKey) ||
+          explicitCanonicalOccurrences.has(canonicalKey)
+        )
+          continue;
 
         occurrences.set(key, {
-          id: `generated-${task.taskId}-${toLocalTimestampKey(nextStartDb)}`,
+          id: `generated-${task.taskId}-${toLocalTimestampKey(canonicalStartDb)}`,
           task_id: task.taskId,
           project_id: task.projectId,
           title: task.title,
@@ -437,21 +654,15 @@ export async function GET(request: NextRequest) {
             status: task.resetStatusTo || "open",
             resetStatusTo: task.resetStatusTo,
             triggerStatus: task.triggerStatus,
-            startAt: nextStart,
+            startAt: applied.startAt,
             now,
           }),
-          start_at: serializeOccurrenceTimestamp(
-            nextStartDb,
-            task.allDay ?? false,
-          ),
-          end_at: serializeOccurrenceTimestamp(
-            nextEndDb,
-            task.allDay ?? false,
-          ),
-          all_day: task.allDay ?? false,
+          start_at: serializeOccurrenceTimestamp(actualStartDb, applied.allDay),
+          end_at: serializeOccurrenceTimestamp(actualEndDb, applied.allDay),
+          all_day: applied.allDay,
           source_kind: "rrule",
           is_generated: true,
-          original_start_at: serializeDbTimestamp(nextStartDb),
+          original_start_at: serializeDbTimestamp(canonicalStartDb),
           tags: tagsByTask.get(task.taskId) || [],
           project_color: extractProjectColor(task.projectMetadata),
         });

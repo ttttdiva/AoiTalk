@@ -14,6 +14,9 @@ import { hasProjectPermission } from "@/lib/server/project-permissions";
 import {
   canReadProjectId,
   canWriteProjectId,
+  hasTaskBrowseScopeParams,
+  resolveReadScope,
+  TaskBrowseScopeError,
 } from "@/lib/server/task-route-utils";
 
 async function loadAttachment(taskId: string, attachmentId: string) {
@@ -52,7 +55,7 @@ function resolveAttachmentPath(storageRoot: string, filePath: string): string | 
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string; attachmentId: string }> },
 ) {
   const user = await getSession();
@@ -61,6 +64,34 @@ export async function GET(
   }
 
   const { id, attachmentId } = await params;
+  if (hasTaskBrowseScopeParams(new URL(request.url).searchParams)) {
+    try {
+      const scope = await resolveReadScope(
+        user,
+        new URL(request.url).searchParams,
+      );
+      const taskProjectId = scope.projectIds[0];
+      if (!scope.explicit || !taskProjectId) {
+        return NextResponse.json({ detail: "Attachment not found" }, { status: 404 });
+      }
+      const [task] = await db
+        .select({ projectId: tasks.projectId })
+        .from(tasks)
+        .where(and(eq(tasks.id, id), isNull(tasks.deletedAt)))
+        .limit(1);
+      if (!task || !scope.projectIds.includes(task.projectId)) {
+        return NextResponse.json({ detail: "Attachment not found" }, { status: 404 });
+      }
+    } catch (error) {
+      if (error instanceof TaskBrowseScopeError) {
+        return NextResponse.json(
+          { detail: error.message },
+          { status: error.status },
+        );
+      }
+      throw error;
+    }
+  }
   const attachment = await loadAttachment(id, attachmentId);
   if (!attachment) {
     return NextResponse.json({ detail: "Attachment not found" }, { status: 404 });

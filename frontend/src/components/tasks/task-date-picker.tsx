@@ -19,7 +19,11 @@ import type { RecurrenceRule } from "@/lib/task-api";
 import { computeUpcomingOccurrences } from "@/lib/recurrence-preview";
 import type { RecurrenceSkipMode } from "@/lib/recurrence-preview";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
-import { isDateOnlyDateTimeValue, parseLocalDateTime } from "@/lib/date-time";
+import {
+  formatLocalDate,
+  hasExplicitTimeComponent,
+  parseLocalDateTime,
+} from "@/lib/date-time";
 import {
   getTaskDatePresets,
   type TaskDatePreset,
@@ -245,20 +249,19 @@ function formatParseableDatePrefix(value: string): string {
 }
 
 function isDateOnly(value: string): boolean {
-  if (isDateOnlyDateTimeValue(value)) return true;
-  const d = parseTaskDateValue(value);
-  return !!d && d.getHours() === 0 && d.getMinutes() === 0;
+  return !hasExplicitTimeComponent(value);
 }
 
 function hasTime(value: string | null): boolean {
-  if (!value) return false;
-  if (isDateOnlyDateTimeValue(value)) return false;
-  const d = parseTaskDateValue(value);
-  return !!d && (d.getHours() !== 0 || d.getMinutes() !== 0);
+  return hasExplicitTimeComponent(value);
 }
 
 function hasExplicitTimeText(raw: string): boolean {
-  return /(^|\s)\d{1,2}:\d{2}\s*$/.test(normalizeDateText(raw));
+  const trimmed = raw.trim();
+  return (
+    hasExplicitTimeComponent(trimmed) ||
+    /(^|\s)\d{1,2}:\d{2}\s*$/.test(normalizeDateText(trimmed))
+  );
 }
 
 function inferAllDay(
@@ -268,7 +271,6 @@ function inferAllDay(
 ): boolean {
   if (hasTime(startValue) || hasTime(endValue)) return false;
   if (!startValue && !endValue) return fallback;
-  if (fallback) return true;
   return true;
 }
 
@@ -1042,11 +1044,13 @@ export function TaskDatePicker({
   const handleSelectDate = useCallback(
     (date: Date | undefined) => {
       if (!date) return;
-      const cur = parseTaskDateValue(activeValue);
-      const hh = cur ? cur.getHours() : 0;
-      const mm = cur ? cur.getMinutes() : 0;
-      date.setHours(hh, mm, 0, 0);
-      const raw = formatDateTimeLocal(date);
+      const preserveExplicitTime = hasExplicitTimeComponent(activeValue);
+      const cur = preserveExplicitTime ? parseTaskDateValue(activeValue) : null;
+      if (cur) date.setHours(cur.getHours(), cur.getMinutes(), 0, 0);
+      else date.setHours(0, 0, 0, 0);
+      const raw = preserveExplicitTime
+        ? formatDateTimeLocal(date)
+        : formatLocalDate(date);
       const nextValue =
         activeField === "end"
           ? adjustEndDateWithStartTime(raw, draftStartAt)
@@ -1079,7 +1083,8 @@ export function TaskDatePicker({
   const handlePreset = useCallback(
     (preset: TaskDatePreset) => {
       const d = preset.getDate();
-      if (activeValue) {
+      const preserveExplicitTime = hasExplicitTimeComponent(activeValue);
+      if (preserveExplicitTime) {
         const existing = parseTaskDateValue(activeValue);
         if (existing) {
           d.setHours(existing.getHours(), existing.getMinutes(), 0, 0);
@@ -1089,7 +1094,9 @@ export function TaskDatePicker({
       } else {
         d.setHours(0, 0, 0, 0);
       }
-      const raw = formatDateTimeLocal(d);
+      const raw = preserveExplicitTime
+        ? formatDateTimeLocal(d)
+        : formatLocalDate(d);
       const nextValue =
         activeField === "end"
           ? adjustEndDateWithStartTime(raw, draftStartAt)
@@ -1155,23 +1162,30 @@ export function TaskDatePicker({
           field === "start" ? draftStartAt : (draftEndAt ?? draftStartAt),
         ) ?? parseFlexibleDate(trimmed);
       if (parsed) {
+        const dateOnlyInput = !hasExplicitTimeText(trimmed);
+        const parsedDate = dateOnlyInput ? parseTaskDateValue(parsed) : null;
+        const canonicalParsed =
+          dateOnlyInput && parsedDate ? formatLocalDate(parsedDate) : parsed;
         const adjusted =
           field === "end"
-            ? adjustEndDateWithStartTime(parsed, draftStartAt)
-            : parsed;
-        const dateOnlyInput = !hasExplicitTimeText(trimmed);
+            ? adjustEndDateWithStartTime(canonicalParsed, draftStartAt)
+            : canonicalParsed;
         const nextStartAt =
           field === "start"
             ? adjusted
             : dateOnlyInput && isSameDateTime(draftStartAt, activeValue)
               ? adjusted
               : draftStartAt;
-        const nextEndAt =
+        const unadjustedNextEndAt =
           field === "end"
             ? adjusted
             : dateOnlyInput && isSameDateTime(draftEndAt, activeValue)
               ? adjusted
               : draftEndAt;
+        const nextEndAt =
+          field === "start" && onRangeChange && unadjustedNextEndAt
+            ? adjustEndDateWithStartTime(unadjustedNextEndAt, nextStartAt)
+            : unadjustedNextEndAt;
         const nextValues = { startAt: nextStartAt, endAt: nextEndAt };
         if (field === "start") {
           setDraftStartAt(nextStartAt);

@@ -70,13 +70,21 @@ LLMは次をJSON objectとして返す。
 ## titleと階層
 
 - titleは根拠のある `subject` と `title_detail` をコード側で `subject - title_detail` に組み立てる。
-- `topic`/`subject` は、source中で最も目立つ固有名詞を選ぶ欄ではない。clipから後で再利用したい中心知識（手法、知見、疑問、構図、workflow、設定目的）を第一に選び、その知識を識別するために必要な製品名・モデル名を次に考慮する。使用モデル、実行環境、出典、作者、providerなどの付帯metadataは、clip自体がそのモデル・環境・人物・出典を説明する内容でない限りtopicへ昇格させず、`short_literals`（`kind=setting`）またはprovenanceとして保存する。`model:...`、`model=...`、`使用モデル:`、`checkpoint:`、`provider:`、`author:`、`source:` などの行だけを理由にsubjectを決めてはならない。
+- `topic`/`subject` は中心知識そのものを全文で格納する欄ではなく、一覧・検索・ツリーでその中心知識を識別するための短いtitle labelである。例として `Anima 3.8B`、`Anima 3.8B - Qwen3.5 4B併用`、`真上から横向きの顔を見せる構図`、`RTX 5090での推論設定` を許容する。
+- 短い疑問形のtitleも許容する。末尾の `?` / `？` だけを理由にtitleを拒否してはならない。
+- 長い事実説明、条件、結論、knowledge propositionはroot titleへ昇格させず `knowledge_items` に保持する。短いtitleが同じsource rangeをparaphraseしていても、そのrangeに含まれる再利用可能な説明文をtitle evidenceとの重複だけを理由に削除しない。
+- `title_detail` はsubjectだけでは識別しづらい場合の短い補助labelであり、説明文や結論文を置く欄ではない。metadataまたは長文subjectが無効でも、同一の単一source rangeにgroundedな短い `title_detail` が有効ならsubjectへpromoteできる。
+- 使用モデル、実行環境、出典、作者、providerなどの付帯metadataは、clip自体がそのモデル・環境・人物・出典を説明する内容でない限りtopicへ昇格させず、`short_literals`（`kind=setting`）またはprovenanceとして保存する。`model:...`、`model=...`、`使用モデル:`、`checkpoint:`、`provider:`、`author:`、`source:` などの行だけを理由にsubjectを決めてはならない。clip自体が `Anima 3.8B` を説明している場合の `Anima 3.8B` は許容する。
 - 表示用の `topic`/`subject` と、knowledge source prefilterだけに使う内部 `topic_anchor` は別物である。中心知識の自然なsubjectをidentifierとして無理に扱わず、metadata行にあるモデル等のidentifierを内部anchorとして使う場合も、既存のstrict境界・完全一致・version/polarity/chimera gateを緩めない。
 - titleの要約はsource-groundingを保つ自然な表現差を許容するが、`title_evidence` で指定した単一のsource range内に、中心語と主要述語が存在することを必須とする。自由なsemantic fuzzy matchや、根拠範囲にない未知の製品名・数値・version・能力のtitleへの追加は禁止する。既存のstrictなentity境界、unsupported fact、cross-source chimeraの検査を緩めてはならない。
-- このtopic/subject選定とtitle groundingの意味論は、serverとmobile（オンライン、local/offlineを含む）で同一に適用する。
+- 通常のroot title候補に対するstyle判定はserver/mobileで同一とし、広範な日本語文法推測ではなく明示的な長文・説明文signalだけを除外する。正常な短い日本語名詞句、設定見出し、疑問形見出しを助詞や `?` / `？` の存在だけでrejectしてはならない。
+- serverのforum title exceptionは既存のforum専用grounding/security gateを満たす場合に限って維持し、通常の短いtitle style gateへ置き換えない。
+- このtopic/subject選定、fallback順序、title groundingの意味論は、serverとmobile（オンライン、local/offlineを含む）で同一に適用する。
 - 上限は240 Unicode code point。subjectを優先し、detail側を短縮する。
 - 根拠がないdetailは捨て、subjectだけを許容する。URLの未知の内容は補完しない。
 - title/detailと同義のknowledge itemは保存しない。
+- validated title evidenceの1行が短いtitleより多くの再利用可能な情報を持つ場合、その説明文は既存knowledge grounding/security検証を通過する限り `knowledge_items` として保持する。
+- title-likeなsource lineが存在しない場合、説明文をrootへ上げるより、利用可能ならURL slug、添付filename stem、最後に `取り込みメモ` を優先する。
 - `knowledge_items` は確定topic直下の兄弟ノードとして保存し、`おすすめ理由`、`概要`、`特徴`のような汎用ラベルを1段挟まない。appendでも新規生成ノードはtopicの直接子にする。
 - command、設定値、URL、短い引用は、意味のあるラベルと値の2段構造を維持する。
 - 未取得URLは `元リンク（本文を取得できず内容は未確認）` の下にURLを置く。

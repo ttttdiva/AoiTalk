@@ -13,6 +13,7 @@ from ..services.turn_context import get_turn_context
 from .conversation_context import normalize_usage, persist_usage_sync
 from .openai_compatible_local_profiles import openai_compatible_local_base_url
 from .sglang_url import resolve_sglang_base_url
+from .deployment_resolver import canonical_model_for_provider, is_retired_model
 
 logger = logging.getLogger(__name__)
 
@@ -93,13 +94,16 @@ def _ensure_v1_base_url(value: Any, default: str) -> str:
     return clean
 
 
-def _provider_model(config: Any, provider: str, fallback: str) -> str:
+def _provider_model(config: Any, provider: str, fallback: str = "") -> str:
     value = _first_config_value(
         config,
         (f"{provider}.model", f"{provider}_model"),
         default=fallback,
     )
-    return str(value or fallback).strip() or fallback
+    resolved = str(value or fallback).strip()
+    if is_retired_model(resolved):
+        return canonical_model_for_provider(config, provider)
+    return resolved or canonical_model_for_provider(config, provider)
 
 
 def _normalized_model(value: Any) -> str:
@@ -126,6 +130,10 @@ def _resolve_native_transport(
     """
 
     char_data = char_data or {}
+    if not _normalized_model(model) or is_retired_model(model):
+        raise ValueError(
+            "A safe model must be resolved before constructing a native transport"
+        )
     requested = str(provider or "openai").strip().lower() or "openai"
     # ``native_runtime`` implements chat-completions for these provider labels.
     # Unknown/CLI labels cannot be dispatched by this function, so use the
@@ -142,7 +150,12 @@ def _resolve_native_transport(
         "sglang",
         "openai_compatible_local",
     }
-    effective = requested if requested in supported else "openai"
+    if requested not in supported:
+        raise ValueError(
+            f"Unsupported group-chat provider '{requested}'; refusing to "
+            "fall back to the official OpenAI transport."
+        )
+    effective = requested
 
     # Character-level endpoint/key overrides are accepted for deployments
     # that attach provider settings to the character record.  They are read
@@ -562,19 +575,34 @@ class GroupChatManager:
                 or _config_get(self.config, "llm_provider", "openai")
                 or "openai"
             ).strip().lower()
-            # Keep non-OpenAI provider fallbacks unchanged, but never let a
-            # missing OpenAI model setting select the retired mini model.
-            provider_fallback_model = (
-                "gpt-5.6-luna" if persisted_provider == "openai" else "gpt-4o-mini"
+            raw_character_model = _normalized_model(char_data.get("model"))
+            # A retired model may remain in a character row from an older
+            # seed.  Treat it as unset and resolve the provider's canonical
+            # model instead of forwarding it to any transport.
+            character_model = (
+                "" if is_retired_model(raw_character_model) else raw_character_model
             )
-            character_model = _normalized_model(char_data.get("model"))
-            main_model = _normalized_model(_config_get(self.config, "llm_model"))
-            provider_model = _provider_model(
-                self.config,
-                persisted_provider,
-                provider_fallback_model,
+            raw_main_model = _normalized_model(_config_get(self.config, "llm_model"))
+            persisted_config_provider = str(
+                _config_get(self.config, "llm_provider", "openai") or "openai"
+            ).strip().lower() or "openai"
+            main_model = (
+                ""
+                if persisted_config_provider != persisted_provider
+                or is_retired_model(raw_main_model)
+                else raw_main_model
             )
-            persisted_model = character_model or main_model or provider_model
+            provider_model = _provider_model(self.config, persisted_provider)
+            persisted_model = (
+                character_model
+                or main_model
+                or provider_model
+                or canonical_model_for_provider(self.config, persisted_provider)
+            )
+            if not persisted_model or is_retired_model(persisted_model):
+                raise RuntimeError(
+                    f"No safe model is configured for provider '{persisted_provider}'"
+                )
             provider = persisted_provider
             model = _normalized_model(persisted_model)
             route_source = (

@@ -9,9 +9,29 @@ export const NO_STORE_HEADERS = {
 export type InternalPythonUser = {
   id?: string | null;
   username?: string | null;
+  authoritySource?: "web_session" | "internal";
 };
 
-const FORWARDABLE_REQUEST_HEADERS = new Set(["idempotency-key"]);
+// Only these explicitly named headers may cross the Next→FastAPI boundary.
+// Verification headers are forwarded for every proxy route so a Playwright or
+// runtime harness can attribute entities created by any API surface (not just
+// the admin cleanup endpoint).  Arbitrary client headers remain blocked.
+const FORWARDABLE_REQUEST_HEADERS = new Set([
+  "idempotency-key",
+  "x-aoitalk-verification-run-id",
+  "x-aoitalk-verification-harness",
+  "x-aoitalk-verification-source",
+  "x-aoitalk-verification-disposable",
+  "x-aoitalk-verification-signature",
+]);
+
+const VERIFICATION_REQUEST_HEADERS = [
+  "x-aoitalk-verification-run-id",
+  "x-aoitalk-verification-harness",
+  "x-aoitalk-verification-source",
+  "x-aoitalk-verification-disposable",
+  "x-aoitalk-verification-signature",
+] as const;
 
 const ENTERPRISE_DISABLED_API_ROOTS = [
   "/api/mobile",
@@ -61,6 +81,9 @@ export function buildInternalPythonHeaders(
   if (user.username) {
     nextHeaders.set("x-forwarded-user", user.username);
   }
+  if (user.authoritySource) {
+    nextHeaders.set("x-forwarded-authority-source", user.authoritySource);
+  }
   return nextHeaders;
 }
 
@@ -94,7 +117,10 @@ function isEnterpriseDisabledApiPath(apiPath: string): boolean {
 
 function copySearchParams(source: URLSearchParams, target: URL): void {
   source.forEach((value, key) => {
-    target.searchParams.set(key, value);
+    // Preserve repeated keys. Browse-scope parsing intentionally rejects
+    // duplicate target parameters; collapsing them here would silently turn
+    // malformed input into an accepted request at the FastAPI boundary.
+    target.searchParams.append(key, value);
   });
 }
 
@@ -130,6 +156,10 @@ function buildResponseSecurityHeaders(res: Response): Record<string, string> {
     "referrer-policy",
     "permissions-policy",
     "cross-origin-resource-policy",
+    // Preserve backend latency diagnostics for the browser Performance panel.
+    // Server-Timing is response metadata only and does not expose request
+    // credentials or body contents.
+    "server-timing",
   ]) {
     const value = res.headers.get(name);
     if (value) forwarded[name] = value;
@@ -185,6 +215,41 @@ function isReadableStreamBody(
   );
 }
 
+class BufferedResponseTooLargeError extends Error {}
+
+async function readBoundedResponse(
+  response: Response,
+  maxBytes: number,
+): Promise<ArrayBuffer> {
+  const declared = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    await response.body?.cancel();
+    throw new BufferedResponseTooLargeError();
+  }
+  if (!response.body) return new ArrayBuffer(0);
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      throw new BufferedResponseTooLargeError();
+    }
+    chunks.push(value);
+  }
+  const buffer = new ArrayBuffer(total);
+  const output = new Uint8Array(buffer);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return buffer;
+}
+
 export async function proxyRequestToPythonApi(
   request: NextRequest,
   options: {
@@ -209,6 +274,17 @@ export async function proxyRequestToPythonApi(
      * headers must never cross the internal API boundary.
      */
     forwardHeaders?: readonly string[];
+    /**
+     * Buffer a bounded, application-owned response before returning it from
+     * the Next route. Next 16 may abort an upstream stream tied to
+     * ``request.signal`` as soon as the route handler returns; Operations
+     * responses are JSON and capped by their Pydantic/service field limits,
+     * so buffering this namespace keeps the proxy deterministic without
+     * changing large download/media routes.
+     */
+    bufferResponse?: boolean;
+    /** Required byte ceiling whenever bufferResponse is enabled. */
+    maxBufferedResponseBytes?: number;
   },
 ): Promise<NextResponse> {
   const apiPath = normalizeApiPath(options.path);
@@ -246,7 +322,15 @@ export async function proxyRequestToPythonApi(
   const rangeHeader = request.headers.get("range");
   if (rangeHeader) headers["range"] = rangeHeader;
 
-  for (const requestedName of options.forwardHeaders ?? []) {
+  // Verification context is opt-in at the transport level (the browser must
+  // supply all signed values), but once present it is safe and necessary to
+  // forward on every internal API proxy route.  This prevents one overlooked
+  // BFF endpoint from silently creating untracked verification rows.
+  const requestedHeaders = new Set([
+    ...(options.forwardHeaders ?? []),
+    ...VERIFICATION_REQUEST_HEADERS,
+  ]);
+  for (const requestedName of requestedHeaders) {
     const name = requestedName.trim().toLowerCase();
     if (!FORWARDABLE_REQUEST_HEADERS.has(name)) continue;
     const value = request.headers.get(name);
@@ -276,6 +360,18 @@ export async function proxyRequestToPythonApi(
     // deployment paths or other sensitive values.
     const message = error instanceof Error ? error.message.toLowerCase() : "";
     if (message.includes("internal_api_key") || message.includes("internal api key")) {
+      if (apiPath === "/api/hydrus" || apiPath.startsWith("/api/hydrus/")) {
+        return NextResponse.json(
+          {
+            detail: {
+              category: "python_proxy",
+              code: "python_proxy_unreachable",
+              message: "AoiTalkのHydrusプロキシに接続できません",
+            },
+          },
+          { status: 503, headers: NO_STORE_HEADERS },
+        );
+      }
       return NextResponse.json(
         {
           detail: "Internal Python API authentication is not configured",
@@ -334,11 +430,25 @@ export async function proxyRequestToPythonApi(
 
     const hasNoBody =
       request.method === "HEAD" || [204, 205].includes(res.status);
-    return new NextResponse(hasNoBody ? null : res.body, {
+    const responseBody = hasNoBody
+      ? null
+      : options.bufferResponse
+        ? await readBoundedResponse(
+            res,
+            Math.max(1, options.maxBufferedResponseBytes ?? 8 * 1024 * 1024),
+          )
+        : res.body;
+    return new NextResponse(responseBody, {
       status: res.status,
       headers: buildResponseHeaders(res, isGet),
     });
   } catch (error) {
+    if (error instanceof BufferedResponseTooLargeError) {
+      return NextResponse.json(
+        { detail: "Python API response exceeds proxy limit" },
+        { status: 502, headers: NO_STORE_HEADERS },
+      );
+    }
     // A disconnected browser request must stay cancelled all the way through
     // the proxy.  Do not manufacture a 502 response after the client has gone
     // away; Next/Fetch will terminate the downstream stream and the upstream
@@ -349,6 +459,18 @@ export async function proxyRequestToPythonApi(
       (error instanceof Error && error.name === "AbortError")
     ) {
       throw error;
+    }
+    if (apiPath === "/api/hydrus" || apiPath.startsWith("/api/hydrus/")) {
+      return NextResponse.json(
+        {
+          detail: {
+            category: "python_proxy",
+            code: "python_proxy_unreachable",
+            message: "AoiTalkのHydrusプロキシに接続できません",
+          },
+        },
+        { status: 502, headers: NO_STORE_HEADERS },
+      );
     }
     return NextResponse.json(
       { detail: "Python APIに接続できません" },

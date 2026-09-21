@@ -3,7 +3,13 @@
  * ExplorerContext.fetchDirectory から呼び出される。
  */
 
-import type { ExplorerListResponse } from "@/lib/explorer-api";
+import type {
+  ExplorerDirectory,
+  ExplorerListResponse,
+  ExplorerSearchOptions,
+  ExplorerSearchResponse,
+  SearchResult,
+} from "@/lib/explorer-api";
 import {
   HF_PREFIX,
   buildHfPath,
@@ -11,9 +17,13 @@ import {
   parseHfPath,
   type HfVirtualPath,
 } from "./virtual-path";
+import { createHfNameMatcher, normalizeHfSearchLimit } from "./search";
 
 async function jsonFetch<T>(url: string): Promise<T> {
-  const res = await fetch(url, { credentials: "include" });
+  const res = await fetch(url, {
+    credentials: "include",
+    cache: "no-store",
+  });
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`${res.status}: ${t || res.statusText}`);
@@ -61,6 +71,15 @@ interface TreeResp {
     lastModified?: string;
   }>;
 }
+
+export type HfExplorerSearchOptions = ExplorerSearchOptions & {
+  /**
+   * The visible HF root repositories.  Root search is deliberately local:
+   * fetching every repository solely to answer a name query would turn a
+   * keyboard shortcut into an unbounded network fan-out.
+   */
+  rootDirectories?: readonly ExplorerDirectory[];
+};
 
 /**
  * HF 仮想パスを ExplorerListResponse に変換。
@@ -214,4 +233,95 @@ async function loadRepoTree(
     files,
     total_items: directories.length + files.length,
   };
+}
+
+function normalizedHfPath(value: string | undefined): string {
+  const segments = (value ?? "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+|\/+$/g, "")
+    .split("/")
+    .filter(Boolean);
+  if (
+    segments.some(
+      (segment) =>
+        segment === ".." ||
+        segment.includes("|") ||
+        /[\u0000-\u001f\u007f]/.test(segment),
+    )
+  ) {
+    throw new Error("HFパスが不正です");
+  }
+  return segments.filter((segment) => segment !== ".").join("/");
+}
+
+function asRootSearchResult(directory: ExplorerDirectory): SearchResult {
+  return {
+    name: directory.name,
+    path: directory.path,
+    kind: "directory",
+    item_count: directory.item_count,
+    modified_at: directory.modified_at,
+  };
+}
+
+function rootSearch(
+  query: string,
+  limit: number,
+  options: HfExplorerSearchOptions,
+): ExplorerSearchResponse {
+  const matcher = createHfNameMatcher(query, options.regex);
+  const matching = (options.rootDirectories ?? [])
+    .filter((directory) => matcher(directory.name))
+    .map(asRootSearchResult);
+  const results = matching.slice(0, limit);
+  return {
+    success: true,
+    results,
+    total: matching.length,
+    total_returned: results.length,
+    root_path: HF_PREFIX,
+    truncated: matching.length > results.length,
+    query: query.trim(),
+  };
+}
+
+/**
+ * Search the displayed HF root or one repository subtree using the same
+ * ExplorerSearchResponse shape as local Files search.
+ */
+export async function hfExplorerSearch(
+  path: string,
+  query: string,
+  limit?: number,
+  options: HfExplorerSearchOptions = {},
+): Promise<ExplorerSearchResponse> {
+  const normalizedLimit = normalizeHfSearchLimit(limit);
+  const parsed =
+    path === HF_PREFIX ? { kind: "root" as const } : parseHfPath(path);
+  if (!parsed) {
+    throw new Error("HFパスが不正です");
+  }
+  if (parsed.kind === "root") {
+    return rootSearch(query, normalizedLimit, options);
+  }
+
+  // Compile locally first so invalid regex patterns never result in a network
+  // request.  The authenticated route repeats this validation as its trust
+  // boundary; this also keeps root and repository search behavior aligned.
+  createHfNameMatcher(query, options.regex);
+
+  const qs = new URLSearchParams({
+    q: query.trim(),
+    repoId: parsed.repoId ?? "",
+    repoType: parsed.repoType ?? "model",
+    limit: String(normalizedLimit),
+  });
+  if (parsed.accountId) qs.set("accountId", parsed.accountId);
+  const subPath = normalizedHfPath(parsed.subPath);
+  if (subPath) qs.set("path", subPath);
+  if (options.regex) qs.set("regex", "true");
+
+  return jsonFetch<ExplorerSearchResponse>(
+    `/api/huggingface/search?${qs.toString()}`,
+  );
 }

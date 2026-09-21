@@ -115,6 +115,8 @@ MANIFEST_TARGET_KEYS = {
     "process_detail",
     "output_label",
     "output_detail",
+    # Server-owned provenance marker for automatically promoted managed tools.
+    "x_aoitalk_managed_tool_lineage",
     *MANIFEST_COMMAND_KEYS,
 }
 

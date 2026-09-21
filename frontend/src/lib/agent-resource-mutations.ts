@@ -32,6 +32,47 @@ export function dedupeAgentResourceMutations(
   return [...byResource.values()];
 }
 
+/**
+ * Compact only the inline assistant-message card projection.
+ *
+ * docs_create_nodes creates one durable node per outline line. A node is
+ * hidden here only when its canonical parent is another outline-created node
+ * from the same AgentRun. Missing provenance or hierarchy metadata is
+ * intentionally fail-open; hierarchy is never inferred from titles, order,
+ * indentation, or timestamps.
+ */
+export function compactAgentResourceMutationsForChatCards(
+  mutations: AgentResourceMutation[] | null | undefined,
+): AgentResourceMutation[] {
+  const deduped = dedupeAgentResourceMutations(mutations);
+  const outlineCreatedIds = new Set(
+    deduped
+      .filter(
+        (mutation) =>
+          mutation.resource_type === "docs_node" &&
+          mutation.created_in_outline === true,
+      )
+      .map((mutation) => mutation.resource_id),
+  );
+
+  if (outlineCreatedIds.size === 0) return deduped;
+
+  return deduped.filter((mutation) => {
+    if (
+      mutation.resource_type !== "docs_node" ||
+      mutation.created_in_outline !== true
+    ) {
+      return true;
+    }
+    const parentId = mutation.parent_id?.trim();
+    return (
+      !parentId ||
+      parentId === mutation.resource_id ||
+      !outlineCreatedIds.has(parentId)
+    );
+  });
+}
+
 function mergeMutation(
   previous: AgentResourceMutation,
   current: AgentResourceMutation,

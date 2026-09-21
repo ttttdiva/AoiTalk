@@ -9,6 +9,7 @@ Supports two modes:
 import asyncio
 import contextlib
 import logging
+import threading
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass
@@ -41,9 +42,17 @@ class SharedQdrantClient:
     """
     _instance: Optional['QdrantClient'] = None
     _local_path: Optional[str] = None
+    _creation_lock = threading.RLock()
 
     @classmethod
     def get_client(cls, local_path: str) -> 'QdrantClient':
+        # Async callers can open storage in executor threads. Serialize with
+        # legacy synchronous callers so only one client acquires its file lock.
+        with cls._creation_lock:
+            return cls._get_client_locked(local_path)
+
+    @classmethod
+    def _get_client_locked(cls, local_path: str) -> 'QdrantClient':
         if not QDRANT_AVAILABLE:
             raise RuntimeError("qdrant-client not installed")
         resolved = str(Path(local_path).resolve())
@@ -61,6 +70,11 @@ class SharedQdrantClient:
 
     @classmethod
     def close(cls):
+        with cls._creation_lock:
+            cls._close_locked()
+
+    @classmethod
+    def _close_locked(cls):
         if cls._instance is not None:
             try:
                 cls._instance.close()

@@ -1,3 +1,4 @@
+import { ScopeSwitcher } from "../../../components/scope-switcher";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Alert,
@@ -75,7 +76,6 @@ export default function TaskCreateScreen() {
     "none" | "DAILY" | "WEEKLY" | "MONTHLY"
   >("none");
   const [recurrenceInterval, setRecurrenceInterval] = useState("1");
-  const [projectMenu, setProjectMenu] = useState(false);
   const [statusMenu, setStatusMenu] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -204,7 +204,6 @@ export default function TaskCreateScreen() {
     }
   };
 
-  const selectedProject = projects.find((project) => project.id === projectId);
   const statusLabel = STATUSES.find((item) => item.value === status)?.label;
 
   return (
@@ -247,33 +246,8 @@ export default function TaskCreateScreen() {
         </View>
 
         <View style={styles.attributeRow}>
-          <Menu
-            visible={projectMenu}
-            onDismiss={() => setProjectMenu(false)}
-            anchor={
-              <Chip
-                icon="folder-outline"
-                compact
-                onPress={() => setProjectMenu(true)}
-                style={styles.chip}
-              >
-                {selectedProject?.name ?? "Project"}
-              </Chip>
-            }
-          >
-            {scopedProjects.map((project) => (
-              <Menu.Item
-                key={project.id}
-                title={project.name}
-                leadingIcon={project.id === projectId ? "check" : undefined}
-                onPress={() => {
-                  setProjectId(project.id);
-                  setSelectedTagIds([]);
-                  setProjectMenu(false);
-                }}
-              />
-            ))}
-          </Menu>
+          <ScopeSwitcher variant="chip" projects={scopedProjects} projectId={projectId} allowAll={false}
+            onSelectProject={(id) => { if (id) { setProjectId(id); setSelectedTagIds([]); } }} />
           <Menu
             visible={statusMenu}
             onDismiss={() => setStatusMenu(false)}

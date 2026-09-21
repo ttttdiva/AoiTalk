@@ -4,14 +4,19 @@ Gemini LLM engine implementation with Function Calling support
 
 import os
 import asyncio
+import copy
+import inspect
 import threading
 import concurrent.futures
 import uuid
 import json
 import logging
-from dataclasses import replace
+import io
+import mimetypes
+from collections.abc import Mapping, Sequence
 from typing import Optional, List, Dict, Any, Union, Generator
 import google.generativeai as genai
+from google.api_core.exceptions import DeadlineExceeded
 from google.generativeai.types import (
     HarmCategory,
     HarmBlockThreshold,
@@ -33,7 +38,11 @@ from ..services.project_context import (
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
-from ..services.turn_context import get_turn_context
+from .manager_parts.context_building import strip_project_context_bundle
+from ..services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    get_turn_context,
+)
 from ..services.story_chat_context import (
     build_story_chat_context,
     run_story_chat_context_sync,
@@ -45,7 +54,11 @@ from .runtime_tool_registry import (
     build_runtime_tool_registry_for_client,
 )
 from .tool_packs import ensure_load_tool_pack_tool
-from .tool_exposure import filtered_registry_for_client, is_review_generation
+from .tool_exposure import (
+    filtered_registry_for_client,
+    get_strict_tool_allowlist,
+    is_review_generation,
+)
 from .generation_policy import (
     DEFAULT_GENERATION_POLICY,
     GenerationProfile,
@@ -53,7 +66,7 @@ from .generation_policy import (
     reset_current_generation_policy,
     set_current_generation_policy,
 )
-from .generation_cancellation import GenerationInterrupted
+from .generation_cancellation import GenerationInterrupted, PlanningInteractionTerminated
 from .agentic_completion import (
     render_messages_for_review,
     run_agentic_completion_loop_sync,
@@ -73,11 +86,13 @@ from .turn_stream_events import (
     emit_tool_start,
     make_sync_stream_emitter,
 )
-from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
+from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall, UnifiedToolResult
 from .multimodal import data_url_to_bytes, normalize_image_payloads
 from .conversation_context import persist_usage_sync
 from .context_snapshot import (
+    capture_context_manifest_before_context_clear,
     component,
+    context_manifest_metadata,
     context_bundle_components,
     message_components,
     reconcile_snapshot,
@@ -87,10 +102,13 @@ from .context_snapshot import (
 )
 from ..services.user_settings_service import get_user_custom_instructions_sync
 from ..services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
-    RawMediaBlocked,
+    PrivacyError,
     get_privacy_policy_context,
 )
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
+from ..utils.startup_console import safe_startup_reason
 
 
 logger = logging.getLogger(__name__)
@@ -109,6 +127,65 @@ def _gemini_part_is_thought(part: Any) -> bool:
 
 
 _GEMINI_STORY_CONTEXT_UNSET = object()
+
+
+def _plain_json_value(value: Any, *, path: str = "arguments") -> Any:
+    """Convert Gemini proto containers into ordinary JSON values.
+
+    ``google.generativeai`` exposes function-call arguments through
+    ``MapComposite``/``RepeatedComposite`` rather than builtin ``dict``/``list``
+    instances.  Those values must never be allowed to cross the tool boundary
+    (or leak into durable JSON) as provider objects.  Unknown provider values
+    fail closed instead of being stringified into executable arguments.
+    """
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_json_value(item, path=f"{path}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, Sequence) and not isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return [
+            _plain_json_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    if isinstance(value, (set, frozenset)):
+        return [
+            _plain_json_value(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+
+    # Some SDK releases expose nested messages with a ``to_dict`` helper but
+    # do not register them as Mapping.  Re-enter the strict conversion after
+    # obtaining that plain representation.
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        try:
+            converted = to_dict()
+        except Exception as exc:  # pragma: no cover - provider-specific
+            raise ValueError(f"unsupported Gemini value at {path}") from exc
+        if converted is value:
+            raise ValueError(f"unsupported Gemini value at {path}")
+        return _plain_json_value(converted, path=path)
+
+    raise ValueError(
+        f"unsupported Gemini provider value at {path}: {type(value).__name__}"
+    )
+
+
+def _plain_json_object(value: Any, *, path: str = "arguments") -> dict[str, Any]:
+    converted = _plain_json_value(value, path=path)
+    if not isinstance(converted, dict):
+        raise ValueError(f"Gemini {path} must be an object")
+    return converted
+
+
+class _GeminiAgenticReviewDeadline(Exception):
+    """Internal sentinel separating optional review timeout from continuation."""
 
 
 def _declaration_names(tools: Any) -> tuple[str, ...]:
@@ -186,7 +263,11 @@ def _gemini_generation_config(
     except Exception as exc:
         if not includes_thoughts:
             raise
-        print(f"[GeminiLLMClient] include_thoughts 非対応のため除外します: {exc}")
+        logger.info(
+            "Gemini include_thoughts is unsupported; omitting it (%s)",
+            safe_startup_reason(exc),
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         return _gemini_generation_config_without_thoughts(config_kwargs), False
 
 
@@ -207,7 +288,11 @@ def _gemini_generation_config_without_thoughts(config_kwargs: Dict[str, Any]) ->
     try:
         return genai.types.GenerationConfig(**fallback_kwargs)
     except Exception as exc:
-        print(f"[GeminiLLMClient] thinking_config を無効化して継続します: {exc}")
+        logger.info(
+            "Gemini thinking_config was disabled after configuration fallback (%s)",
+            safe_startup_reason(exc),
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         fallback_kwargs.pop("thinking_config", None)
         return genai.types.GenerationConfig(**fallback_kwargs)
 
@@ -219,6 +304,10 @@ class GeminiLLMClient:
     # requested current_session_id changes, so ingress must not prefill a
     # second user-scoped history copy before the provider request.
     manages_conversation_session_history = True
+
+    DEFAULT_REQUEST_TIMEOUT_SECONDS = 60
+    MIN_REQUEST_TIMEOUT_SECONDS = 1
+    MAX_REQUEST_TIMEOUT_SECONDS = 300
 
     def __init__(
         self,
@@ -236,8 +325,27 @@ class GeminiLLMClient:
         from ..memory.history import HistoryManager
 
         self.config = config
+        self._lightweight_ephemeral_client = bool(
+            config
+            and config.get(
+                "runtime.lightweight_ephemeral_client",
+                False,
+            )
+        )
+        target_tools = (
+            config.get("runtime.target_enable_tools", None)
+            if config
+            else None
+        )
+        self._target_tools_enabled = target_tools is not False
+        if self._lightweight_ephemeral_client:
+            self._target_tools_enabled = False
         self._privacy_gateway = OutboundPrivacyGateway(config)
-        self.character_name = config.default_character if config else "Assistant"
+        self.character_name = (
+            "Assistant"
+            if self._lightweight_ephemeral_client
+            else config.default_character if config else "Assistant"
+        )
         self.conversation_history = []
         self.history_manager = HistoryManager()
         self.model_name = model
@@ -277,6 +385,7 @@ class GeminiLLMClient:
         self._cleanup_done = False
         self._memory_loop: Optional[asyncio.AbstractEventLoop] = None
         self._memory_thread: Optional[threading.Thread] = None
+        self._memory_warmup_future = None
         if self._memory_enabled:
             memory_config = MemoryConfig()
             if config:
@@ -288,9 +397,6 @@ class GeminiLLMClient:
                     "llm_model", memory_config.llm_model
                 )
                 memory_config.enable_search = memory_settings.get("enable_search", True)
-                memory_config.preload_embedding_model = memory_settings.get(
-                    "preload_embedding_model", False
-                )
             self.memory_manager = ConversationMemoryManager(memory_config)
 
             # Start persistent memory event loop thread
@@ -303,7 +409,7 @@ class GeminiLLMClient:
             memory_settings = config.get("memory", {}) if config else {}
             if memory_settings.get("enable_search", True):
                 # Pre-warm cross-session memory only when semantic memory search is enabled.
-                asyncio.run_coroutine_threadsafe(
+                self._memory_warmup_future = asyncio.run_coroutine_threadsafe(
                     self._warmup_cross_session_memory(), self._memory_loop
                 )
 
@@ -311,8 +417,17 @@ class GeminiLLMClient:
         genai.configure(api_key=api_key)
 
         # Initialize system prompt based on character
-        self.system_prompt = self._build_system_prompt()
-        if config:
+        if self._lightweight_ephemeral_client:
+            self.system_prompt = (
+                "Follow the supplied instruction exactly and return only "
+                "the requested content. Do not use tools or character context."
+            )
+        else:
+            self.system_prompt = self._build_system_prompt()
+
+        if self._lightweight_ephemeral_client or not self._target_tools_enabled:
+            self._tool_registry = ToolRegistry()
+        elif config:
             self._tool_registry = build_runtime_tool_registry_for_client(
                 build_runtime_tool_registry,
                 config,
@@ -327,7 +442,12 @@ class GeminiLLMClient:
             self._tool_registry = get_registry()
 
         # Initialize available tools from unified registry
-        self.tools = self._setup_tools()
+        self.tools = (
+            self._setup_tools()
+            if self._target_tools_enabled
+            and not self._lightweight_ephemeral_client
+            else []
+        )
 
         # Initialize model with safety settings and tools
         self._safety_settings = {
@@ -341,21 +461,150 @@ class GeminiLLMClient:
             model_name=model, safety_settings=self._safety_settings, tools=self.tools
         )
 
-        print(f"[GeminiLLMClient] モデル初期化: {model}")
+        logger.info(
+            "Gemini model initialized: %s",
+            model,
+        )
 
         # Initialize Spotify
-        if self.config:
+        if self.config and not self._lightweight_ephemeral_client:
             from ..tools import init_spotify_manager
 
             spotify_success = init_spotify_manager()
             if spotify_success:
-                print(f"[GeminiLLMClient] Spotify初期化成功")
+                logger.info(
+                    "Spotify integration initialized for Gemini",
+                )
             else:
-                print(f"[GeminiLLMClient] Spotify初期化スキップ（設定不完全）")
+                logger.info(
+                    "Spotify integration skipped for Gemini (configuration incomplete)",
+                )
 
-        print(f"[GeminiLLMClient] Geminiクライアント初期化: {self.character_name}")
-        print(f"[GeminiLLMClient] 使用モデル: {model}")
-        print(f"[GeminiLLMClient] 利用可能ツール数: {len(self._tool_registry)}")
+        logger.info(
+            "Gemini client initialized: character=%s model=%s tools=%s",
+            self.character_name,
+            model,
+            len(self._tool_registry),
+        )
+
+    def _gemini_request_timeout_seconds(self) -> int:
+        configured = (
+            self.config.get("gemini.request_timeout_seconds")
+            if getattr(self, "config", None)
+            else None
+        )
+        try:
+            value = int(configured)
+        except (TypeError, ValueError):
+            value = self.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        if value < self.MIN_REQUEST_TIMEOUT_SECONDS:
+            return self.DEFAULT_REQUEST_TIMEOUT_SECONDS
+        return min(value, self.MAX_REQUEST_TIMEOUT_SECONDS)
+
+    def _send_message_with_deadline(
+        self,
+        chat: Any,
+        message: Any,
+        *,
+        generation_config: Any,
+        tools: Any = None,
+        tool_config: Any = None,
+        privacy_payload: Any = None,
+    ) -> Any:
+        """Send one Gemini chat turn with the configured transport deadline."""
+
+        kwargs: dict[str, Any] = {
+            "generation_config": generation_config,
+            "request_options": {"timeout": self._gemini_request_timeout_seconds()},
+        }
+        # The deprecated SDK accepts ``tools``/``tool_config`` on
+        # ChatSession.send_message.  Lightweight compatibility fakes in older
+        # callers may expose only the historical three parameters, so inspect
+        # an explicit signature and omit these optional keywords for them.
+        try:
+            parameters = inspect.signature(chat.send_message).parameters
+            accepts_var_kwargs = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            )
+        except (TypeError, ValueError):
+            parameters = {}
+            accepts_var_kwargs = True
+        if tools is not None and (
+            accepts_var_kwargs or "tools" in parameters
+        ):
+            kwargs["tools"] = tools
+        if tool_config is not None and (
+            accepts_var_kwargs or "tool_config" in parameters
+        ):
+            kwargs["tool_config"] = tool_config
+        # Keep the provider call inside the privacy transaction.  The
+        # historical implementation protected the prompt in a separate step
+        # and then sent it later, which left a TOCTOU gap for review/approval
+        # and allowed a caller to accidentally send the pre-redaction value.
+        gateway = getattr(self, "_privacy_gateway", None)
+        if not isinstance(gateway, OutboundPrivacyGateway):
+            gateway = OutboundPrivacyGateway(getattr(self, "config", None))
+            self._privacy_gateway = gateway
+
+        request_payload: dict[str, Any] = {
+            "message": message,
+            # ``ChatSession.send_message`` implicitly resends its history.
+            # Include that provider-managed state in the same transaction so
+            # a review/redaction decision covers the complete wire payload,
+            # not only the latest user part.
+            "history": list(getattr(chat, "history", None) or []),
+            **kwargs,
+        }
+        if privacy_payload is not None:
+            request_payload["privacy_payload"] = privacy_payload
+        base_url = str(
+            getattr(getattr(self, "config", None), "get", lambda *_: "")(
+                "gemini.base_url", ""
+            )
+            or "https://generativelanguage.googleapis.com"
+        )
+        descriptor = EgressDescriptor(
+            action="model.generate",
+            transport="gemini.chat.send_message",
+            destination=base_url,
+            provider="gemini",
+            model=str(getattr(self, "model_name", "") or ""),
+        )
+
+        def send_message(outbound: dict[str, Any]) -> Any:
+            if not isinstance(outbound, dict) or "message" not in outbound:
+                raise PrivacyError("Gemini outbound message is missing")
+            outbound_kwargs = dict(outbound)
+            outbound_message = outbound_kwargs.pop("message")
+            if outbound_message is None:
+                raise PrivacyError("Gemini outbound message is empty")
+            outbound_history = outbound_kwargs.pop("history", None)
+            if outbound_history is None:
+                raise PrivacyError("Gemini outbound history is missing")
+            # ``privacy_payload`` is a gateway-only evidence field (for
+            # example raw attachment bytes).  It must never be forwarded to
+            # the provider SDK; the actual media remains in ``message``.
+            outbound_kwargs.pop("privacy_payload", None)
+            if outbound_history is not None:
+                try:
+                    chat.history = outbound_history
+                except Exception:
+                    # Some SDK chat fakes expose read-only history.  The
+                    # latest message is still passed through the gateway;
+                    # retaining the existing state is the safest fallback.
+                    pass
+            return chat.send_message(outbound_message, **outbound_kwargs)
+
+        return gateway.execute_sync(
+            request_payload,
+            provider="gemini",
+            descriptor=descriptor,
+            sender=send_message,
+            base_url=base_url,
+            source_kind="model_request",
+            model=str(getattr(self, "model_name", "") or ""),
+        )
 
     def set_tool_registry(self, registry: ToolRegistry) -> None:
         """専門委譲用に許可済みtoolだけでGemini宣言を再構築する。"""
@@ -390,16 +639,26 @@ class GeminiLLMClient:
             return [Tool(function_declarations=function_declarations)]
 
         except Exception as e:
-            print(f"[GeminiLLMClient] ツール初期化エラー: {e}")
+            logger.warning(
+                "Gemini tool initialization was skipped: %s",
+                safe_startup_reason(e),
+            )
             return []
 
     def _build_system_prompt(self) -> str:
         """Build system prompt based on character configuration"""
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         return build_unified_instructions(
             character_name=self.character_name,
             config=self.config,
-            custom_instructions=get_user_custom_instructions_sync(
-                self._get_session_user_id()
+            custom_instructions=(
+                None
+                if suppress_automatic_context
+                else get_user_custom_instructions_sync(self._get_session_user_id())
             ),
             include_static_tool_reference=False,
             # Gemini receives function declarations via the API.  Keep the
@@ -408,6 +667,39 @@ class GeminiLLMClient:
         )
 
     def _build_effective_system_prompt(self, story_context=None) -> str:
+        turn = get_turn_context()
+        suppress_automatic_context = bool(
+            getattr(turn, "suppress_automatic_context", False)
+        )
+        # ``suppress_automatic_context`` is shared by Help and trusted
+        # background controllers.  Help has no strict scope and must keep its
+        # fixed, tool-free prompt; a Project Steward/agent-check turn carries a
+        # server-issued strict scope and must retain its isolated prompt.
+        strict_background_scope = bool(
+            getattr(turn, "strict_project_scope", False)
+        ) or get_strict_tool_allowlist() is not None
+        command_capabilities = {
+            str(value).strip().casefold()
+            for value in (
+                getattr(self, "current_command_capabilities", ()) or ()
+            )
+            if str(value).strip()
+        }
+        is_help_turn = "aoitalk_help" in command_capabilities
+        if suppress_automatic_context and (
+            is_help_turn or not strict_background_scope
+        ):
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+        override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if override:
+            return override
+        # Keep compatibility with lightweight clients that still expose the
+        # legacy private override attribute.
+        override = str(getattr(self, "_system_prompt_override", "") or "").strip()
+        if override:
+            return override
         if story_context:
             return story_context.prompt
         return self._build_system_prompt()
@@ -419,6 +711,12 @@ class GeminiLLMClient:
             bounded_snapshot = sanitized_snapshot_series(context_snapshots)
             if bounded_snapshot:
                 metadata["context_snapshot"] = bounded_snapshot
+        manifest = context_manifest_metadata(
+            self,
+            allow_snapshot_only=True,
+        )
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
         return metadata
 
     @staticmethod
@@ -466,8 +764,12 @@ class GeminiLLMClient:
     ) -> None:
         """Record the exact prompt layers used for one Gemini request."""
         try:
+            # Keep ContextManifest traces subject to the same immutable
+            # Project Context OFF boundary as the model prompt.
             rendered_bundle, bundle_parts = context_bundle_components(
-                self._current_context_bundle
+                self._context_bundle_for_turn(
+                    project_context_enabled_for_client(self)
+                )
             )
             normalized_messages: List[Dict[str, Any]] = []
             for index, item in enumerate(history):
@@ -623,6 +925,10 @@ class GeminiLLMClient:
         is_streaming: bool = False,
     ) -> None:
         """Gemini レスポンスの usage を永続化する（失敗しても本処理は落とさない）。"""
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Help is a one-turn Guide projection; do not create ordinary
+            # token-usage records from a direct provider invocation.
+            return
         try:
             payload = self._gemini_usage_payload(response)
             if not payload:
@@ -676,6 +982,20 @@ class GeminiLLMClient:
         )
         from .tool_packs import tool_visible_for_session
 
+        # Trusted controller turns (notably ``/help``) provide their own
+        # bounded prompt and must not inherit StoryWritingSession context from
+        # a reused provider instance.  Force an explicit ``None`` through the
+        # exposure layer so it cannot re-resolve the current session behind
+        # the caller's back.
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            # Help is a tool-free controller turn.  Do not even expose the
+            # legacy prebuilt declarations when a lightweight client has no
+            # common registry to filter.
+            return []
+
         registry = getattr(self, "_tool_registry", None)
         if registry is None:
             # Lightweight test/legacy clients may only provide prebuilt Gemini
@@ -723,7 +1043,13 @@ class GeminiLLMClient:
                     fallback_tools.append(Tool(function_declarations=kept))
             return fallback_tools
 
-        if story_context is _GEMINI_STORY_CONTEXT_UNSET or story_context is None:
+        if suppress_automatic_context:
+            effective_registry = filtered_registry_for_client(
+                self,
+                registry,
+                story_context=None,
+            )
+        elif story_context is _GEMINI_STORY_CONTEXT_UNSET or story_context is None:
             effective_registry = filtered_registry_for_client(
                 self,
                 registry,
@@ -851,34 +1177,47 @@ class GeminiLLMClient:
 
             print(f"[GeminiLLMClient] Transcribing audio: {file_path}")
 
-            # Audio bytes are raw media, so do not upload them to Gemini in a
-            # protected/local-only turn unless an explicit media policy allows
-            # it.  The gateway is checked before ``upload_file``.
-            if self._privacy_gateway.mode in {"protected", "local_only"}:
-                self._privacy_gateway.ensure_provider_allowed("gemini")
-                if self._privacy_gateway.settings.raw_media_policy == "block":
-                    raise RawMediaBlocked(
-                        "raw media is blocked in protected privacy mode"
-                    )
-
             prompt = "Please transcribe the speech in this audio file. Output only the transcribed text without any additional explanation."
-            protected = self._privacy_gateway.protect_sync(
-                {"prompt": prompt, "media": file_path.read_bytes()},
+            media_bytes = file_path.read_bytes()
+            media_type = mimetypes.guess_type(str(file_path))[0] or "audio/wav"
+            descriptor = EgressDescriptor(
+                action="model.transcribe",
+                transport="gemini.files.upload+generate_content",
+                destination="https://generativelanguage.googleapis.com",
                 provider="gemini",
-                source_kind="audio_transcription",
+                model="gemini-2.5-flash",
             )
-            if isinstance(protected.payload, dict):
-                prompt = str(protected.payload.get("prompt") or prompt)
 
-            # Upload audio file using existing genai configuration
-            audio_file = genai.upload_file(path=str(file_path))
+            def send_audio_request(outbound: dict[str, Any]) -> Any:
+                # Build the upload and transcription request only from the
+                # final payload supplied by the gateway.  BytesIO avoids
+                # reintroducing a local filesystem path after protected
+                # redaction and keeps both provider calls in one transaction.
+                outbound_prompt = outbound.get("prompt")
+                if not isinstance(outbound_prompt, str) or not outbound_prompt:
+                    raise PrivacyError("Gemini audio prompt is missing")
+                outbound_media = outbound.get("media")
+                if isinstance(outbound_media, (bytes, bytearray, memoryview)):
+                    upload_source: Any = io.BytesIO(bytes(outbound_media))
+                else:
+                    upload_source = outbound_media
+                audio_file = genai.upload_file(
+                    path=upload_source,
+                    mime_type=media_type,
+                )
+                transcription_model = genai.GenerativeModel("gemini-2.5-flash")
+                return transcription_model.generate_content(
+                    [outbound_prompt, audio_file]
+                )
 
-            # Create a simple model for transcription (or reuse existing)
-            # Note: We use a fresh model instance for transcription to avoid tool conflicts
-            transcription_model = genai.GenerativeModel("gemini-2.5-flash")
-
-            # Generate transcription
-            response = transcription_model.generate_content([prompt, audio_file])
+            response = self._privacy_gateway.execute_sync(
+                {"prompt": prompt, "media": media_bytes},
+                provider="gemini",
+                descriptor=descriptor,
+                sender=send_audio_request,
+                source_kind="audio_transcription",
+                model="gemini-2.5-flash",
+            )
             # Audio transcription is a direct Gemini API request outside the
             # normal chat loop.  Record it independently when usage metadata
             # is returned; ``_record_gemini_usage`` safely no-ops otherwise.
@@ -910,12 +1249,14 @@ class GeminiLLMClient:
             character_name: Name of the character
         """
         self.character_name = character_name
+        self._isolated_system_prompt_override = ""
         self.system_prompt = self._build_system_prompt()
 
     def set_session_context(
         self, user_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None
     ):
         """Update identifiers used for persistent memory logging."""
+        self._isolated_system_prompt_override = ""
         if user_id:
             self.session_user_id = str(user_id)
         if metadata:
@@ -930,7 +1271,16 @@ class GeminiLLMClient:
         return self.session_user_id or "default_user"
 
     def _get_memory_metadata(self) -> Dict[str, Any]:
-        return self.session_metadata.copy() if self.session_metadata else {}
+        metadata = self.session_metadata.copy() if self.session_metadata else {}
+        manifest = context_manifest_metadata(self)
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
+        return metadata
+
+    def _get_user_memory_metadata(self) -> Dict[str, Any]:
+        metadata = self.session_metadata.copy() if self.session_metadata else {}
+        metadata.pop("context_manifest", None)
+        return metadata
 
     def update_character(self, yaml_filename: str):
         """Update character from YAML file
@@ -943,6 +1293,7 @@ class GeminiLLMClient:
             new_config = self.config.get_character_config(yaml_filename)
             if new_config:
                 self.character_name = new_config.get("name", yaml_filename)
+                self._isolated_system_prompt_override = ""
                 # Clear conversation history when switching characters
                 self.clear_history()
                 self.system_prompt = self._build_system_prompt()
@@ -962,8 +1313,17 @@ class GeminiLLMClient:
         Args:
             prompt: System prompt
         """
+        self._isolated_system_prompt_override = ""
         self.system_prompt = prompt
-        print(f"[GeminiLLMClient] システムプロンプト設定")
+        logger.info(
+            "Gemini system prompt configured",
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
+
+    def set_isolated_system_prompt(self, prompt: str):
+        isolated_prompt = str(prompt or "").strip()
+        self._isolated_system_prompt_override = isolated_prompt
+        self.system_prompt = isolated_prompt
 
     def set_llm_mode(self, mode: str):
         """Set LLM response mode
@@ -988,12 +1348,321 @@ class GeminiLLMClient:
         """
         return "thinking" if getattr(self, "_thinking_mode", False) else "fast"
 
+    @staticmethod
+    def _approved_action_directive():
+        """Resolve the provider-neutral approved-plan cursor lazily."""
+
+        from ..services.planning_runtime import get_approved_action_directive
+
+        return get_approved_action_directive()
+
+    @staticmethod
+    def _current_planning_state():
+        from .planning_policy import get_current_planning_run_state
+
+        return get_current_planning_run_state()
+
+    @staticmethod
+    def _approved_action_budget(state: Any, tool_call_count: int) -> int | None:
+        """Snapshot the provider-round budget for an executing approved plan."""
+
+        if (
+            state is None
+            or not getattr(state, "plan", None)
+            or str(getattr(state, "phase", ""))
+            not in {"executing", "PlanningRunPhase.EXECUTING"}
+        ):
+            return None
+        actions = tuple(state.plan.actions or ())
+        cursor = int(
+            (getattr(state, "metadata", {}) or {}).get(
+                "approved_action_cursor", 0
+            )
+        )
+        if cursor < 0 or cursor > len(actions):
+            raise ValueError("approved action cursor out of range")
+        # Include rounds already consumed before approval, every action still
+        # pending at the server cursor, and one mandatory no-tools final.
+        return int(tool_call_count) + (len(actions) - cursor) + 1
+
+    def _approved_action_call(self, directive, *, tool_name: str, arguments: Any):
+        """Bind a Gemini function call to one server-owned action."""
+
+        from ..services.planning_runtime import bind_approved_action_call
+        from ..services.turn_context import override_turn_context, reset_turn_context
+
+        token = override_turn_context(tool_call_id=directive.call_id)
+        try:
+            return bind_approved_action_call(
+                directive,
+                tool_name=tool_name,
+                proposed_arguments=_plain_json_object(arguments),
+            )
+        finally:
+            reset_turn_context(token)
+
+    def _approved_action_receipt(self, directive):
+        from ..services.planning_runtime import get_approved_action_receipt
+
+        return self._run_async_sync(get_approved_action_receipt(directive))
+
+    def _accept_approved_action_receipt(self, directive, receipt):
+        from ..services.planning_runtime import accept_approved_action_receipt
+
+        return self._run_async_sync(accept_approved_action_receipt(directive, receipt))
+
+    def _persist_approved_action_result(
+        self,
+        directive,
+        *,
+        arguments: dict[str, Any],
+        result: Any,
+        success: bool,
+    ):
+        from ..services.planning_runtime import persist_and_accept_approved_action_result
+
+        return self._run_async_sync(
+            persist_and_accept_approved_action_result(
+                directive,
+                arguments=arguments,
+                result=result,
+                success=bool(success),
+            )
+        )
+
+    def _fail_approved_action(self, directive, *, reason: str, detail: str = ""):
+        from ..services.planning_runtime import fail_approved_action
+
+        return self._run_async_sync(
+            fail_approved_action(directive, reason=reason, detail=detail)
+        )
+
+    def _protect_approved_action_replay(
+        self,
+        directive: Any,
+        receipt_output: str,
+    ) -> tuple[dict[str, Any], str]:
+        """Protect durable replay payloads before they re-enter Gemini.
+
+        Receipt arguments are durable execution evidence, but the synthetic
+        ``FunctionCall`` sent during a reconnect must be reconstructed from
+        the current server-owned directive rather than trusting provider
+        payloads stored in the receipt.  Arguments and result are transformed
+        together so one gateway alias table is used for the whole replay.
+        """
+
+        try:
+            directive_arguments = _plain_json_object(
+                getattr(directive, "arguments", None) or {}
+            )
+            protected = self._privacy_gateway.protect_sync(
+                {
+                    "arguments": directive_arguments,
+                    "result": str(receipt_output),
+                },
+                provider="gemini",
+                source_kind="approved_action_replay",
+            )
+            protected_payload = getattr(protected, "payload", None)
+            if not isinstance(protected_payload, Mapping):
+                raise ValueError("protected replay payload must be an object")
+            protected_arguments = _plain_json_object(
+                protected_payload.get("arguments")
+            )
+            protected_result = protected_payload.get("result")
+            if not isinstance(protected_result, str):
+                raise ValueError("protected replay result must be a string")
+            # Validate the exact values that will cross the provider boundary,
+            # not merely the pre-transform directive.  ``_plain_json_object``
+            # removes Gemini proto containers from arguments; JSON encoding
+            # then rejects any remaining provider-specific object instead of
+            # allowing an implicit stringification fallback.
+            json.dumps(
+                protected_arguments,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            json.dumps(protected_result, ensure_ascii=False)
+            return protected_arguments, protected_result
+        except Exception as exc:
+            self._fail_approved_action(
+                directive,
+                reason="approved_action_privacy_protection_failed",
+                detail=str(exc),
+            )
+            raise AssertionError("unreachable")
+
+    def _fail_completed_plan_provider_call(
+        self,
+        function_calls: Sequence[Any],
+    ) -> None:
+        """Fail closed when Gemini emits tools after plan execution completed.
+
+        A completed approved plan is requested with ``tools=[]`` and
+        ``function_calling_config.mode=NONE``.  Providers can still return a
+        malformed/stale function-call part, however.  There is no current
+        approved action to attach to such a call, so use the planning
+        runtime's plan-level failure sentinel instead of manufacturing an
+        ``action.failed`` receipt with a null action.
+        """
+
+        from ..services.planning_runtime import (
+            _planning_failure,
+            _record_planning_audit_event,
+        )
+
+        # Keep a plan-level audit trail without persisting provider arguments
+        # or pretending that a non-existent approved action failed.
+        try:
+            self._run_async_sync(
+                _record_planning_audit_event(
+                    "plan.execution.failed",
+                    status="failed",
+                    payload={
+                        "reason": "approved_plan_completed_tool_call",
+                        "provider_function_count": len(function_calls),
+                    },
+                )
+            )
+        except Exception:
+            logger.debug(
+                "Failed to record completed-plan provider tool violation",
+                exc_info=True,
+            )
+        raise _planning_failure("approved_plan_completed_tool_call")
+
+    @staticmethod
+    def _gemini_tool_config(*, mode: str, allowed_function_names: Sequence[str] = ()) -> dict[str, Any]:
+        config: dict[str, Any] = {"mode": str(mode).upper()}
+        names = [str(name).strip() for name in allowed_function_names if str(name).strip()]
+        if names and config["mode"] == "ANY":
+            config["allowed_function_names"] = names
+        return {"function_calling_config": config}
+
+    @staticmethod
+    def _filter_gemini_tools(tools: Sequence[Any], tool_name: str) -> list[Any]:
+        """Keep exactly one declaration for an approved action round."""
+
+        filtered: list[Any] = []
+        target = str(tool_name or "").strip()
+        for tool in list(tools or []):
+            declarations = [
+                declaration
+                for declaration in list(
+                    getattr(tool, "function_declarations", []) or []
+                )
+                if str(getattr(declaration, "name", "") or "") == target
+            ]
+            if declarations:
+                filtered.append(Tool(function_declarations=declarations))
+        return filtered
+
+    @staticmethod
+    def _function_response_part(name: str, result: Any) -> Any:
+        """Build a Gemini function response using plain JSON payloads."""
+
+        return genai.protos.Part(
+            function_response=genai.protos.FunctionResponse(
+                name=str(name or ""),
+                response={"result": str(result or "")},
+            )
+        )
+
+    @staticmethod
+    def _synthetic_function_call_part(name: str, arguments: Mapping[str, Any]) -> Any:
+        return genai.protos.Part(
+            function_call=genai.protos.FunctionCall(
+                name=str(name or ""),
+                args=_plain_json_object(arguments),
+            )
+        )
+
+    def _execute_tool_result(
+        self,
+        function_name: str,
+        arguments: Mapping[str, Any] | None,
+        *,
+        call_id: str = "",
+    ) -> UnifiedToolResult:
+        """Execute through the unified router without serializing control flow."""
+
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        story_context = (
+            None if suppress_automatic_context else self._get_story_chat_context_sync()
+        )
+        if story_context and not is_story_workflow_tool_allowed(
+            function_name,
+            story_context,
+        ):
+            call = UnifiedToolCall(
+                tool=function_name,
+                arguments=_plain_json_object(arguments or {}),
+                call_id=call_id,
+            )
+            return UnifiedToolResult(
+                call=call,
+                output=(
+                    f"{function_name} is not available in this scenario "
+                    f"{story_context.mode} session. Continue using the scenario "
+                    "workflow context only."
+                ),
+                success=False,
+                error="tool unavailable in scenario",
+            )
+
+        registry = filtered_registry_for_client(
+            self,
+            self._tool_registry,
+            **({"story_context": None} if suppress_automatic_context else {}),
+        )
+        if function_name not in registry:
+            call = UnifiedToolCall(
+                tool=function_name,
+                arguments=_plain_json_object(arguments or {}),
+                call_id=call_id,
+            )
+            return UnifiedToolResult(
+                call=call,
+                output=f"エラー: 未知の関数 '{function_name}'",
+                success=False,
+                error="unknown tool",
+            )
+
+        return RegistryToolRouter(
+            registry,
+            log_prefix="GeminiLLMClient",
+            config=self.config,
+            client=self,
+            user_input="",
+        ).execute(
+            UnifiedToolCall(
+                tool=function_name,
+                arguments=_plain_json_object(arguments or {}),
+                call_id=call_id,
+            )
+        )
+
     def _execute_tool(self, function_name: str, arguments: Dict[str, Any]) -> str:
         """Execute a tool function and return its result"""
         try:
+            arguments = _plain_json_object(arguments or {})
             print(f"[GeminiLLMClient] ツール実行: {function_name} with {arguments}")
 
-            story_context = self._get_story_chat_context_sync()
+            suppress_automatic_context = bool(
+                getattr(get_turn_context(), "suppress_automatic_context", False)
+            )
+            if suppress_automatic_context:
+                # This legacy raw seam can be called directly by lightweight
+                # integrations even though the normal Gemini loop exposes no
+                # tools for Help.  Keep the controller boundary fail-closed so
+                # a model/provider cannot smuggle an arbitrary mutation here.
+                return "エラー: AoiTalk Helpターンではツールを実行できません"
+            story_context = (
+                self._get_story_chat_context_sync()
+            )
             if story_context and not is_story_workflow_tool_allowed(
                 function_name,
                 story_context,
@@ -1005,7 +1674,11 @@ class GeminiLLMClient:
                 )
 
             # 統一レジストリからツール取得・実行
-            registry = filtered_registry_for_client(self, self._tool_registry)
+            registry = filtered_registry_for_client(
+                self,
+                self._tool_registry,
+                **({"story_context": None} if suppress_automatic_context else {}),
+            )
             if function_name not in registry:
                 return f"エラー: 未知の関数 '{function_name}'"
 
@@ -1024,11 +1697,18 @@ class GeminiLLMClient:
                 print(f"[GeminiLLMClient] ツール結果: {result.model_output}")
                 return str(result.model_output)
 
+            except PlanningInteractionTerminated:
+                raise
             except Exception as e:
                 error_msg = f"ツール実行エラー ({function_name}): {str(e)}"
                 print(f"[GeminiLLMClient] {error_msg}")
                 return error_msg
 
+        except PlanningInteractionTerminated:
+            # Planning timeout/cancel and approval failures are control-flow
+            # signals consumed by the terminal mode; never stringify them as
+            # a provider fallback or model-visible tool result.
+            raise
         except Exception as e:
             error_msg = f"ツール実行エラー ({function_name}): {str(e)}"
             print(f"[GeminiLLMClient] {error_msg}")
@@ -1041,15 +1721,28 @@ class GeminiLLMClient:
         """Build conversation context from history for Gemini chat"""
         messages = []
 
-        story_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        story_context = (
+            None if suppress_automatic_context else self._get_story_chat_context_sync()
+        )
         # Scenario workflow sessions use a dedicated system prompt instead of
         # the globally selected app-header assistant prompt.
         enhanced_system_prompt = self._build_effective_system_prompt(story_context)
+        isolated_override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
         include_project_context = project_context_enabled_for_client(self)
         context_bundle = self._context_bundle_for_turn(include_project_context)
         context_builder_block = (
             context_bundle.render_for_prompt()
-            if not story_context and context_bundle
+            if (
+                not suppress_automatic_context
+                and not isolated_override
+                and not story_context
+                and context_bundle
+            )
             else ""
         )
         if context_builder_block:
@@ -1058,7 +1751,12 @@ class GeminiLLMClient:
             )
         project_context = (
             None
-            if story_context or not include_project_context
+            if (
+                suppress_automatic_context
+                or isolated_override
+                or story_context
+                or not include_project_context
+            )
             else get_runtime_project_context()
         )
         if project_context and not context_builder_block:
@@ -1074,8 +1772,11 @@ class GeminiLLMClient:
             {"role": "model", "parts": ["了解しました。設定と記憶を理解しました。"]}
         )
 
-        # Add conversation history (last 10 exchanges)
-        if self.conversation_history:
+        # Add conversation history (last 10 exchanges).  Isolated controller
+        # turns (notably Help) must remain one-turn even if this helper is
+        # called outside ``generate_response`` or a stale client history is
+        # still present.
+        if not suppress_automatic_context and self.conversation_history:
             for msg in self.conversation_history[
                 -20:
             ]:  # Last 10 exchanges (user + assistant)
@@ -1096,21 +1797,18 @@ class GeminiLLMClient:
         """Hide stale selected-Project layers when Project Context is OFF."""
 
         bundle = self._current_context_bundle
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if bundle is None or include_project_context:
             return bundle
-        return replace(
-            bundle,
-            project_context_block="",
-            project_information_block="",
-            agent_memory_block="",
-            project_pack_block="",
-            task_context_block="",
-        )
+        return strip_project_context_bundle(bundle)
 
     def _get_routed_model(self, user_input: str) -> Optional[str]:
         return None
 
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if not self.current_project_id and not self.current_session_id:
             return None
 
@@ -1131,6 +1829,8 @@ class GeminiLLMClient:
             return None
 
     def _get_story_chat_context_sync(self):
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if not self.current_session_id:
             return None
         return run_story_chat_context_sync(
@@ -1150,11 +1850,17 @@ class GeminiLLMClient:
     def _build_context_bundle_sync(
         self, user_input: str, project_context: Optional[dict[str, Any]]
     ) -> Optional[ContextBundle]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if self._get_story_chat_context_sync():
             return None
         try:
+            try:
+                context_builder = ContextBuilder(manifest_config=self.config)
+            except TypeError:
+                context_builder = ContextBuilder()
             return self._run_async_sync(
-                ContextBuilder().build_context(
+                context_builder.build_context(
                     user_id=self._get_session_user_id(),
                     message=user_input,
                     project_id=self.current_project_id,
@@ -1171,9 +1877,18 @@ class GeminiLLMClient:
             return None
 
     def _build_tool_hint_context(self, user_input: str) -> str:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            return ""
         return build_tool_hint_context_sync(
             user_input=user_input,
-            registry=filtered_registry_for_client(self, self._tool_registry),
+            registry=filtered_registry_for_client(
+                self,
+                self._tool_registry,
+                **({"story_context": None} if suppress_automatic_context else {}),
+            ),
             policy=get_client_generation_policy(self),
             log_prefix="GeminiLLMClient",
         )
@@ -1202,7 +1917,14 @@ class GeminiLLMClient:
         user_input: str,
         is_streaming: bool = False,
     ) -> str:
-        story_context = self._get_story_chat_context_sync()
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if suppress_automatic_context:
+            raise RuntimeError("Gemini review loop is disabled for isolated Help turns")
+        story_context = (
+            None if suppress_automatic_context else self._get_story_chat_context_sync()
+        )
         effective_tools = self._get_effective_gemini_tools(story_context)
         review_model = self._model_for_effective_tools(
             effective_tools,
@@ -1220,7 +1942,8 @@ class GeminiLLMClient:
                 response_tokens=getattr(generation_config, "max_output_tokens", None),
                 request_kind="agentic_review",
             )
-            response = chat.send_message(
+            response = self._send_message_with_deadline(
+                chat,
                 latest_message,
                 generation_config=generation_config,
             )
@@ -1257,7 +1980,10 @@ class GeminiLLMClient:
             function_response_parts = []
             for func_call in function_calls:
                 function_name = func_call.name
-                arguments = dict(func_call.args) if func_call.args else {}
+                arguments = _plain_json_object(
+                    getattr(func_call, "args", None) or {},
+                    path=f"review.{function_name}",
+                )
                 result = self._execute_tool(function_name, arguments)
                 tool_calls.append(
                     OpenAIToolCallRecord(
@@ -1267,16 +1993,60 @@ class GeminiLLMClient:
                     )
                 )
                 function_response_parts.append(
-                    genai.protos.Part(
-                        function_response=genai.protos.FunctionResponse(
-                            name=function_name,
-                            response={"result": result},
-                        )
-                    )
+                    self._function_response_part(function_name, result)
                 )
             latest_message = function_response_parts
 
         return "ツール実行の上限に達したため、検証を完了できませんでした。"
+
+    def _run_agentic_completion_from_valid_response(
+        self,
+        *,
+        context: str,
+        user_input: str,
+        initial_response: str,
+        generation_config: Any,
+        is_streaming: bool,
+    ) -> str:
+        """Review a valid response without hiding continuation failures.
+
+        A review is optional verification, so only its transport deadline may
+        retain the already-valid provider response. A requested continuation
+        is additional production work and keeps the provider's existing error
+        propagation/fallback contract.
+        """
+
+        def run_continuation_once(prompt: str) -> str:
+            return self._run_agentic_review_once(
+                prompt,
+                generation_config=generation_config,
+                user_input=user_input,
+                is_streaming=is_streaming,
+            )
+
+        def run_review_once(prompt: str) -> str:
+            try:
+                return run_continuation_once(prompt)
+            except DeadlineExceeded as exc:
+                raise _GeminiAgenticReviewDeadline from exc
+
+        try:
+            return run_agentic_completion_loop_sync(
+                client=self,
+                run_once=run_continuation_once,
+                run_review_once=run_review_once,
+                run_continuation_once=run_continuation_once,
+                context=context,
+                user_input=user_input,
+                initial_response=initial_response,
+            )
+        except _GeminiAgenticReviewDeadline as review_timeout:
+            print(
+                "[GeminiLLMClient] agentic reviewがタイムアウト"
+                "したため有効な応答を保持します: "
+                f"{review_timeout.__cause__ or review_timeout}"
+            )
+            return initial_response
 
     def generate_response(
         self,
@@ -1311,6 +2081,57 @@ class GeminiLLMClient:
         )
         project_token = None
         tool_policy_token = set_current_user_input(user_input)
+        # Trusted controller turns such as AoiTalk Help carry a complete,
+        # bounded context of their own.  They must not read or append the
+        # provider's durable conversation history, even when a long-lived
+        # Gemini client is reused for a normal session.
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        isolated_privacy_gateway_previous = (
+            getattr(self, "_privacy_gateway", None)
+            if suppress_automatic_context
+            else None
+        )
+        isolated_privacy_gateway_active = bool(suppress_automatic_context)
+        if isolated_privacy_gateway_active:
+            # Direct Gemini callers may skip TerminalMode's provider snapshot.
+            # Start with a fresh alias scope and restore the ordinary gateway
+            # after this one-turn Guide request completes.
+            try:
+                turn = get_turn_context()
+                self._privacy_gateway = OutboundPrivacyGateway(
+                    getattr(self, "config", None),
+                    user_id=str(
+                        getattr(turn, "user_id", None)
+                        or self._get_session_user_id()
+                        or ""
+                    ),
+                    session_id=str(
+                        getattr(turn, "session_id", None)
+                        or session_id
+                        or ""
+                    ),
+                    session_context={},
+                    project_metadata={},
+                )
+                setattr(self._privacy_gateway, "_aoitalk_help_isolated", True)
+            except Exception:
+                isolated_privacy_gateway_active = False
+        isolated_history_snapshot = None
+        if suppress_automatic_context:
+            # ``TerminalMode`` normally snapshots the whole provider before
+            # priming Help.  Keep this direct-provider safeguard as well for
+            # legacy callers that invoke Gemini without that orchestration.
+            with self._history_lock:
+                try:
+                    saved_history = copy.deepcopy(self.conversation_history)
+                except Exception:
+                    saved_history = list(self.conversation_history or [])
+                isolated_history_snapshot = (
+                    saved_history,
+                    getattr(self, "_loaded_session_id", None),
+                )
         generation_policy_token = set_current_generation_policy(
             get_client_generation_policy(self)
         )
@@ -1318,17 +2139,38 @@ class GeminiLLMClient:
         try:
             # Alias mappings are session-scoped; never carry them to another
             # conversation when a long-lived Gemini client is reused.
-            privacy_user_id = str(self._get_session_user_id() or "")
-            privacy_session_id = str(session_id or "")
+            turn_context = get_turn_context()
+            privacy_user_id = str(
+                (
+                    getattr(turn_context, "user_id", None) or ""
+                    if suppress_automatic_context
+                    else self._get_session_user_id() or ""
+                )
+            )
+            privacy_session_id = str(
+                (
+                    getattr(turn_context, "session_id", None) or ""
+                    if suppress_automatic_context
+                    else session_id or ""
+                )
+            )
             privacy_session_context = (
-                self._privacy_session_context
-                if isinstance(self._privacy_session_context, dict)
-                else {}
+                {}
+                if suppress_automatic_context
+                else (
+                    self._privacy_session_context
+                    if isinstance(self._privacy_session_context, dict)
+                    else {}
+                )
             )
             privacy_project_metadata = (
-                self._privacy_project_metadata
-                if isinstance(self._privacy_project_metadata, dict)
-                else {}
+                {}
+                if suppress_automatic_context
+                else (
+                    self._privacy_project_metadata
+                    if isinstance(self._privacy_project_metadata, dict)
+                    else {}
+                )
             )
             gateway = getattr(self, "_privacy_gateway", None)
             if not isinstance(gateway, OutboundPrivacyGateway) or (
@@ -1361,15 +2203,15 @@ class GeminiLLMClient:
                 else {}
             )
             self._privacy_gateway.update_policy_context(
-                session_context=(
-                    self._privacy_session_context
-                    if isinstance(self._privacy_session_context, dict)
-                    else {}
-                ),
+                session_context=privacy_session_context,
                 project_metadata=(
-                    self._privacy_project_metadata
-                    if isinstance(self._privacy_project_metadata, dict)
-                    else {}
+                    privacy_project_metadata
+                    if suppress_automatic_context
+                    else (
+                        self._privacy_project_metadata
+                        if isinstance(self._privacy_project_metadata, dict)
+                        else {}
+                    )
                 ),
             )
             self._current_context_bundle = self._build_context_bundle_sync(
@@ -1378,8 +2220,16 @@ class GeminiLLMClient:
 
             # Lock protects conversation_history and _loaded_session_id from concurrent access
             with self._history_lock:
+                if suppress_automatic_context:
+                    # Do not allow a previous normal turn's in-memory history
+                    # (or a DB reload) to enter the Help prompt.  Reset the
+                    # loaded marker so the next ordinary turn reloads the
+                    # canonical session history instead of inheriting this
+                    # intentionally empty provider context.
+                    self.conversation_history = []
+                    self._loaded_session_id = None
                 # Load conversation history from database only when session changes
-                if session_id and self.memory_manager and self._memory_enabled:
+                elif session_id and self.memory_manager and self._memory_enabled:
                     if session_id != self._loaded_session_id:
                         try:
                             print(
@@ -1408,35 +2258,28 @@ class GeminiLLMClient:
                 user_input,
                 tool_hint_context,
             )
-            protected_context = self._privacy_gateway.protect_sync(
-                {"context": context, "message": model_user_input},
-                provider="gemini",
-                source_kind="model_request",
-            )
-            protected_bundle = protected_context.payload
-            if isinstance(protected_bundle, dict):
-                context = protected_bundle.get("context", context)
-                model_user_input = str(
-                    protected_bundle.get("message", model_user_input) or ""
-                )
             if tool_hint_context:
                 if context:
                     context[-1]["parts"] = [model_user_input]
 
             # Initialize memory manager if needed and save user message (outside lock, fire-and-forget)
             if (
-                self.memory_manager
+                not suppress_automatic_context
+                and self.memory_manager
                 and self._memory_enabled
                 and not external_persistence
             ):
                 try:
                     if session_id:
-                        # Use session-specific storage (fire-and-forget for speed)
+                        # Freeze user metadata before the background coroutine can
+                        # observe a later turn. User messages never carry Manifest.
+                        user_metadata = self._get_user_memory_metadata()
                         self._safe_memory_operation(
                             self._save_user_message_to_session,
                             user_input,
                             session_id,
                             edit_message_id,
+                            user_metadata,
                             fire_and_forget=True,
                         )
                     # Note: If no session_id, we skip saving to avoid creating project_id=None sessions
@@ -1504,7 +2347,11 @@ class GeminiLLMClient:
             )
 
             # モデルルーティング: 有効なら動的モデル選択
-            story_context = self._get_story_chat_context_sync()
+            story_context = (
+                None
+                if suppress_automatic_context
+                else self._get_story_chat_context_sync()
+            )
             effective_tools = self._get_effective_gemini_tools(story_context)
             routed_model = self._get_routed_model(user_input)
             if routed_model and routed_model != self.model_name:
@@ -1532,22 +2379,23 @@ class GeminiLLMClient:
                     history=context[:-1]
                 )  # All except last message
 
-            max_tool_calls = 5  # Prevent infinite loops (increased from 3 to support multi-step operations)
+            # Ordinary turns retain the historical five-round cap.  An
+            # approved plan gets a separate budget snapshot once execution is
+            # observed: already-consumed provider rounds, the actions still
+            # pending at the server cursor, and one mandatory no-tools final
+            # synthesis round.  Recomputing from the full plan on every loop
+            # would lose pre-approval rounds and can truncate a valid plan.
+            max_tool_calls = 5
+            approved_round_budget: int | None = None
             tool_call_count = 0
 
             # Build the message content - handle multimodal input
             message_parts = []
 
-            # Add images if provided
-            if image_data:
-                # Protected mode must not hand raw image bytes/data URLs to
-                # Google's transport.  A local recognizer can be wired before
-                # this point; absent one, the gateway fails closed.
-                self._privacy_gateway.protect_sync(
-                    image_data,
-                    provider="gemini",
-                    source_kind="attachment",
-                )
+            # Add images if provided.  The raw attachment is carried as an
+            # auxiliary privacy payload into ``_send_message_with_deadline``;
+            # that method executes the provider call only after the gateway
+            # has reviewed the exact request (including media policy).
             for image_item in normalize_image_payloads(image_data):
                 from google.generativeai import protos
 
@@ -1578,12 +2426,220 @@ class GeminiLLMClient:
             all_tool_results = []
 
             while tool_call_count < max_tool_calls:
+                # Replay durable receipts before asking Gemini to propose the
+                # next action.  This is the crash/reconnect path: a receipt is
+                # authoritative and must advance the server cursor without a
+                # second side effect.
+                replay_parts = []
+                approved_directive = (
+                    None
+                    if suppress_automatic_context
+                    else self._approved_action_directive()
+                )
+                while approved_directive is not None:
+                    try:
+                        existing_receipt = self._approved_action_receipt(
+                            approved_directive
+                        )
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_receipt_unavailable",
+                            detail=str(exc),
+                        )
+                        raise AssertionError("unreachable")
+                    if existing_receipt is None:
+                        break
+                    try:
+                        if not isinstance(existing_receipt, Mapping):
+                            raise ValueError("receipt must be an object")
+                        receipt_call_id = str(
+                            existing_receipt.get("tool_call_id") or ""
+                        ).strip()
+                        receipt_tool_name = str(
+                            existing_receipt.get("tool_name") or ""
+                        ).strip()
+                        if receipt_call_id != approved_directive.call_id:
+                            raise ValueError("receipt tool_call_id mismatch")
+                        if receipt_tool_name != approved_directive.tool:
+                            raise ValueError("receipt tool_name mismatch")
+                        if existing_receipt.get("success") is not True:
+                            raise ValueError("receipt success is not true")
+                        receipt_arguments_value = existing_receipt.get("arguments")
+                        if receipt_arguments_value is None:
+                            receipt_arguments_value = {}
+                        _plain_json_object(receipt_arguments_value)
+                        receipt_output_value = existing_receipt.get("result")
+                        if not isinstance(receipt_output_value, str):
+                            raise ValueError("receipt result must be a string")
+                        receipt_output = receipt_output_value
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_receipt_mismatch",
+                            detail=str(exc),
+                        )
+                        raise AssertionError("unreachable")
+                    protected_receipt_arguments, protected_receipt_output = (
+                        self._protect_approved_action_replay(
+                            approved_directive,
+                            receipt_output,
+                        )
+                    )
+                    response_part = self._function_response_part(
+                        approved_directive.tool,
+                        protected_receipt_output,
+                    )
+                    # Gemini history must retain durable receipts as strict
+                    # model FunctionCall / user FunctionResponse pairs.  The
+                    # final user response is held for ``latest_message`` below
+                    # because ChatSession appends that wire message itself.
+                    history = getattr(chat, "history", None)
+                    if not isinstance(history, list):
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_receipt_mismatch",
+                            detail="Gemini chat history is unavailable",
+                        )
+                        raise AssertionError("unreachable")
+                    try:
+                        history.append(
+                            genai.protos.Content(
+                                role="model",
+                                parts=[
+                                    self._synthetic_function_call_part(
+                                        approved_directive.tool,
+                                        protected_receipt_arguments,
+                                    )
+                                ],
+                            )
+                        )
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_receipt_mismatch",
+                            detail=f"Gemini receipt replay history append failed: {exc}",
+                        )
+                        raise AssertionError("unreachable")
+                    replay_parts.append(response_part)
+                    all_tool_results.append(protected_receipt_output)
+                    self._accept_approved_action_receipt(
+                        approved_directive,
+                        existing_receipt,
+                    )
+                    next_directive = (
+                        None
+                        if suppress_automatic_context
+                        else self._approved_action_directive()
+                    )
+                    if next_directive is not None:
+                        # Keep every completed receipt except the final one as
+                        # a fully materialized model/user pair.  The final
+                        # FunctionResponse is sent as ``latest_message`` below
+                        # so ChatSession adds it exactly once to the wire
+                        # sequence (avoiding a user/user duplicate).
+                        history.append(
+                            genai.protos.Content(
+                                role="user",
+                                parts=[response_part],
+                            )
+                        )
+                    approved_directive = next_directive
+                if replay_parts:
+                    latest_message = [replay_parts[-1]]
+                planning_state = (
+                    None
+                    if suppress_automatic_context
+                    else self._current_planning_state()
+                )
+                if (
+                    approved_round_budget is None
+                    and planning_state is not None
+                    and getattr(planning_state, "plan", None)
+                    and str(getattr(planning_state, "phase", ""))
+                    in {"executing", "PlanningRunPhase.EXECUTING"}
+                ):
+                    try:
+                        approved_round_budget = self._approved_action_budget(
+                            planning_state,
+                            tool_call_count,
+                        )
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_receipt_mismatch",
+                            detail=f"approved plan budget unavailable: {exc}",
+                        )
+                        raise AssertionError("unreachable")
+                if approved_round_budget is not None:
+                    max_tool_calls = approved_round_budget
+                completed_final_round = bool(
+                    planning_state is not None
+                    and str(getattr(planning_state, "phase", ""))
+                    in {"completed", "PlanningRunPhase.COMPLETED"}
+                )
+                if approved_directive is not None:
+                    # Approved execution is a phase boundary.  The initial
+                    # exposure snapshot may have been built while the run
+                    # was still planning (and therefore intentionally hides
+                    # mutation declarations).  Re-resolve the provider
+                    # exposure for each server-owned action, then narrow that
+                    # fresh snapshot to the one exact directive declaration.
+                    # Never consult the raw registry or auto-load a pack here;
+                    # the provider-neutral exposure layer remains the sole
+                    # capability/ACL authority.
+                    try:
+                        refreshed_effective_tools = self._get_effective_gemini_tools(
+                            story_context
+                        )
+                        round_effective_tools = self._filter_gemini_tools(
+                            refreshed_effective_tools,
+                            approved_directive.tool,
+                        )
+                        declaration_count = sum(
+                            len(
+                                list(
+                                    getattr(tool, "function_declarations", [])
+                                    or []
+                                )
+                            )
+                            for tool in round_effective_tools
+                        )
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_tool_unavailable",
+                            detail=f"approved action tool exposure failed: {exc}",
+                        )
+                        raise AssertionError("unreachable")
+                    if declaration_count != 1:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_tool_unavailable",
+                            detail=(
+                                "approved action requires exactly one exposed "
+                                f"declaration; found {declaration_count}"
+                            ),
+                        )
+                        raise AssertionError("unreachable")
+                    round_tool_config = self._gemini_tool_config(
+                        mode="ANY",
+                        allowed_function_names=[approved_directive.tool],
+                    )
+                elif completed_final_round:
+                    # ``tools=[]`` and ``NONE`` are explicit: model defaults
+                    # must not re-open mutation capability after completion.
+                    round_effective_tools = []
+                    round_tool_config = self._gemini_tool_config(mode="NONE")
+                else:
+                    round_effective_tools = effective_tools
+                    round_tool_config = None
                 # Send the latest message
                 try:
                     self._capture_context_request(
                         history=list(getattr(chat, "history", None) or context[:-1]),
                         latest_message=latest_message,
-                        tools=effective_tools,
+                        tools=round_effective_tools,
                         response_tokens=generation_config_kwargs["max_output_tokens"],
                         request_kind=(
                             "initial_generation"
@@ -1593,10 +2649,27 @@ class GeminiLLMClient:
                         model_name=routed_model or self.model_name,
                     )
                     try:
-                        response = chat.send_message(
-                            latest_message, generation_config=generation_config
+                        response = self._send_message_with_deadline(
+                            chat,
+                            latest_message,
+                            generation_config=generation_config,
+                            tools=round_effective_tools,
+                            tool_config=round_tool_config,
+                            privacy_payload=image_data if tool_call_count == 0 else None,
                         )
                     except Exception as send_error:
+                        if approved_directive is not None:
+                            # A pending approved action has no safe provider
+                            # fallback.  Transport failure must terminalize the
+                            # planning run instead of returning a normal answer
+                            # (or retrying with a potentially divergent
+                            # request).
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_transport_failed",
+                                detail=str(send_error),
+                            )
+                            raise AssertionError("unreachable")
                         if not uses_thought_parts:
                             raise
                         # include_thoughts を受け付けないサーバー向けに1度だけ外して再試行する。
@@ -1608,8 +2681,13 @@ class GeminiLLMClient:
                             generation_config_kwargs
                         )
                         uses_thought_parts = False
-                        response = chat.send_message(
-                            latest_message, generation_config=generation_config
+                        response = self._send_message_with_deadline(
+                            chat,
+                            latest_message,
+                            generation_config=generation_config,
+                            tools=round_effective_tools,
+                            tool_config=round_tool_config,
+                            privacy_payload=image_data if tool_call_count == 0 else None,
                         )
                     self._reconcile_context_usage(response)
                     self._record_gemini_usage(
@@ -1622,8 +2700,25 @@ class GeminiLLMClient:
                     )
                 except GenerationInterrupted:
                     raise
+                except PlanningInteractionTerminated:
+                    # ``fail_approved_action`` raises this control-flow
+                    # signal.  Keep it outside the provider fallback handler
+                    # so a pending action can never be reported as success.
+                    raise
                 except Exception as e:
                     print(f"[GeminiLLMClient] Gemini API呼び出しエラー: {e}")
+                    if approved_directive is not None:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_transport_failed",
+                            detail=str(e),
+                        )
+                        raise AssertionError("unreachable")
+                    if suppress_automatic_context:
+                        # A generic fallback is not Guide-grounded.  Surface
+                        # the transport failure to the outer Help boundary so
+                        # it can return the deterministic unavailable message.
+                        raise
                     if self.config.get("free_team.propagate_errors", False):
                         try:
                             e.free_team_side_effect_started = tool_call_count > 0
@@ -1632,12 +2727,13 @@ class GeminiLLMClient:
                         raise
                     # フォールバック応答
                     fallback = self._get_fallback_response()
-                    self.conversation_history.append(
-                        {"role": "user", "content": user_input}
-                    )
-                    self.conversation_history.append(
-                        {"role": "assistant", "content": fallback}
-                    )
+                    if not suppress_automatic_context:
+                        self.conversation_history.append(
+                            {"role": "user", "content": user_input}
+                        )
+                        self.conversation_history.append(
+                            {"role": "assistant", "content": fallback}
+                        )
 
                     if stream:
 
@@ -1654,23 +2750,65 @@ class GeminiLLMClient:
                         print(
                             f"[GeminiLLMClient] 警告: レスポンスにcandidatesがありません"
                         )
+                        if approved_directive is not None:
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_no_candidates",
+                            )
+                            raise AssertionError("unreachable")
                         break
 
                     candidate = candidates[0]
                     if not hasattr(candidate, "content") or not candidate.content:
                         print(f"[GeminiLLMClient] 警告: candidateにcontentがありません")
+                        if approved_directive is not None:
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_no_content",
+                            )
+                            raise AssertionError("unreachable")
                         break
 
-                    if (
-                        not hasattr(candidate.content, "parts")
-                        or not candidate.content.parts
-                    ):
+                    if not hasattr(candidate.content, "parts"):
                         print(f"[GeminiLLMClient] 警告: contentにpartsがありません")
+                        if approved_directive is not None:
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_no_parts",
+                            )
+                            raise AssertionError("unreachable")
                         break
 
                     parts = candidate.content.parts
+                    if parts is None:
+                        print(f"[GeminiLLMClient] 警告: contentにpartsがありません")
+                        if approved_directive is not None:
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_no_parts",
+                            )
+                            raise AssertionError("unreachable")
+                        break
+                    if not parts:
+                        print(f"[GeminiLLMClient] 警告: content partsが空です")
+                        if approved_directive is not None:
+                            self._fail_approved_action(
+                                approved_directive,
+                                reason="approved_action_empty_response",
+                            )
+                            raise AssertionError("unreachable")
+                        break
+                except PlanningInteractionTerminated:
+                    raise
                 except Exception as e:
                     print(f"[GeminiLLMClient] レスポンス解析エラー: {e}")
+                    if approved_directive is not None:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_response_invalid",
+                            detail=str(e),
+                        )
+                        raise AssertionError("unreachable")
                     break
 
                 # Look for function calls
@@ -1678,18 +2816,47 @@ class GeminiLLMClient:
                 text_parts = []
                 thought_parts = []
 
-                for part in parts:
-                    if hasattr(part, "function_call") and part.function_call:
-                        function_calls.append(part.function_call)
-                        continue
-                    part_text = getattr(part, "text", None)
-                    if not part_text:
-                        continue
-                    # thought part を本文へ混ぜない（include_thoughts有効時のみ発生）。
-                    if _gemini_part_is_thought(part):
-                        thought_parts.append(part_text)
-                        continue
-                    text_parts.append(part_text)
+                try:
+                    if isinstance(parts, (str, bytes, bytearray)):
+                        raise TypeError("Gemini response parts must be a sequence")
+                    for part in parts:
+                        if hasattr(part, "function_call") and part.function_call:
+                            function_calls.append(part.function_call)
+                            continue
+                        part_text = getattr(part, "text", None)
+                        if not part_text:
+                            continue
+                        # thought part を本文へ混ぜない（include_thoughts有効時のみ発生）。
+                        if _gemini_part_is_thought(part):
+                            thought_parts.append(part_text)
+                            continue
+                        text_parts.append(part_text)
+                except PlanningInteractionTerminated:
+                    raise
+                except Exception as e:
+                    print(f"[GeminiLLMClient] レスポンスparts解析エラー: {e}")
+                    if approved_directive is not None:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_response_invalid",
+                            detail=str(e),
+                        )
+                        raise AssertionError("unreachable")
+
+                # A completed plan has no remaining approved action.  Even if
+                # Gemini violates the explicit NONE/tool-less request and
+                # returns a stale or malicious function call, terminalize the
+                # plan before any ordinary tool/router or human-interaction
+                # path can observe it.
+                if completed_final_round and function_calls:
+                    self._fail_completed_plan_provider_call(function_calls)
+
+                if approved_directive is not None and not function_calls and not text_parts:
+                    self._fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_empty_response",
+                    )
+                    raise AssertionError("unreachable")
 
                 # 中間・最終どちらのラウンドでも思考はそのまま配信する。
                 for thought_text in thought_parts:
@@ -1698,6 +2865,42 @@ class GeminiLLMClient:
                         thought_text,
                         round_index=tool_call_count,
                     )
+
+                if approved_directive is not None:
+                    # The server-owned cursor requires exactly one function
+                    # call from the one declaration exposed for this round.
+                    # Reject malformed/plain/multi-call responses before any
+                    # mutation can reach the router.
+                    if not function_calls:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_plain_final_rejected",
+                        )
+                        raise AssertionError("unreachable")
+                    if len(function_calls) != 1:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_multiple_calls_rejected",
+                        )
+                        raise AssertionError("unreachable")
+                    try:
+                        candidate_name = str(
+                            getattr(function_calls[0], "name", "") or ""
+                        ).strip()
+                    except Exception as exc:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_response_invalid",
+                            detail=str(exc),
+                        )
+                        raise AssertionError("unreachable")
+                    if candidate_name != approved_directive.tool:
+                        self._fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_wrong_tool",
+                            detail=candidate_name,
+                        )
+                        raise AssertionError("unreachable")
 
                 if function_calls:
                     # ツール呼び出しを伴うラウンドの通常テキストは途中経過として配信する。
@@ -1719,9 +2922,141 @@ class GeminiLLMClient:
                     current_calls = []
                     duplicate_detected = False
 
-                    for func_call in function_calls:
+                    for function_call_index, func_call in enumerate(function_calls):
+                        if approved_directive is not None:
+                            try:
+                                function_name = str(
+                                    getattr(func_call, "name", "") or ""
+                                ).strip()
+                                proposed_arguments = _plain_json_object(
+                                    getattr(func_call, "args", None) or {}
+                                )
+                                proposed_arguments = _plain_json_object(
+                                    self._privacy_gateway.restore_tool_arguments(
+                                        proposed_arguments,
+                                        tool_name=function_name,
+                                    )
+                                )
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    approved_directive,
+                                    reason="approved_action_arguments_invalid",
+                                    detail=str(exc),
+                                )
+                                raise AssertionError("unreachable")
+                            try:
+                                arguments = self._approved_action_call(
+                                    approved_directive,
+                                    tool_name=function_name,
+                                    arguments=proposed_arguments,
+                                )
+                            except PlanningInteractionTerminated:
+                                raise
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    approved_directive,
+                                    reason="approved_action_arguments_invalid",
+                                    detail=str(exc),
+                                )
+                                raise AssertionError("unreachable")
+                            operation_id = approved_directive.call_id
+                            emit_tool_start(
+                                turn_event_emitter,
+                                tool=function_name,
+                                arguments=arguments,
+                                operation_id=operation_id,
+                            )
+                            try:
+                                unified_result = self._execute_tool_result(
+                                    function_name,
+                                    arguments,
+                                    call_id=operation_id,
+                                )
+                            except PlanningInteractionTerminated:
+                                raise
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    approved_directive,
+                                    reason="approved_action_tool_failed",
+                                    detail=str(exc),
+                                )
+                                raise AssertionError("unreachable")
+                            result_text = str(unified_result.model_output)
+                            try:
+                                protected_result = self._privacy_gateway.protect_sync(
+                                    result_text,
+                                    provider="gemini",
+                                    source_kind="tool_result",
+                                )
+                                protected_payload = protected_result.payload
+                                if not isinstance(protected_payload, str):
+                                    raise ValueError(
+                                        "protected approved tool result must be a string"
+                                    )
+                                result_text = protected_payload
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    approved_directive,
+                                    reason="approved_action_privacy_protection_failed",
+                                    detail=str(exc),
+                                )
+                                raise AssertionError("unreachable")
+                            emit_tool_end(
+                                turn_event_emitter,
+                                tool=function_name,
+                                arguments=arguments,
+                                output=result_text,
+                                error=(
+                                    unified_result.error
+                                    if not unified_result.success
+                                    else ""
+                                ),
+                                operation_id=operation_id,
+                            )
+                            results_text.append(result_text)
+                            all_tool_results.append(result_text)
+                            function_results.append(
+                                {
+                                    "function_response": {
+                                        "name": function_name,
+                                        "response": {"result": result_text},
+                                    }
+                                }
+                            )
+                            # Persist the receipt and advance the server cursor
+                            # only after the tool result is known.  The helper
+                            # reuses an existing receipt if a crash/replay
+                            # raced this execution.
+                            try:
+                                self._persist_approved_action_result(
+                                    approved_directive,
+                                    arguments=arguments,
+                                    result=result_text,
+                                    success=bool(unified_result.success),
+                                )
+                            except PlanningInteractionTerminated:
+                                raise
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    approved_directive,
+                                    reason="approved_action_receipt_unavailable",
+                                    detail=str(exc),
+                                )
+                                raise AssertionError("unreachable")
+                            continue
+
                         function_name = func_call.name
-                        arguments = dict(func_call.args) if func_call.args else {}
+                        try:
+                            arguments = _plain_json_object(
+                                getattr(func_call, "args", None) or {}
+                            )
+                        except (TypeError, ValueError) as exc:
+                            # Ordinary Gemini calls cannot safely execute
+                            # provider objects either; fail this round without
+                            # stringifying nested proto values.
+                            raise ValueError(
+                                f"invalid Gemini function arguments for {function_name}: {exc}"
+                            ) from exc
                         arguments = self._privacy_gateway.restore_tool_arguments(
                             arguments,
                             tool_name=function_name,
@@ -1730,7 +3065,12 @@ class GeminiLLMClient:
                         # Create signature for duplicate detection
                         call_signature = (
                             function_name,
-                            tuple(sorted(arguments.items())),
+                            json.dumps(
+                                arguments,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            ),
                         )
 
                         # Check for duplicate calls within this session
@@ -1812,6 +3152,73 @@ class GeminiLLMClient:
                             }
                         )
 
+                        # A provider batch is only a proposal.  If the first
+                        # call obtains approval, defer every later call in that
+                        # same batch until the next server-controlled round;
+                        # never let a stale provider batch perform mutations.
+                        if (
+                            function_name == "submit_plan_for_approval"
+                            and (
+                                state_after_approval := (
+                                    None
+                                    if suppress_automatic_context
+                                    else self._current_planning_state()
+                                )
+                            )
+                            is not None
+                            and str(
+                                getattr(state_after_approval, "phase", "")
+                            )
+                            in {"executing", "PlanningRunPhase.EXECUTING"}
+                        ):
+                            for skipped in function_calls[function_call_index + 1 :]:
+                                skipped_name = str(
+                                    getattr(skipped, "name", "") or ""
+                                ).strip()
+                                skipped_result = (
+                                    "Not executed: approved actions start on the next "
+                                    "server-controlled round."
+                                )
+                                function_results.append(
+                                    {
+                                        "function_response": {
+                                            "name": skipped_name,
+                                            "response": {"result": skipped_result},
+                                        }
+                                    }
+                                )
+                            break
+
+                    # Approval may have been granted in the last legacy-cap
+                    # round (for example, round five).  Extend the loop before
+                    # its ``while`` condition is evaluated so the server-owned
+                    # actions and mandatory final round still run.
+                    if approved_round_budget is None:
+                        state_after_batch = (
+                            None
+                            if suppress_automatic_context
+                            else self._current_planning_state()
+                        )
+                        if (
+                            state_after_batch is not None
+                            and getattr(state_after_batch, "plan", None)
+                            and str(getattr(state_after_batch, "phase", ""))
+                            in {"executing", "PlanningRunPhase.EXECUTING"}
+                        ):
+                            try:
+                                approved_round_budget = self._approved_action_budget(
+                                    state_after_batch,
+                                    tool_call_count,
+                                )
+                            except Exception as exc:
+                                self._fail_approved_action(
+                                    self._approved_action_directive(),
+                                    reason="approved_action_receipt_mismatch",
+                                    detail=f"approved plan budget unavailable: {exc}",
+                                )
+                                raise AssertionError("unreachable")
+                            max_tool_calls = approved_round_budget
+
                     # Clear recent calls after successful non-duplicate execution
                     if tool_call_count >= max_tool_calls:
                         self._recent_tool_calls = []
@@ -1864,51 +3271,53 @@ class GeminiLLMClient:
                     if "generated_image_tags" in locals() and generated_image_tags:
                         response_text += "\n" + "\n".join(generated_image_tags)
 
-                    response_text = run_agentic_completion_loop_sync(
-                        client=self,
-                        run_once=lambda review_prompt: self._run_agentic_review_once(
-                            review_prompt,
-                            generation_config=generation_config,
+                    if not completed_final_round and not suppress_automatic_context:
+                        response_text = self._run_agentic_completion_from_valid_response(
+                            context=self._render_gemini_context_for_review(
+                                context,
+                                latest_message,
+                            ),
                             user_input=user_input,
+                            initial_response=response_text,
+                            generation_config=generation_config,
                             is_streaming=bool(stream),
-                        ),
-                        context=self._render_gemini_context_for_review(
-                            context,
-                            latest_message,
-                        ),
-                        user_input=user_input,
-                        initial_response=response_text,
-                    )
+                        )
                     response_text = str(
                         self._privacy_gateway.restore_aliases(response_text)
                     )
-                    response_text = self._finalize_roleplay_response_sync(
-                        response_text,
-                        stream_callback=stream_callback,
-                    )
+                    if not suppress_automatic_context:
+                        response_text = self._finalize_roleplay_response_sync(
+                            response_text,
+                            stream_callback=stream_callback,
+                        )
 
                     # Add to history (under lock to prevent interleaving with concurrent requests)
-                    with self._history_lock:
-                        self.conversation_history.append(
-                            {"role": "user", "content": user_input}
-                        )
-                        self.conversation_history.append(
-                            {"role": "assistant", "content": response_text}
-                        )
+                    if not suppress_automatic_context:
+                        with self._history_lock:
+                            self.conversation_history.append(
+                                {"role": "user", "content": user_input}
+                            )
+                            self.conversation_history.append(
+                                {"role": "assistant", "content": response_text}
+                            )
 
                     # Save assistant response to memory
                     if (
-                        self.memory_manager
+                        not suppress_automatic_context
+                        and self.memory_manager
                         and self._memory_enabled
                         and not external_persistence
                     ):
                         try:
                             if session_id:
-                                # Use session-specific storage (fire-and-forget for speed)
+                                # Manifest generation must observe this completed turn,
+                                # not whichever turn the memory loop executes under later.
+                                assistant_metadata = self._get_memory_metadata()
                                 self._safe_memory_operation(
                                     self._save_assistant_message_to_session,
                                     response_text,
                                     session_id,
+                                    assistant_metadata,
                                     fire_and_forget=True,
                                 )
                             # Note: Skip saving if no session_id to avoid project_id=None sessions
@@ -1935,7 +3344,11 @@ class GeminiLLMClient:
                 break
 
             # If we exhausted max_tool_calls but have tool results, try to get a final response
-            if tool_call_count >= max_tool_calls and all_tool_results:
+            if (
+                tool_call_count >= max_tool_calls
+                and all_tool_results
+                and not completed_final_round
+            ):
                 print(
                     f"[GeminiLLMClient] ツール呼び出し上限({max_tool_calls})に達しました。最終応答を生成します..."
                 )
@@ -1950,7 +3363,8 @@ class GeminiLLMClient:
                         request_kind="tool_limit_finalization",
                         model_name=routed_model or self.model_name,
                     )
-                    final_response = chat.send_message(
+                    final_response = self._send_message_with_deadline(
+                        chat,
                         final_prompt, generation_config=generation_config
                     )
                     self._reconcile_context_usage(final_response)
@@ -1975,36 +3389,37 @@ class GeminiLLMClient:
                                 continue
                             if hasattr(part, "text") and part.text:
                                 response_text = part.text
-                                response_text = run_agentic_completion_loop_sync(
-                                    client=self,
-                                    run_once=lambda review_prompt: (
-                                        self._run_agentic_review_once(
-                                            review_prompt,
-                                            generation_config=generation_config,
+                                if not suppress_automatic_context:
+                                    response_text = (
+                                        self._run_agentic_completion_from_valid_response(
+                                            context=(
+                                                self._render_gemini_context_for_review(
+                                                    context,
+                                                    latest_message,
+                                                )
+                                            ),
                                             user_input=user_input,
+                                            initial_response=response_text,
+                                            generation_config=generation_config,
                                             is_streaming=bool(stream),
                                         )
-                                    ),
-                                    context=self._render_gemini_context_for_review(
-                                        context,
-                                        latest_message,
-                                    ),
-                                    user_input=user_input,
-                                    initial_response=response_text,
-                                )
+                                    )
                                 response_text = str(
                                     self._privacy_gateway.restore_aliases(response_text)
                                 )
-                                response_text = self._finalize_roleplay_response_sync(
-                                    response_text,
-                                    stream_callback=stream_callback,
-                                )
-                                self.conversation_history.append(
-                                    {"role": "user", "content": user_input}
-                                )
-                                self.conversation_history.append(
-                                    {"role": "assistant", "content": response_text}
-                                )
+                                if not suppress_automatic_context:
+                                    response_text = self._finalize_roleplay_response_sync(
+                                        response_text,
+                                        stream_callback=stream_callback,
+                                    )
+                                if not suppress_automatic_context:
+                                    with self._history_lock:
+                                        self.conversation_history.append(
+                                            {"role": "user", "content": user_input}
+                                        )
+                                        self.conversation_history.append(
+                                            {"role": "assistant", "content": response_text}
+                                        )
                                 print(
                                     f"[GeminiLLMClient] 最終応答生成: {len(response_text)}文字"
                                 )
@@ -2022,11 +3437,19 @@ class GeminiLLMClient:
                         raise
 
             # Fallback if no valid response
+            if suppress_automatic_context:
+                raise RuntimeError("Gemini returned no valid Help response")
             if self.config.get("free_team.propagate_errors", False):
                 raise RuntimeError("Gemini returned no valid response")
             fallback = self._get_fallback_response()
-            self.conversation_history.append({"role": "user", "content": user_input})
-            self.conversation_history.append({"role": "assistant", "content": fallback})
+            if not suppress_automatic_context:
+                with self._history_lock:
+                    self.conversation_history.append(
+                        {"role": "user", "content": user_input}
+                    )
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": fallback}
+                    )
 
             if stream:
 
@@ -2036,19 +3459,33 @@ class GeminiLLMClient:
                 return fallback_generator()
             return fallback
 
+        except PlanningInteractionTerminated:
+            # Keep planning control-flow visible to the terminal response
+            # handler instead of converting it into a normal fallback answer.
+            raise
         except Exception as e:
             print(f"[GeminiLLMClient] エラー: {e}")
             import traceback
 
             traceback.print_exc()
+            if suppress_automatic_context:
+                # Do not fabricate a character fallback for a Guide-only turn.
+                raise
             if self.config.get("free_team.propagate_errors", False):
                 raise
 
             fallback = self._get_fallback_response()
 
-            # Add to history even on error
-            self.conversation_history.append({"role": "user", "content": user_input})
-            self.conversation_history.append({"role": "assistant", "content": fallback})
+            # Add to history even on error, except for isolated controller
+            # turns whose provider context must never leak into normal chat.
+            if not suppress_automatic_context:
+                with self._history_lock:
+                    self.conversation_history.append(
+                        {"role": "user", "content": user_input}
+                    )
+                    self.conversation_history.append(
+                        {"role": "assistant", "content": fallback}
+                    )
 
             if stream:
 
@@ -2058,11 +3495,22 @@ class GeminiLLMClient:
                 return error_generator()
             return fallback
         finally:
+            if suppress_automatic_context and isolated_history_snapshot is not None:
+                saved_history, saved_loaded_session_id = isolated_history_snapshot
+                with self._history_lock:
+                    try:
+                        self.conversation_history = copy.deepcopy(saved_history)
+                    except Exception:
+                        self.conversation_history = list(saved_history or [])
+                    self._loaded_session_id = saved_loaded_session_id
             reset_current_generation_policy(generation_policy_token)
             reset_current_user_input(tool_policy_token)
             if project_token is not None:
                 reset_runtime_project_context(project_token)
+            capture_context_manifest_before_context_clear(self)
             self._current_context_bundle = None
+            if isolated_privacy_gateway_active:
+                self._privacy_gateway = isolated_privacy_gateway_previous
 
     def _get_fallback_response(self) -> str:
         """Get fallback response for errors"""
@@ -2120,17 +3568,19 @@ class GeminiLLMClient:
             csm = get_cross_session_memory()
             initialized = await csm.initialize()
             if initialized:
-                print("[GeminiLLMClient] Cross-session memory pre-initialized")
+                logger.info(
+                    "Gemini cross-session memory pre-initialized",
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
             else:
                 logger.warning(
-                    "[GeminiLLMClient] Cross-session semantic memory unavailable; "
-                    "continuing without semantic memory"
+                    "Gemini cross-session semantic memory unavailable; continuing without it",
                 )
-        except Exception as e:
+        except Exception:
             logger.warning(
-                "[GeminiLLMClient] Cross-session semantic memory degraded; "
-                "continuing without semantic memory: %s",
-                e,
+                "Gemini cross-session semantic memory degraded; continuing without it",
+                exc_info=True,
+                extra=FILE_ONLY_LOG_EXTRA,
             )
 
     def _safe_memory_operation(
@@ -2155,7 +3605,10 @@ class GeminiLLMClient:
         if fire_and_forget:
 
             def _on_done(f):
-                exc = f.exception()
+                try:
+                    exc = f.exception()
+                except asyncio.CancelledError:
+                    return
                 if exc:
                     print(f"[GeminiLLMClient] Background memory op failed: {exc}")
 
@@ -2220,7 +3673,9 @@ class GeminiLLMClient:
             await self.memory_manager.initialize()
 
         try:
-            from .manager import ConversationMemoryManager
+            from ..services.privacy_masking_projection import (
+                is_privacy_masking_source,
+            )
 
             messages = await self.memory_manager.repository.get_session_messages(
                 session_id
@@ -2229,6 +3684,12 @@ class GeminiLLMClient:
             # Convert to conversation_history format
             history = []
             for msg in messages:
+                # The raw user row for a masking turn is retained for audit/UI,
+                # but it is never valid provider prompt context.  Keep this
+                # direct Gemini history loader aligned with the shared memory
+                # projection used by other LLM clients.
+                if is_privacy_masking_source(msg):
+                    continue
                 history.append(
                     {
                         "role": "user" if msg.role == "user" else "assistant",
@@ -2246,6 +3707,7 @@ class GeminiLLMClient:
         user_input: str,
         session_id: str,
         branch_from_message_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """Save user message to specific session
 
@@ -2256,16 +3718,25 @@ class GeminiLLMClient:
         if not self.memory_manager.is_initialized():
             await self.memory_manager.initialize()
 
+        persisted_metadata = (
+            dict(metadata)
+            if metadata is not None
+            else self._get_user_memory_metadata()
+        )
+        persisted_metadata.pop("context_manifest", None)
         await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="user",
             content=user_input,
-            metadata=self._get_memory_metadata(),
+            metadata=persisted_metadata,
             branch_from_message_id=branch_from_message_id,
         )
 
     async def _save_assistant_message_to_session(
-        self, response_text: str, session_id: str
+        self,
+        response_text: str,
+        session_id: str,
+        metadata: Optional[Dict[str, Any]] = None,
     ):
         """Save assistant message to specific session
 
@@ -2276,11 +3747,16 @@ class GeminiLLMClient:
         if not self.memory_manager.is_initialized():
             await self.memory_manager.initialize()
 
+        persisted_metadata = (
+            dict(metadata)
+            if metadata is not None
+            else self._get_memory_metadata()
+        )
         await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="assistant",
             content=response_text,
-            metadata=self._get_memory_metadata(),
+            metadata=persisted_metadata,
             message_id=getattr(self, "current_assistant_message_id", None),
         )
 
@@ -2303,6 +3779,41 @@ class GeminiLLMClient:
         system_prompt: Optional[str] = None,
         request_type: str = "plain",
     ) -> str:
+        """Generate ephemeral text while preserving a reused Help client."""
+
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        if not suppress_automatic_context:
+            return self._generate_plain_text_impl(
+                prompt,
+                system_prompt=system_prompt,
+                request_type=request_type,
+            )
+
+        previous_gateway = getattr(self, "_privacy_gateway", None)
+        previous_session_context = getattr(self, "_privacy_session_context", None)
+        previous_project_metadata = getattr(self, "_privacy_project_metadata", None)
+        try:
+            return self._generate_plain_text_impl(
+                prompt,
+                # A Help provider helper must not accept a stale/custom system
+                # instruction as an alternate authority.
+                system_prompt=AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+                request_type=request_type,
+            )
+        finally:
+            self._privacy_gateway = previous_gateway
+            self._privacy_session_context = previous_session_context
+            self._privacy_project_metadata = previous_project_metadata
+
+    def _generate_plain_text_impl(
+        self,
+        prompt: str,
+        *,
+        system_prompt: Optional[str] = None,
+        request_type: str = "plain",
+    ) -> str:
         """Generate text with a fresh tool-free model and no conversation state."""
         self._refresh_plain_text_privacy_gateway()
         model_kwargs: Dict[str, Any] = {
@@ -2319,15 +3830,37 @@ class GeminiLLMClient:
                 "candidate_count": 1,
             }
         )
-        protected = self._privacy_gateway.protect_sync(
-            {"prompt": prompt or ""},
+        descriptor = EgressDescriptor(
+            action="model.generate",
+            transport="gemini.generate_content",
+            destination="https://generativelanguage.googleapis.com",
             provider="gemini",
-            source_kind=request_type,
+            model=str(self.model_name or ""),
         )
-        outbound_prompt = str((protected.payload or {}).get("prompt") or "")
-        response = model.generate_content(
-            outbound_prompt,
-            generation_config=generation_config,
+
+        def send_plain_text_request(outbound: dict[str, Any]) -> Any:
+            if not isinstance(outbound, dict) or "prompt" not in outbound:
+                raise PrivacyError("Gemini plain-text prompt is missing")
+            outbound_prompt = outbound.get("prompt")
+            if not isinstance(outbound_prompt, str) or not outbound_prompt:
+                raise PrivacyError("Gemini plain-text prompt is empty")
+            if "generation_config" not in outbound:
+                raise PrivacyError("Gemini generation config is missing")
+            return model.generate_content(
+                outbound_prompt,
+                generation_config=outbound.get("generation_config"),
+            )
+
+        response = self._privacy_gateway.execute_sync(
+            {
+                "prompt": prompt or "",
+                "generation_config": generation_config,
+            },
+            provider="gemini",
+            descriptor=descriptor,
+            sender=send_plain_text_request,
+            source_kind=request_type,
+            model=str(self.model_name or ""),
         )
         self._record_gemini_usage(
             response,
@@ -2347,6 +3880,9 @@ class GeminiLLMClient:
             turn = get_turn_context()
         except Exception:
             turn = None
+        suppress_automatic_context = bool(
+            getattr(turn, "suppress_automatic_context", False)
+        )
         inherited = get_privacy_policy_context()
         user_id = str(self._get_session_user_id() or "")
         if not user_id or user_id == "default_user":
@@ -2356,6 +3892,30 @@ class GeminiLLMClient:
             or getattr(turn, "session_id", None)
             or ""
         )
+        if suppress_automatic_context:
+            # A reused Gemini client may still carry the previous session's
+            # actor.  Help's TurnContext is authoritative for this isolated
+            # request, so prefer it whenever it is present.
+            user_id = str(
+                getattr(turn, "user_id", None)
+                or self._get_session_user_id()
+                or ""
+            )
+            session_id = str(
+                getattr(turn, "session_id", None)
+                or self.current_session_id
+                or ""
+            )
+            gateway = OutboundPrivacyGateway(
+                self.config,
+                user_id=user_id,
+                session_id=session_id,
+                session_context={},
+                project_metadata={},
+            )
+            setattr(gateway, "_aoitalk_help_isolated", True)
+            self._privacy_gateway = gateway
+            return gateway
         session_context = (
             dict(inherited.session_context)
             if inherited.session_context is not None
@@ -2530,15 +4090,130 @@ class GeminiLLMClient:
             return
 
         self._cleanup_done = True
+        cleanup_cancelled = False
 
-        # Stop persistent memory event loop
-        if self._memory_loop and self._memory_loop.is_running():
-            self._memory_loop.call_soon_threadsafe(self._memory_loop.stop)
-        if self._memory_thread and self._memory_thread.is_alive():
-            self._memory_thread.join(timeout=5)
+        memory_loop = self._memory_loop
+        memory_thread = self._memory_thread
 
-        # Clean up memory manager
-        if self.memory_manager:
+        async def _await_threadsafe(future, *, timeout: float) -> bool:
+            """Await a concurrent-futures result without closing its loop."""
+
+            wrapped = asyncio.wrap_future(future)
+            try:
+                await asyncio.wait_for(asyncio.shield(wrapped), timeout=timeout)
+            except asyncio.CancelledError:
+                # Distinguish cancellation of the submitted future from
+                # cancellation of this cleanup waiter.  The former is the
+                # expected warmup shutdown result; the latter must be deferred
+                # until all memory resources and the loop are released.
+                if future.done():
+                    try:
+                        future.result()
+                    except concurrent.futures.CancelledError:
+                        pass
+                    return False
+                current = asyncio.current_task()
+                if current is not None:
+                    uncancel = getattr(current, "uncancel", None)
+                    if callable(uncancel):
+                        uncancel()
+                return True
+            except asyncio.TimeoutError:
+                # Do not leave a submitted coroutine pending when the owner
+                # is shutting its loop down.
+                future.cancel()
+                try:
+                    await asyncio.wait_for(wrapped, timeout=5.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+            return False
+
+        async def _await_threadsafe_completion(future) -> None:
+            """Await a cross-thread future to completion without detaching it.
+
+            The ConversationMemoryManager owns its own cleanup task and uses a
+            shield internally.  A cancellation of this caller must therefore
+            be deferred until that future has completed, otherwise stopping
+            the memory loop below could strand the manager's DB/index tasks.
+            """
+
+            wrapped = asyncio.wrap_future(future)
+            caller_cancelled = False
+            while not wrapped.done():
+                try:
+                    await asyncio.shield(wrapped)
+                except asyncio.CancelledError:
+                    if wrapped.done():
+                        break
+                    caller_cancelled = True
+                    current = asyncio.current_task()
+                    if current is not None:
+                        uncancel = getattr(current, "uncancel", None)
+                        if callable(uncancel):
+                            uncancel()
+                    continue
+            try:
+                await asyncio.shield(wrapped)
+            except asyncio.CancelledError:
+                # The submitted future itself was cancelled; retrieve and
+                # consume that expected outcome.
+                pass
+            if caller_cancelled:
+                raise asyncio.CancelledError
+
+        # The manager's owned indexing/summarization tasks run on the
+        # persistent memory loop.  Cleanup must execute there and complete
+        # before that loop is stopped; awaiting it from the caller's loop
+        # afterwards would otherwise cross an already-closed event loop.
+        if (
+            memory_loop
+            and memory_thread
+            and memory_thread.is_alive()
+            and not memory_loop.is_closed()
+        ):
+            warmup_future = self._memory_warmup_future
+            if warmup_future is not None:
+                if not warmup_future.done():
+                    warmup_future.cancel()
+                try:
+                    # Await both a cancelled and an already-completed future
+                    # so its result/exception is always retrieved.
+                    cleanup_cancelled = (
+                        await _await_threadsafe(warmup_future, timeout=5.0)
+                        or cleanup_cancelled
+                    )
+                except Exception as e:
+                    print(f"[GeminiLLMClient] Memory warmup cleanup error: {e}")
+
+            if self.memory_manager:
+                try:
+                    cleanup_future = asyncio.run_coroutine_threadsafe(
+                        self.memory_manager.cleanup(), memory_loop
+                    )
+                    # Do not use a timeout here.  ConversationMemoryManager
+                    # may still be awaiting owned indexing/summarization tasks
+                    # before closing its DB; stopping the loop at a timeout
+                    # would strand those tasks and recreate shutdown warnings.
+                    await _await_threadsafe_completion(cleanup_future)
+                    print("[GeminiLLMClient] Memory manager cleaned up")
+                except asyncio.CancelledError:
+                    cleanup_cancelled = True
+                except Exception as e:
+                    print(f"[GeminiLLMClient] Error during memory cleanup: {e}")
+
+            memory_loop.call_soon_threadsafe(memory_loop.stop)
+            if memory_thread and memory_thread.is_alive():
+                memory_thread.join(timeout=5)
+            if (
+                (memory_thread is None or not memory_thread.is_alive())
+                and not memory_loop.is_closed()
+            ):
+                memory_loop.close()
+            self._memory_warmup_future = None
+        elif self.memory_manager:
+            # Startup may fail before the persistent loop is running.  There
+            # are no loop-owned background tasks in that case, so close on the
+            # current loop as a fallback.
             try:
                 await self.memory_manager.cleanup()
                 print("[GeminiLLMClient] Memory manager cleaned up")
@@ -2546,6 +4221,8 @@ class GeminiLLMClient:
                 print(f"[GeminiLLMClient] Error during memory cleanup: {e}")
 
         print(f"[GeminiLLMClient] クリーンアップ完了")
+        if cleanup_cancelled:
+            raise asyncio.CancelledError
 
 
 def create_gemini_client(config: Config) -> GeminiLLMClient:

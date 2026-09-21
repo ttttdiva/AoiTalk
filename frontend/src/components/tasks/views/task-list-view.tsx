@@ -32,11 +32,13 @@ import {
 import { toast } from "sonner";
 import {
   taskApi,
+  type MoveOccurrencePayload,
   type Project,
   type RecurringOccurrenceContext,
   type Task,
 } from "@/lib/task-api";
 import { RecurringDeleteDialog } from "@/components/tasks/task-detail/recurring-delete-dialog";
+import { RecurringDateChangeDialog } from "@/components/tasks/task-detail/recurring-date-change-dialog";
 import { TagPill } from "@/components/tasks/tag-pill";
 import {
   applyTaskFilter,
@@ -46,6 +48,7 @@ import { TaskRowDatePicker } from "@/components/tasks/task-row-date-picker";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
 import { formatTaskDateLabel } from "@/lib/task-date-label";
 import { cn } from "@/lib/utils";
+import type { TaskBrowseScope } from "@/lib/task-browse-scope";
 import { useProject } from "@/contexts/project-context";
 import {
   getTaskDisplayAllDay,
@@ -113,6 +116,11 @@ function compactElapsedLabel(startedAt: string, now: number): string {
   if (minutes > 0) return `${minutes}m`;
   return `${seconds}s`;
 }
+
+type RowStatusFocusSession = {
+  epoch: number;
+  phase: "pending" | "canceled" | "consumed";
+};
 
 // The first three columns are fixed controls (selection, hierarchy, status).
 // Keep their total width stable so adding the hierarchy toggle never widens
@@ -470,6 +478,7 @@ type TaskListViewProps = {
     taskId: string,
     occurrenceContext?: RecurringOccurrenceContext | null,
   ) => void;
+  browseScope?: TaskBrowseScope | null;
 };
 
 type TaskListFilterState = {
@@ -490,6 +499,17 @@ type TaskListFilterState = {
   currentUserId: string | null;
 };
 
+type PendingRecurringDateChange = {
+  taskId: string;
+  task: Task;
+  payload: Omit<MoveOccurrencePayload, "mode">;
+  optimisticUpdates: {
+    effective_start_at: string;
+    effective_end_at: string | null;
+    effective_all_day: boolean;
+  };
+};
+
 export function TaskListView({
   projectContext,
   taskData,
@@ -508,6 +528,7 @@ export function TaskListView({
   draftTask,
   openTask,
   openTaskById,
+  browseScope = null,
 }: TaskListViewProps) {
   // Search has two viewport-specific controls. Keep the refs separate so the
   // desktop toolbar cannot overwrite the visible mobile input (Ctrl/Cmd+F
@@ -540,17 +561,22 @@ export function TaskListView({
     refreshProjects,
     projectsLoading,
     projectsLoadError,
+    accessibleProjects,
   } = projectContext;
+  const readableProjects = useMemo(
+    () => accessibleProjects ?? allProjects ?? projects ?? [],
+    [accessibleProjects, allProjects, projects],
+  );
   const remoteReadOnly =
     selectedProject?.source === "remote" ||
     selectedProject?.can_write === false;
-  const scopeReadOnly = projectTab !== "all" && remoteReadOnly;
+  const scopeReadOnly = Boolean(browseScope) || (projectTab !== "all" && remoteReadOnly);
   const projectAccessById = useMemo(
     () =>
       new Map(
-        [...allProjects, ...projects].map((project) => [project.id, project]),
+        [...readableProjects, ...projects].map((project) => [project.id, project]),
       ),
-    [allProjects, projects],
+    [projects, readableProjects],
   );
   const isTaskReadOnly = useCallback(
     (task: Task) =>
@@ -622,11 +648,25 @@ export function TaskListView({
   const [bulkLoading, setBulkLoading] = useState(false);
   const taskRowRefs = useRef<Record<string, HTMLTableRowElement | null>>({});
   const pendingRowStatusFocusTaskIdRef = useRef<string | null>(null);
+  const rowStatusFocusEpochRef = useRef(0);
+  const rowStatusFocusSessionsRef = useRef(
+    new Map<string, RowStatusFocusSession>(),
+  );
+  const activeRowStatusMenuTaskIdRef = useRef<string | null>(null);
   const [focusedTaskId, setFocusedTaskId] = useState<string | null>(null);
   const projectIds = useMemo(
     () => new Set(projects.map((project) => project.id)),
     [projects],
   );
+  const browseProjectIds = useMemo(() => {
+    if (!browseScope) return null;
+    if (browseScope.kind === "project") return new Set([browseScope.id]);
+    return new Set(
+      readableProjects
+        .filter((project) => project.space_id === browseScope.id)
+        .map((project) => project.id),
+    );
+  }, [browseScope, readableProjects]);
   const retryInitialData = useCallback(() => {
     void Promise.all([fetchData({ forceLoading: true }), refreshProjects()]);
   }, [fetchData, refreshProjects]);
@@ -655,6 +695,8 @@ export function TaskListView({
     task: Task;
     occurrenceContext: RecurringOccurrenceContext;
   } | null>(null);
+  const [pendingRecurringDateChange, setPendingRecurringDateChange] =
+    useState<PendingRecurringDateChange | null>(null);
   const requestRecurringDelete = useCallback((task: Task): boolean => {
     if (!task.has_recurrence) return false;
     const occurrenceContext = getTaskOccurrenceContext(task);
@@ -699,6 +741,42 @@ export function TaskListView({
       }
     },
     [clearSelection, fetchData, isTaskReadOnly, pendingRecurringDelete],
+  );
+  const handleRecurringDateChange = useCallback(
+    async (mode: "single" | "future") => {
+      if (!pendingRecurringDateChange) return;
+      if (isTaskReadOnly(pendingRecurringDateChange.task)) {
+        setPendingRecurringDateChange(null);
+        toast.error("Enterprise参照は読み取り専用です");
+        return;
+      }
+
+      const pending = pendingRecurringDateChange;
+      // Keep the scope dialog from being reopened while the optimistic update
+      // and server mutation are in flight.  No local patch is made before the
+      // user chooses a scope, so dismissing the dialog is a complete rollback.
+      setPendingRecurringDateChange(null);
+      applyTaskPatchLocally(pending.taskId, pending.optimisticUpdates);
+      try {
+        await taskApi.moveOccurrence(pending.taskId, {
+          ...pending.payload,
+          mode,
+        });
+        await fetchData({ forceLoading: false });
+      } catch (err) {
+        console.error("繰り返し発生日時の更新に失敗:", err);
+        toast.error("繰り返し発生日時の更新に失敗しました", {
+          description: err instanceof Error ? err.message : undefined,
+        });
+        await fetchData();
+      }
+    },
+    [
+      applyTaskPatchLocally,
+      fetchData,
+      isTaskReadOnly,
+      pendingRecurringDateChange,
+    ],
   );
   // 親タスクグループ（親行 + サブ行 + サブタスク追加行）の hover 管理
   const [hoveredGroupId, setHoveredGroupId] = useState<string | null>(null);
@@ -759,15 +837,12 @@ export function TaskListView({
             : task.effective_occurrence_start_at;
         if (!nextStartAt) return;
         const nextEndAt = hasEndUpdate
-          ? updates.end_at
+          ? (updates.end_at ?? null)
           : (task.effective_occurrence_end_at ?? null);
-        applyTaskPatchLocally(task.id, {
-          effective_start_at: nextStartAt,
-          effective_end_at: nextEndAt,
-          effective_all_day: updates.all_day,
-        });
-        try {
-          await taskApi.moveOccurrence(task.id, {
+        setPendingRecurringDateChange({
+          taskId: task.id,
+          task,
+          payload: {
             occurrence_id: task.effective_occurrence_id ?? null,
             occurrence_start_at: task.effective_occurrence_start_at,
             occurrence_end_at: task.effective_occurrence_end_at ?? null,
@@ -778,12 +853,13 @@ export function TaskListView({
             next_end_at: nextEndAt,
             status: task.effective_occurrence_status ?? task.status,
             all_day: updates.all_day,
-          });
-          await fetchData({ forceLoading: false });
-        } catch (err) {
-          console.error("繰り返し発生日時の更新に失敗:", err);
-          await fetchData();
-        }
+          },
+          optimisticUpdates: {
+            effective_start_at: nextStartAt,
+            effective_end_at: nextEndAt,
+            effective_all_day: updates.all_day,
+          },
+        });
         return;
       }
 
@@ -803,6 +879,16 @@ export function TaskListView({
     },
     [applyTaskPatchLocally, fetchData, isTaskReadOnly, pushUndo, snapshotTask],
   );
+
+  useEffect(() => {
+    if (
+      pendingRecurringDateChange &&
+      (scopeReadOnly ||
+        !tasks.some((task) => task.id === pendingRecurringDateChange.taskId))
+    ) {
+      setPendingRecurringDateChange(null);
+    }
+  }, [pendingRecurringDateChange, scopeReadOnly, tasks]);
 
   // タイマー操作
   const handleTimer = useCallback(
@@ -905,7 +991,7 @@ export function TaskListView({
   } = useTaskDnd({
     tasks: writableTasks,
     projectIds: writableProjectIds,
-    projectTab,
+    projectTab: browseScope ? "all" : projectTab,
     fetchData,
     applyTaskPatchesLocally,
     applyTopLevelReorderLocally,
@@ -1054,10 +1140,11 @@ export function TaskListView({
 
   // プロジェクト名マップ
   const projectMap = useMemo(
-    () => new Map(allProjects.map((p) => [p.id, p.name])),
-    [allProjects],
+    () => new Map(readableProjects.map((p) => [p.id, p.name])),
+    [readableProjects],
   );
-  const showProjectColumn = projectTab === "all" || columnVisibility.project;
+  const showProjectColumn =
+    browseScope !== null || projectTab === "all" || columnVisibility.project;
   const showStartColumn = columnVisibility.start;
   const showDueColumn = columnVisibility.due;
   const showTimeColumn = columnVisibility.time;
@@ -1267,73 +1354,140 @@ export function TaskListView({
     [beginColumnResize, resizingColumn],
   );
 
-  const focusTaskById = useCallback((taskId: string | null) => {
-    setFocusedTaskId(taskId);
-    if (!taskId) return;
-    requestAnimationFrame(() => {
-      const row = taskRowRefs.current[taskId];
-      row?.focus();
-      row?.scrollIntoView({ block: "nearest" });
-    });
+  const invalidateRowStatusFocusSessions = useCallback(() => {
+    rowStatusFocusEpochRef.current += 1;
+    for (const [taskId, session] of rowStatusFocusSessionsRef.current) {
+      if (session.phase === "pending") {
+        session.phase = "canceled";
+        if (pendingRowStatusFocusTaskIdRef.current === taskId) {
+          pendingRowStatusFocusTaskIdRef.current = null;
+        }
+      }
+    }
   }, []);
 
-  const refocusPendingRowStatusTask = useCallback(
-    (taskId: string, clearPending = false) => {
-      if (pendingRowStatusFocusTaskIdRef.current !== taskId) return;
-      focusTaskById(taskId);
-      if (clearPending) {
-        pendingRowStatusFocusTaskIdRef.current = null;
+  const clearConsumedRowStatusFocusSessions = useCallback(() => {
+    for (const [taskId, session] of rowStatusFocusSessionsRef.current) {
+      if (session.phase === "consumed") {
+        rowStatusFocusSessionsRef.current.delete(taskId);
       }
+    }
+  }, []);
+
+  const beginRowStatusFocusSession = useCallback((taskId: string) => {
+    rowStatusFocusSessionsRef.current.set(taskId, {
+      epoch: rowStatusFocusEpochRef.current,
+      phase: "pending",
+    });
+    pendingRowStatusFocusTaskIdRef.current = taskId;
+  }, []);
+
+  const focusTaskById = useCallback(
+    (taskId: string | null) => {
+      invalidateRowStatusFocusSessions();
+      setFocusedTaskId(taskId);
+      if (!taskId) return;
+      requestAnimationFrame(() => {
+        const row = taskRowRefs.current[taskId];
+        row?.focus();
+        row?.scrollIntoView({ block: "nearest" });
+      });
     },
-    [focusTaskById],
+    [invalidateRowStatusFocusSessions],
+  );
+
+  const focusTaskRowImmediately = useCallback(
+    (taskId: string) => {
+      invalidateRowStatusFocusSessions();
+      setFocusedTaskId(taskId);
+      taskRowRefs.current[taskId]?.focus();
+    },
+    [invalidateRowStatusFocusSessions],
+  );
+
+  const handleTaskRowFocus = useCallback(
+    (taskId: string) => {
+      invalidateRowStatusFocusSessions();
+      setFocusedTaskId(taskId);
+    },
+    [invalidateRowStatusFocusSessions],
   );
 
   const resolveRowStatusMenuFinalFocus = useCallback((taskId: string) => {
-    if (pendingRowStatusFocusTaskIdRef.current !== taskId) return true;
-    return false;
+    // A previous popup can finish unmounting after its trigger has already
+    // reopened a menu. Never let that stale cleanup steal focus from the
+    // currently open menu.
+    if (activeRowStatusMenuTaskIdRef.current === taskId) return false;
+    const session = rowStatusFocusSessionsRef.current.get(taskId);
+    if (!session) return true;
+
+    const shouldReturnFocus =
+      session.phase === "pending" &&
+      session.epoch === rowStatusFocusEpochRef.current;
+    session.phase = "consumed";
+    if (pendingRowStatusFocusTaskIdRef.current === taskId) {
+      pendingRowStatusFocusTaskIdRef.current = null;
+    }
+    if (!shouldReturnFocus) return false;
+    return taskRowRefs.current[taskId] ?? false;
   }, []);
 
   const closeRowStatusMenuAndRefocusTask = useCallback(
     (taskId: string) => {
-      pendingRowStatusFocusTaskIdRef.current = taskId;
-      setFocusedTaskId(taskId);
+      focusTaskRowImmediately(taskId);
+      activeRowStatusMenuTaskIdRef.current = null;
+      beginRowStatusFocusSession(taskId);
       setRowStatusMenuTaskId(null);
-      window.setTimeout(() => refocusPendingRowStatusTask(taskId), 0);
-      window.setTimeout(() => refocusPendingRowStatusTask(taskId), 80);
-      window.setTimeout(() => refocusPendingRowStatusTask(taskId, true), 200);
     },
-    [refocusPendingRowStatusTask],
+    [beginRowStatusFocusSession, focusTaskRowImmediately],
   );
 
   const handleRowStatusMenuOpenChange = useCallback(
-    (taskId: string, open: boolean) => {
+    (
+      taskId: string,
+      open: boolean,
+      eventDetails?: { reason: string },
+    ) => {
       if (open) {
+        clearConsumedRowStatusFocusSessions();
+        invalidateRowStatusFocusSessions();
+        // A canceled/consumed session belongs to the previous popup. The
+        // current open starts with the default focus contract unless it is
+        // later closed by Escape or by an explicit status selection.
+        rowStatusFocusSessionsRef.current.delete(taskId);
+        activeRowStatusMenuTaskIdRef.current = taskId;
         pendingRowStatusFocusTaskIdRef.current = null;
         setMobileRowStatusMenuTaskId(null);
+      } else if (eventDetails?.reason === "escape-key") {
+        if (activeRowStatusMenuTaskIdRef.current === taskId) {
+          activeRowStatusMenuTaskIdRef.current = null;
+        }
+        focusTaskRowImmediately(taskId);
+        beginRowStatusFocusSession(taskId);
+      } else if (activeRowStatusMenuTaskIdRef.current === taskId) {
+        activeRowStatusMenuTaskIdRef.current = null;
       }
       setRowStatusMenuTaskId(open ? taskId : null);
     },
-    [],
+    [
+      beginRowStatusFocusSession,
+      clearConsumedRowStatusFocusSessions,
+      focusTaskRowImmediately,
+      invalidateRowStatusFocusSessions,
+    ],
   );
 
   const handleMobileRowStatusMenuOpenChange = useCallback(
     (taskId: string, open: boolean) => {
       if (open) {
+        clearConsumedRowStatusFocusSessions();
+        invalidateRowStatusFocusSessions();
         pendingRowStatusFocusTaskIdRef.current = null;
         setRowStatusMenuTaskId(null);
       }
       setMobileRowStatusMenuTaskId(open ? taskId : null);
     },
-    [],
-  );
-
-  const handleRowStatusMenuOpenChangeComplete = useCallback(
-    (taskId: string, open: boolean) => {
-      if (!open) {
-        refocusPendingRowStatusTask(taskId);
-      }
-    },
-    [refocusPendingRowStatusTask],
+    [clearConsumedRowStatusFocusSessions, invalidateRowStatusFocusSessions],
   );
 
   // タスクコマンドダイアログ（`/` ショートカット）
@@ -1463,7 +1617,9 @@ export function TaskListView({
     }
 
     // プロジェクトタブフィルタ
-    if (projectTab !== "all") {
+    if (browseProjectIds) {
+      result = result.filter((task) => browseProjectIds.has(task.project_id));
+    } else if (projectTab !== "all") {
       result = result.filter((t) => t.project_id === projectTab);
     } else {
       result = result.filter((t) => projectIds.has(t.project_id));
@@ -1516,6 +1672,7 @@ export function TaskListView({
     filter,
     search,
     projectTab,
+    browseProjectIds,
     projectIds,
     showClosed,
     showFuture,
@@ -1672,9 +1829,9 @@ export function TaskListView({
   // 一括操作
   const {
     handleRowStatusChange: handleWritableRowStatusChange,
-    handleBulkStatusChange,
-    handleBulkDelete,
-    handleBulkDuplicate,
+    handleBulkStatusChange: handleWritableBulkStatusChange,
+    handleBulkDelete: handleWritableBulkDelete,
+    handleBulkDuplicate: handleWritableBulkDuplicate,
     handleBulkMove: handleWritableBulkMove,
     handleDeleteTasks: handleWritableDeleteTasks,
   } = useBulkTaskActions({
@@ -1695,6 +1852,21 @@ export function TaskListView({
     refreshTasks: fetchData,
     requestRecurringDelete,
   });
+  const handleBulkStatusChange = useCallback(
+    async (status: string) => {
+      if (scopeReadOnly) return;
+      await handleWritableBulkStatusChange(status);
+    },
+    [handleWritableBulkStatusChange, scopeReadOnly],
+  );
+  const handleBulkDelete = useCallback(async () => {
+    if (scopeReadOnly) return;
+    await handleWritableBulkDelete();
+  }, [handleWritableBulkDelete, scopeReadOnly]);
+  const handleBulkDuplicate = useCallback(async () => {
+    if (scopeReadOnly) return;
+    await handleWritableBulkDuplicate();
+  }, [handleWritableBulkDuplicate, scopeReadOnly]);
   const handleRowStatusChange = useCallback(
     async (task: Task, status: string) => {
       if (isTaskReadOnly(task)) return;
@@ -1704,6 +1876,7 @@ export function TaskListView({
   );
   const handleBulkMove = useCallback(
     async (targetProjectId: string) => {
+      if (scopeReadOnly) return;
       const targetProject = projectAccessById.get(targetProjectId);
       if (
         !targetProject ||
@@ -1715,14 +1888,15 @@ export function TaskListView({
       }
       await handleWritableBulkMove(targetProjectId);
     },
-    [handleWritableBulkMove, projectAccessById],
+    [handleWritableBulkMove, projectAccessById, scopeReadOnly],
   );
   const handleDeleteTasks = useCallback(
     async (taskList: Task[]) => {
+      if (scopeReadOnly) return;
       if (taskList.some(isTaskReadOnly)) return;
       await handleWritableDeleteTasks(taskList);
     },
-    [handleWritableDeleteTasks, isTaskReadOnly],
+    [handleWritableDeleteTasks, isTaskReadOnly, scopeReadOnly],
   );
 
   useEffect(() => {
@@ -1791,7 +1965,7 @@ export function TaskListView({
           (project) =>
             project.source !== "remote" && project.can_write !== false,
         )}
-        filterProjects={allProjects}
+        filterProjects={readableProjects}
         tags={tags}
         filter={filter}
         setFilter={setFilter}
@@ -1811,10 +1985,10 @@ export function TaskListView({
          search={search}
          setSearch={setSearch}
          onCreateTask={handleCreateNewTask}
-         createDisabled={remoteReadOnly}
+         createDisabled={scopeReadOnly}
          columnVisibility={columnVisibility}
          onColumnVisibilityChange={onColumnVisibilityChange}
-         projectScopeAll={projectTab === "all"}
+         projectScopeAll={browseScope !== null || projectTab === "all"}
        />
       <p className="px-3 py-2 text-xs text-muted-foreground md:hidden">
         タップで開く / チェックで複数選択
@@ -2072,7 +2246,7 @@ export function TaskListView({
                           data-testid={`task-row-${task.id}`}
                           draggable={!taskReadOnly}
                           tabIndex={focusedTaskId === task.id ? 0 : -1}
-                          onFocus={() => setFocusedTaskId(task.id)}
+                          onFocus={() => handleTaskRowFocus(task.id)}
                           onDragStart={(e) => handleDragStart(e, task.id)}
                           onDragOver={(e) => handleDragOver(e, task.id)}
                           onDragLeave={handleDragLeave}
@@ -2178,18 +2352,26 @@ export function TaskListView({
                               ) : (
                                 <DropdownMenu
                                   open={rowStatusMenuTaskId === task.id}
-                                  onOpenChange={(open) =>
-                                    handleRowStatusMenuOpenChange(task.id, open)
-                                  }
-                                  onOpenChangeComplete={(open) =>
-                                    handleRowStatusMenuOpenChangeComplete(
+                                  onOpenChange={(open, eventDetails) =>
+                                    handleRowStatusMenuOpenChange(
                                       task.id,
                                       open,
+                                      eventDetails,
                                     )
                                   }
                                 >
                                   <DropdownMenuTrigger
+                                    // Opening on mousedown installs a modal backdrop
+                                    // before the browser can start dragging the row.
+                                    onPointerDown={(e) => e.preventBaseUIHandler()}
+                                    onMouseDown={(e) => e.preventBaseUIHandler()}
                                     onClick={(e) => e.stopPropagation()}
+                                    onKeyDown={(e) => {
+                                      if (e.key !== "Escape") return;
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      focusTaskRowImmediately(task.id);
+                                    }}
                                     className={cn(
                                       "size-4 shrink-0 rounded-full border-2 transition-colors hover:ring-2 hover:ring-offset-1 hover:ring-primary/30 cursor-pointer",
                                       STATUS_DOT_COLORS[displayStatus] ||
@@ -2658,11 +2840,12 @@ export function TaskListView({
                                showAssigneeColumn={showAssigneeColumn}
                                showTimeColumn={showTimeColumn}
                                onStatusChange={handleRowStatusChange}
+                               statusFocusEpochRef={rowStatusFocusEpochRef}
                                rowRef={(node) => {
                                  taskRowRefs.current[sub.id] = node;
                                }}
                                tabIndex={focusedTaskId === sub.id ? 0 : -1}
-                               onFocus={() => setFocusedTaskId(sub.id)}
+                               onFocus={() => handleTaskRowFocus(sub.id)}
                                focusRow={() => focusTaskById(sub.id)}
                                focused={focusedTaskId === sub.id}
                              />
@@ -2697,7 +2880,7 @@ export function TaskListView({
         )}
       </ScrollArea>
 
-      {!remoteReadOnly && (
+      {!scopeReadOnly && (
         <Button
           type="button"
           size="icon"
@@ -2734,6 +2917,17 @@ export function TaskListView({
           onDeleteSingle={() => void handleRecurringDelete("single")}
           onDeleteFuture={() => void handleRecurringDelete("future")}
           onDeleteSeries={() => void handleRecurringDelete("series")}
+        />
+      )}
+
+      {!scopeReadOnly && (
+        <RecurringDateChangeDialog
+          open={!!pendingRecurringDateChange}
+          onOpenChange={(open) => {
+            if (!open) setPendingRecurringDateChange(null);
+          }}
+          onApplySingle={() => void handleRecurringDateChange("single")}
+          onApplyFuture={() => void handleRecurringDateChange("future")}
         />
       )}
 

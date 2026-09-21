@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-01T10:47:10.7304244Z",
+  "scope": "bounded WIQA/J8 legacy cleanup preflight",
+  "manifest_id": "wiqa_20260830_epic",
+  "run_id": "wiqa_20260830_epic",
+  "manifest_digest": "c8840b69a1fda64c44f966ad2159bffccec6dc7003e9505327504a73cda7341b",
+  "preview_digest": "9662510a68841620b202cf34d2b73eac071e01c8baa55ed27b41d28e9d846a12",
+  "runtime": {
+    "database": "aoitalk_memory",
+    "schema": "public",
+    "quiesced": true,
+    "selection_authority": "exact UUIDs plus frozen metadata/graph assertions; names are evidence only"
+  },
+  "classification_counts": {
+    "projects": {"A": 1, "B": 30, "C": 18},
+    "tasks": {"A": 7, "B": 3, "C": 756},
+    "users": {"A": 0, "B": 219, "C": 5}
+  },
+  "category_a": {
+    "reason": "One project has the explicit project_metadata.qa_fixture=wiqa_20260830_epic marker and an exact seven-task graph; no users are selected.",
+    "projects": 1,
+    "tasks": 7,
+    "users": 0,
+    "related": {
+      "project_members": 3,
+      "knowledge_nodes": 22,
+      "sessions": 18,
+      "messages": 95,
+      "session_participants": 21,
+      "context_memories": 22,
+      "scoped_memory_jobs": 14,
+      "agent_runs": 44,
+      "token_usage": 275,
+      "notification_deliveries": 8,
+      "project_overviews": 1,
+      "project_overview_refresh_jobs": 7,
+      "heartbeat_run_states": 1,
+      "heartbeat_run_history": 4
+    }
+  },
+  "category_b_groups_preserved": {
+    "reason": "Strong verification/test indicators or known fixture paths, but no durable run marker or complete ownership proof in the legacy rows; not auto-deleted.",
+    "users": 219,
+    "projects": 30,
+    "tasks": 3,
+    "groups": [
+      "docs_api_test_*", "docs_meeting_import_*", "docs_acl_*", "e2e_onboarding_*",
+      "qa_files_edge*", "QA-Luna*", "flow*", "trpg_e2e_spectator*", "__dashboard_*", "tmp*"
+    ]
+  },
+  "category_c_preserved": {
+    "reason": "Legitimate, shared, or ambiguous ownership/provenance (including admin, hannibal, WIQA-named users, fixed __playwright_e2e__, and unrelated runtime rows).",
+    "users": 5,
+    "projects": 18,
+    "tasks": 756
+  },
+  "pre_cleanup_totals": {
+    "users": 224,
+    "projects": 49,
+    "tasks": 766,
+    "spaces": 26,
+    "project_members": 39,
+    "docs_libraries": 22,
+    "knowledge_nodes": 142505,
+    "conversation_sessions": 322,
+    "conversation_messages": 1205,
+    "context_memories": 215,
+    "scoped_memory_jobs": 324,
+    "agent_runs": 910,
+    "token_usage": 33986
+  },
+  "protected_anchors": {
+    "user_ids": ["118eb287-43cf-43aa-bb10-c8cabaf21b0f", "568a4cda-3426-4b0d-a15b-f7d59a05cf65", "f03ea3d3-377e-4227-abea-bb608a3325ea"],
+    "space_id": "40813367-bc26-4705-afd9-660ca3e21246",
+    "docs_library_id": "3e73f8c6-5870-4902-821d-241d3653c4ea",
+    "knowledge_root_id": "70151ac3-1a55-47d1-b71f-622a21411656"
+  }
+}

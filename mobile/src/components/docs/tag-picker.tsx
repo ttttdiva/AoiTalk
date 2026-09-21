@@ -17,9 +17,10 @@ type TagPickerProps = {
   nodeId: string;
   tags: DocsSupertag[];
   onChanged: () => void;
+  readOnly?: boolean;
 };
 
-export function TagPicker({ nodeId, tags, onChanged }: TagPickerProps) {
+export function TagPicker({ nodeId, tags, onChanged, readOnly = false }: TagPickerProps) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [allSupertags, setAllSupertags] = useState<DocsSupertag[]>([]);
@@ -104,7 +105,7 @@ export function TagPicker({ nodeId, tags, onChanged }: TagPickerProps) {
             <Chip
               key={tag.id}
               compact
-              onClose={() => void removeTag(tag.id)}
+              onClose={readOnly ? undefined : () => void removeTag(tag.id)}
               style={[
                 styles.chip,
                 tag.color ? { borderColor: tag.color } : null,
@@ -117,7 +118,7 @@ export function TagPicker({ nodeId, tags, onChanged }: TagPickerProps) {
           ))
         )}
       </View>
-      <View style={styles.addRow}>
+      {!readOnly ? <View style={styles.addRow}>
         <TextInput
           value={draft}
           onChangeText={setDraft}
@@ -137,8 +138,8 @@ export function TagPicker({ nodeId, tags, onChanged }: TagPickerProps) {
         >
           新規
         </Button>
-      </View>
-      {candidates.length > 0 ? (
+      </View> : null}
+      {!readOnly && candidates.length > 0 ? (
         <ScrollView
           style={styles.candidateList}
           keyboardShouldPersistTaps="handled"

@@ -21,6 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
+from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
@@ -733,6 +734,68 @@ def encrypt_text(value: Optional[str], *, aad: Optional[str] = None) -> Optional
     )
 
 
+def encrypt_text_with_key_id(
+    value: Optional[str],
+    *,
+    aad: Optional[str] = None,
+    key_id: Optional[str] = None,
+) -> Optional[str]:
+    """Key-id aware compatibility primitive.
+
+    The legacy ``encrypt_text`` format already carries a key id.  This helper
+    is intentionally conservative: ``local`` delegates to the existing
+    provider and non-local ids require the Media Credential key provider,
+    while callers that do not need rotation retain identical behavior.
+    """
+
+    if value is None or value == "" or is_encrypted_value(value):
+        return value
+    selected = str(key_id or _KEY_ID)
+    if selected == _KEY_ID:
+        return encrypt_text(value, aad=aad)
+    try:
+        from .media_credential_crypto import _key_for_id  # type: ignore[attr-defined]
+
+        key = _key_for_id(selected)
+    except Exception as exc:
+        raise FieldCryptoError("field crypto key is unavailable") from None
+    nonce = os.urandom(_NONCE_LEN)
+    ciphertext = AESGCM(key).encrypt(nonce, value.encode("utf-8"), _aad_bytes(aad))
+    return ":".join(
+        ["enc", "v1", _ALG, selected, _b64url_encode(nonce), _b64url_encode(ciphertext)]
+    )
+
+
+def decrypt_text_with_key_id(
+    value: Optional[str], *, aad: Optional[str] = None
+) -> Optional[str]:
+    """Decrypt a key-id carrying ciphertext (legacy values included)."""
+
+    if value is None or value == "" or not is_encrypted_value(value):
+        return value
+    parts = value.split(":")
+    if len(parts) != 6 or parts[:3] != ["enc", "v1", _ALG]:
+        raise FieldCryptoError("unsupported encrypted field format")
+    if parts[3] == _KEY_ID:
+        return decrypt_text(value, aad=aad)
+    try:
+        from .media_credential_crypto import _key_for_id  # type: ignore[attr-defined]
+
+        key = _key_for_id(parts[3])
+        nonce = _b64url_decode(parts[4])
+        ciphertext = _b64url_decode(parts[5])
+        if len(nonce) != _NONCE_LEN or len(ciphertext) < 16:
+            raise FieldCryptoError("unsupported encrypted field format")
+        plaintext = AESGCM(key).decrypt(nonce, ciphertext, _aad_bytes(aad))
+        return plaintext.decode("utf-8")
+    except InvalidTag:
+        raise FieldCryptoError("encrypted field authentication failed") from None
+    except FieldCryptoError:
+        raise
+    except Exception:
+        raise FieldCryptoError("encrypted field decryption failed") from None
+
+
 def decrypt_text(value: Optional[str], *, aad: Optional[str] = None) -> Optional[str]:
     if value is None or value == "":
         return value
@@ -751,7 +814,13 @@ def decrypt_text(value: Optional[str], *, aad: Optional[str] = None) -> Optional
     ciphertext = _b64url_decode(parts[5])
     if len(nonce) != _NONCE_LEN or len(ciphertext) < 16:
         raise FieldCryptoError("unsupported encrypted field format")
-    plaintext = AESGCM(get_data_key()).decrypt(nonce, ciphertext, _aad_bytes(aad))
+    try:
+        plaintext = AESGCM(get_data_key()).decrypt(nonce, ciphertext, _aad_bytes(aad))
+    except InvalidTag:
+        # Authentication failures are expected for wrong AAD/key or tampered
+        # ciphertext.  Do not let cryptography's raw exception escape callers,
+        # and never include ciphertext/plaintext/key material in the message.
+        raise FieldCryptoError("encrypted field authentication failed") from None
     return plaintext.decode("utf-8")
 
 

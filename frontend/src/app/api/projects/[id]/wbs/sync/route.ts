@@ -25,6 +25,11 @@ import {
 } from "@/lib/server/project-workspace-management";
 import { toDbLocalTimestamp } from "@/lib/server/db-time";
 import { canReadProjectId } from "@/lib/server/task-route-utils";
+import { normalizeTaskStatus } from "@/lib/task-status";
+import {
+  enqueueKnowledgeCaptureForCompletion,
+  recordTaskActivity,
+} from "@/lib/server/knowledge-capture-enqueue";
 
 type JsonRecord = Record<string, unknown>;
 const AI_GENERATED_TAG_NAME = "ai_generated";
@@ -419,43 +424,67 @@ export async function POST(
           due_at: row.plannedEnd,
         });
         if (!dryRun) {
-          const [task] = await db
-            .insert(tasks)
-            .values({
-              projectId: id,
-              title: row.title,
-              description,
-              status: row.status,
-              priority: row.priority,
-              startAt: toTaskTimestamp(row.plannedStart ?? row.actualStart),
-              endAt: toTaskTimestamp(row.plannedEnd ?? row.actualEnd),
-              allDay: true,
-              reminderOffsets: null,
-              notificationsEnabled: true,
-              source: "wbs",
-              createdBy: userId,
-              completedAt:
-                row.status === "closed"
-                  ? toDbLocalTimestamp(new Date())
-                  : null,
-              taskMetadata: nextMetadata,
-              sortOrder: nextSortOrder,
-            })
-            .returning();
-          nextSortOrder -= 1;
-          await db.insert(taskAssignees).values({
-            taskId: task.id,
-            userId,
-            isPrimary: true,
-          });
-          const tagId = await getAiGeneratedTagId();
-          if (tagId) {
-            await db.insert(taskTags).values({
-              taskId: task.id,
-              tagId,
+          await db.transaction(async (tx) => {
+            const normalizedStatus = normalizeTaskStatus(row.status);
+            const [inserted] = await tx
+              .insert(tasks)
+              .values({
+                projectId: id,
+                title: row.title,
+                description,
+                status: normalizedStatus,
+                priority: row.priority,
+                startAt: toTaskTimestamp(row.plannedStart ?? row.actualStart),
+                endAt: toTaskTimestamp(row.plannedEnd ?? row.actualEnd),
+                allDay: true,
+                reminderOffsets: null,
+                notificationsEnabled: true,
+                source: "wbs",
+                createdBy: userId,
+                completedAt:
+                  normalizedStatus === "closed"
+                    ? toDbLocalTimestamp(new Date())
+                    : null,
+                taskMetadata: nextMetadata,
+                sortOrder: nextSortOrder,
+              })
+              .returning();
+            nextSortOrder -= 1;
+            await tx.insert(taskAssignees).values({
+              taskId: inserted.id,
+              userId,
+              isPrimary: true,
             });
-            aiGeneratedTagged += 1;
-          }
+            const tagId = await getAiGeneratedTagId();
+            if (tagId) {
+              await tx.insert(taskTags).values({
+                taskId: inserted.id,
+                tagId,
+              });
+              aiGeneratedTagged += 1;
+            }
+            const activity = await recordTaskActivity(tx, {
+              taskId: inserted.id,
+              userId,
+              activityType: "task_created",
+              payload: {
+                project_id: String(id),
+                status: normalizedStatus,
+                source: "wbs",
+              },
+            });
+            if (normalizedStatus === "closed") {
+              await enqueueKnowledgeCaptureForCompletion(tx, {
+                taskId: inserted.id,
+                projectId: id,
+                status: normalizedStatus,
+                completedAt: inserted.completedAt,
+                activity,
+                triggerUserId: userId,
+              });
+            }
+            return inserted;
+          });
         }
         continue;
       }
@@ -477,29 +506,70 @@ export async function POST(
         wbs_id: row.wbsId,
       });
       if (!dryRun) {
-        await db
-          .update(tasks)
-          .set({
-            title: row.title,
-            description,
-            status: row.status,
-            priority: row.priority,
-            startAt: toTaskTimestamp(row.plannedStart ?? row.actualStart),
-            endAt: toTaskTimestamp(row.plannedEnd ?? row.actualEnd),
-            allDay: true,
-            completedAt:
-              row.status === "closed" ? toDbLocalTimestamp(new Date()) : null,
-            taskMetadata: {
-              ...metadata,
-              ...nextMetadata,
-              wbs: {
-                ...asRecord(metadata.wbs),
-                ...asRecord(nextMetadata.wbs),
+        await db.transaction(async (tx) => {
+          const [lockedTask] = await tx
+            .select()
+            .from(tasks)
+            .where(eq(tasks.id, existing.id))
+            .for("update")
+            .limit(1);
+          if (!lockedTask) return;
+          const previousStatus = normalizeTaskStatus(lockedTask.status);
+          const nextStatus = normalizeTaskStatus(row.status);
+          const becameClosed =
+            previousStatus !== "closed" &&
+            previousStatus !== "cancelled" &&
+            nextStatus === "closed";
+          const [updatedTask] = await tx
+            .update(tasks)
+            .set({
+              title: row.title,
+              description,
+              status: nextStatus,
+              priority: row.priority,
+              startAt: toTaskTimestamp(row.plannedStart ?? row.actualStart),
+              endAt: toTaskTimestamp(row.plannedEnd ?? row.actualEnd),
+              allDay: true,
+              completedAt:
+                nextStatus === "closed"
+                  ? becameClosed
+                    ? toDbLocalTimestamp(new Date())
+                    : lockedTask.completedAt
+                  : null,
+              taskMetadata: {
+                ...metadata,
+                ...nextMetadata,
+                wbs: {
+                  ...asRecord(metadata.wbs),
+                  ...asRecord(nextMetadata.wbs),
+                },
               },
+              updatedAt: new Date(),
+            })
+            .where(eq(tasks.id, lockedTask.id))
+            .returning();
+          if (!updatedTask || previousStatus === nextStatus) return;
+          const activity = await recordTaskActivity(tx, {
+            taskId: updatedTask.id,
+            userId,
+            activityType: "task_updated",
+            payload: {
+              status: nextStatus,
+              previous_status: previousStatus,
+              source: "wbs_sync",
             },
-            updatedAt: new Date(),
-          })
-          .where(eq(tasks.id, existing.id));
+          });
+          if (becameClosed) {
+            await enqueueKnowledgeCaptureForCompletion(tx, {
+              taskId: updatedTask.id,
+              projectId: updatedTask.projectId,
+              status: nextStatus,
+              completedAt: updatedTask.completedAt,
+              activity,
+              triggerUserId: userId,
+            });
+          }
+        });
       }
     }
   }

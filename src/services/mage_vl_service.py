@@ -36,6 +36,7 @@ from src.llm.conversation_context import normalize_usage
 from src.services.agent_team_service import config_get
 from src.services.turn_context import get_turn_context
 from src.services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     effective_privacy_mode,
     get_privacy_policy_context,
@@ -487,8 +488,34 @@ class MageVLService:
     async def _probe(self) -> bool:
         url = f"{self.base_url().rstrip('/')}/models"
         try:
-            async with httpx.AsyncClient(timeout=2.5) as client:
-                response = await client.get(url, headers={"Authorization": f"Bearer {self.api_key()}"})
+            descriptor = EgressDescriptor(
+                action="media.mage_vl.probe",
+                transport="httpx",
+                destination=url,
+                provider="mage_vl",
+                tool="media_recognition",
+                model=self.model(),
+            )
+            async with httpx.AsyncClient(
+                timeout=2.5,
+                follow_redirects=False,
+            ) as client:
+                async def send_probe(_payload: Any) -> httpx.Response:
+                    return await client.get(
+                        url,
+                        headers={"Authorization": f"Bearer {self.api_key()}"},
+                        follow_redirects=False,
+                    )
+
+                response = await self._privacy_gateway.execute(
+                    {},
+                    provider="mage_vl",
+                    descriptor=descriptor,
+                    sender=send_probe,
+                    base_url=self.base_url(),
+                    source_kind="mage_vl_probe",
+                    model=self.model(),
+                )
             if response.is_success:
                 self._last_probe_error = ""
                 return True
@@ -670,28 +697,44 @@ class MageVLService:
             base_url=self.base_url(),
             api_key=self.api_key(),
             timeout=inference_timeout,
+            # One provider call equals one reviewed transaction; do not let
+            # the SDK replay media behind the gateway on transient failures.
+            max_retries=0,
         )
+        endpoint = f"{self.base_url().rstrip('/')}/chat/completions"
+        request_payload: dict[str, Any] = {
+            "model": self.model(),
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max(1, int(max_new_tokens)),
+        }
+        descriptor = EgressDescriptor(
+            action="media.video.vision",
+            transport="openai.chat.completions",
+            destination=endpoint,
+            provider="mage_vl",
+            tool="media_recognition",
+            model=self.model(),
+        )
+
+        async def send_video_request(protected_payload: Any) -> Any:
+            if not isinstance(protected_payload, Mapping):
+                raise MageVLUnavailableError(
+                    "Mage-VL privacy protection returned no request payload"
+                )
+            return await asyncio.wait_for(
+                client.chat.completions.create(**dict(protected_payload)),
+                timeout=inference_timeout,
+            )
+
         try:
-            protected = await request_gateway.protect(
-                {"messages": [{"role": "user", "content": content}]},
+            response = await request_gateway.execute(
+                request_payload,
                 provider="mage_vl",
+                descriptor=descriptor,
+                sender=send_video_request,
                 base_url=self.base_url(),
                 source_kind="mage_vl_video",
-            )
-            protected_messages = (
-                protected.payload.get("messages")
-                if isinstance(protected.payload, Mapping)
-                else None
-            )
-            if isinstance(protected_messages, list):
-                content = protected_messages[0].get("content", content)
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=self.model(),
-                    messages=[{"role": "user", "content": content}],
-                    max_tokens=max(1, int(max_new_tokens)),
-                ),
-                timeout=inference_timeout,
+                model=self.model(),
             )
             self._record_usage(
                 response,

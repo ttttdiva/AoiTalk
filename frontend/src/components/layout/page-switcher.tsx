@@ -46,6 +46,7 @@ export function PageSwitcher() {
       if (
         (event.ctrlKey || event.metaKey) &&
         !event.shiftKey &&
+        !event.altKey &&
         event.key.toLowerCase() === "p"
       ) {
         if (pathnameRef.current?.startsWith("/filer")) return;

@@ -9,7 +9,7 @@ from typing import List, Optional
 
 import yaml
 
-from .models import HeartbeatDefinition
+from .models import HeartbeatDefinition, validate_heartbeat_mode
 from .registry import get_heartbeat_registry, register_heartbeat
 from .security import HeartbeatSecurityError, resolve_heartbeat_yaml_path, validate_heartbeat_name
 
@@ -28,6 +28,7 @@ def load_heartbeat_from_yaml(path: Path) -> Optional[HeartbeatDefinition]:
             name=data.get("name", path.stem),
             description=data.get("description", ""),
             checklist=data.get("checklist", ""),
+            mode=data.get("mode", "agent_check"),
             interval_minutes=data.get("interval_minutes", 30),
             enabled=data.get("enabled", True),
             active_hours=data.get("active_hours"),
@@ -65,15 +66,17 @@ def save_heartbeat_to_yaml(heartbeat: HeartbeatDefinition, heartbeats_dir: Optio
     directory.mkdir(parents=True, exist_ok=True)
     try:
         validate_heartbeat_name(heartbeat.name)
+        validate_heartbeat_mode(heartbeat.mode)
         path = resolve_heartbeat_yaml_path(heartbeat.name, directory)
-    except HeartbeatSecurityError:
-        logger.error("[HeartbeatLoader] 無効な Heartbeat 名: %s", heartbeat.name)
+    except (HeartbeatSecurityError, ValueError):
+        logger.error("[HeartbeatLoader] 無効な Heartbeat 定義: %s", heartbeat.name)
         return False
 
     data = {
         "name": heartbeat.name,
         "description": heartbeat.description,
         "checklist": heartbeat.checklist,
+        "mode": heartbeat.mode,
         "interval_minutes": heartbeat.interval_minutes,
         "enabled": heartbeat.enabled,
         "notify_channel": heartbeat.notify_channel,

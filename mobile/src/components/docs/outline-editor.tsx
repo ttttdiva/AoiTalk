@@ -7,7 +7,7 @@ import React, {
   useRef,
   useState,
 } from "react";
-import { FlatList, Keyboard, Pressable, StyleSheet, View } from "react-native";
+import { Alert, FlatList, Keyboard, Pressable, StyleSheet, View } from "react-native";
 import {
   Button,
   Dialog,
@@ -19,9 +19,20 @@ import {
   TextInput,
 } from "react-native-paper";
 import { docsRepo } from "../../repositories/docs";
+import {
+  blankParagraphBodyJson,
+  clearBlankParagraphMarker,
+  isEditableDocsBlockBody,
+  isExplicitBlankParagraph,
+} from "../../lib/docs-blank";
 import type { DocsNode } from "../../types/api";
 import { flattenVisibleOutline } from "./outline-editor-model";
 import { DocBlockEditor, isDocBlockNode } from "./verbatim-blocks";
+
+function isProtectedProjectNode(node: Pick<DocsNode, "system_key">) {
+  const key = String(node.system_key ?? "").trim();
+  return key === "project_information_root" || key.startsWith("project_information:");
+}
 
 export type OutlineEditorHandle = {
   focusFirstOrCreate: () => Promise<void>;
@@ -146,10 +157,15 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
     );
 
     const beginEditing = useCallback((nodeId: string) => {
+      const node = nodesRef.current.find((candidate) => candidate.id === nodeId);
+      if (node && isProtectedProjectNode(node)) {
+        onOpen(nodeId);
+        return;
+      }
       setSelectedId(nodeId);
       setEditingId(nodeId);
       requestAnimationFrame(() => inputRefs.current.get(nodeId)?.focus());
-    }, []);
+    }, [onOpen]);
 
     const clearTitleTapCandidate = useCallback(() => {
       if (titleTapTimerRef.current) clearTimeout(titleTapTimerRef.current);
@@ -180,7 +196,11 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
         return saveChainsRef.current.get(nodeId) ?? Promise.resolve();
       }
       draftsRef.current.delete(nodeId);
-      const normalized = draft.replace(/[\r\n]+/g, " ").slice(0, 500);
+      const normalizedRaw = draft.replace(/[\r\n]+/g, " ").slice(0, 500);
+      // Whitespace-only IME drafts are semantically cleared paragraphs.  Do
+      // not enqueue a title consisting solely of spaces, which the server
+      // normalizes to empty and correctly rejects as a malformed blank row.
+      const normalized = normalizedRaw.trim().length === 0 ? "" : normalizedRaw;
       savingTitlesRef.current.set(nodeId, normalized);
       const previous = saveChainsRef.current.get(nodeId) ?? Promise.resolve();
       const next = previous
@@ -189,24 +209,50 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
           try {
             const currentNode = nodesRef.current.find((node) => node.id === nodeId);
             const currentBody = currentNode?.body_json;
-            const isBlock = currentBody?.format === "doc_block"
-              && (currentBody.block_type === "markdown" || currentBody.block_type === "code");
+            const isBlock = isEditableDocsBlockBody(currentBody);
+            const currentIsBlank = currentNode
+              ? typeof currentNode.is_explicit_blank === "boolean"
+                ? currentNode.is_explicit_blank === true
+                : isExplicitBlankParagraph(
+                    currentNode.title,
+                    currentBody,
+                    currentNode.node_type,
+                  )
+              : false;
+            const blockLabel = isBlock && normalized.trim().length === 0
+              ? (typeof currentBody?.label === "string" && currentBody.label.trim()
+                ? currentBody.label
+                : currentNode?.title || "本文")
+              : normalized;
             const patch = isBlock
               ? {
-                  title: normalized,
-                  bodyText: normalized,
-                  bodyJson: { ...currentBody, label: normalized },
+                  title: blockLabel,
+                  bodyText: blockLabel,
+                  bodyJson: { ...currentBody, label: blockLabel },
                 }
-              : { title: normalized };
+              : normalized === ""
+                ? {
+                    title: "",
+                    bodyText: "",
+                    bodyJson: blankParagraphBodyJson(currentBody),
+                  }
+                : currentIsBlank
+                  ? {
+                      title: normalized,
+                      bodyText: normalized,
+                      bodyJson: clearBlankParagraphMarker(currentBody),
+                    }
+                  : { title: normalized };
             const updated = await docsRepo.updateNode(nodeId, patch);
-            if (isBlock) {
+            if (isBlock || normalized === "" || currentIsBlank || updated.title !== normalized) {
               setNodes((current) => current.map((node) =>
                 node.id === nodeId
                   ? {
                       ...node,
-                      title: normalized,
-                      body_text: normalized,
+                      title: updated.title,
+                      body_text: updated.body_text,
                       body_json: updated.body_json,
+                      is_explicit_blank: updated.is_explicit_blank,
                     }
                   : node,
               ));
@@ -430,6 +476,8 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
         const actionRootId = rootNodeId;
         await flushDraft(nodeId);
         if (activeRootIdRef.current !== actionRootId) return;
+        const target = nodesRef.current.find((node) => node.id === nodeId);
+        if (target && isProtectedProjectNode(target)) return;
         let indentParentId: string | null = null;
         if (action === "indent") {
           await docsRepo.indentNode(nodeId);
@@ -481,7 +529,10 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
               </Pressable>
             )
           }
-          renderItem={({ item: row }) => (
+          renderItem={({ item: row }) => {
+            const protectedNode = isProtectedProjectNode(row.node);
+            const displayTitle = row.node.is_explicit_blank ? " " : row.node.title || "メモ";
+            return (
             <View
               style={[
                 styles.row,
@@ -528,7 +579,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                 )}
               </Pressable>
               <View style={styles.rowContent}>
-              {editingId === row.node.id ? (
+              {editingId === row.node.id && !protectedNode ? (
                 <TextInput
                   ref={(input: PaperInput | null) => {
                     if (input) inputRefs.current.set(row.node.id, input);
@@ -569,16 +620,18 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                   accessibilityRole="button"
                   accessibilityLabel={`編集: ${row.node.title || "空のノード"}`}
                   style={styles.displayTitle}
-                  onPress={() => handleDisplayTitlePress(row.node.id)}
+                  onPress={() => protectedNode
+                    ? requestOpenNode(row.node.id)
+                    : handleDisplayTitlePress(row.node.id)}
                 >
                   <Text
                     style={
-                      row.node.title
+                      row.node.title && !row.node.is_explicit_blank
                         ? styles.displayTitleText
                         : styles.displayPlaceholder
                     }
                   >
-                    {row.node.title || "メモ"}
+                    {displayTitle}
                   </Text>
                 </Pressable>
               )}
@@ -607,9 +660,11 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                   setSelectedId(row.node.id);
                   setMoreTargetId(row.node.id);
                 }}
+                disabled={protectedNode}
               />
             </View>
-          )}
+            );
+          }}
         />
 
         {keyboardVisible && selectedRow ? (
@@ -617,7 +672,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
             <Button
               compact
               icon="format-indent-decrease"
-              disabled={selectedRow.depth === 0}
+                disabled={selectedRow.depth === 0 || isProtectedProjectNode(selectedRow.node)}
               onPress={() => {
                 cancelTitleTap();
                 void runStructureChange("outdent", selectedRow.node.id);
@@ -628,7 +683,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
             <Button
               compact
               icon="format-indent-increase"
-              disabled={selectedRow.siblingIndex === 0}
+                disabled={selectedRow.siblingIndex === 0 || isProtectedProjectNode(selectedRow.node)}
               onPress={() => {
                 cancelTitleTap();
                 void runStructureChange("indent", selectedRow.node.id);
@@ -709,6 +764,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
               </Button>
               <Button
                 icon="folder-move-outline"
+                disabled={Boolean(moreTargetRow && isProtectedProjectNode(moreTargetRow.node))}
                 onPress={() => {
                   const target = moreTargetId;
                   setMoreTargetId(null);
@@ -720,6 +776,7 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
               <Button
                 icon="archive-outline"
                 textColor="#f38ba8"
+                disabled={Boolean(moreTargetRow && isProtectedProjectNode(moreTargetRow.node))}
                 onPress={() => {
                   const target = moreTargetId;
                   setMoreTargetId(null);
@@ -734,6 +791,8 @@ export const OutlineEditor = forwardRef<OutlineEditorHandle, Props>(
                       ),
                     );
                     onChanged?.();
+                  }).catch((error) => {
+                    Alert.alert("Docs", error instanceof Error ? error.message : "ノードのアーカイブに失敗しました");
                   });
                 }}
               >

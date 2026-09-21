@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
@@ -85,7 +85,7 @@ async def ensure_project_information_root(
         select(KnowledgeNode)
         .where(
             KnowledgeNode.docs_library_id == docs_library_id,
-            KnowledgeNode.system_key == PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
+            func.btrim(KnowledgeNode.system_key) == PROJECT_INFORMATION_ROOT_SYSTEM_KEY,
         )
         .limit(1)
     )
@@ -114,6 +114,7 @@ async def ensure_project_information_root(
             or getattr(root, "project_id", None) is not None
             or getattr(root, "archived_at", None) is not None
             or getattr(root, "root_page_id", None) not in (None, root.id)
+            or getattr(root, "is_explicit_blank", False) is True
         )
         if root_needs_repair and not is_owner:
             raise PermissionError("案件情報hubの修復はPersonal Library所有者のみ許可されています")
@@ -128,6 +129,7 @@ async def ensure_project_information_root(
     root.root_page_id = root.id
     root.project_id = None
     root.archived_at = None
+    root.is_explicit_blank = False
     root.updated_by = user_id
     await _upsert_search_index(session, root)
     await session.flush()
@@ -172,8 +174,32 @@ async def ensure_project_information_doc(
 ) -> KnowledgeNode:
     """Ensure the single canonical Docs node for a project information page."""
 
+    # Every caller eventually takes the Project-information advisory and may
+    # touch the Project pointer/node.  Lock the canonical Project first so
+    # callers that also hold chat/task rows (for example Project Q&A curation)
+    # share one parent-first order with Project deletion/rebinding paths.
+    if isinstance(session, AsyncSession):
+        locked_project_result = await session.execute(
+            select(Project)
+            .where(Project.id == project.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+            .limit(1)
+        )
+        locked_project = locked_project_result.scalars().first()
+        if locked_project is None:
+            raise ValueError("Projectが見つかりません")
+        project = locked_project
+
     if is_default_inbox_project(project):
         raise ValueError("Inboxは案件情報Docsの保存先にできません。実案件を指定してください。")
+    if project.deleted_at is not None or project.is_completed:
+        # Retained canonical rows are cleanup/inspection artifacts.  Reusing
+        # this active bootstrap writer for them would unarchive a stale root
+        # and silently resurrect a deleted/completed Project identity.
+        raise ValueError(
+            "完了/削除済みProjectのcanonical Docsは専用クリーンアップ経路で管理されます"
+        )
 
     # Project information lives in the owner's Personal Docs Library.  The
     # resolver checks Project write membership; node mutations re-check that
@@ -204,9 +230,10 @@ async def ensure_project_information_doc(
             or node.docs_library_id != library.id
             or node.project_id != project.id
             or node.archived_at is not None
-            or node.system_key != f"project_information:{project.id}"
+            or str(node.system_key or "").strip() != f"project_information:{project.id}"
             or node.parent_id is None
             or node.root_page_id != node.parent_id
+            or getattr(node, "is_explicit_blank", False) is True
         ):
             raise PermissionError(
                 "Project Docsのcanonical正本は所有者以外には作成・修復できません"
@@ -217,7 +244,7 @@ async def ensure_project_information_doc(
             .where(
                 KnowledgeNodeSupertag.node_id == node.id,
                 KnowledgeSupertag.docs_library_id == library.id,
-                KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
+                func.btrim(KnowledgeSupertag.system_key) == PROJECT_INFORMATION_SYSTEM_KEY,
             )
             .limit(1)
         )
@@ -234,19 +261,30 @@ async def ensure_project_information_doc(
     )
     await session.execute(
         text("select pg_advisory_xact_lock(hashtext(:lock_key))"),
-        {"lock_key": f"{library.id}:project-information:{project.id}"},
+        {"lock_key": f"project-information:{project.id}"},
     )
 
     node = None
     if project.knowledge_node_id:
-        node = await session.get(KnowledgeNode, project.knowledge_node_id)
+        # Lock the pointed node before any repair/unarchive write.  Generic
+        # Docs archive/delete uses the same node->Project lock order, so a
+        # concurrent pointer repair cannot commit an active pointer to a row
+        # that was just archived after its preflight read.
+        node_result = await session.execute(
+            select(KnowledgeNode)
+            .where(KnowledgeNode.id == project.knowledge_node_id)
+            .with_for_update()
+            .limit(1)
+        )
+        node = node_result.scalars().first()
         if node and (
             node.docs_library_id != library.id
             or node.project_id != project.id
             or node.archived_at is not None
             or node.parent_id != root.id
             or node.root_page_id != root.id
-            or node.system_key != f"project_information:{project.id}"
+            or str(node.system_key or "").strip() != f"project_information:{project.id}"
+            or getattr(node, "is_explicit_blank", False) is True
         ):
             node = None
 
@@ -258,7 +296,7 @@ async def ensure_project_information_doc(
         select(KnowledgeSupertag)
         .where(
             KnowledgeSupertag.docs_library_id == library.id,
-            KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
+            func.btrim(KnowledgeSupertag.system_key) == PROJECT_INFORMATION_SYSTEM_KEY,
         )
         .limit(1)
     )
@@ -310,6 +348,22 @@ async def ensure_project_information_doc(
             # leave that row untouched and create a fresh canonical root.
             node = None
 
+    if node is None:
+        # ``docs_library_id + system_key`` is unique even when an old
+        # canonical row was archived or left under a malformed parent.  Lock
+        # and reuse that exact row during repair rather than attempting an
+        # INSERT that can never satisfy the unique constraint.
+        exact_result = await session.execute(
+            select(KnowledgeNode)
+            .where(
+                KnowledgeNode.docs_library_id == library.id,
+                func.btrim(KnowledgeNode.system_key) == f"project_information:{project.id}",
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        node = exact_result.scalars().first()
+
     # If a pointer was stale/malformed, search only for an already canonical
     # candidate.  A stale ordinary node is never adopted, while an existing
     # canonical candidate is reused so repeated repair cannot create duplicate
@@ -329,11 +383,12 @@ async def ensure_project_information_doc(
                 KnowledgeNode.docs_library_id == library.id,
                 KnowledgeNode.project_id == project.id,
                 KnowledgeNode.archived_at.is_(None),
-                KnowledgeNode.system_key == f"project_information:{project.id}",
+                func.btrim(KnowledgeNode.system_key) == f"project_information:{project.id}",
                 KnowledgeNode.parent_id == root.id,
                 KnowledgeNode.root_page_id == root.id,
+                KnowledgeNode.is_explicit_blank.is_(False),
                 KnowledgeSupertag.docs_library_id == library.id,
-                KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
+                func.btrim(KnowledgeSupertag.system_key) == PROJECT_INFORMATION_SYSTEM_KEY,
             )
             .order_by(KnowledgeNode.updated_at.desc(), KnowledgeNode.id)
             .limit(1)
@@ -349,6 +404,7 @@ async def ensure_project_information_doc(
             root_page_id=root.id,
             project_id=project.id,
             system_key=f"project_information:{project.id}",
+            is_explicit_blank=False,
             title=node_title,
             body_json=_project_information_body_json(),
             body_text=node_title,
@@ -361,31 +417,86 @@ async def ensure_project_information_doc(
         await session.flush()
         created = True
 
-    legacy_title = f"{project.name} 案件情報"
-    if not (node.title or "").strip() or node.title.strip() == legacy_title:
-        node.title = project.name
-    previous_root_id = node.id if node.root_page_id in {None, node.id} else None
+    canonical_title = (str(project.name or "").strip() or "案件情報")
+    node.title = canonical_title
     node.parent_id = root.id
     node.root_page_id = root.id
     node.project_id = project.id
     node.system_key = f"project_information:{project.id}"
-    if previous_root_id is not None:
-        descendants = await session.scalars(
-            select(KnowledgeNode).where(
-                KnowledgeNode.docs_library_id == library.id,
-                KnowledgeNode.project_id == project.id,
-                KnowledgeNode.root_page_id == previous_root_id,
-                KnowledgeNode.id != node.id,
+    node.archived_at = None
+    # A canonical Project-information root is identity-bearing, never an
+    # explicit user blank, even if a stale row carried the old marker.
+    node.is_explicit_blank = False
+    conflicting_identity = await session.execute(
+        text(
+            """
+            with recursive descendants as (
+                select id, system_key
+                from knowledge_nodes
+                where id = :node_id and docs_library_id = :library_id
+                union all
+                select child.id, child.system_key
+                from knowledge_nodes child
+                join descendants parent on child.parent_id = parent.id
+                where child.docs_library_id = :library_id
             )
-        )
-        for descendant in descendants:
-            descendant.root_page_id = root.id
-            descendant.updated_by = user_id
+            select 1
+            from descendants d
+            left join projects p on p.knowledge_node_id = d.id
+            where d.id <> :node_id
+              and (
+                (p.id is not null and p.id <> :project_id)
+                or btrim(d.system_key) like 'project_information:%'
+              )
+            limit 1
+            """
+        ),
+        {
+            "node_id": node.id,
+            "library_id": library.id,
+            "project_id": project.id,
+        },
+    )
+    if conflicting_identity.first() is not None:
+        raise ValueError("Project canonical hierarchy contains another Project identity")
+    # Rebase the complete structural closure, not only rows that happened to
+    # retain the stale root_page_id/project_id denormalizers.  This keeps
+    # grandchildren visible after repairing an archived/malformed root.
+    await session.execute(
+        text(
+            """
+            with recursive descendants as (
+                select id
+                from knowledge_nodes
+                where id = :node_id and docs_library_id = :library_id
+                union all
+                select child.id
+                from knowledge_nodes child
+                join descendants parent on child.parent_id = parent.id
+                where child.docs_library_id = :library_id
+            )
+            update knowledge_nodes
+            set root_page_id = :root_id,
+                project_id = :project_id,
+                updated_by = :user_id,
+                updated_at = now()
+            where id in (select id from descendants)
+              and id <> :node_id
+            """
+        ),
+        {
+            "node_id": node.id,
+            "library_id": library.id,
+            "root_id": root.id,
+            "project_id": project.id,
+            "user_id": user_id,
+        },
+    )
 
     legacy_root_body = ""
     if (node.body_text or "").strip() not in {"", node.title.strip()}:
         legacy_root_body = node.body_text
-    node.body_text = node.title.strip()
+    node.body_text = canonical_title
 
     if node.docs_library_id != supertag.docs_library_id:
         tag_result = await session.execute(
@@ -393,7 +504,7 @@ async def ensure_project_information_doc(
             .where(
                 KnowledgeSupertag.docs_library_id == node.docs_library_id,
                 or_(
-                    KnowledgeSupertag.system_key == PROJECT_INFORMATION_SYSTEM_KEY,
+                    func.btrim(KnowledgeSupertag.system_key) == PROJECT_INFORMATION_SYSTEM_KEY,
                     KnowledgeSupertag.name == PROJECT_INFORMATION_SUPERTAG,
                 ),
             )
@@ -480,9 +591,12 @@ async def update_project_information_doc(
 ) -> KnowledgeNode:
     node = await ensure_project_information_doc(session, project=project, user_id=user_id)
     service = DocsGraphService(session)
-    if title is not None and str(title).strip():
-        node.title = str(title).strip()[:500]
-        node.body_text = node.title
+    # Project.name is the sole canonical label authority.  Historical callers
+    # may still pass a proposed title, but accepting it would let an agent or
+    # stale mobile retry silently diverge the Project pointer identity.
+    canonical_title = str(project.name or "").strip() or "案件情報"
+    node.title = canonical_title
+    node.body_text = canonical_title
 
     if section_heading and (body_text is not None or append_text is not None):
         await service.append_to_section(
@@ -521,16 +635,6 @@ async def update_project_information_doc(
             source_refs=source_refs,
         )
     )
-    # Keep source mutation and stale marking in the same transaction.  The
-    # caller owns commit/enqueue so a rollback cannot leave a false stale
-    # marker or schedule a rebuild for a failed Docs write.
-    from .project_context_pack_service import invalidate_project_context_pack
-
-    await invalidate_project_context_pack(
-        session=session,
-        project_id=project.id,
-        reason="project_information_doc_updated",
-    )
     await session.flush()
     return node
 
@@ -542,6 +646,8 @@ def serialize_project_information_node(node: KnowledgeNode) -> dict[str, Any]:
         "parent_id": str(node.parent_id) if node.parent_id else None,
         "root_page_id": str(node.root_page_id) if node.root_page_id else None,
         "project_id": str(node.project_id) if node.project_id else None,
+        "system_key": node.system_key,
+        "is_explicit_blank": bool(getattr(node, "is_explicit_blank", False)),
         "title": node.title,
         "body_json": node.body_json or {},
         "body_text": node.body_text or "",

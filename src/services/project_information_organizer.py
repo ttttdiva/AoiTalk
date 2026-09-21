@@ -10,19 +10,11 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
-from uuid import UUID, uuid4
+from uuid import UUID
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..memory.models import Project, ProjectContextPack, ProjectQaEntry
-from .project_context_pack_service import (
-    _TERMINAL_QUESTION_STATES,
-    create_pack_revision,
-    invalidate_project_context_pack,
-    pack_snapshot,
-    validate_generated_pack_replacement,
-)
+from ..memory.models import Project, ProjectQaEntry
 from .project_information_docs import update_project_information_doc
 from .project_qa_candidate_service import (
     _normalized_question_hash,
@@ -923,95 +915,20 @@ async def apply_organization_draft(
         append_text=_draft_to_markdown(draft, scanned_files),
         change_summary="フォルダ整理結果を案件情報Docs正本へ反映",
     )
-    # Keep source mutation and projection invalidation in this transaction.
-    # The pack is rebuilt below when the organizer succeeds, so the final
-    # status is reset to fresh before the same commit.
-    await invalidate_project_context_pack(
-        session=session,
-        project_id=project_id,
-        reason="project_information_docs_updated",
-    )
-
-    pack_result = await session.execute(
-        select(ProjectContextPack)
-        .where(ProjectContextPack.project_id == project_id)
-        .with_for_update()
-    )
-    pack = pack_result.scalar_one_or_none()
-    existing_pack = pack is not None
-    if pack is None:
-        pack = ProjectContextPack(id=uuid4(), project_id=project_id)
-        session.add(pack)
-    old_pack_payload = pack_snapshot(pack)
-    questions_to_migrate: list[tuple[Any, str, str, bool]] = []
-    for legacy_item in old_pack_payload.get("open_questions") or []:
-        if isinstance(legacy_item, dict):
-            question = legacy_item.get("text") or legacy_item.get("question")
-            legacy_status = str(
-                legacy_item.get("status") or "open"
-            ).strip().casefold()
-            source_deleted = bool(legacy_item.get("deleted_at"))
-        else:
-            question = legacy_item
-            legacy_status = "open"
-            source_deleted = False
-        if source_deleted:
-            qa_status = "archived"
-            review_state = "accepted"
-        elif legacy_status in _TERMINAL_QUESTION_STATES:
-            if legacy_status in {"answered", "resolved"}:
-                qa_status = "answered"
-            elif legacy_status in {"cancelled", "canceled"}:
-                qa_status = "cancelled"
-            elif legacy_status == "stale":
-                qa_status = "stale"
-            else:
-                qa_status = "archived"
-            review_state = (
-                "rejected" if legacy_status == "rejected" else "accepted"
-            )
-        else:
-            qa_status = "unanswered"
-            review_state = "candidate"
-        questions_to_migrate.append(
-            (question, qa_status, review_state, source_deleted)
-        )
-    questions_to_migrate.extend(
-        (question, "unanswered", "candidate", False)
-        for question in draft.open_questions
-    )
-    migrated_hashes: set[str] = set()
-    for question, qa_status, review_state, source_deleted in questions_to_migrate:
+    question_hashes: set[str] = set()
+    for question in draft.open_questions:
         if not str(question or "").strip():
             continue
         question_hash = _normalized_question_hash(question)
-        if question_hash in migrated_hashes:
+        if question_hash in question_hashes:
             continue
-        migrated_hashes.add(question_hash)
+        question_hashes.add(question_hash)
         existing_question = await find_existing_project_qa_entry(
             session,
             project_id=project_id,
             question=str(question),
             question_hash=question_hash,
         )
-        incoming_terminal = (
-            qa_status != "unanswered" or review_state == "rejected"
-        )
-        if existing_question is not None and incoming_terminal:
-            existing_terminal = (
-                existing_question.status != "unanswered"
-                or existing_question.review_state == "rejected"
-            )
-            if not existing_terminal:
-                existing_question.status = qa_status
-                existing_question.review_state = review_state
-                existing_question.updated_by = user_id
-        if (
-            existing_question is not None
-            and source_deleted
-            and existing_question.deleted_at is None
-        ):
-            existing_question.deleted_at = datetime.utcnow()
         if existing_question is None:
             session.add(
                 ProjectQaEntry(
@@ -1019,57 +936,18 @@ async def apply_organization_draft(
                     knowledge_node_id=node.id,
                     question=str(question).strip(),
                     normalized_question_hash=question_hash,
-                    status=qa_status,
-                    review_state=review_state,
+                    status="unanswered",
+                    review_state="candidate",
                     confidence=0.65,
                     asked_count=1,
                     created_by=user_id,
                     updated_by=user_id,
                     created_by_agent=True,
-                    deleted_at=(datetime.utcnow() if source_deleted else None),
+                    # Folder organization proposes a question for review; it
+                    # is not an explicit user-authored Q&A mutation.
+                    origin="legacy_auto",
                 )
             )
-    new_pack_payload = {
-        **old_pack_payload,
-        "summary_md": draft.summary_md,
-        "goals": draft.goals,
-        "constraints": draft.constraints,
-        "decisions": draft.decisions,
-        # ProjectQaEntry is the single status-bearing canonical store.
-        "open_questions": [],
-    }
-    validate_generated_pack_replacement(
-        old_pack_payload,
-        new_pack_payload,
-        fields=(
-            "summary_md",
-            "goals",
-            "constraints",
-            "decisions",
-        ),
-    )
-    if existing_pack:
-        await create_pack_revision(
-            session,
-            pack,
-            change_reason="project_information_organizer",
-            snapshot=old_pack_payload,
-        )
-    pack.summary_md = draft.summary_md
-    pack.goals = draft.goals
-    pack.constraints = draft.constraints
-    pack.decisions = draft.decisions
-    pack.open_questions = []
-    pack.generated_from = {
-        "source": "project_information_organizer",
-        "folder": draft.source_folder,
-        "generated_by": draft.generated_by,
-        "file_count": len(scanned_files),
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-    pack.status = "fresh"
-    pack.generated_at = datetime.utcnow()
-    pack.updated_at = datetime.utcnow()
 
     await session.commit()
     return {

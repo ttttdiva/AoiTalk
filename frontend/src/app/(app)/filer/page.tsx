@@ -1,4 +1,6 @@
 "use client";
+import { StorageControls, StorageWorkspace, StorageWorkspacePanel, useStorageWorkspace } from "@/components/explorer/storage-workspace";
+import { scrollExplorerItemIntoView } from "./scroll-explorer-item";
 
 /* eslint-disable @next/next/no-img-element */
 
@@ -31,6 +33,7 @@ import { UploadZone } from "@/components/explorer/upload-zone";
 import { FilePreviewPanel } from "@/components/explorer/file-preview-panel";
 import {
   HydrusSearchBar,
+  type HydrusSearchError,
   type HydrusPagingController,
 } from "@/components/hf-browser/hydrus-search-bar";
 import { HfReferenceDialog } from "@/components/hf-browser/hf-reference-dialog";
@@ -102,9 +105,11 @@ import dynamic from "next/dynamic";
 import { toast } from "sonner";
 import {
   boundaryViewerFile,
+  adjacentViewerFile,
   preloadViewerFiles,
   viewerFiles,
 } from "@/lib/viewer-navigation";
+import { hfExplorerSearch } from "@/lib/hf/explorer-loader";
 import {
   DOUBLE_ESCAPE_RESET_EVENT,
   EMPTY_DOUBLE_ESCAPE_STATE,
@@ -202,6 +207,21 @@ function isFilesWorkspaceTarget(
 }
 
 /**
+ * Keyboard delivery from a browser/CUA surface can report a broader target
+ * than the element that still owns DOM focus.  Keep the document boundary
+ * scoped to Files while accepting that focused Files control as the fallback.
+ */
+function isFilesWorkspaceKeyboardTarget(
+  target: EventTarget | null,
+  canvasRoot: HTMLElement | null,
+): boolean {
+  return (
+    isFilesWorkspaceTarget(target, canvasRoot) ||
+    isFilesWorkspaceTarget(document.activeElement, canvasRoot)
+  );
+}
+
+/**
  * Alt+A のクイックランチャーが開いている間は、そちらのニーモニック入力と
  * ショートカットを優先し、Files 側のインクリメンタルサーチは抑止する。
  */
@@ -252,6 +272,7 @@ export function FileViewer({
   returnFocusRef?: React.RefObject<HTMLElement | null>;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const mediaSurfaceRef = useRef<HTMLDivElement>(null);
   const initialFocusRef = useRef<HTMLButtonElement>(null);
   const touchStartRef = useRef<{ x: number; y: number; t: number } | null>(
     null,
@@ -259,6 +280,10 @@ export function FileViewer({
   const viewableFiles = useMemo(() => viewerFiles(files), [files]);
   const currentIndex = viewableFiles.findIndex((f) => f.path === file.path);
   const isImageFile = isImage(file.type || "");
+  // Keep a synchronous path cursor in addition to React state.  Key events
+  // can arrive several times before the parent re-renders `file`; using the
+  // rendered index in that window would navigate to the same item repeatedly.
+  const navigationPathRef = useRef(file.path);
   const navigatingRef = useRef(false);
   const navigationGenerationRef = useRef(0);
   const viewerMountedRef = useRef(true);
@@ -279,10 +304,29 @@ export function FileViewer({
     };
   }, []);
 
+  useEffect(() => {
+    navigationPathRef.current = file.path;
+  }, [file.path]);
+
+  const navigateTo = useCallback(
+    (target: ExplorerFile) => {
+      // A direct thumbnail/button selection supersedes any in-flight
+      // boundary fetch.  Advance the generation so a late page response
+      // cannot overwrite the user's newer choice.
+      navigationGenerationRef.current += 1;
+      navigatingRef.current = false;
+      navigationPathRef.current = target.path;
+      onNavigate(target);
+    },
+    [onNavigate],
+  );
+
   const goPrev = useCallback(async () => {
     if (navigatingRef.current) return;
-    if (currentIndex > 0) {
-      onNavigate(viewableFiles[currentIndex - 1]);
+    const cursorPath = navigationPathRef.current;
+    const adjacent = adjacentViewerFile(files, cursorPath, -1);
+    if (adjacent) {
+      navigateTo(adjacent);
       return;
     }
     if (!onBoundaryNavigate) return;
@@ -291,7 +335,7 @@ export function FileViewer({
     try {
       const target = await onBoundaryNavigate(-1);
       if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
-        onNavigate(target);
+        navigateTo(target);
       }
     } catch (error) {
       if (viewerMountedRef.current) {
@@ -300,12 +344,14 @@ export function FileViewer({
     } finally {
       if (generation === navigationGenerationRef.current) navigatingRef.current = false;
     }
-  }, [currentIndex, onBoundaryNavigate, onNavigate, viewableFiles]);
+  }, [files, navigateTo, onBoundaryNavigate]);
 
   const goNext = useCallback(async () => {
     if (navigatingRef.current) return;
-    if (currentIndex < viewableFiles.length - 1) {
-      onNavigate(viewableFiles[currentIndex + 1]);
+    const cursorPath = navigationPathRef.current;
+    const adjacent = adjacentViewerFile(files, cursorPath, 1);
+    if (adjacent) {
+      navigateTo(adjacent);
       return;
     }
     if (!onBoundaryNavigate) return;
@@ -314,7 +360,7 @@ export function FileViewer({
     try {
       const target = await onBoundaryNavigate(1);
       if (target && viewerMountedRef.current && generation === navigationGenerationRef.current) {
-        onNavigate(target);
+        navigateTo(target);
       }
     } catch (error) {
       if (viewerMountedRef.current) {
@@ -323,7 +369,7 @@ export function FileViewer({
     } finally {
       if (generation === navigationGenerationRef.current) navigatingRef.current = false;
     }
-  }, [currentIndex, onBoundaryNavigate, onNavigate, viewableFiles]);
+  }, [files, navigateTo, onBoundaryNavigate]);
 
   // 前後の画像をviewer存続中のブラウザキャッシュへ載せる（動画は容量的に除外）
   useEffect(() => {
@@ -411,43 +457,69 @@ export function FileViewer({
     [isImageFile, goPrev, goNext],
   );
 
+  const toggleFullscreen = useCallback(async () => {
+    try {
+      if (document.fullscreenElement) {
+        if (typeof document.exitFullscreen === "function") {
+          await document.exitFullscreen();
+        }
+        return;
+      }
+      // Video keeps its native fullscreen target.  For images, fullscreen a
+      // media surface that also owns the viewer's sizing/padding rather than
+      // the bare <img>, so controls and the visual framing remain natural.
+      const target =
+        videoRef.current ?? (isImageFile ? mediaSurfaceRef.current : null);
+      if (target && typeof target.requestFullscreen === "function") {
+        await target.requestFullscreen();
+      }
+    } catch {
+      // Fullscreen can be rejected by browser policy (or by a test/runtime
+      // double).  It is an optional enhancement and must never surface an
+      // unhandled promise rejection from the keyboard handler.
+    }
+  }, [isImageFile]);
+
   useEffect(() => {
     const handleKey = (e: KeyboardEvent) => {
       // video要素自体がフォーカスされている場合はネイティブ処理に任せる（二重発火防止）
       if (e.target === videoRef.current) return;
       if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        e.stopPropagation();
         void goPrev();
         return;
       }
       if (e.key === "ArrowRight") {
+        e.preventDefault();
+        e.stopPropagation();
         void goNext();
         return;
       }
       const video = videoRef.current;
-      if (video) {
-        if (e.key === " " || e.key === "k" || e.key === "K") {
-          e.preventDefault();
-          if (video.paused) {
-            void video.play();
-          } else {
-            video.pause();
-          }
-        }
-        if (e.key === "j" || e.key === "J") video.currentTime -= 10;
-        if (e.key === "l" || e.key === "L") video.currentTime += 10;
-        if (e.key === "f" || e.key === "F") {
-          if (document.fullscreenElement) {
-            void document.exitFullscreen();
-          } else {
-            void video.requestFullscreen();
-          }
-        }
-        if (e.key === "m" || e.key === "M") video.muted = !video.muted;
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        void toggleFullscreen();
+        return;
       }
+      if (!video) return;
+      if (e.key === " " || e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        if (video.paused) {
+          void video.play().catch(() => undefined);
+        } else {
+          video.pause();
+        }
+      }
+      if (e.key === "j" || e.key === "J") video.currentTime -= 10;
+      if (e.key === "l" || e.key === "L") video.currentTime += 10;
+      if (e.key === "m" || e.key === "M") video.muted = !video.muted;
     };
-    window.addEventListener("keydown", handleKey);
-    return () => window.removeEventListener("keydown", handleKey);
-  }, [goPrev, goNext]);
+    // Capture before Base UI's DialogPopup, which consumes arrow keys while
+    // focus is inside the modal and otherwise prevents viewer navigation.
+    window.addEventListener("keydown", handleKey, true);
+    return () => window.removeEventListener("keydown", handleKey, true);
+  }, [goPrev, goNext, toggleFullscreen]);
 
   const [fileInfo, setFileInfo] = useState<{
     size_bytes?: number;
@@ -525,7 +597,11 @@ export function FileViewer({
         onTouchStart={handleTouchStart}
         onTouchEnd={handleTouchEnd}
       >
-      <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden">
+      <div
+        ref={mediaSurfaceRef}
+        data-files-viewer-media-surface="true"
+        className="relative flex min-w-0 flex-1 flex-col overflow-hidden bg-black"
+      >
         <div className="pointer-events-none absolute inset-x-0 top-0 z-20 flex items-start justify-between p-4">
           <div className="pointer-events-auto flex min-w-0 items-center gap-3 rounded-md border border-border bg-card/90 px-4 py-2 backdrop-blur">
             <DialogTitle className="min-w-0 truncate text-[16px] font-medium">{file.name}</DialogTitle>
@@ -605,7 +681,7 @@ export function FileViewer({
                 const active = item.path === file.path;
                 const itemIsImage = isImage(item.type || "");
                 return (
-                  <button key={item.path} type="button" className={cn("relative size-16 shrink-0 overflow-hidden rounded-md border border-border bg-muted/40 opacity-60 transition-opacity hover:opacity-100", active && "border-2 border-primary opacity-100 ring-2 ring-primary/20")} onClick={() => onNavigate(item)} title={item.name}>
+                  <button key={item.path} type="button" className={cn("relative size-16 shrink-0 overflow-hidden rounded-md border border-border bg-muted/40 opacity-60 transition-opacity hover:opacity-100", active && "border-2 border-primary opacity-100 ring-2 ring-primary/20")} onClick={() => navigateTo(item)} title={item.name}>
                     {itemIsImage ? <img src={getImageThumbnailUrl(item.path, 128)} alt="" className="size-full object-cover" loading="lazy" /> : <span className="flex size-full items-center justify-center text-muted-foreground">{isVideo(item.type || "") ? <Play className="size-5" /> : <FileIcon className="size-5" />}</span>}
                   </button>
                 );
@@ -931,6 +1007,7 @@ function NewTextFileDialog({
 function ExplorerContent() {
   const explorerRootRef = useRef<HTMLDivElement>(null);
   const explorerScrollRef = useRef<HTMLDivElement>(null);
+  const pendingEditorEscapeFocusExitFrameRef = useRef<number | null>(null);
   const pendingIncrementalSearchRef = useRef("");
   const quickFilterInputRef = useRef<HTMLInputElement>(null);
   const fileSearchInputRef = useRef<HTMLInputElement>(null);
@@ -944,7 +1021,12 @@ function ExplorerContent() {
     );
   }, []);
   const activePathRef = useRef<string | null>(null);
+  // A restore signal is emitted only for a successful Back/Forward view-state
+  // restore.  Remember the navigation identity we have consumed so ordinary
+  // Arrow/click focus changes (or unrelated rerenders) never scroll again.
+  const consumedHistoryScrollRestoreRef = useRef<string | null>(null);
   const searchParams = useSearchParams();
+  const {isDefaultStorage, selectDefaultStorage} = useStorageWorkspace();
   const {
     currentPath,
     navigate,
@@ -970,6 +1052,7 @@ function ExplorerContent() {
     setBrowseData,
     selectedItems,
     focusedItemPath,
+    historyScrollRestore,
     selectItem,
     toggleSelect,
     selectRange,
@@ -1020,7 +1103,8 @@ function ExplorerContent() {
   });
 
   // Hydrus 検索エラー（検索結果そのものは context の browseData に流し込む）
-  const [hydrusError, setHydrusError] = useState<string | null>(null);
+  const [hydrusError, setHydrusError] = useState<HydrusSearchError | null>(null);
+  const hydrusRetryRef = useRef<(() => void) | null>(null);
   const [fileSearchQuery, setFileSearchQuery] = useState("");
   const [fileSearchReplaceQuery, setFileSearchReplaceQuery] = useState("");
   const [fileSearchRegex, setFileSearchRegex] = useState(false);
@@ -1030,6 +1114,13 @@ function ExplorerContent() {
   const [fileSearchError, setFileSearchError] = useState<string | null>(null);
   const [fileSearchCount, setFileSearchCount] = useState(0);
   const [fileSearchTruncated, setFileSearchTruncated] = useState(false);
+  const fileSearchGenerationRef = useRef(0);
+  // Preserve the repository list shown before a root-level HF search replaces
+  // browseData with search results.  Subsequent query changes must keep using
+  // that bounded snapshot rather than refetching every repository.
+  const hfRootDirectoriesRef = useRef<readonly ExplorerDirectory[] | null>(
+    null,
+  );
   const [quickFilterOpen, setQuickFilterOpen] = useState(false);
   const [quickFilterQuery, setQuickFilterQuery] = useState("");
   // `openEditorFromFiler` is also used by the URL-open effect.  Keep the
@@ -1076,6 +1167,7 @@ function ExplorerContent() {
     setRecordTableFile(null);
     setHfReferenceOpen(false);
     setHydrusError(null);
+    hydrusRetryRef.current = null;
     closeEditor();
   }, [closeEditor, userId]);
 
@@ -1196,7 +1288,7 @@ function ExplorerContent() {
   const canUseFileShortcuts =
     !isRemoteWorkspace && !isHfMode && filerTab !== "hydrus";
   const canUseDownloadShortcut = !isHfMode && filerTab !== "hydrus";
-  const canUseExplorerSearch = !isHfMode && filerTab !== "hydrus";
+  const canUseExplorerSearch = filerTab !== "hydrus";
   const isExplorerInteractionBlocked =
     loading ||
     !!editingFile ||
@@ -1220,6 +1312,39 @@ function ExplorerContent() {
 
   const resetEditorEscape = useCallback(() => {
     editorEscapeStateRef.current = resetDoubleEscapeState();
+  }, []);
+
+  const scheduleEditorEscapeFocusExitCheck = useCallback(() => {
+    if (pendingEditorEscapeFocusExitFrameRef.current !== null) {
+      window.cancelAnimationFrame(
+        pendingEditorEscapeFocusExitFrameRef.current,
+      );
+    }
+    pendingEditorEscapeFocusExitFrameRef.current = window.requestAnimationFrame(
+      () => {
+        pendingEditorEscapeFocusExitFrameRef.current = null;
+        if (
+          isFilesWorkspaceTarget(
+            document.activeElement,
+            explorerRootRef.current,
+          )
+        ) {
+          return;
+        }
+        resetEditorEscape();
+      },
+    );
+  }, [resetEditorEscape]);
+
+  useEffect(() => {
+    return () => {
+      if (pendingEditorEscapeFocusExitFrameRef.current !== null) {
+        window.cancelAnimationFrame(
+          pendingEditorEscapeFocusExitFrameRef.current,
+        );
+        pendingEditorEscapeFocusExitFrameRef.current = null;
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -1267,7 +1392,7 @@ function ExplorerContent() {
         editorEscapeStateRef.current,
         event,
         {
-          blocked: isEditorEscapeBlocked,
+          blocked: isEditorEscapeBlocked || isBookmarkQuickLauncherOpen(),
           now: performance.now(),
         },
       );
@@ -1293,7 +1418,14 @@ function ExplorerContent() {
   // both while remaining scoped to Files-marked surfaces (never all Escapes).
   useEffect(() => {
     const handleFilesKeyDown = (event: KeyboardEvent) => {
-      if (!isFilesWorkspaceTarget(event.target, explorerRootRef.current)) return;
+      if (
+        !isFilesWorkspaceKeyboardTarget(
+          event.target,
+          explorerRootRef.current,
+        )
+      ) {
+        return;
+      }
       processEditorEscape(event, event);
     };
     document.addEventListener("keydown", handleFilesKeyDown, true);
@@ -1308,35 +1440,45 @@ function ExplorerContent() {
   useEffect(() => {
     const handleDocumentFocusOut = (event: FocusEvent) => {
       if (!isFilesWorkspaceTarget(event.target, explorerRootRef.current)) return;
-      if (event.relatedTarget && isFilesWorkspaceTarget(event.relatedTarget, explorerRootRef.current)) {
+      if (event.relatedTarget) {
+        if (isFilesWorkspaceTarget(event.relatedTarget, explorerRootRef.current)) {
+          return;
+        }
+        resetEditorEscape();
         return;
       }
-      resetEditorEscape();
+      scheduleEditorEscapeFocusExitCheck();
     };
     document.addEventListener("focusout", handleDocumentFocusOut, true);
     return () => document.removeEventListener("focusout", handleDocumentFocusOut, true);
-  }, [resetEditorEscape]);
+  }, [resetEditorEscape, scheduleEditorEscapeFocusExitCheck]);
 
   const handleExplorerBlur = useCallback(
     (event: React.FocusEvent<HTMLDivElement>) => {
       const relatedTarget = event.relatedTarget;
-      if (
-        relatedTarget &&
-        isFilesWorkspaceTarget(relatedTarget, event.currentTarget)
-      ) {
+      if (relatedTarget) {
+        if (isFilesWorkspaceTarget(relatedTarget, event.currentTarget)) {
+          return;
+        }
+        resetEditorEscape();
         return;
       }
-      resetEditorEscape();
+      scheduleEditorEscapeFocusExitCheck();
     },
-    [resetEditorEscape],
+    [resetEditorEscape, scheduleEditorEscapeFocusExitCheck],
   );
 
   const resetFileSearchState = useCallback((clearQuery = false) => {
-    if (clearQuery) setFileSearchQuery("");
+    fileSearchGenerationRef.current += 1;
+    if (clearQuery) {
+      setFileSearchQuery("");
+      hfRootDirectoriesRef.current = null;
+    }
     setFileSearchActive(false);
     setFileSearchError(null);
     setFileSearchCount(0);
     setFileSearchTruncated(false);
+    setFileSearchLoading(false);
   }, []);
 
   const clearFileSearch = useCallback(() => {
@@ -1441,14 +1583,49 @@ function ExplorerContent() {
       return;
     }
 
+    const requestGeneration = ++fileSearchGenerationRef.current;
+    const requestPath = currentPath;
+    const requestTab = filerTab;
+    const requestUserId = userId;
+
     setFileSearchLoading(true);
     setFileSearchError(null);
     setFileSearchActive(false);
     setFileSearchTruncated(false);
     try {
-      const data = await explorerSearch(query, currentPath, 200, {
-        regex: fileSearchRegex,
-      });
+      // HF virtual paths must never cross into the local filesystem search
+      // API.  The dedicated helper keeps HF credentials server-side and
+      // preserves virtual paths in its Explorer-compatible results.  At the
+      // HF root, constrain the search to the repository snapshot already
+      // visible in the UI instead of discovering every repository again.
+      let data;
+      if (isHfMode || isHfPath(currentPath)) {
+        let rootDirectories: readonly ExplorerDirectory[] | undefined;
+        if (currentPath === HF_PREFIX) {
+          if (hfRootDirectoriesRef.current === null) {
+            hfRootDirectoriesRef.current = [
+              ...(browseData?.directories ?? []),
+            ];
+          }
+          rootDirectories = hfRootDirectoriesRef.current;
+        }
+        data = await hfExplorerSearch(currentPath, query, 200, {
+          regex: fileSearchRegex,
+          rootDirectories,
+        });
+      } else {
+        data = await explorerSearch(query, currentPath, 200, {
+          regex: fileSearchRegex,
+        });
+      }
+      if (
+        requestGeneration !== fileSearchGenerationRef.current ||
+        requestPath !== currentPath ||
+        requestTab !== filerTab ||
+        requestUserId !== userId
+      ) {
+        return;
+      }
       const directories: ExplorerDirectory[] = [];
       const files: ExplorerFile[] = [];
 
@@ -1475,12 +1652,17 @@ function ExplorerContent() {
       setFileSearchTruncated(Boolean(data.truncated));
       clearSelection();
     } catch (error) {
-      setFileSearchError(explorerErrorMessage(error));
+      if (requestGeneration === fileSearchGenerationRef.current) {
+        setFileSearchError(explorerErrorMessage(error));
+      }
     } finally {
-      setFileSearchLoading(false);
+      if (requestGeneration === fileSearchGenerationRef.current) {
+        setFileSearchLoading(false);
+      }
     }
   }, [
     browseData?.can_go_up,
+    browseData?.directories,
     browseData?.is_admin_mode,
     browseData?.parent_path,
     clearFileSearch,
@@ -1488,7 +1670,10 @@ function ExplorerContent() {
     currentPath,
     fileSearchQuery,
     fileSearchRegex,
+    filerTab,
+    isHfMode,
     setBrowseData,
+    userId,
   ]);
 
   const replaceFileSearch = useCallback(async () => {
@@ -1546,7 +1731,13 @@ function ExplorerContent() {
     setFileSearchQuery("");
     setFileSearchReplaceQuery("");
     setFileSearchRegex(false);
+    hfRootDirectoriesRef.current = null;
   }, [currentPath, filerTab, resetFileSearchState]);
+
+  useEffect(() => {
+    hfRootDirectoriesRef.current = null;
+    resetFileSearchState();
+  }, [resetFileSearchState, userId]);
 
   // ファイルを開く
   const handleFileClick = useCallback(
@@ -2023,7 +2214,48 @@ function ExplorerContent() {
   }, [activePath]);
 
   useEffect(() => {
-    if (loading || isExplorerInteractionBlocked || activePath) return;
+    const restore = historyScrollRestore;
+    if (!restore) {
+      consumedHistoryScrollRestoreRef.current = null;
+      return;
+    }
+    // The provider only emits this signal for a successful history restore.
+    // Keep the page-side DOM work tied to that request's directory and virtual
+    // focus; a late signal from another navigation must be ignored.
+    if (
+      loading ||
+      currentPath !== restore.directoryPath ||
+      focusedItemPath !== restore.focusedItemPath
+    ) {
+      return;
+    }
+    const identity = `${restore.navigationEpoch}\u0000${restore.directoryPath}\u0000${restore.focusedItemPath}`;
+    if (consumedHistoryScrollRestoreRef.current === identity) return;
+    consumedHistoryScrollRestoreRef.current = identity;
+
+    const frame = window.requestAnimationFrame(() => {
+      scrollExplorerItemIntoView(
+        explorerRootRef.current,
+        restore.focusedItemPath,
+      );
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [
+    currentPath,
+    focusedItemPath,
+    historyScrollRestore,
+    loading,
+  ]);
+
+  useEffect(() => {
+    if (
+      loading ||
+      isExplorerInteractionBlocked ||
+      activePath ||
+      historyScrollRestore
+    ) {
+      return;
+    }
     if (!browseData || visibleItems.length === 0) return;
     const frame = window.requestAnimationFrame(() => {
       const firstPath = getRenderedItemPaths()[0] ?? visibleItems[0]?.path;
@@ -2035,6 +2267,7 @@ function ExplorerContent() {
     browseData,
     focusRenderedItemPath,
     getRenderedItemPaths,
+    historyScrollRestore,
     isExplorerInteractionBlocked,
     loading,
     visibleItems,
@@ -2151,6 +2384,40 @@ function ExplorerContent() {
         pendingIncrementalSearchRef.current += e.key;
         return;
       }
+
+      // History navigation is intentionally allowed while a directory GET is
+      // in flight.  ExplorerProvider queues the newer request and binds it to
+      // its navigation epoch; dropping Backspace/Alt+Arrow here would lose a
+      // user's rapid A→B→Back intent.  Other transient surfaces (editor,
+      // viewer, dialogs, context menu, and text inputs) still own the key.
+      const isHistoryShortcut =
+        (!primaryModifier &&
+          !e.altKey &&
+          !e.shiftKey &&
+          e.key === "Backspace") ||
+        (!primaryModifier &&
+          e.altKey &&
+          !e.shiftKey &&
+          (e.key === "ArrowLeft" ||
+            e.key === "ArrowRight" ||
+            e.key === "Backspace"));
+      if (isHistoryShortcut) {
+        const historyNavigationBlocked =
+          !!editingFile ||
+          !!recordTableFile ||
+          !!viewerFile ||
+          !!previewFile ||
+          !!renameTarget ||
+          newFolderOpen ||
+          newTextFileOpen ||
+          !!ctxPos;
+        if (historyNavigationBlocked || isTextInput(e.target)) return;
+        e.preventDefault();
+        if (e.altKey && e.key === "ArrowRight") goForward();
+        else goBack();
+        return;
+      }
+
       if (isExplorerInteractionBlocked || isTextInput(e.target)) return;
       // Files source tabs: Ctrl+← / Ctrl+→.
       // Alt+←/→ は履歴移動、修飾なし←/→はファイルフォーカス移動のまま維持する。
@@ -2231,13 +2498,6 @@ function ExplorerContent() {
         }
       }
 
-      // Backspace は削除ではなく「戻る」。Alt+← と同じ扱い。
-      if (!primaryModifier && !e.altKey && !e.shiftKey && e.key === "Backspace") {
-        e.preventDefault();
-        goBack();
-        return;
-      }
-
       // 現在のファイラータブのホームへ戻る。
       if (
         e.ctrlKey &&
@@ -2253,16 +2513,6 @@ function ExplorerContent() {
       }
 
       if (!primaryModifier && e.altKey && !e.shiftKey) {
-        if (e.key === "ArrowLeft" || e.key === "Backspace") {
-          e.preventDefault();
-          goBack();
-          return;
-        }
-        if (e.key === "ArrowRight") {
-          e.preventDefault();
-          goForward();
-          return;
-        }
         if (e.key === "ArrowUp") {
           e.preventDefault();
           goUp();
@@ -2370,7 +2620,11 @@ function ExplorerContent() {
           return;
         }
       }
-      if (!primaryModifier && !e.altKey && e.shiftKey) {
+      if (
+        !e.altKey &&
+        e.shiftKey &&
+        (!primaryModifier || e.key === "Home" || e.key === "End")
+      ) {
         let offset = 0;
         if (e.key === "ArrowUp") offset = -1;
         if (e.key === "ArrowDown") offset = 1;
@@ -2476,9 +2730,16 @@ function ExplorerContent() {
     closeFileSearch,
     closeQuickFilter,
     cycleFilerTab,
+    ctxPos,
     fileSearchOpen,
+    newFolderOpen,
+    newTextFileOpen,
     openFileSearch,
+    previewFile,
     quickFilterOpen,
+    recordTableFile,
+    renameTarget,
+    viewerFile,
   ]);
 
   const fileSearchControl = fileSearchOpen ? (
@@ -2517,7 +2778,7 @@ function ExplorerContent() {
             id="filer-search-regex"
             checked={fileSearchRegex}
             onCheckedChange={(checked) => setFileSearchRegex(checked === true)}
-            disabled={isRemoteWorkspace}
+            disabled={isRemoteWorkspace || fileSearchLoading}
           />
           正規表現
         </label>
@@ -2670,7 +2931,7 @@ function ExplorerContent() {
   return (
     <div
       ref={explorerRootRef}
-      className="flex h-full min-h-0 min-w-0 flex-row"
+      className="flex min-h-0 min-w-0 flex-1 flex-row overflow-hidden"
       data-shell-workspace="files"
       data-shell-region="files-canvas"
       tabIndex={-1}
@@ -2698,9 +2959,10 @@ function ExplorerContent() {
           onBackgroundContextMenu={handleBackgroundContextMenu}
         />
       ) : (
-        <UploadZone onContextMenu={handleBackgroundContextMenu}>
+        <UploadZone disabled={!isDefaultStorage} onContextMenu={isDefaultStorage ? handleBackgroundContextMenu : undefined}>
           <div
             ref={explorerScrollRef}
+            data-files-scroll-region="browser"
             className="flex h-full min-h-0 flex-col overflow-auto bg-background"
           >
             {/* ヘッダー */}
@@ -2709,7 +2971,7 @@ function ExplorerContent() {
                 <h1 className="text-[16px] font-semibold">Files</h1>
                 {isRemoteWorkspace && <span className="rounded border border-amber-400/30 bg-amber-400/10 px-2 py-0.5 text-[10px] font-medium text-amber-300">Read-only</span>}
               </div>
-              {filerTab !== "hydrus" ? (
+              {isDefaultStorage && filerTab !== "hydrus" ? (
                 <ExplorerToolbar
                   onNewFolder={() => setNewFolderOpen(true)}
                   onAddHfReference={() => setHfReferenceOpen(true)}
@@ -2718,74 +2980,108 @@ function ExplorerContent() {
             </div>
 
             {/* Files tabs: project files / user files / HF / Hydrus */}
-            <div className="flex shrink-0 items-center gap-5 border-b border-border px-6 pt-1">
-              <Button
-                variant={
-                  filerTab === "workspace" && !isAbsoluteFilerPath
-                    ? "default"
-                    : "outline"
-                }
-                size="sm"
-                className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", filerTab === "workspace" && !isAbsoluteFilerPath && "border-primary text-primary")}
-                onClick={() => setFilerTab("workspace")}
-              >
-                {FILER_TAB_LABELS.workspace}
-              </Button>
-              <Button
-                variant={
-                  filerTab === "user" && !isAbsoluteFilerPath
-                    ? "default"
-                    : "outline"
-                }
-                size="sm"
-                className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", filerTab === "user" && !isAbsoluteFilerPath && "border-primary text-primary")}
-                onClick={() => setFilerTab("user")}
-              >
-                {FILER_TAB_LABELS.user}
-              </Button>
-              <Button
-                variant={filerTab === "hf" ? "default" : "outline"}
-                size="sm"
-                className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", filerTab === "hf" && "border-primary text-primary")}
-                onClick={() => setFilerTab("hf")}
-              >
-                {FILER_TAB_LABELS.hf}
-              </Button>
-              <Button
-                variant={filerTab === "hydrus" ? "default" : "outline"}
-                size="sm"
-                className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", filerTab === "hydrus" && "border-primary text-primary")}
-                onClick={() => setFilerTab("hydrus")}
-              >
-                {FILER_TAB_LABELS.hydrus}
-              </Button>
-              {selectedPaths.length > 0 && (
-                <span
-                  className="ml-auto shrink-0 pb-1 text-xs font-medium text-primary"
-                  aria-live="polite"
+            <div className="flex shrink-0 items-center gap-3 border-b border-border px-3 pt-1 sm:px-6" data-files-toolbar="source-storage">
+              <div className="flex min-w-0 flex-1 items-center gap-5 overflow-x-auto">
+                <Button
+                  variant={isDefaultStorage && filerTab === "workspace" && !isAbsoluteFilerPath ? "default" : "outline"}
+                  size="sm"
+                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "workspace" && !isAbsoluteFilerPath && "border-primary text-primary")}
+                  onClick={() => {selectDefaultStorage(); setFilerTab("workspace");}}
                 >
-                  {selectedPaths.length} item
-                  {selectedPaths.length === 1 ? "" : "s"} selected
-                </span>
-              )}
+                  {FILER_TAB_LABELS.workspace}
+                </Button>
+                <Button
+                  variant={isDefaultStorage && filerTab === "user" && !isAbsoluteFilerPath ? "default" : "outline"}
+                  size="sm"
+                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "user" && !isAbsoluteFilerPath && "border-primary text-primary")}
+                  onClick={() => {selectDefaultStorage(); setFilerTab("user");}}
+                >
+                  {FILER_TAB_LABELS.user}
+                </Button>
+                <Button
+                  variant={isDefaultStorage && filerTab === "hf" ? "default" : "outline"}
+                  size="sm"
+                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "hf" && "border-primary text-primary")}
+                  onClick={() => {selectDefaultStorage(); setFilerTab("hf");}}
+                >
+                  {FILER_TAB_LABELS.hf}
+                </Button>
+                <Button
+                  variant={isDefaultStorage && filerTab === "hydrus" ? "default" : "outline"}
+                  size="sm"
+                  className={cn("h-9 rounded-none border-0 border-b-2 border-transparent bg-transparent px-0 text-xs text-muted-foreground hover:bg-transparent hover:text-foreground", isDefaultStorage && filerTab === "hydrus" && "border-primary text-primary")}
+                  onClick={() => {selectDefaultStorage(); setFilerTab("hydrus");}}
+                >
+                  {FILER_TAB_LABELS.hydrus}
+                </Button>
+              </div>
+              <div className="ml-auto flex min-w-0 shrink-0 items-center gap-3 pb-1">
+                {isDefaultStorage && selectedPaths.length > 0 && (
+                  <span className="hidden shrink-0 text-xs font-medium text-primary xl:inline" aria-live="polite">
+                    {selectedPaths.length} item{selectedPaths.length === 1 ? "" : "s"} selected
+                  </span>
+                )}
+                <StorageControls />
+              </div>
             </div>
 
+            <StorageWorkspacePanel />
+            {isDefaultStorage && <>
             {/* Hydrus 検索バー（カスタムUIはこれだけ。結果は context の browseData に流す） */}
             {filerTab === "hydrus" && (
               <HydrusSearchBar
                 onPagingChange={(controller) => {
                   hydrusPagingRef.current = controller;
                 }}
+                onRetryChange={(retry) => {
+                  hydrusRetryRef.current = retry;
+                }}
                 onResults={(data) => {
                   setBrowseData(data);
                   setHydrusError(null);
                 }}
-                onError={(msg) => setHydrusError(msg)}
+                onError={(nextError) => setHydrusError(nextError)}
               />
             )}
             {filerTab === "hydrus" && hydrusError && (
-              <div className="py-2 text-center text-xs text-destructive">
-                {hydrusError}
+              <div
+                className="mx-6 my-2 space-y-1 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                role="alert"
+                aria-live="polite"
+                data-hydrus-error-code={hydrusError.code ?? "unknown"}
+              >
+                <p>{hydrusError.message}</p>
+                {hydrusError.code === "hydrus_endpoint_policy_rejected" && (
+                  <p>
+                    同じPCのHydrus Clientは loopback（localhost / 127.0.0.1 / ::1）を使用してください。LAN上のprivate endpointは安全ポリシーで制限されます。
+                  </p>
+                )}
+                {hydrusError.code === "hydrus_auth_failed" && (
+                  <p>Access KeyとHydrus API権限を確認してください。</p>
+                )}
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {hydrusError.retryable && (
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="outline"
+                      onClick={() => hydrusRetryRef.current?.()}
+                    >
+                      再試行
+                    </Button>
+                  )}
+                  <a
+                    href="/settings#hydrus"
+                    className="underline underline-offset-2"
+                  >
+                    Hydrus設定を開く
+                  </a>
+                  {hydrusError.traceId && (
+                    <span className="text-[10px] opacity-80">
+                      トレースID: {hydrusError.traceId}
+                    </span>
+                  )}
+                </div>
               </div>
             )}
 
@@ -2948,6 +3244,7 @@ function ExplorerContent() {
                   </div>
                 </div>
               )}
+            </>}
           </div>
         </UploadZone>
       )}
@@ -3032,8 +3329,10 @@ function ExplorerContent() {
 function FilerPageInner() {
   return (
     <ExplorerProvider>
-      <FilesWorkspaceShellRegistration />
-      <ExplorerContent />
+      <StorageWorkspace>
+        <FilesWorkspaceShellRegistration />
+        <ExplorerContent />
+      </StorageWorkspace>
     </ExplorerProvider>
   );
 }

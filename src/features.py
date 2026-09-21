@@ -35,6 +35,11 @@ class Features:
         "entertainment": True,     # Spotify/YouTube/ニコニコ等
         "code_agent": False,       # コード保守エージェント（企業用）
         "remote_server_view": True,  # 外部AoiTalkサーバー接続・閲覧（個人版で有効）
+        # WS01 identity foundation remains inert until a later workstream
+        # explicitly enables the corresponding runtime/company/media gate.
+        "autonomous_agent_runtime": False,
+        "virtual_company": False,
+        "media_operations_autonomy": False,
     }
 
     # Enterprise profile - minimal features for code maintenance
@@ -47,6 +52,9 @@ class Features:
         "code_agent": True,
         # 会社版は外向きの外部サーバー接続をしない（逆方向接続の禁止）
         "remote_server_view": False,
+        "autonomous_agent_runtime": False,
+        "virtual_company": False,
+        "media_operations_autonomy": False,
     }
 
     @classmethod
@@ -138,6 +146,9 @@ class Features:
             "crawler_status",
             "entertainment",
             "remote_server_view",
+            "autonomous_agent_runtime",
+            "virtual_company",
+            "media_operations_autonomy",
         }:
             return False
 
@@ -148,6 +159,12 @@ class Features:
             result = env_value.lower() in ("true", "1", "yes")
             if not cls._initialized:
                 logger.debug(f"Feature '{feature}': {result} (from env: {env_key})")
+            if feature == "media_operations_autonomy" and result and not cls.is_enabled(
+                "autonomous_agent_runtime"
+            ):
+                # Media autonomy is a WorkSource on the future common runtime;
+                # never expose it as enabled when that coordinator gate is off.
+                return False
             return result
         
         # 2. Check profile settings
@@ -156,12 +173,20 @@ class Features:
             result = profile_settings[feature]
             if not cls._initialized:
                 logger.debug(f"Feature '{feature}': {result} (from profile)")
+            if feature == "media_operations_autonomy" and result and not cls.is_enabled(
+                "autonomous_agent_runtime"
+            ):
+                return False
             return result
         
         # 3. Fall back to defaults
         result = cls.DEFAULTS.get(feature, False)
         if not cls._initialized:
             logger.debug(f"Feature '{feature}': {result} (from defaults)")
+        if feature == "media_operations_autonomy" and result and not cls.is_enabled(
+            "autonomous_agent_runtime"
+        ):
+            return False
         return result
     
     @classmethod
@@ -181,6 +206,32 @@ class Features:
     def get_all(cls) -> Dict[str, bool]:
         """Get all feature flags as a dictionary"""
         return {feature: cls.is_enabled(feature) for feature in cls.DEFAULTS.keys()}
+
+    @classmethod
+    def dependency_errors(cls) -> list[str]:
+        """Return invalid WS01 feature combinations without enabling them."""
+
+        errors: list[str] = []
+        if cls.media_operations_autonomy() and not cls.autonomous_agent_runtime():
+            errors.append(
+                "media_operations_autonomy requires autonomous_agent_runtime"
+            )
+        if cls.is_enterprise() and any(
+            cls.is_enabled(name)
+            for name in (
+                "autonomous_agent_runtime",
+                "virtual_company",
+                "media_operations_autonomy",
+            )
+        ):
+            errors.append("Enterprise profile forbids WS01 autonomous/company features")
+        return errors
+
+    @classmethod
+    def validate_dependencies(cls) -> bool:
+        """Fail-closed dependency check suitable for startup/readiness gates."""
+
+        return not cls.dependency_errors()
     
     @classmethod
     def reset_cache(cls) -> None:
@@ -223,3 +274,18 @@ class Features:
     def remote_server_view(cls) -> bool:
         """Check if outbound external AoiTalk server connection is enabled"""
         return cls.is_enabled("remote_server_view")
+
+    @classmethod
+    def autonomous_agent_runtime(cls) -> bool:
+        """Whether the future common durable Agent coordinator is enabled."""
+        return cls.is_enabled("autonomous_agent_runtime")
+
+    @classmethod
+    def virtual_company(cls) -> bool:
+        """Whether company/employment Agent management surfaces are enabled."""
+        return cls.is_enabled("virtual_company")
+
+    @classmethod
+    def media_operations_autonomy(cls) -> bool:
+        """Whether future autonomous MediaOps WorkSources may be registered."""
+        return cls.is_enabled("media_operations_autonomy")

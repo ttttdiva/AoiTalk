@@ -1,37 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { timeEntries, tasks, users, projects } from "@/db/schema";
-import { eq, and, gte, lte, desc, inArray } from "drizzle-orm";
+import { eq, and, gte, lte, desc, inArray, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
-import { getParticipatingProjectIds } from "@/lib/server/task-route-utils";
 import {
-  correctLikelyTimerStartedAt,
-  dbTimestampToLocalDate,
-  toDbLocalTimestamp,
+  resolveReadScope,
+  TaskBrowseScopeError,
+} from "@/lib/server/task-route-utils";
+import {
+  calculateTimerDurationSeconds,
+  timerDateKey,
+  toDbTimerTimestamp,
   type DbTimestampValue,
 } from "@/lib/server/db-time";
-
-function toLocalDateKey(value: Date): string {
-  return `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(
-    2,
-    "0",
-  )}-${String(value.getDate()).padStart(2, "0")}`;
-}
 
 function calcDurationSeconds(
   startedAt: DbTimestampValue,
   endedAt: DbTimestampValue,
   now: Date,
 ): number {
-  if (!startedAt) return 0;
-  const start = dbTimestampToLocalDate(startedAt);
-  if (!start) return 0;
-  const effectiveEnd = endedAt ? dbTimestampToLocalDate(endedAt) : now;
-  if (!effectiveEnd) return 0;
-  return Math.max(
-    0,
-    Math.floor((effectiveEnd.getTime() - start.getTime()) / 1000),
-  );
+  return calculateTimerDurationSeconds(startedAt, endedAt, now);
 }
 
 export async function GET(request: NextRequest) {
@@ -41,8 +29,6 @@ export async function GET(request: NextRequest) {
   }
 
   const { searchParams } = new URL(request.url);
-  const projectId = searchParams.get("project_id");
-  const spaceId = searchParams.get("space_id");
   const dateFrom = searchParams.get("date_from");
   const dateTo = searchParams.get("date_to");
 
@@ -53,21 +39,36 @@ export async function GET(request: NextRequest) {
     by_user: [],
     by_project: [],
   };
-  const readableProjectIds = await getParticipatingProjectIds(user.id, {
-    projectId,
-    spaceId: projectId ? null : spaceId,
-  });
+  let readableProjectIds: string[];
+  try {
+    readableProjectIds = (await resolveReadScope(user, searchParams)).projectIds;
+  } catch (error) {
+    if (error instanceof TaskBrowseScopeError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
   if (readableProjectIds.length === 0) {
     return NextResponse.json(emptyResponse);
   }
 
-  const conditions = [inArray(tasks.projectId, readableProjectIds)];
+  const conditions = [
+    inArray(tasks.projectId, readableProjectIds),
+    isNull(tasks.deletedAt),
+    isNull(projects.deletedAt),
+    isNull(timeEntries.deletedAt),
+  ];
 
   if (dateFrom) {
-    conditions.push(gte(timeEntries.startedAt, toDbLocalTimestamp(dateFrom)));
+    // time_entries uses the deployment-zone naive wall clock, unlike generic
+    // task/date fields handled by toDbLocalTimestamp.
+    conditions.push(gte(timeEntries.startedAt, toDbTimerTimestamp(dateFrom)));
   }
   if (dateTo) {
-    conditions.push(lte(timeEntries.startedAt, toDbLocalTimestamp(dateTo)));
+    conditions.push(lte(timeEntries.startedAt, toDbTimerTimestamp(dateTo)));
   }
 
   const rows = await db
@@ -93,11 +94,7 @@ export async function GET(request: NextRequest) {
   let totalSeconds = 0;
   let activeEntries = 0;
   for (const r of rows) {
-    const startedAt =
-      !r.endedAt && r.startedAt
-        ? correctLikelyTimerStartedAt(r.startedAt, r.createdAt, r.source)
-        : r.startedAt;
-    const dur = calcDurationSeconds(startedAt, r.endedAt, now);
+    const dur = calcDurationSeconds(r.startedAt, r.endedAt, now);
     if (dur) totalSeconds += dur;
     if (!r.endedAt) activeEntries++;
   }
@@ -122,11 +119,7 @@ export async function GET(request: NextRequest) {
       project_id: r.projectId,
       project_name: r.projectName,
     };
-    const startedAt =
-      !r.endedAt && r.startedAt
-        ? correctLikelyTimerStartedAt(r.startedAt, r.createdAt, r.source)
-        : r.startedAt;
-    existing.seconds += calcDurationSeconds(startedAt, r.endedAt, now);
+    existing.seconds += calcDurationSeconds(r.startedAt, r.endedAt, now);
     existing.entries += 1;
     taskMap.set(key, existing);
   }
@@ -152,11 +145,7 @@ export async function GET(request: NextRequest) {
       seconds: 0,
       entries: 0,
     };
-    const startedAt =
-      !r.endedAt && r.startedAt
-        ? correctLikelyTimerStartedAt(r.startedAt, r.createdAt, r.source)
-        : r.startedAt;
-    existing.seconds += calcDurationSeconds(startedAt, r.endedAt, now);
+    existing.seconds += calcDurationSeconds(r.startedAt, r.endedAt, now);
     existing.entries += 1;
     projectMap.set(key, existing);
   }
@@ -174,15 +163,10 @@ export async function GET(request: NextRequest) {
   const dayMap = new Map<string, { seconds: number; entries: number }>();
   for (const r of rows) {
     if (!r.startedAt) continue;
-    const startedAt =
-      !r.endedAt && r.startedAt
-        ? correctLikelyTimerStartedAt(r.startedAt, r.createdAt, r.source)
-        : r.startedAt;
-    const start = dbTimestampToLocalDate(startedAt);
-    if (!start) continue;
-    const day = toLocalDateKey(start);
+    const day = timerDateKey(r.startedAt);
+    if (!day) continue;
     const existing = dayMap.get(day) || { seconds: 0, entries: 0 };
-    existing.seconds += calcDurationSeconds(startedAt, r.endedAt, now);
+    existing.seconds += calcDurationSeconds(r.startedAt, r.endedAt, now);
     existing.entries += 1;
     dayMap.set(day, existing);
   }
@@ -224,11 +208,7 @@ export async function GET(request: NextRequest) {
       seconds: 0,
       entries: 0,
     };
-    const startedAt =
-      !r.endedAt && r.startedAt
-        ? correctLikelyTimerStartedAt(r.startedAt, r.createdAt, r.source)
-        : r.startedAt;
-    existing.seconds += calcDurationSeconds(startedAt, r.endedAt, now);
+    existing.seconds += calcDurationSeconds(r.startedAt, r.endedAt, now);
     existing.entries += 1;
     userMap.set(key, existing);
   }

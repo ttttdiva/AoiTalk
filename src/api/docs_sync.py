@@ -20,7 +20,7 @@ from typing import Any, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
-from sqlalchemy import and_, case, false, or_, select
+from sqlalchemy import and_, case, false, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
@@ -44,6 +44,7 @@ from ..services.docs_graph_service import (
 from ..services.docs_acl import (
     batch_sync_node_access,
     docs_readable_node_predicate,
+    docs_node_renderable_predicate,
     can_read_node,
     can_write_node,
     library_can_read,
@@ -411,6 +412,18 @@ def _annotate_docs_page(
 def serialize_docs_node(row: KnowledgeNode) -> dict[str, Any]:
     node_type = _normalize_node_type(row.node_type)
     query_json = row.query_json if isinstance(row.query_json, dict) else None
+    try:
+        body_json = row.body_json if isinstance(row.body_json, dict) else {}
+    except Exception:
+        # Lifecycle/ACL projections must never return ciphertext or fail the
+        # whole page because a stale identity row has an invalid encrypted
+        # payload.  Redact only the unreadable body and keep the node ID and
+        # lifecycle metadata available for cleanup.
+        body_json = {}
+    try:
+        body_text = row.body_text or ""
+    except Exception:
+        body_text = ""
     payload = {
         "id": str(row.id),
         "docs_library_id": str(row.docs_library_id) if row.docs_library_id else None,
@@ -418,12 +431,13 @@ def serialize_docs_node(row: KnowledgeNode) -> dict[str, Any]:
         "root_page_id": str(row.root_page_id) if row.root_page_id else None,
         "project_id": str(row.project_id) if row.project_id else None,
         "system_key": row.system_key,
+        "is_explicit_blank": bool(getattr(row, "is_explicit_blank", False)),
         "title": row.title,
         "aliases": row.aliases if isinstance(row.aliases, list) else [],
         "description": row.description or "",
         # ORM の暗号化プロパティが属性アクセス時に自動復号する（平文を返す）。
-        "body_json": row.body_json if isinstance(row.body_json, dict) else {},
-        "body_text": row.body_text or "",
+        "body_json": body_json,
+        "body_text": body_text,
         "node_type": node_type,
         "display_props": row.display_props if isinstance(row.display_props, dict) else {},
         "query_json": query_json if node_type == "search" else None,
@@ -436,6 +450,35 @@ def serialize_docs_node(row: KnowledgeNode) -> dict[str, Any]:
         "updated_at": _iso(row.updated_at),
         "archived_at": _iso(row.archived_at),
     }
+    # Emit an explicit fail-closed lifecycle state for every identity-bearing
+    # system key, including malformed rows whose project_id/pointer cannot be
+    # resolved.  The async sync serializer below upgrades this projection to
+    # active/retained only after validating the reverse pointer.
+    system_key = str(row.system_key or "").strip()
+    if system_key == "project_information_root":
+        hub_valid = bool(
+            row.archived_at is None
+            and row.parent_id is None
+            and (row.root_page_id is None or row.root_page_id == row.id)
+            and str(row.title or "").strip() == "案件情報"
+        )
+        payload["lifecycle"] = {
+            "kind": "project_information_root",
+            "state": "protected" if hub_valid else "unresolved",
+            "canonical": True,
+            "active": hub_valid,
+            "resolved": hub_valid,
+            "pointer_valid": False,
+        }
+    elif system_key.startswith("project_information:"):
+        payload["lifecycle"] = {
+            "kind": "project_information",
+            "state": "unresolved",
+            "canonical": False,
+            "active": False,
+            "resolved": False,
+            "pointer_valid": False,
+        }
     return with_legacy_docs_library_aliases(payload, row.docs_library_id)
 
 
@@ -450,6 +493,92 @@ async def serialize_docs_node_for_sync(
     """Attach source/access metadata consumed by mobile's local ACL guard."""
 
     payload = serialize_docs_node(row)
+    # Project metadata is the authority for a canonical information-root
+    # title.  Include an additive lifecycle projection in sync responses so a
+    # mobile cache never renders a stale/blank identity from a denormalized
+    # node row alone.  Missing/invalid pointers are explicitly marked stale;
+    # they are never silently adopted as the active canonical node.
+    system_key = str(row.system_key or "").strip()
+    canonical_key = f"project_information:{row.project_id}" if row.project_id else None
+    if canonical_key and system_key == canonical_key:
+        project = await session.get(Project, row.project_id)
+        if project is not None:
+            canonical_title = str(project.name or "").strip() or "案件情報"
+            retained = bool(project.deleted_at is not None or project.is_completed)
+            pointer_matches = project.knowledge_node_id == row.id
+            library_is_owner_personal = (
+                str(getattr(library, "library_type", "personal") or "personal").lower()
+                == "personal"
+                and library.owner_user_id == project.owner_id
+            )
+            hub = (
+                await session.get(KnowledgeNode, row.parent_id)
+                if row.parent_id is not None
+                else None
+            )
+            hub_valid = bool(
+                hub is not None
+                and hub.docs_library_id == row.docs_library_id
+                and str(hub.system_key or "").strip() == "project_information_root"
+                and str(hub.title or "").strip() == "案件情報"
+                and hub.parent_id is None
+                and (hub.root_page_id is None or hub.root_page_id == hub.id)
+                and hub.archived_at is None
+                and getattr(hub, "node_type", None) in (None, "node")
+                and getattr(hub, "is_explicit_blank", False) is not True
+            )
+            tag_valid = False
+            try:
+                tag_result = await session.execute(
+                    select(KnowledgeNodeSupertag.node_id)
+                    .join(
+                        KnowledgeSupertag,
+                        KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                    )
+                    .where(
+                        KnowledgeNodeSupertag.node_id == row.id,
+                        KnowledgeSupertag.docs_library_id == row.docs_library_id,
+                        KnowledgeSupertag.system_key == "project_info",
+                    )
+                    .limit(1)
+                )
+                tag_valid = tag_result.scalar_one_or_none() is not None
+            except Exception:
+                # A metadata lookup failure must not upgrade an identity row
+                # to active; the next pull can retry the strict projection.
+                tag_valid = False
+            structure_valid = bool(
+                library_is_owner_personal
+                and row.archived_at is None
+                and getattr(row, "is_explicit_blank", False) is not True
+                and getattr(row, "node_type", None) in (None, "node")
+                and row.parent_id is not None
+                and row.root_page_id == row.parent_id
+                and hub_valid
+                and tag_valid
+            )
+            pointer_valid = bool(pointer_matches and structure_valid)
+            lifecycle_state = (
+                "retained"
+                if retained
+                else "active"
+                if pointer_valid
+                else "stale"
+            )
+            payload["canonical_title"] = canonical_title
+            payload["lifecycle"] = {
+                "kind": "project_information",
+                "state": lifecycle_state,
+                "canonical": bool(pointer_valid and not retained),
+                "retained": retained,
+                "active": bool(pointer_valid and not retained),
+                "resolved": pointer_valid,
+                "pointer_valid": pointer_valid,
+                "canonical_title": canonical_title,
+            }
+            if pointer_valid:
+                payload["title"] = canonical_title
+                payload["body_text"] = canonical_title
     if access_metadata is not None:
         payload.update(
             {
@@ -654,6 +783,10 @@ async def pull_docs_table(
             project_access,
             KnowledgeNode.project_id == scope_project_id,
         )
+    # Do not let malformed markerless empty rows consume pull pages or become
+    # client-visible ghost paragraphs.  Intentional blanks pass through the
+    # SQL discriminator; system-keyed rows remain visible for lifecycle repair.
+    project_access = and_(project_access, docs_node_renderable_predicate(KnowledgeNode))
     visible_node_ids = select(KnowledgeNode.id).where(
         KnowledgeNode.docs_library_id == docs_library_id,
         project_access,
@@ -704,14 +837,21 @@ async def pull_docs_table(
     if table == "knowledge_nodes":
         digest_rows = (
             await session.execute(
-                select(KnowledgeNode.id, KnowledgeNode.updated_at).where(
+                select(
+                    KnowledgeNode.id,
+                    KnowledgeNode.updated_at,
+                    KnowledgeNode.is_explicit_blank,
+                ).where(
                     KnowledgeNode.docs_library_id == docs_library_id,
                     project_access,
                 )
             )
         ).all()
         digest = _docs_digest(
-            [f"{id_}:{_digest_dt(updated_at)}" for id_, updated_at in digest_rows]
+            [
+                f"{id_}:{_digest_dt(updated_at)}:{int(bool(is_explicit_blank))}"
+                for id_, updated_at, is_explicit_blank in digest_rows
+            ]
         )
         effective_force_full = _effective_force_full(
             force_full,
@@ -836,7 +976,7 @@ async def pull_docs_table(
         if next_cursor is None:
             if include_authoritative_ids:
                 result["authoritative_ids"] = [
-                    str(id_) for id_, _ in digest_rows
+                    str(id_) for id_, _, _ in digest_rows
                 ]
             result["authoritative_scope_id"] = str(docs_library_id)
             result["authoritative_digest"] = digest
@@ -2064,16 +2204,20 @@ async def _active_project_pointer(
         select(Project)
         .where(
             Project.knowledge_node_id == node_id,
-            Project.deleted_at.is_(None),
         )
         .limit(1)
     )
     if for_update:
         stmt = stmt.with_for_update()
+    stmt = stmt.limit(2)
     result = await session.execute(stmt)
-    # Defensive ``first`` avoids a malformed database with duplicate pointer
-    # rows turning a protected root into a 500 before the denial is returned.
-    return result.scalars().first()
+    pointer_rows = result.scalars().all()
+    if len(pointer_rows) > 1:
+        raise DocsOperationError(
+            "複数のProjectが同じDocs nodeを参照しているため操作を中止しました",
+            status_code=409,
+        )
+    return pointer_rows[0] if pointer_rows else None
 
 
 async def _load_canonical_project_node(
@@ -2527,7 +2671,7 @@ async def _apply_node_operation(
 
     if action == "create":
         node_id = parse_uuid(payload.get("id")) or parse_uuid(entity_id)
-        title = str(payload.get("title") or "").strip()
+        title = str(payload.get("title") or "")
         node_type = str(payload.get("node_type") or "node")
         # Validate the full blank discriminator before resolving parents or
         # project roots.  Only an ordinary ``node`` with the canonical
@@ -2537,11 +2681,18 @@ async def _apply_node_operation(
         except ValueError as exc:
             raise DocsOperationError(str(exc), status_code=400) from exc
         explicit_blank = is_explicit_blank_paragraph(title, body_json, node_type)
-        if not title and not explicit_blank:
+        if not title.strip() and not explicit_blank:
             raise DocsOperationError("空行はDocs nodeとして保存できません", status_code=400)
         parent = None
         parent_ref = payload.get("parent_id")
         requested_project_id = parse_uuid(payload.get("project_id"))
+        if requested_project_id is not None:
+            requested_project = await service.session.get(Project, requested_project_id)
+            if requested_project is not None and bool(getattr(requested_project, "is_completed", False)):
+                raise DocsOperationError(
+                    "完了済みProjectのDocsには新しいnodeを作成できません",
+                    status_code=409,
+                )
         if (
             "project_id" in payload
             and payload.get("project_id") not in (None, "")
@@ -2551,6 +2702,8 @@ async def _apply_node_operation(
         canonical_project_root: KnowledgeNode | None = None
         if parent_ref:
             parent = await _get_node(service, docs_library_id, parent_ref)
+            if parent.archived_at is not None:
+                raise DocsOperationError("アーカイブ済みnodeの下には作成できません", status_code=409)
             await assert_generic_allowed(parent, "docs_rest_create")
         if requested_project_id is not None:
             # Explicit Project creates always resolve the canonical Project
@@ -2632,9 +2785,14 @@ async def _apply_node_operation(
 
     if action in ("archive", "delete"):
         node = await _get_node(service, docs_library_id, entity_id)
-        if await _active_project_pointer(service.session, node.id):
+        identity_system_key = str(getattr(node, "system_key", "") or "").strip()
+        if (
+            identity_system_key == "project_information_root"
+            or identity_system_key.startswith("project_information:")
+            or await _active_project_pointer(service.session, node.id)
+        ):
             raise DocsOperationError(
-                "アクティブProjectのcanonical情報rootは通常のDocs操作でアーカイブ/削除できません",
+                "案件情報の正本/stale nodeは通常のDocs操作でアーカイブ/削除できません",
                 status_code=409,
             )
         await assert_generic_allowed(node, "docs_rest_archive")
@@ -2666,7 +2824,79 @@ async def _apply_node_operation(
         if not new_parent_ref:
             raise DocsOperationError("new_parent_id is required", status_code=400)
         new_parent = await _get_node(service, docs_library_id, new_parent_ref)
+        if new_parent.archived_at is not None:
+            raise DocsOperationError("アーカイブ済みnodeの下には移動できません", status_code=409)
+        if str(getattr(new_parent, "system_key", "") or "").strip() == "project_information_root":
+            raise DocsOperationError("案件情報hub直下への通常のDocs moveはできません", status_code=409)
         await assert_generic_allowed(new_parent, "docs_rest_move")
+        identity_system_key = str(getattr(node, "system_key", "") or "").strip()
+        if identity_system_key == "project_information_root" or identity_system_key.startswith(
+            "project_information:"
+        ):
+            raise DocsOperationError(
+                "案件情報hubは通常のDocs moveでは移動できません",
+                status_code=409,
+            )
+        # Moving an ordinary ancestor rewrites root_page_id for its complete
+        # subtree.  Fence that operation when any descendant is a persisted
+        # Project pointer; otherwise a malformed ancestor could invalidate a
+        # canonical child without touching the child directly.
+        pointer_result = await service.session.execute(
+            text(
+                """
+                with recursive descendants as (
+                    select id
+                    from knowledge_nodes
+                    where id = :node_id and docs_library_id = :library_id
+                    union all
+                    select child.id
+                    from knowledge_nodes child
+                    join descendants parent on child.parent_id = parent.id
+                    where child.docs_library_id = :library_id
+                )
+                select p.id
+                from projects p
+                join descendants d on d.id = p.knowledge_node_id
+                limit 1
+                """
+            ),
+            {"node_id": node.id, "library_id": docs_library_id},
+        )
+        if pointer_result.first() is not None:
+            raise DocsOperationError(
+                "Projectが参照するDocs nodeを含むため通常のDocs moveでは移動できません",
+                status_code=409,
+            )
+        identity_result = await service.session.execute(
+            text(
+                """
+                with recursive descendants as (
+                    select id, system_key
+                    from knowledge_nodes
+                    where id = :node_id and docs_library_id = :library_id
+                    union all
+                    select child.id, child.system_key
+                    from knowledge_nodes child
+                    join descendants parent on child.parent_id = parent.id
+                    where child.docs_library_id = :library_id
+                )
+                select id
+                from descendants
+                where id <> :node_id
+                  and (
+                    btrim(system_key) = 'project_information_root'
+                    or btrim(system_key) like 'project_information:%'
+                  )
+                limit 1
+                """
+            ),
+            {"node_id": node.id, "library_id": docs_library_id},
+        )
+        if identity_result.first() is not None:
+            raise DocsOperationError(
+                "Project canonical/stale identityを含むDocs subtreeは通常のmoveで変更できません",
+                status_code=409,
+            )
         node_project_id = parse_uuid(node.project_id)
         parent_project_id = parse_uuid(new_parent.project_id)
         await _ensure_docs_project_allowed(
@@ -2714,12 +2944,29 @@ async def _apply_node_operation(
         node = await _get_node(service, docs_library_id, entity_id)
         active_project_pointer = await _active_project_pointer(service.session, node.id)
         await assert_generic_allowed(node, "docs_rest_update")
+        identity_system_key = str(getattr(node, "system_key", "") or "").strip()
+        if (
+            identity_system_key == "project_information_root"
+            or identity_system_key.startswith("project_information:")
+        ) and active_project_pointer is None:
+            raise DocsOperationError(
+                "stale案件情報の正本nodeは専用クリーンアップ/修復経路でのみ変更できます",
+                status_code=409,
+            )
+        if active_project_pointer is not None and (
+            active_project_pointer.deleted_at is not None
+            or bool(getattr(active_project_pointer, "is_completed", False))
+        ):
+            raise DocsOperationError(
+                "完了/削除済みProjectのcanonical情報rootは通常のDocs操作では変更できません",
+                status_code=409,
+            )
         requested_title = (
-            str(payload.get("title") or "").strip()
+            str(payload.get("title") or "")
             if "title" in payload
             else None
         )
-        if requested_title is not None and not requested_title:
+        if requested_title is not None and not requested_title.strip():
             if not is_explicit_blank_paragraph(
                 requested_title,
                 normalized_body_json,
@@ -2753,14 +3000,9 @@ async def _apply_node_operation(
                 "Docs nodeのProject identityは通常の更新では変更できません",
                 status_code=400,
             )
-        if active_project_pointer is not None and "project_id" in payload:
-            # Even a no-op assignment is a generic identity operation on the
-            # reverse-pointer root.  Keep all Project identity lifecycle work
-            # behind the dedicated Project Information API.
-            raise DocsOperationError(
-                "アクティブProjectのcanonical情報rootのProject identityは変更できません",
-                status_code=409,
-            )
+        # A no-op project_id is emitted by older mobile clients on every
+        # update.  It is harmless when it matches the persisted identity; a
+        # changed value was rejected by the comparison above.
         # A canonical reverse-pointer root may still receive title/body edits,
         # but its parent/identity lifecycle belongs to Project Information
         # APIs, never generic sync operations.
@@ -2790,6 +3032,17 @@ async def _apply_node_operation(
         elif node.parent_id is not None:
             final_parent = await _get_node(service, docs_library_id, str(node.parent_id))
         if final_parent is not None:
+            if final_parent.archived_at is not None:
+                raise DocsOperationError("アーカイブ済みnodeの下には移動できません", status_code=409)
+            if (
+                str(getattr(final_parent, "system_key", "") or "").strip()
+                == "project_information_root"
+                and current_project_id is None
+            ):
+                raise DocsOperationError(
+                    "案件情報hub直下にはProject経由でのみ作成/移動できます",
+                    status_code=409,
+                )
             await assert_generic_allowed(final_parent, "docs_rest_update")
 
         if final_parent is not None:
@@ -2849,10 +3102,30 @@ async def _apply_node_operation(
         if has_content:
             try:
                 body_json = normalized_body_json
+                if active_project_pointer is not None:
+                    # Project metadata is the title authority.  Generic sync
+                    # retries may contain a stale rename or the ordinary blank
+                    # paragraph envelope; neither may corrupt the canonical
+                    # root.  Preserve the canonical document body when the
+                    # editor sends a blank marker.
+                    if "title" in payload:
+                        payload = dict(payload)
+                        payload["title"] = (
+                            str(active_project_pointer.name or "").strip()
+                            or "案件情報"
+                        )
+                    if body_json is not None and is_explicit_blank_paragraph(
+                        "", body_json, getattr(node, "node_type", "node")
+                    ):
+                        body_json = None
                 await service.update_node(
                     node=node,
                     user_id=user_id,
-                    title=payload.get("title"),
+                    title=(
+                        (str(active_project_pointer.name or "").strip() or "案件情報")
+                        if active_project_pointer is not None
+                        else payload.get("title")
+                    ),
                     description=payload.get("description"),
                     body_json=body_json,
                     source_refs=source_refs,
@@ -2899,6 +3172,14 @@ async def _apply_node_supertag_operation(
     if not node_ref:
         raise DocsOperationError("node_id is required", status_code=400)
     node = await _get_node(service, docs_library_id, node_ref)
+    system_key = str(getattr(node, "system_key", "") or "").strip()
+    if system_key == "project_information_root" or system_key.startswith(
+        "project_information:"
+    ) or await service._project_pointer_for_node(node.id) is not None:
+        raise DocsOperationError(
+            "案件情報の正本nodeは通常のDocs supertag操作で変更できません",
+            status_code=409,
+        )
     from ..services.managed_docs_policy import assert_managed_docs_tree_mutation_allowed
 
     try:
@@ -2978,6 +3259,16 @@ async def _apply_field_value_operation(
     if field_id is None:
         raise DocsOperationError("invalid field_id", status_code=400)
     node = await _get_node(service, docs_library_id, node_ref)
+    system_key = str(getattr(node, "system_key", "") or "").strip()
+    if (
+        system_key == "project_information_root"
+        or system_key.startswith("project_information:")
+        or await service._project_pointer_for_node(node.id) is not None
+    ):
+        raise DocsOperationError(
+            "案件情報の正本nodeのProject/Page Role fieldは専用Project APIで管理されます",
+            status_code=409,
+        )
     from ..services.managed_docs_policy import assert_managed_docs_tree_mutation_allowed
 
     try:

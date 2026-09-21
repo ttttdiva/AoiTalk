@@ -1,5 +1,6 @@
-import { and, asc, desc, eq, ilike, inArray, isNull, lt, or, sql } from "drizzle-orm";
-import { existsSync, readdirSync, rmSync, statSync } from "node:fs";
+import { and, asc, desc, eq, ilike, inArray, isNotNull, isNull, lt, or, sql } from "drizzle-orm";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, readdirSync, rmSync, statSync } from "node:fs";
 import { basename, resolve, sep } from "node:path";
 import { db } from "@/db";
 import {
@@ -31,6 +32,7 @@ import {
 } from "@/lib/docs-model";
 import { collectKnowledgeDisplayDescendantIds } from "@/lib/docs-outline-graph";
 import { extractDocsReferenceHints } from "@/lib/docs-references";
+import { isExplicitBlankParagraph } from "@/lib/docs-block-model";
 import {
   getAccessibleProject,
   getWritableProject,
@@ -54,8 +56,13 @@ import {
   decryptDocsNodeBodyText,
   DOCS_NODE_TITLE_MAX,
   insertDocsNode,
+  updateDocsNodeLifecycle,
   updateDocsNode,
 } from "./docs-node-writer";
+import {
+  assertGenericDocsMutationAllowed,
+  managedDocsDomain,
+} from "./managed-docs-policy";
 
 type SessionUser = {
   id: string;
@@ -73,6 +80,116 @@ const VALID_SUGGESTION_STATUSES = new Set([
 ]);
 
 const HOME_SYSTEM_KEY = "home";
+
+/**
+ * The AoiTalk Guide is a first-class, visible Docs subtree.  Its content is
+ * kept in the repository (rather than duplicated in the web bundle) so the
+ * Python and Next.js writers can converge on the same deterministic seed.
+ * Keep the system key stable: it is the ownership boundary used by both the
+ * managed-docs policy and Help retrieval.
+ */
+export const AOITALK_GUIDE_SYSTEM_KEY = "aoitalk_guide";
+const AOITALK_GUIDE_CHILD_KEY_PREFIX = `${AOITALK_GUIDE_SYSTEM_KEY}:`;
+const AOITALK_GUIDE_RESOURCE_NAME = "aoitalk_guide.ja.json";
+
+type AoiTalkGuideSeedSection = {
+  key: string;
+  title: string;
+  sort_order: number;
+  markdown: string;
+  keywords?: string[];
+};
+
+export type AoiTalkGuideSeed = {
+  schema_version: number;
+  seed_version: string;
+  title: string;
+  description: string;
+  intro_markdown: string;
+  sections: AoiTalkGuideSeedSection[];
+  /** SHA-256 of the exact repository resource bytes. */
+  seed_hash: string;
+};
+
+let cachedAoiTalkGuideSeed: AoiTalkGuideSeed | null = null;
+
+function guideResourceCandidates() {
+  // `next dev/start` normally runs with `frontend/` as cwd while local
+  // scripts often run from the repository root.  Resolve both locations and
+  // retain a final parent fallback for packaged `.next` launchers.
+  return [
+    resolve(process.cwd(), "resources", AOITALK_GUIDE_RESOURCE_NAME),
+    resolve(process.cwd(), "..", "resources", AOITALK_GUIDE_RESOURCE_NAME),
+    resolve(process.cwd(), "..", "..", "resources", AOITALK_GUIDE_RESOURCE_NAME),
+  ];
+}
+
+function parseAoiTalkGuideSeed(rawText: string, sourcePath: string): AoiTalkGuideSeed {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (error) {
+    throw new Error(`AoiTalk Guide seed JSONを読み込めません: ${sourcePath}`, { cause: error });
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("AoiTalk Guide seedの形式が不正です");
+  }
+  const value = parsed as Record<string, unknown>;
+  const schemaVersion = Number(value.schema_version);
+  const seedVersion = typeof value.seed_version === "string" ? value.seed_version.trim() : "";
+  const title = typeof value.title === "string" ? value.title.trim() : "";
+  const description = typeof value.description === "string" ? value.description.trim() : "";
+  const introMarkdown = typeof value.intro_markdown === "string" ? value.intro_markdown : "";
+  if (schemaVersion !== 1 || !seedVersion || !title || !introMarkdown) {
+    throw new Error("AoiTalk Guide seedの必須項目が不足しています");
+  }
+  if (!Array.isArray(value.sections) || value.sections.length === 0) {
+    throw new Error("AoiTalk Guide seedに章がありません");
+  }
+  const seenKeys = new Set<string>();
+  const sections: AoiTalkGuideSeedSection[] = value.sections.map((candidate, index) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      throw new Error(`AoiTalk Guide seedの章${index + 1}が不正です`);
+    }
+    const section = candidate as Record<string, unknown>;
+    const key = typeof section.key === "string" ? section.key.trim() : "";
+    const sectionTitle = typeof section.title === "string" ? section.title.trim() : "";
+    const markdown = typeof section.markdown === "string" ? section.markdown : "";
+    const sortOrder = Number(section.sort_order);
+    const keywords = Array.isArray(section.keywords)
+      ? section.keywords.filter((item): item is string => typeof item === "string").map((item) => item.trim()).filter(Boolean)
+      : [];
+    if (!key || !/^[a-z0-9][a-z0-9_-]*$/u.test(key) || seenKeys.has(key) || !sectionTitle || !markdown || !Number.isFinite(sortOrder)) {
+      throw new Error(`AoiTalk Guide seedの章${index + 1}が不正です`);
+    }
+    seenKeys.add(key);
+    return { key, title: sectionTitle, sort_order: sortOrder, markdown, keywords };
+  });
+  return {
+    schema_version: schemaVersion,
+    seed_version: seedVersion,
+    title,
+    description,
+    intro_markdown: introMarkdown,
+    sections,
+    // Match Python's json.dumps(ensure_ascii=False, sort_keys=True,
+    // separators=(",", ":")) so both runtimes converge on one provenance
+    // hash even though they read the resource independently.
+    seed_hash: createHash("sha256").update(stableJson(value), "utf8").digest("hex"),
+  };
+}
+
+/** Load and validate the canonical repository guide seed once per process. */
+export function loadAoiTalkGuideSeed(): AoiTalkGuideSeed {
+  if (cachedAoiTalkGuideSeed) return cachedAoiTalkGuideSeed;
+  const sourcePath = guideResourceCandidates().find((candidate) => existsSync(candidate));
+  if (!sourcePath) {
+    throw new Error(`AoiTalk Guide seedが見つかりません (${AOITALK_GUIDE_RESOURCE_NAME})`);
+  }
+  const rawText = readFileSync(sourcePath, "utf8");
+  cachedAoiTalkGuideSeed = parseAoiTalkGuideSeed(rawText, sourcePath);
+  return cachedAoiTalkGuideSeed;
+}
 
 const HOME_QUERY_DEFAULTS = {
   projects: {
@@ -196,6 +313,106 @@ export function decryptNodeBodyJson(value: unknown): Record<string, unknown> {
   return decryptDocsNodeBodyJson(value);
 }
 
+/**
+ * SQL visibility predicate shared by bootstrap, child metadata, and lazy
+ * children routes.
+ *
+ * ``body_json`` is encrypted for application-managed rows, so SQL must not
+ * inspect its ``blank`` marker.  ``is_explicit_blank`` is a non-sensitive
+ * discriminator maintained by the Docs writer/backfill.  Markerless legacy
+ * ordinary empty rows remain hidden unless they bridge to a meaningful or
+ * explicitly blank descendant.  Identity/system-keyed rows stay addressable
+ * even when malformed so their fail-closed lifecycle can be shown and cleaned
+ * up rather than becoming invisible garbage.
+ */
+export function docsNodeVisibleOrBridge(docsLibraryId: unknown) {
+  return sql<boolean>`(
+    (
+      ${knowledgeNodes.isExplicitBlank} = true
+      AND ${knowledgeNodes.title} = ''
+      AND ${knowledgeNodes.nodeType} = 'node'
+      AND coalesce(btrim(${knowledgeNodes.systemKey}), '') = ''
+    )
+    OR regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
+    OR coalesce(btrim(${knowledgeNodes.systemKey}), '') <> ''
+    OR EXISTS (
+      WITH RECURSIVE blank_descendants AS (
+        SELECT
+          id,
+          parent_id,
+          title,
+          is_explicit_blank,
+          node_type,
+          system_key,
+          archived_at,
+          docs_library_id,
+          ARRAY[id]::uuid[] AS visited_path,
+          0 AS depth
+        FROM knowledge_nodes
+        WHERE parent_id = ${knowledgeNodes.id}
+          AND docs_library_id = ${docsLibraryId}
+        UNION ALL
+        SELECT
+          child.id,
+          child.parent_id,
+          child.title,
+          child.is_explicit_blank,
+          child.node_type,
+          child.system_key,
+          child.archived_at,
+          child.docs_library_id,
+          ancestor.visited_path || ARRAY[child.id]::uuid[],
+          ancestor.depth + 1
+        FROM knowledge_nodes AS child
+        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
+        WHERE child.docs_library_id = ${docsLibraryId}
+          AND ancestor.depth < 512
+          AND NOT child.id = ANY(ancestor.visited_path)
+      )
+      SELECT 1 FROM blank_descendants
+      WHERE archived_at IS NULL
+        AND (
+          (
+            is_explicit_blank = true
+            AND title = ''
+            AND node_type = 'node'
+            AND coalesce(btrim(system_key), '') = ''
+          )
+          OR regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
+        )
+    )
+  )`;
+}
+
+function isDirectDocsNodeRenderable(node: typeof knowledgeNodes.$inferSelect) {
+  // Identity/system-keyed rows stay addressable for stale cleanup.  Ordinary
+  // empty rows require the authoritative discriminator; legacy payloads may
+  // fall back to the strict decrypted marker for compatibility.
+  const raw = node as unknown as Record<string, unknown>;
+  // Lightweight ACL test/adapter rows from older deployments may carry only
+  // identity/library fields. Preserve that compatibility shape; real ORM
+  // rows always expose title/body/node_type and are evaluated strictly below.
+  if (!("title" in raw) && !("bodyJson" in raw) && !("isExplicitBlank" in raw)) {
+    return true;
+  }
+  if (
+    String(node.title ?? "").trim()
+    || (typeof node.systemKey === "string" && node.systemKey.trim())
+  ) return true;
+  if (typeof node.isExplicitBlank === "boolean") {
+    return node.isExplicitBlank === true && node.title === "" && node.nodeType === "node";
+  }
+  try {
+    return isExplicitBlankParagraph(
+      node.title,
+      decryptDocsNodeBodyJson(node.bodyJson),
+      node.nodeType,
+    );
+  } catch {
+    return false;
+  }
+}
+
 export function cleanString(
   value: unknown,
   fallback = "",
@@ -284,6 +501,57 @@ function serializeNodeWithOptions(
   options: { includeBody: boolean },
 ) {
   const includeBody = options.includeBody;
+  const systemKey = typeof row.systemKey === "string" ? row.systemKey.trim() : "";
+  // This serializer intentionally cannot consult Project rows (it is used by
+  // lightweight child/bootstrap queries).  Still emit a fail-closed
+  // lifecycle DTO for identity-bearing system keys so older clients never
+  // interpret a canonical/stale row as an ordinary paragraph.  The sync
+  // serializer enriches this projection with strict pointer validation.
+  const lifecycle = systemKey === "project_information_root"
+    ? {
+        kind: "project_information_root",
+        state: row.archivedAt == null
+          && row.parentId == null
+          && (row.rootPageId == null || row.rootPageId === row.id)
+          && row.isExplicitBlank !== true
+          && String(row.title ?? "").trim() === "案件情報"
+          ? "protected"
+          : "unresolved",
+        canonical: true,
+        active: row.archivedAt == null,
+        resolved: row.archivedAt == null
+          && row.parentId == null
+          && (row.rootPageId == null || row.rootPageId === row.id)
+          && row.isExplicitBlank !== true
+          && String(row.title ?? "").trim() === "案件情報",
+        pointer_valid: false,
+      }
+    : systemKey.startsWith("project_information:")
+      ? {
+          kind: "project_information",
+          state: "unresolved",
+          canonical: false,
+          active: false,
+          resolved: false,
+          pointer_valid: false,
+        }
+      : undefined;
+  let bodyJson: Record<string, unknown> = {};
+  let bodyText = "";
+  if (includeBody) {
+    try {
+      bodyJson = decryptNodeBodyJson(row.bodyJson ?? {});
+    } catch {
+      // Keep malformed legacy ciphertext addressable as a lifecycle/stale row
+      // without ever serializing ciphertext or failing the whole Docs page.
+      bodyJson = {};
+    }
+    try {
+      bodyText = decryptNodeBodyText(row.bodyText ?? "");
+    } catch {
+      bodyText = "";
+    }
+  }
   return {
     id: row.id,
     docs_library_id: row.docsLibraryId,
@@ -291,11 +559,15 @@ function serializeNodeWithOptions(
     root_page_id: row.rootPageId,
     project_id: row.projectId,
     system_key: row.systemKey,
+    // Keep the encrypted body marker and the SQL-visible discriminator in the
+    // DTO.  Consumers that receive an outline/lightweight projection can
+    // still distinguish an intentional blank from a markerless legacy row.
+    is_explicit_blank: row.isExplicitBlank === true,
     title: row.title,
     aliases: Array.isArray(row.aliases) ? row.aliases.filter((item): item is string => typeof item === "string") : [],
     description: row.description ?? "",
-    body_json: includeBody ? decryptNodeBodyJson(row.bodyJson ?? {}) : {},
-    body_text: includeBody ? decryptNodeBodyText(row.bodyText ?? "") : "",
+    body_json: bodyJson,
+    body_text: bodyText,
     node_type: normalizeDocsNodeType(row.nodeType),
     display_props: normalizeJsonObject(row.displayProps ?? {}),
     query_json: normalizeDocsNodeType(row.nodeType) === "search" && row.queryJson && typeof row.queryJson === "object" && !Array.isArray(row.queryJson)
@@ -309,6 +581,7 @@ function serializeNodeWithOptions(
     created_at: serializeDate(row.createdAt),
     updated_at: serializeDate(row.updatedAt),
     archived_at: serializeDate(row.archivedAt),
+    ...(lifecycle ? { lifecycle } : {}),
   };
 }
 
@@ -586,6 +859,284 @@ async function resolveReferenceTargetIds(
   }
 
   return Array.from(targetIds);
+}
+
+type AoiTalkGuideNodeSpec = {
+  systemKey: string;
+  title: string;
+  description: string;
+  markdown: string;
+  parentId: string | null;
+  rootPageId: string | null;
+  sortOrder: number;
+  label: string;
+};
+
+function aoiTalkGuideDisplayProps(
+  seed: AoiTalkGuideSeed,
+  key: string,
+): Record<string, unknown> {
+  return {
+    system_managed: true,
+    managed_domain: "aoitalk_guide",
+    managed_allowed_tools: ["aoitalk_guide_sync"],
+    managed_allow_revival: true,
+    managed_source_refs_required: true,
+    hidden_from_sidebar: false,
+    source: "repository",
+    seed_version: seed.seed_version,
+    seed_sha256: seed.seed_hash,
+    aoitalk_guide: {
+      system_key: key,
+      seed_version: seed.seed_version,
+      seed_sha256: seed.seed_hash,
+      source: "repository",
+    },
+  };
+}
+
+function aoiTalkGuideBodyJson(
+  seed: AoiTalkGuideSeed,
+  markdown: string,
+  label: string,
+  systemKey: string,
+): Record<string, unknown> {
+  return {
+    format: "doc_block",
+    block_type: "markdown",
+    content: markdown,
+    label,
+    aoitalk_guide: {
+      system_key: systemKey,
+      seed_version: seed.seed_version,
+      seed_sha256: seed.seed_hash,
+      source: "repository",
+    },
+  };
+}
+
+function aoiTalkGuideNodeNeedsRepair(
+  row: typeof knowledgeNodes.$inferSelect,
+  spec: AoiTalkGuideNodeSpec,
+  seed: AoiTalkGuideSeed,
+) {
+  let body: Record<string, unknown>;
+  try {
+    body = decryptNodeBodyJson(row.bodyJson ?? {});
+  } catch {
+    return true;
+  }
+  const expectedBody = aoiTalkGuideBodyJson(seed, spec.markdown, spec.label, spec.systemKey);
+  const currentProps = normalizeJsonObject(row.displayProps ?? {});
+  const expectedProps = {
+    ...currentProps,
+    ...aoiTalkGuideDisplayProps(seed, spec.systemKey),
+  };
+  return row.parentId !== spec.parentId
+    || row.rootPageId !== spec.rootPageId
+    || row.projectId !== null
+    || row.appId !== null
+    || row.systemKey !== spec.systemKey
+    || row.title !== spec.title
+    || row.description !== spec.description
+    || !jsonObjectsEqual(row.aliases ?? [], [])
+    || !jsonObjectsEqual(body, expectedBody)
+    || !jsonObjectsEqual(currentProps, expectedProps)
+    || row.nodeType !== "node"
+    || row.queryJson !== null
+    || !jsonObjectsEqual(row.viewJson ?? {}, {})
+    || Number(row.sortOrder ?? 0) !== spec.sortOrder
+    || row.archivedAt !== null;
+}
+
+/**
+ * Materialize the repository-owned AoiTalk Guide under a Personal Docs
+ * library.  The operation is deliberately scoped by the stable system keys;
+ * ordinary user nodes with the same title are never selected or modified.
+ * Every write goes through the encrypted Docs writer and refreshes the
+ * lexical index/revision just like a normal Docs mutation.
+ */
+export async function ensureAoiTalkGuideHierarchy(
+  tx: DocsDb,
+  docsLibraryId: string,
+  userId: string,
+) {
+  const seed = loadAoiTalkGuideSeed();
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(hashtext(${`${docsLibraryId}:aoitalk-guide-seed`}))`,
+  );
+
+  const existingRows = await tx
+    .select()
+    .from(knowledgeNodes)
+    .where(
+      and(
+        eq(knowledgeNodes.docsLibraryId, docsLibraryId),
+        or(
+          eq(knowledgeNodes.systemKey, AOITALK_GUIDE_SYSTEM_KEY),
+          ilike(knowledgeNodes.systemKey, `${AOITALK_GUIDE_CHILD_KEY_PREFIX}%`),
+        ),
+      ),
+    );
+  const bySystemKey = new Map(
+    existingRows
+      .filter((row) => typeof row.systemKey === "string" && row.systemKey.trim())
+      .map((row) => [row.systemKey as string, row]),
+  );
+
+  const rootSpec: AoiTalkGuideNodeSpec = {
+    systemKey: AOITALK_GUIDE_SYSTEM_KEY,
+    title: seed.title,
+    description: "",
+    markdown: seed.intro_markdown,
+    parentId: null,
+    // Top-level roots leave root_page_id NULL; descendants point to this id.
+    rootPageId: null,
+    sortOrder: 0,
+    label: seed.title,
+  };
+
+  let root = bySystemKey.get(AOITALK_GUIDE_SYSTEM_KEY);
+  if (!root) {
+    const rootId = crypto.randomUUID();
+    root = await insertDocsNode(tx, {
+      id: rootId,
+      docsLibraryId,
+      parentId: null,
+      rootPageId: null,
+      projectId: null,
+      appId: null,
+      systemKey: rootSpec.systemKey,
+      title: rootSpec.title,
+      description: rootSpec.description,
+      aliases: [],
+      nodeType: "node",
+      bodyJson: aoiTalkGuideBodyJson(seed, rootSpec.markdown, rootSpec.label, rootSpec.systemKey),
+      displayProps: aoiTalkGuideDisplayProps(seed, rootSpec.systemKey),
+      queryJson: null,
+      viewJson: {},
+      sortOrder: rootSpec.sortOrder,
+      createdBy: userId,
+      updatedBy: userId,
+    });
+    await upsertKnowledgeSearchIndex(tx, root, seed.intro_markdown);
+    await appendKnowledgeRevision(tx, root, userId, "AoiTalkガイドのrootを作成");
+  } else {
+    if (aoiTalkGuideNodeNeedsRepair(root, rootSpec, seed)) {
+      root = await updateDocsNode(tx, root.id, {
+        parentId: null,
+        rootPageId: null,
+        projectId: null,
+        appId: null,
+        systemKey: rootSpec.systemKey,
+        title: rootSpec.title,
+        description: rootSpec.description,
+        aliases: [],
+        nodeType: "node",
+        bodyJson: aoiTalkGuideBodyJson(seed, rootSpec.markdown, rootSpec.label, rootSpec.systemKey),
+        displayProps: {
+          ...normalizeJsonObject(root.displayProps ?? {}),
+          ...aoiTalkGuideDisplayProps(seed, rootSpec.systemKey),
+        },
+        queryJson: null,
+        viewJson: {},
+        sortOrder: rootSpec.sortOrder,
+        archivedAt: null,
+        updatedBy: userId,
+        updatedAt: new Date(),
+      }) ?? root;
+      await upsertKnowledgeSearchIndex(tx, root, seed.intro_markdown);
+      await appendKnowledgeRevision(tx, root, userId, "AoiTalkガイドのrootをseedから修復");
+    } else {
+      // Keep the index fresh if a legacy deployment inserted the row without
+      // a corresponding search entry while avoiding needless revisions.
+      await upsertKnowledgeSearchIndex(tx, root, seed.intro_markdown);
+    }
+  }
+
+  const expectedKeys = new Set<string>([AOITALK_GUIDE_SYSTEM_KEY]);
+  for (const section of seed.sections) {
+    const systemKey = `${AOITALK_GUIDE_CHILD_KEY_PREFIX}${section.key}`;
+    expectedKeys.add(systemKey);
+    const spec: AoiTalkGuideNodeSpec = {
+      systemKey,
+      title: section.title,
+      description: "",
+      markdown: section.markdown,
+      parentId: root.id,
+      rootPageId: root.id,
+      sortOrder: section.sort_order,
+      label: section.title,
+    };
+    let row = bySystemKey.get(systemKey);
+    if (!row) {
+      row = await insertDocsNode(tx, {
+        docsLibraryId,
+        parentId: root.id,
+        rootPageId: root.id,
+        projectId: null,
+        appId: null,
+        systemKey,
+        title: section.title,
+        description: spec.description,
+        aliases: [],
+        nodeType: "node",
+        bodyJson: aoiTalkGuideBodyJson(seed, section.markdown, section.title, systemKey),
+        displayProps: aoiTalkGuideDisplayProps(seed, systemKey),
+        queryJson: null,
+        viewJson: {},
+        sortOrder: section.sort_order,
+        createdBy: userId,
+        updatedBy: userId,
+      });
+      await upsertKnowledgeSearchIndex(tx, row, section.markdown);
+      await appendKnowledgeRevision(tx, row, userId, "AoiTalkガイドの章を作成");
+    } else if (aoiTalkGuideNodeNeedsRepair(row, spec, seed)) {
+      row = await updateDocsNode(tx, row.id, {
+        parentId: root.id,
+        rootPageId: root.id,
+        projectId: null,
+        appId: null,
+        systemKey,
+        title: section.title,
+        description: spec.description,
+        aliases: [],
+        nodeType: "node",
+        bodyJson: aoiTalkGuideBodyJson(seed, section.markdown, section.title, systemKey),
+        displayProps: {
+          ...normalizeJsonObject(row.displayProps ?? {}),
+          ...aoiTalkGuideDisplayProps(seed, systemKey),
+        },
+        queryJson: null,
+        viewJson: {},
+        sortOrder: section.sort_order,
+        archivedAt: null,
+        updatedBy: userId,
+        updatedAt: new Date(),
+      }) ?? row;
+      await upsertKnowledgeSearchIndex(tx, row, section.markdown);
+      await appendKnowledgeRevision(tx, row, userId, "AoiTalkガイドの章をseedから修復");
+    } else {
+      await upsertKnowledgeSearchIndex(tx, row, section.markdown);
+    }
+  }
+
+  // If a future seed removes a chapter, retain its history but hide it from
+  // the active tree.  Only the namespaced system-key closure is eligible.
+  for (const row of existingRows) {
+    const key = typeof row.systemKey === "string" ? row.systemKey.trim() : "";
+    if (!key.startsWith(AOITALK_GUIDE_CHILD_KEY_PREFIX) || expectedKeys.has(key) || row.archivedAt) continue;
+    const archived = await updateDocsNodeLifecycle(tx, row.id, {
+      archivedAt: new Date(),
+      updatedBy: userId,
+      updatedAt: new Date(),
+    });
+    if (archived) {
+      await appendKnowledgeRevision(tx, archived, userId, "AoiTalkガイドの旧章をアーカイブ");
+    }
+  }
+
+  return { root, seed };
 }
 
 export async function syncKnowledgeNodeReferenceEdges(
@@ -932,6 +1483,7 @@ async function seedDefaultDocsWorkspace(
       });
       if (updated) await appendKnowledgeRevision(tx, updated, userId, "Home検索クエリの既定limitを補正");
     }
+    await ensureAoiTalkGuideHierarchy(tx, docsLibraryId, userId);
     return;
   }
 
@@ -978,6 +1530,7 @@ async function seedDefaultDocsWorkspace(
     await upsertKnowledgeSearchIndex(tx, child, effectiveDocsSearchBodyText(child));
     await appendKnowledgeRevision(tx, child, userId, "Home初期テンプレートを作成");
   }
+  await ensureAoiTalkGuideHierarchy(tx, docsLibraryId, userId);
 }
 
 export async function ensureDocsWorkspace(user: SessionUser) {
@@ -1306,11 +1859,12 @@ export async function getDocsNodeAccessMap(
   const ownerProjectRows: typeof candidateRows = [];
   const candidateRowsForAcl: typeof candidateRows = [];
   for (const row of candidateRows) {
+    if (!isDirectDocsNodeRenderable(row.node)) continue;
     if (row.workspace.ownerUserId !== user.id) {
       candidateRowsForAcl.push(row);
       continue;
     }
-    if (row.node.systemKey === "project_information_root" || !row.node.projectId) {
+    if (row.node.systemKey?.trim() === "project_information_root" || !row.node.projectId) {
       accessByNodeId.set(row.node.id, {
         node: row.node,
         workspace: row.workspace,
@@ -1322,7 +1876,7 @@ export async function getDocsNodeAccessMap(
   }
 
   const hubRows = candidateRowsForAcl.filter(
-    (row) => row.node.systemKey === "project_information_root",
+    (row) => row.node.systemKey?.trim() === "project_information_root",
   );
   let hubChildRows: Array<{
     id: string;
@@ -1364,9 +1918,29 @@ export async function getDocsNodeAccessMap(
     ...hubChildRows.map((row) => row.projectId),
   ].filter((value): value is string => Boolean(value));
   const projectPermissions = await getProjectPermissionSets(projectIds, user);
+  // A deleted Project no longer participates in normal ACL checks, but its
+  // retained canonical rows still live in the owner's Personal Library and
+  // must remain inspectable for explicit stale cleanup.
+  const inactiveOwnerProjectIds = new Set<string>();
+  const ownerProjectIds = Array.from(new Set(
+    ownerProjectRows
+      .map((row) => row.node.projectId)
+      .filter((value): value is string => Boolean(value)),
+  ));
+  if (ownerProjectIds.length > 0) {
+    const inactiveRows = await db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(and(inArray(projects.id, ownerProjectIds), isNotNull(projects.deletedAt)));
+    for (const project of inactiveRows) inactiveOwnerProjectIds.add(project.id);
+  }
 
   for (const row of ownerProjectRows) {
-    if (!row.node.projectId || !projectPermissions.readable.has(row.node.projectId)) continue;
+    if (
+      !row.node.projectId
+      || (!projectPermissions.readable.has(row.node.projectId)
+        && !inactiveOwnerProjectIds.has(row.node.projectId))
+    ) continue;
     accessByNodeId.set(row.node.id, {
       node: row.node,
       workspace: row.workspace,
@@ -1390,7 +1964,12 @@ export async function getDocsNodeAccessMap(
   }
 
   const shareCandidates = candidateRowsForAcl.filter(
-    (row) => row.node.systemKey !== "project_information_root" && !row.node.projectId,
+    (row) => {
+      const systemKey = row.node.systemKey?.trim() ?? "";
+      return systemKey !== "project_information_root"
+        && !systemKey.startsWith("project_information:")
+        && !row.node.projectId;
+    },
   );
   const ancestorIdsByNodeId = await getDocsAncestorPaths(
     shareCandidates.map((row) => ({
@@ -1436,12 +2015,76 @@ export async function getDocsNodeAccessMap(
     }
   }
 
+  const identityCandidateIds = candidateRowsForAcl
+    .filter((row) => (row.node.systemKey?.trim() ?? "").startsWith("project_information:"))
+    .map((row) => row.node.id)
+    .filter(Boolean);
+  const strictIdentityIds = new Set<string>();
+  if (identityCandidateIds.length > 0) {
+    try {
+      const strictIdentityRows = await db
+        .select({ id: knowledgeNodes.id })
+        .from(knowledgeNodes)
+        .innerJoin(
+          projects,
+          and(
+            eq(projects.id, knowledgeNodes.projectId),
+            eq(projects.knowledgeNodeId, knowledgeNodes.id),
+          ),
+        )
+        .innerJoin(docsLibraries, eq(docsLibraries.id, knowledgeNodes.docsLibraryId))
+        .innerJoin(
+          knowledgeNodeSupertags,
+          eq(knowledgeNodeSupertags.nodeId, knowledgeNodes.id),
+        )
+        .innerJoin(
+          knowledgeSupertags,
+          eq(knowledgeSupertags.id, knowledgeNodeSupertags.supertagId),
+        )
+        .where(
+          and(
+            inArray(knowledgeNodes.id, identityCandidateIds),
+            eq(knowledgeNodes.nodeType, "node"),
+            isNull(knowledgeNodes.archivedAt),
+            eq(knowledgeNodes.isExplicitBlank, false),
+            eq(knowledgeNodes.rootPageId, knowledgeNodes.parentId),
+            sql`btrim(${knowledgeNodes.systemKey}) = concat('project_information:', ${projects.id})`,
+            isNull(projects.deletedAt),
+            eq(projects.isCompleted, false),
+            eq(docsLibraries.libraryType, "personal"),
+            eq(docsLibraries.ownerUserId, projects.ownerId),
+            eq(knowledgeSupertags.docsLibraryId, docsLibraries.id),
+            eq(knowledgeSupertags.systemKey, "project_info"),
+            sql`EXISTS (
+              SELECT 1
+              FROM knowledge_nodes AS project_information_hub
+              WHERE project_information_hub.id = ${knowledgeNodes.parentId}
+                AND project_information_hub.docs_library_id = ${knowledgeNodes.docsLibraryId}
+                AND project_information_hub.system_key = 'project_information_root'
+                AND project_information_hub.parent_id IS NULL
+                AND (project_information_hub.root_page_id IS NULL
+                     OR project_information_hub.root_page_id = project_information_hub.id)
+                AND project_information_hub.title = '案件情報'
+                AND project_information_hub.archived_at IS NULL
+            )`,
+          ),
+        );
+      for (const row of strictIdentityRows) {
+        if (row.id) strictIdentityIds.add(row.id);
+      }
+    } catch {
+      // A rolling deployment/malformed identity table must not expose
+      // canonical rows to members.  The identity branch below fails closed.
+    }
+  }
+
   for (const row of candidateRowsForAcl) {
+    const systemKey = row.node.systemKey?.trim() ?? "";
     // Evaluate the Personal project-information hub before generic
     // `project_id` handling.  A malformed/stale hub carrying a project id
     // must never grant a member write access; only the library owner may
     // repair such metadata.
-    if (row.node.systemKey === "project_information_root") {
+    if (systemKey === "project_information_root") {
       if (
         !row.node.projectId &&
         !row.node.parentId &&
@@ -1454,6 +2097,18 @@ export async function getDocsNodeAccessMap(
           permission: "read",
         });
       }
+      continue;
+    }
+    if (
+      systemKey.startsWith("project_information:")
+      && (
+        !row.node.projectId
+        || !strictIdentityIds.has(row.node.id)
+        || systemKey.slice("project_information:".length).trim() !== row.node.projectId
+      )
+    ) {
+      // Unresolved/stale identity rows are owner/admin cleanup data, not
+      // ordinary shareable Personal nodes.
       continue;
     }
 
@@ -1722,6 +2377,8 @@ export async function getDocsNodeAccess(
     libraryType: rawWorkspace.libraryType,
   } as typeof docsLibraries.$inferSelect;
 
+  if (!isDirectDocsNodeRenderable(node)) return null;
+
   const directAccess = (permission: DocsNodeAccess["permission"]): DocsNodeAccess => ({
     node,
     workspace,
@@ -1731,12 +2388,14 @@ export async function getDocsNodeAccess(
   // A project-information hub is owner-private metadata.  The owner may
   // always access it (including a stale project_id); members can read only a
   // canonical shell that has a readable active direct project child.
-  if (node.systemKey === "project_information_root") {
+  if (node.systemKey?.trim() === "project_information_root") {
     if (workspace.ownerUserId === user.id) return directAccess("owner");
     if (
+      workspace.libraryType !== "personal" ||
       node.projectId ||
       node.parentId ||
-      node.rootPageId !== node.id
+      node.rootPageId !== node.id ||
+      (node.title?.trim() ?? "") !== "案件情報"
     ) {
       return null;
     }
@@ -1767,12 +2426,84 @@ export async function getDocsNodeAccess(
       : null;
   }
 
+  const identitySystemKey = node.systemKey?.trim() ?? "";
+  if (identitySystemKey.startsWith("project_information:")) {
+    // Any unresolved/duplicate identity is owner-cleanup data.  Do this before
+    // the generic project_id ACL so a misparented duplicate cannot be exposed
+    // to project members as an ordinary writable node.
+    if (workspace.ownerUserId === user.id) return directAccess("owner");
+    const projectId = node.projectId;
+    if (!projectId) return null;
+    const identityProjects = await db
+      .select({
+        id: projects.id,
+        ownerId: projects.ownerId,
+        isCompleted: projects.isCompleted,
+        deletedAt: projects.deletedAt,
+        knowledgeNodeId: projects.knowledgeNodeId,
+      })
+      .from(projects)
+      .where(and(eq(projects.id, projectId), eq(projects.knowledgeNodeId, node.id)))
+      .limit(2);
+    if (identityProjects.length !== 1) return null;
+    const identityProject = identityProjects[0];
+    if (
+      !identityProject
+      || identityProject.isCompleted
+      || identityProject.deletedAt
+      || identitySystemKey.slice("project_information:".length).trim() !== projectId
+      || workspace.libraryType !== "personal"
+      || workspace.ownerUserId !== identityProject.ownerId
+      || node.nodeType !== "node"
+      || node.isExplicitBlank === true
+      || !node.parentId
+      || node.rootPageId !== node.parentId
+    ) return null;
+    const [hub] = await db
+      .select()
+      .from(knowledgeNodes)
+      .where(
+        and(
+          eq(knowledgeNodes.id, node.parentId),
+          eq(knowledgeNodes.docsLibraryId, workspace.id),
+          eq(knowledgeNodes.systemKey, "project_information_root"),
+          isNull(knowledgeNodes.parentId),
+          or(isNull(knowledgeNodes.rootPageId), eq(knowledgeNodes.rootPageId, node.parentId)),
+          isNull(knowledgeNodes.archivedAt),
+          eq(knowledgeNodes.title, "案件情報"),
+        ),
+      )
+      .limit(1);
+    if (!hub) return null;
+    const [tagLink] = await db
+      .select({ nodeId: knowledgeNodeSupertags.nodeId })
+      .from(knowledgeNodeSupertags)
+      .innerJoin(knowledgeSupertags, eq(knowledgeSupertags.id, knowledgeNodeSupertags.supertagId))
+      .where(
+        and(
+          eq(knowledgeNodeSupertags.nodeId, node.id),
+          eq(knowledgeSupertags.docsLibraryId, workspace.id),
+          eq(knowledgeSupertags.systemKey, "project_info"),
+        ),
+      )
+      .limit(1);
+    if (!tagLink) return null;
+  }
+
   const effectiveProjectId = node.projectId;
   if (effectiveProjectId) {
     // Project membership is an ACL gate for every node carrying project_id,
     // including nodes in a Personal Library.  This is the same decision as
     // getDocsNodeAccessMap, but scoped to this one project instead of all
     // project references in the library.
+    if (workspace.ownerUserId === user.id) {
+      const [projectRow] = await db
+        .select({ deletedAt: projects.deletedAt })
+        .from(projects)
+        .where(eq(projects.id, effectiveProjectId))
+        .limit(1);
+      if (projectRow?.deletedAt) return directAccess("owner");
+    }
     const projectPermissions = await getProjectPermissionSets([effectiveProjectId], user);
     if (!projectPermissions.readable.has(effectiveProjectId)) return null;
     if (workspace.ownerUserId === user.id) return directAccess("owner");
@@ -1842,6 +2573,15 @@ export async function getDocsNodeShareManager(
     access.workspace.libraryType !== "personal"
   ) return null;
   if (access.workspace.ownerUserId !== user.id) return null;
+  // Sharing is itself a mutation of the Docs visibility graph.  A Guide
+  // subtree is owner-scoped and must never become reachable through a share,
+  // including when a caller targets an ordinary descendant whose managed
+  // ancestor is only discoverable by walking the parent chain.
+  try {
+    await assertGenericDocsMutationAllowed(access.node);
+  } catch {
+    return null;
+  }
   return access;
 }
 
@@ -1909,41 +2649,7 @@ export async function getKnowledgeNodeChildMetadata(
     : accessibleProjectIds.length > 0
       ? or(isNull(knowledgeNodes.projectId), inArray(knowledgeNodes.projectId, accessibleProjectIds))
       : isNull(knowledgeNodes.projectId);
-  const nodeVisibleOrBridge = sql<boolean>`(
-    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
-    OR EXISTS (
-      WITH RECURSIVE blank_descendants AS (
-        SELECT
-          id,
-          parent_id,
-          title,
-          archived_at,
-          docs_library_id,
-          ARRAY[id]::uuid[] AS visited_path,
-          0 AS depth
-        FROM knowledge_nodes
-        WHERE parent_id = ${knowledgeNodes.id}
-          AND docs_library_id = ${docsLibraryId}
-        UNION ALL
-        SELECT
-          child.id,
-          child.parent_id,
-          child.title,
-          child.archived_at,
-          child.docs_library_id,
-          ancestor.visited_path || ARRAY[child.id]::uuid[],
-          ancestor.depth + 1
-        FROM knowledge_nodes AS child
-        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
-        WHERE child.docs_library_id = ${docsLibraryId}
-          AND ancestor.depth < 512
-          AND NOT child.id = ANY(ancestor.visited_path)
-      )
-      SELECT 1 FROM blank_descendants
-      WHERE archived_at IS NULL
-        AND regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
-    )
-  )`;
+  const nodeVisibleOrBridge = docsNodeVisibleOrBridge(docsLibraryId);
   const notLegacyEmailBlank = sql<boolean>`NOT (
     ${knowledgeNodes.title} = '（空行）'
     AND EXISTS (
@@ -2027,12 +2733,19 @@ export async function getKnowledgeNodeChildMetadata(
     );
   }
   const childCountByParent: Record<string, number> = {};
+  const countedChildren = new Set<string>();
   for (const row of childRows) {
     if (!row.parentId || (visibleChildIds && !visibleChildIds.has(row.id))) continue;
+    const key = `${row.parentId}:${row.id}`;
+    if (countedChildren.has(key)) continue;
+    countedChildren.add(key);
     childCountByParent[row.parentId] = (childCountByParent[row.parentId] ?? 0) + 1;
   }
   for (const row of placementRows) {
     if (!row.parentId || (visibleChildIds && !visibleChildIds.has(row.nodeId))) continue;
+    const key = `${row.parentId}:${row.nodeId}`;
+    if (countedChildren.has(key)) continue;
+    countedChildren.add(key);
     childCountByParent[row.parentId] = (childCountByParent[row.parentId] ?? 0) + 1;
   }
   return {
@@ -2062,6 +2775,450 @@ const docsArchiveLastPurgedAt = new Map<string, number>();
 const docsArchivePurgeInFlight = new Map<string, Promise<number>>();
 
 /**
+ * Physical Docs deletion is deliberately bounded.  A closure that reaches
+ * this depth is treated as unsafe rather than allowing an unbounded recursive
+ * query or a partially inspected cascade to remove data.
+ */
+export const DOCS_DELETION_MAX_DESCENDANT_DEPTH = 512;
+const DOCS_DELETION_MAX_STABILIZATION_PASSES = 4;
+
+export type LockedDocsDeletionClosureRow = {
+  rootId: string;
+  id: string;
+  docsLibraryId: string;
+  depth: number;
+  retainedOrActive: boolean;
+};
+
+function sameStringSet(left: Set<string>, right: Set<string>) {
+  if (left.size !== right.size) return false;
+  for (const value of left) {
+    if (!right.has(value)) return false;
+  }
+  return true;
+}
+
+/**
+ * Select old archived roots in one set-based recursive pass.  The previous
+ * implementation ran a correlated cross-library recursive CTE once per root;
+ * on a large Personal library that made the retention worker exceed its
+ * ten-second HTTP budget before it reached the DELETE statement.
+ *
+ * This query is only an eligibility snapshot.  The destructive transaction
+ * locks and rechecks the closure and Project pointers below.
+ */
+async function selectPurgeableDocsArchiveRootIds(
+  client: DocsDb,
+  docsLibraryId: string,
+  cutoff: Date,
+): Promise<string[]> {
+  const cutoffIso = cutoff.toISOString();
+  const rows = await client.execute(sql`
+    with recursive
+    candidate_roots as materialized (
+      select
+        n.id,
+        n.docs_library_id,
+        n.archived_at
+      from knowledge_nodes n
+      where n.docs_library_id = ${docsLibraryId}
+        and n.archived_at < ${cutoffIso}
+    ),
+    walk as (
+      -- depth=-1 makes a direct child depth=0, matching the former query.
+      select
+        root.id as root_id,
+        root.id as node_id,
+        root.docs_library_id,
+        root.archived_at,
+        array[root.id]::uuid[] as visited_path,
+        -1::integer as depth
+      from candidate_roots root
+
+      union all
+
+      select
+        parent.root_id,
+        child.id,
+        child.docs_library_id,
+        child.archived_at,
+        parent.visited_path || array[child.id]::uuid[],
+        parent.depth + 1
+      from walk parent
+      join knowledge_nodes child
+        on child.parent_id = parent.node_id
+      where parent.depth < 512
+        and not child.id = any(parent.visited_path)
+    ),
+    blocked_roots as (
+      select distinct walk.root_id
+      from walk
+      left join projects project_pointer
+        on project_pointer.knowledge_node_id = walk.node_id
+      where
+        -- Every persisted Project pointer is authoritative, including
+        -- completed and soft-deleted tombstones.
+        project_pointer.id is not null
+        or (
+          walk.node_id <> walk.root_id
+          and (
+            walk.docs_library_id <> ${docsLibraryId}
+            or walk.archived_at is null
+            or walk.archived_at >= ${cutoffIso}
+            or walk.depth >= 512
+          )
+        )
+    )
+    select candidate.id::text as id
+    from candidate_roots candidate
+    left join blocked_roots blocked
+      on blocked.root_id = candidate.id
+    where blocked.root_id is null
+  `) as Array<{ id?: string | null }>;
+
+  return rows
+    .map((row) => row.id)
+    .filter((value): value is string => typeof value === "string");
+}
+
+/**
+ * Lock a physical deletion/archive closure and repeat the recursive snapshot
+ * until no new node IDs are discovered.  The repeat closes the small window
+ * where a child can be committed after a statement snapshot is taken but
+ * before the child row is reached by FOR UPDATE.
+ */
+export async function lockDocsDeletionClosureSnapshot(
+  tx: DocsTransaction,
+  rootIds: readonly string[],
+  options: {
+    /** Archive mode traverses only descendants in this Docs Library. */
+    docsLibraryId?: string;
+    /** GC mode exposes old/active state for each locked row. */
+    cutoff?: Date;
+    /**
+     * Project identity carried by the requested root. Project-bound Docs
+     * mutations acquire this row before any node row; include it in the same
+     * ordered prelock as reverse pointers so DELETE/archive cannot take
+     * node→Project while PATCH/task repair takes Project→node.
+     */
+    projectId?: string;
+  } = {},
+): Promise<LockedDocsDeletionClosureRow[]> {
+  const requestedRootIds = Array.from(new Set(rootIds.filter(Boolean))).sort();
+  if (requestedRootIds.length === 0) return [];
+
+  // Project-information repair locks Project rows before their canonical
+  // nodes.  Pre-lock every Project pointer reachable from the requested
+  // closure (using an unlocked structural snapshot) before taking any node
+  // row lock, so archive/purge cannot invert that order on descendants.
+  const pointerRootCsv = requestedRootIds.join(",");
+  const pointerChildLibraryClause = options.docsLibraryId
+    ? sql`and child.docs_library_id = ${options.docsLibraryId}`
+    : sql``;
+  const requestedProjectId = String(options.projectId ?? "").trim();
+  const requestedProjectClause = requestedProjectId
+    ? sql`union
+      select p.id
+      from projects p
+      where p.id = ${requestedProjectId}`
+    : sql``;
+  await tx.execute(sql`
+    with recursive
+    requested_roots as (
+      select unnest(string_to_array(${pointerRootCsv}, ',')::uuid[]) as root_id
+    ),
+    walk as (
+      select
+        root.id as node_id,
+        0::integer as depth,
+        array[root.id]::uuid[] as visited_path
+      from knowledge_nodes root
+      join requested_roots requested on requested.root_id = root.id
+      union all
+      select
+        child.id,
+        parent.depth + 1,
+        parent.visited_path || array[child.id]::uuid[]
+      from walk parent
+      join knowledge_nodes child on child.parent_id = parent.node_id
+      where parent.depth < ${DOCS_DELETION_MAX_DESCENDANT_DEPTH}
+        and not child.id = any(parent.visited_path)
+        ${pointerChildLibraryClause}
+    ),
+    pointer_projects as (
+      select p.id
+      from projects p
+      join walk on walk.node_id = p.knowledge_node_id
+      union
+      select p.id
+      from projects p
+      join knowledge_nodes node on node.project_id = p.id
+      join walk on walk.node_id = node.id
+      ${requestedProjectClause}
+    )
+    select p.id
+    from projects p
+    join pointer_projects pointer on pointer.id = p.id
+    order by p.id
+    for update of p
+  `);
+
+  // These values came from PostgreSQL UUID columns, not request input.  A
+  // comma-separated UUID list keeps the recursive query under bind limits.
+  const rootCsv = requestedRootIds.join(",");
+  const childLibraryClause = options.docsLibraryId
+    ? sql`and child.docs_library_id = ${options.docsLibraryId}`
+    : sql``;
+  const rootLibraryClause = options.docsLibraryId
+    ? sql`and root.docs_library_id = ${options.docsLibraryId}`
+    : sql``;
+  const retainedOrActiveExpr = options.cutoff
+    ? sql<boolean>`(
+        n.archived_at is null
+        or n.archived_at >= ${options.cutoff.toISOString()}
+      )`
+    : sql<boolean>`false`;
+
+  let previousIds = new Set<string>();
+  for (
+    let pass = 0;
+    pass < DOCS_DELETION_MAX_STABILIZATION_PASSES;
+    pass += 1
+  ) {
+    const rows = await tx.execute(sql`
+      with recursive
+      requested_roots as (
+        select unnest(string_to_array(${rootCsv}, ',')::uuid[]) as root_id
+      ),
+      walk as (
+        select
+          root.id as root_id,
+          root.id as node_id,
+          array[root.id]::uuid[] as visited_path,
+          -1::integer as depth
+        from knowledge_nodes root
+        join requested_roots requested
+          on requested.root_id = root.id
+        where ${sql`true`} ${rootLibraryClause}
+
+        union all
+
+        select
+          parent.root_id,
+          child.id,
+          parent.visited_path || array[child.id]::uuid[],
+          parent.depth + 1
+        from walk parent
+        join knowledge_nodes child
+          on child.parent_id = parent.node_id
+        where parent.depth < 512
+          and not child.id = any(parent.visited_path)
+          ${childLibraryClause}
+      )
+      select
+        walk.root_id::text as "rootId",
+        n.id::text as id,
+        n.docs_library_id::text as "docsLibraryId",
+        walk.depth::integer as depth,
+        ${retainedOrActiveExpr} as "retainedOrActive"
+      from walk
+      join knowledge_nodes n
+        on n.id = walk.node_id
+    `) as LockedDocsDeletionClosureRow[];
+
+    const currentIds = new Set(rows.map((row) => row.id));
+    if (currentIds.size === 0) return [];
+
+    // Once a pass has acquired the complete closure, a repeated structural
+    // snapshot with the same ID set is already covered by those locks.  Do
+    // not issue a second SELECT FOR UPDATE over the same rows; this both
+    // keeps the stabilization pass cheap and avoids needlessly re-entering
+    // adapters that expose a strict lock-query budget.
+    if (sameStringSet(previousIds, currentIds)) return rows;
+
+    // The recursive CTE is an unlocked structural snapshot.  Acquire every
+    // discovered node in deterministic lexical order before the next pass;
+    // this matches task binding and generic Docs mutation paths and prevents
+    // root/child lock inversions during archive/delete.  A child inserted
+    // after a parent lock is held must wait on the FK/key-share lock, so the
+    // stabilization pass observes a consistent closure before destructive
+    // work continues.
+    const orderedIds = [...currentIds].sort();
+    const lockedIds = new Set<string>();
+    for (const chunk of chunkDocsAclIds(orderedIds)) {
+      const lockedRows = await tx
+        .select({ id: knowledgeNodes.id })
+        .from(knowledgeNodes)
+        .where(inArray(knowledgeNodes.id, chunk))
+        .orderBy(asc(knowledgeNodes.id))
+        .for("update");
+      for (const row of lockedRows) lockedIds.add(row.id);
+    }
+    if (!sameStringSet(currentIds, lockedIds)) {
+      throw new Error("Docs deletion closure changed while acquiring node locks");
+    }
+    previousIds = currentIds;
+  }
+
+  throw new Error("Docs deletion closure did not stabilize under concurrent writes");
+}
+
+/**
+ * Project pointers are authoritative regardless of Project lifecycle state.
+ * Callers lock any directly pointed Project row before the node closure and
+ * then invoke this under the same transaction; the closure-scoped FOR UPDATE
+ * catches retained pointers on descendants as well.
+ */
+export async function getAllProjectKnowledgeNodePointerIds(
+  tx: DocsTransaction,
+  nodeIds?: readonly string[],
+): Promise<Set<string>> {
+  const pointerCondition = nodeIds && nodeIds.length > 0
+    ? inArray(projects.knowledgeNodeId, Array.from(nodeIds))
+    : sql`${projects.knowledgeNodeId} is not null`;
+  const pointerQuery = tx
+    .select({ knowledgeNodeId: projects.knowledgeNodeId })
+    .from(projects)
+    .where(pointerCondition);
+  const rows = nodeIds && nodeIds.length > 0
+    ? await pointerQuery.for("update")
+    : await pointerQuery;
+  return new Set(
+    rows
+      .map((row) => row.knowledgeNodeId)
+      .filter((value): value is string => typeof value === "string"),
+  );
+}
+
+/**
+ * Database-only half of archive GC.  Keeping it separate makes the
+ * transaction and PostgreSQL regression path directly testable without
+ * touching the filesystem or the process-local once-per-day throttle.
+ */
+export async function purgeExpiredDocsArchiveDatabase(
+  docsLibraryId: string,
+  now = new Date(),
+): Promise<{ purgedIds: string[]; retentionDays: number; cutoff: Date }> {
+  const retentionDays = readDeletionRetentionDays();
+  const cutoff = new Date(
+    now.getTime() - retentionDays * 24 * 60 * 60 * 1000,
+  );
+  const candidateIds = await selectPurgeableDocsArchiveRootIds(
+    db,
+    docsLibraryId,
+    cutoff,
+  );
+
+  let purgedIds: string[] = [];
+  if (candidateIds.length === 0) {
+    return { purgedIds, retentionDays, cutoff };
+  }
+
+  await db.transaction(async (tx) => {
+    // The candidate SQL is only a snapshot. Take the complete structural
+    // closure first so its Project/reverse-pointer prelock runs before any
+    // candidate node row is locked. Project-information repair and task bind
+    // use Project→node; locking candidates first would invert that order and
+    // allow a GC→Project deadlock.
+    const candidateClosure = await lockDocsDeletionClosureSnapshot(
+      tx,
+      candidateIds,
+      { cutoff },
+    );
+
+    // Recheck candidate age after the Project→node prelock. The closure rows
+    // are already locked and stable; filter them to roots that still satisfy
+    // the retention predicate before deriving the destructive set.
+    const lockedCandidates = await tx
+      .select({ id: knowledgeNodes.id })
+      .from(knowledgeNodes)
+      .where(
+        and(
+          inArray(knowledgeNodes.id, candidateIds),
+          lt(knowledgeNodes.archivedAt, cutoff),
+        ),
+      )
+      .orderBy(asc(knowledgeNodes.id))
+      .for("update");
+    const lockedCandidateIds = lockedCandidates.map((row) => row.id);
+    if (lockedCandidateIds.length === 0) return;
+
+    const lockedCandidateSet = new Set(lockedCandidateIds);
+    const closure = candidateClosure.filter((row) =>
+      lockedCandidateSet.has(row.rootId),
+    );
+    const closureNodes = closure.length > 0
+      ? await tx
+        .select({
+          id: knowledgeNodes.id,
+          docsLibraryId: knowledgeNodes.docsLibraryId,
+          parentId: knowledgeNodes.parentId,
+          systemKey: knowledgeNodes.systemKey,
+          displayProps: knowledgeNodes.displayProps,
+        })
+        .from(knowledgeNodes)
+        .where(inArray(knowledgeNodes.id, closure.map((row) => row.id)))
+        .orderBy(asc(knowledgeNodes.id))
+        .for("update")
+      : [];
+    const projectPointerIds = await getAllProjectKnowledgeNodePointerIds(
+      tx,
+      closure.map((row) => row.id),
+    );
+    const presentRoots = new Set<string>();
+    const blockedRoots = new Set<string>();
+
+    for (const row of closure) {
+      if (row.id === row.rootId) presentRoots.add(row.rootId);
+      const closureNode = closureNodes.find((node) => node.id === row.id);
+      if (closureNode && managedDocsDomain(closureNode)) {
+        blockedRoots.add(row.rootId);
+      }
+      if (
+        projectPointerIds.has(row.id) ||
+        row.docsLibraryId !== docsLibraryId ||
+        row.retainedOrActive ||
+        row.depth >= DOCS_DELETION_MAX_DESCENDANT_DEPTH
+      ) {
+        // A pointer on a descendant blocks every candidate ancestor whose
+        // parent_id CASCADE would physically reach that descendant.
+        blockedRoots.add(row.rootId);
+      }
+    }
+
+    purgedIds = lockedCandidateIds.filter(
+      (id) => presentRoots.has(id) && !blockedRoots.has(id),
+    );
+    if (purgedIds.length === 0) return;
+
+    if (typeof tx.insert === "function") {
+      const batchId = createDeletionBatchId();
+      for (const nodeId of purgedIds) {
+        await appendContentDeletionEvent(tx, {
+          batchId,
+          entityType: "docs_node",
+          entityId: nodeId,
+          rootEntityId: nodeId,
+          action: "purged",
+          source: "web.docs.archive_cleanup",
+          eventAt: now,
+          metadata: { retention_days: retentionDays },
+        });
+      }
+    }
+
+    // Keep PostgreSQL's RESTRICT FK as the final integrity boundary. Any
+    // unexpected restrictive owner must abort this transaction; never turn
+    // SQLSTATE 23503 into a successful cleanup result.
+    await tx
+      .delete(knowledgeNodes)
+      .where(inArray(knowledgeNodes.id, purgedIds));
+  });
+
+  return { purgedIds, retentionDays, cutoff };
+}
+
+/**
  * Docsを開いた時に最大1日1回、30日を過ぎたアーカイブだけを物理削除する。
  * activeまたは保存期間内の子孫を持つ親はcascade対象にせず、データ欠損を防ぐ。
  */
@@ -2071,157 +3228,10 @@ export async function purgeExpiredDocsArchive(docsLibraryId: string, now = new D
   const existingRun = docsArchivePurgeInFlight.get(docsLibraryId);
   if (existingRun) return existingRun;
   const run = (async () => {
-    const retentionDays = readDeletionRetentionDays();
-    const cutoff = new Date(
-      now.getTime() - retentionDays * 24 * 60 * 60 * 1000,
+    const { purgedIds, cutoff } = await purgeExpiredDocsArchiveDatabase(
+      docsLibraryId,
+      now,
     );
-    const cutoffIso = cutoff.toISOString();
-    const rows = await db.execute(sql`
-    with recursive purgeable as (
-      select n.id
-      from knowledge_nodes n
-      where n.docs_library_id = ${docsLibraryId}
-        and n.archived_at < ${cutoffIso}
-        and not exists (
-          with recursive descendants as (
-            select
-              child.id,
-              child.archived_at,
-              child.docs_library_id,
-              array[child.id]::uuid[] as visited_path,
-              0 as depth
-            from knowledge_nodes child
-            where child.parent_id = n.id
-              and child.docs_library_id = ${docsLibraryId}
-            union all
-            select
-              child.id,
-              child.archived_at,
-              child.docs_library_id,
-              parent.visited_path || array[child.id]::uuid[],
-              parent.depth + 1
-            from knowledge_nodes child
-            join descendants parent on child.parent_id = parent.id
-            where child.docs_library_id = ${docsLibraryId}
-              and parent.depth < 512
-              and not child.id = any(parent.visited_path)
-          )
-         select 1 from descendants
-         where archived_at is null or archived_at >= ${cutoffIso}
-       )
-        -- Never let a same-library purge cascade into a foreign child.
-        -- Traverse every descendant library with a visited path; a malformed
-        -- cross-library edge blocks the candidate root entirely.
-        and not exists (
-          with recursive all_descendants as (
-            select
-              child.id,
-              child.docs_library_id,
-              array[child.id]::uuid[] as visited_path,
-              0 as depth
-            from knowledge_nodes child
-            where child.parent_id = n.id
-            union all
-            select
-              child.id,
-              child.docs_library_id,
-              parent.visited_path || array[child.id]::uuid[],
-              parent.depth + 1
-            from knowledge_nodes child
-            join all_descendants parent on child.parent_id = parent.id
-            where parent.depth < 512
-              and not child.id = any(parent.visited_path)
-          )
-          select 1 from all_descendants
-          where docs_library_id <> ${docsLibraryId}
-             or depth >= 512
-        )
-   )
-    select id::text as id
-    from purgeable
-    `) as Array<{ id?: string | null }>;
-    const deletedIds = rows
-      .map((row) => row.id)
-      .filter((value): value is string => typeof value === "string");
-    let purgedIds: string[] = [];
-    if (deletedIds.length > 0) {
-      await db.transaction(async (tx) => {
-        // Recheck and lock the candidate rows inside the same transaction as
-        // the audit insert/delete. A concurrent restore therefore removes the
-        // row from this set instead of being audited and then deleted.
-        const lockedRows = await tx
-          .select({ id: knowledgeNodes.id, parentId: knowledgeNodes.parentId })
-          .from(knowledgeNodes)
-          .where(
-            and(
-              inArray(knowledgeNodes.id, deletedIds),
-              lt(knowledgeNodes.archivedAt, cutoff),
-            ),
-          )
-          .for("update");
-        const candidateIds = new Set(lockedRows.map((row) => row.id));
-        const parentById = new Map<string, string | null>(
-          lockedRows.map((row) => [row.id, row.parentId]),
-        );
-        const blocked = new Set<string>();
-        let frontier = lockedRows.map((row) => row.id);
-        // Lock and inspect the full descendant closure. A restored or
-        // foreign-library child must block its candidate ancestor; otherwise
-        // deleting the parent would cascade into the child after the child
-        // transaction appeared to restore successfully.
-        for (let depth = 0; depth < 512 && frontier.length > 0; depth += 1) {
-          const descendants = await tx
-            .select({
-              id: knowledgeNodes.id,
-              parentId: knowledgeNodes.parentId,
-              archivedAt: knowledgeNodes.archivedAt,
-              docsLibraryId: knowledgeNodes.docsLibraryId,
-            })
-            .from(knowledgeNodes)
-            .where(inArray(knowledgeNodes.parentId, frontier))
-            .for("update");
-          if (descendants.length === 0) break;
-          const next: string[] = [];
-          for (const child of descendants) {
-            parentById.set(child.id, child.parentId);
-            const unsafe =
-              child.docsLibraryId !== docsLibraryId ||
-              child.archivedAt === null ||
-              child.archivedAt >= cutoff;
-            if (unsafe) {
-              let ancestor = child.parentId;
-              while (ancestor && candidateIds.has(ancestor)) {
-                blocked.add(ancestor);
-                ancestor = parentById.get(ancestor) ?? null;
-              }
-            }
-            next.push(child.id);
-          }
-          frontier = next;
-        }
-        purgedIds = lockedRows
-          .map((row) => row.id)
-          .filter((id) => !blocked.has(id));
-        if (purgedIds.length === 0) return;
-
-        if (typeof tx.insert === "function") {
-          const batchId = createDeletionBatchId();
-          for (const nodeId of purgedIds) {
-            await appendContentDeletionEvent(tx, {
-              batchId,
-              entityType: "docs_node",
-              entityId: nodeId,
-              rootEntityId: nodeId,
-              action: "purged",
-              source: "web.docs.archive_cleanup",
-              eventAt: now,
-              metadata: { retention_days: retentionDays },
-            });
-          }
-        }
-        await tx.delete(knowledgeNodes).where(inArray(knowledgeNodes.id, purgedIds));
-      });
-    }
     const cwd = resolve(process.cwd());
     const repoRoot = basename(cwd).toLowerCase() === "frontend" ? resolve(cwd, "..") : cwd;
     const runRoot = resolve(repoRoot, "artifacts", "foam_curation", "phase3_source_v1", "semantic_overlay_runs");
@@ -2343,41 +3353,11 @@ export async function listDocsState(
   const search = filters.search?.trim();
   // Bootstrap must retain a legacy blank root only when it bridges to a
   // meaningful descendant; the client then hoists that descendant.
-  const nodeVisibleOrBridge = sql<boolean>`(
-    regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
-    OR EXISTS (
-      WITH RECURSIVE blank_descendants AS (
-        SELECT
-          id,
-          parent_id,
-          title,
-          archived_at,
-          docs_library_id,
-          ARRAY[id]::uuid[] AS visited_path,
-          0 AS depth
-        FROM knowledge_nodes
-        WHERE parent_id = ${knowledgeNodes.id}
-          AND docs_library_id = ${workspace.id}
-        UNION ALL
-        SELECT
-          child.id,
-          child.parent_id,
-          child.title,
-          child.archived_at,
-          child.docs_library_id,
-          ancestor.visited_path || ARRAY[child.id]::uuid[],
-          ancestor.depth + 1
-        FROM knowledge_nodes AS child
-        INNER JOIN blank_descendants AS ancestor ON child.parent_id = ancestor.id
-        WHERE child.docs_library_id = ${workspace.id}
-          AND ancestor.depth < 512
-          AND NOT child.id = ANY(ancestor.visited_path)
-      )
-      SELECT 1 FROM blank_descendants
-      WHERE archived_at IS NULL
-        AND regexp_replace(trim(title), '[[:space:]]+', '', 'g') <> ''
-    )
-  )`;
+  // The state query spans the actor's own and explicitly shared Personal
+  // Libraries. Bind the bridge predicate to the candidate row's library
+  // column rather than the actor's primary workspace, otherwise an explicit
+  // blank parent in a shared library could lose its meaningful descendants.
+  const nodeVisibleOrBridge = docsNodeVisibleOrBridge(knowledgeNodes.docsLibraryId);
   const nodeConditions = [
     inArray(knowledgeNodes.docsLibraryId, workspaceIds),
     nodeVisibleOrBridge,
@@ -2412,10 +3392,23 @@ export async function listDocsState(
         SELECT 1 FROM email_ancestors WHERE system_key LIKE 'project_mail:%'
       )
     )`,
-    // Bootstrap returns only top-level roots. Project information roots are
-    // real children under the Personal 案件情報 hub and load through the
-    // children route.
-    isNull(knowledgeNodes.parentId),
+    // Normal bootstrap returns only active top-level roots.  An explicit Trash
+    // request additionally returns archived roots whose parent is active (or
+    // missing), so an archived child can be restored/permanently cleaned after
+    // reload without flattening active descendants into the sidebar.
+    filters.includeArchived
+      ? or(
+          isNull(knowledgeNodes.parentId),
+          and(
+            isNotNull(knowledgeNodes.archivedAt),
+            sql<boolean>`not exists (
+              select 1 from knowledge_nodes parent
+              where parent.id = ${knowledgeNodes.parentId}
+                and parent.archived_at is not null
+            )`,
+          ),
+        )
+      : isNull(knowledgeNodes.parentId),
     filters.includeArchived ? undefined : isNull(knowledgeNodes.archivedAt),
     tagNodeIds ? inArray(knowledgeNodes.id, tagNodeIds) : undefined,
   ].filter(Boolean);
@@ -2939,19 +3932,40 @@ export async function getWorkspaceViews(docsLibraryId: string) {
 
 export async function getUserProjects(userId: string) {
   const readableProjectIds = await getReadableProjectIds(userId);
-  if (readableProjectIds.length === 0) return [];
+  const [principal] = await db
+    .select({ role: users.role })
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+  // Retained/deleted Projects are normally absent from operational scope,
+  // but owners (and global admins) need their identity rows in the Docs
+  // lifecycle projection to reach the explicit stale-cleanup endpoint.
+  const inactiveOwnerRows = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(
+      principal?.role === "admin"
+        ? sql`${projects.deletedAt} is not null`
+        : and(eq(projects.ownerId, userId), sql`${projects.deletedAt} is not null`),
+    );
+  const projectIds = Array.from(new Set([
+    ...readableProjectIds,
+    ...inactiveOwnerRows.map((row) => row.id),
+  ]));
+  if (projectIds.length === 0) return [];
   const rows = await db
     .select({ project: projects })
     .from(projects)
     .where(
-      and(
-        isNull(projects.deletedAt),
-        inArray(projects.id, readableProjectIds),
-      ),
+      inArray(projects.id, projectIds),
     );
   return rows.map(({ project }) => ({
     id: project.id,
     name: project.name,
+    owner_user_id: project.ownerId,
+    knowledge_node_id: project.knowledgeNodeId,
+    is_completed: project.isCompleted,
+    deleted_at: serializeDate(project.deletedAt),
     space_id: project.spaceId,
     color:
       project.projectMetadata &&

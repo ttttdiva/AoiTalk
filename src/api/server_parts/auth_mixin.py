@@ -3,6 +3,8 @@
 server.py から移設。ロジックは一切変更していない。
 """
 
+import inspect
+
 from ..server_shared import *  # noqa: F401,F403
 from ...features import Features
 
@@ -82,6 +84,7 @@ class AuthMixin:
 
         cookie_header = self._get_cookie_header(websocket.headers)
         username = None
+        session_user_id = None
         next_user_id = None
         next_payload = None
         session_version = None
@@ -96,9 +99,11 @@ class AuthMixin:
                         session_id, max_age=self.session_ttl_seconds
                     )
                     username = session_data.get("u")
+                    session_user_id = session_data.get("i")
                     session_version = int(session_data.get("v", 1) or 1)
                 except Exception:
                     username = None
+                    session_user_id = None
                     session_version = None
 
         # Match HTTP principal resolution: a valid FastAPI/legacy cookie wins
@@ -132,6 +137,13 @@ class AuthMixin:
             user = None
             if next_user_id:
                 user = await UserRepository.get_by_id(db_session, UUID(next_user_id))
+            elif session_user_id:
+                try:
+                    user = await UserRepository.get_by_id(
+                        db_session, UUID(str(session_user_id))
+                    )
+                except (TypeError, ValueError):
+                    return None
             elif username:
                 user = await UserRepository.get_by_username(db_session, username)
             if (
@@ -455,10 +467,17 @@ class AuthMixin:
         password: str,
         *,
         session: Optional[Any] = None,
+        credential_source: Optional[str] = None,
     ) -> Optional[Any]:
-        """Verify credentials against database (async).
+        """Verify credentials through the canonical password auth service.
 
-        Returns User object if successful, None otherwise.
+        ``PasswordAuthenticationService`` owns source selection (local bcrypt
+        versus Active Directory) and JIT provisioning.  The route passes its
+        throttle transaction's session here so an AD binding/user insert is
+        committed together with the successful login audit.  A narrowly scoped
+        local repository fallback is retained for source-tree/test builds in
+        which the optional service module is unavailable; it never attempts AD
+        and therefore cannot turn an AD outage into local authentication.
         """
         if not self.auth_enabled:
             return True
@@ -467,24 +486,109 @@ class AuthMixin:
             logger.warning("UserRepository not available for authentication")
             return None
 
+        owns_session = session is None
+        if owns_session:
+            session = await self._db_manager.get_session()
+
         try:
-            owns_session = session is None
-            if owns_session:
-                session = await self._db_manager.get_session()
+            # Keep this import lazy: source-tree utilities and migration tools
+            # can import the server without optional LDAP dependencies.
             try:
-                user = await UserRepository.authenticate(
-                    session=session,
-                    username=username,
-                    password=password,
-                    commit=owns_session,
+                from ...security.password_authentication import (
+                    AuthenticationError,
+                    PasswordAuthenticationService,
                 )
-                return user
-            finally:
-                if owns_session:
-                    await session.close()
-        except Exception as e:
-            logger.error(f"Authentication error: {e}")
+            except ImportError:
+                AuthenticationError = None
+                PasswordAuthenticationService = None
+
+            if PasswordAuthenticationService is not None:
+                service = None
+                factory = getattr(self, "_password_authentication_service_factory", None)
+                if callable(factory):
+                    service = factory(session)
+                    if inspect.isawaitable(service):
+                        service = await service
+                if service is None:
+                    # The canonical constructor is dependency-oriented and
+                    # keyword-only; the session belongs to ``authenticate``.
+                    # Retain a small compatibility fallback for deployments
+                    # exposing the older session-bound constructor.
+                    try:
+                        service = PasswordAuthenticationService(
+                            repository=UserRepository,
+                            enterprise=Features.is_enterprise(),
+                        )
+                    except TypeError:
+                        try:
+                            service = PasswordAuthenticationService(
+                                session=session,
+                                repository=UserRepository,
+                                enterprise=Features.is_enterprise(),
+                            )
+                        except TypeError:
+                            service = PasswordAuthenticationService(session)
+
+                authenticate = service.authenticate
+                # Current PasswordAuthenticationService accepts the DB session
+                # as its first argument.  A bound/session-injected legacy
+                # service accepts only username/password; inspect the bound
+                # signature instead of catching arbitrary TypeError from the
+                # authentication implementation itself.
+                parameters = list(inspect.signature(authenticate).parameters.values())
+                takes_session = bool(parameters) and parameters[0].name in {
+                    "session",
+                    "db_session",
+                }
+                if takes_session:
+                    result = await authenticate(
+                        session,
+                        username,
+                        password,
+                        credential_source=credential_source,
+                        commit=owns_session,
+                    )
+                else:
+                    result = await authenticate(
+                        username,
+                        password,
+                        credential_source=credential_source,
+                        commit=owns_session,
+                    )
+                # The canonical service returns PasswordAuthenticationResult;
+                # tolerate a direct User return for compatibility with focused
+                # test doubles and older deployments.
+                user = getattr(result, "user", None)
+                return user if user is not None else result
+
+            # Optional-service fallback: local bcrypt only.  Deliberately do
+            # not execute this branch when an AD source was explicitly chosen.
+            if credential_source and str(credential_source).strip().lower() not in {
+                "local",
+                "password",
+                "bcrypt",
+            }:
+                return None
+            return await UserRepository.authenticate(
+                session=session,
+                username=username,
+                password=password,
+                commit=owns_session,
+            )
+        except Exception as exc:
+            # AuthenticationError carries a stable, safe code consumed by the
+            # route.  Re-raise only that typed failure; all unexpected backend
+            # failures retain the historical fail-closed ``None`` result.
+            if AuthenticationError is not None and isinstance(exc, AuthenticationError):
+                raise
+            # Never serialize exception text at a credential boundary: a
+            # third-party adapter may include the submitted password or bind
+            # name in its diagnostic string.
+            logger.error("Authentication backend failed")
             return None
+        finally:
+            if owns_session:
+                await session.close()
 
     def _verify_credentials(self, username: str, password: str) -> bool:
         """Verify credentials (sync wrapper for backward compatibility).
@@ -517,14 +621,26 @@ class AuthMixin:
             return False
 
     def _sign_session(
-        self, username: str, session_version: Optional[int] = 1
+        self,
+        username: str,
+        session_version: Optional[int] = 1,
+        *,
+        user_id: Optional[Any] = None,
     ) -> str:
         serializer = self._get_serializer()
         if not serializer:
             raise ValueError("WebUI 認証シークレットが未設定です")
-        return serializer.dumps(
-            {"u": username, "v": max(1, int(session_version or 1))}
-        )
+        payload: Dict[str, Any] = {
+            "u": username,
+            "v": max(1, int(session_version or 1)),
+        }
+        # New sessions carry the stable local users.id as an additional
+        # subject while retaining the historical username claim for old
+        # clients/cookies.  Resolvers below prefer ``i`` and only fall back to
+        # ``u`` for legacy cookies.
+        if user_id:
+            payload["i"] = str(user_id)
+        return serializer.dumps(payload)
 
     def _verify_session(self, session_id: str) -> bool:
         if not self.auth_enabled:
@@ -566,12 +682,15 @@ class AuthMixin:
     ) -> bool:
         """Verify a FastAPI cookie against current DB user state.
 
-        Signed cookies contain only a username for backward compatibility, so the
-        reset-required flag must be checked against the current database row.
+        New cookies carry the stable local ``users.id`` subject alongside the
+        historical username claim.  Legacy cookies remain username-based, and
+        every form checks the reset/active/session state against the current DB
+        row.
         """
         session_data = self._signed_session_data(session_id)
         username = session_data.get("u") if session_data else None
-        if not username:
+        user_id = session_data.get("i") if session_data else None
+        if not username and not user_id:
             return False
         if not USER_REPOSITORY_AVAILABLE or self._db_manager is None:
             if raise_on_db_error:
@@ -581,7 +700,18 @@ class AuthMixin:
             from ...memory.models import User
 
             with self._db_manager.get_sync_session() as session:
-                user = session.query(User).filter(User.username == username).first()
+                user = None
+                if user_id:
+                    try:
+                        user = session.get(User, UUID(str(user_id)))
+                    except (TypeError, ValueError):
+                        return False
+                # ``i`` is authoritative for newly issued cookies.  A
+                # missing/invalid subject must not fall back to a stale
+                # mutable username and accidentally authenticate another
+                # account after an AD rename or collision.
+                elif username:
+                    user = session.query(User).filter(User.username == username).first()
                 if user is None or not user.is_active:
                     return False
                 if not self._session_version_matches(
@@ -991,6 +1121,25 @@ class AuthMixin:
                 raise_on_db_error=raise_on_db_error,
             ):
                 return None
+            stable_user_id = session_data.get("i")
+            if stable_user_id and USER_REPOSITORY_AVAILABLE and self._db_manager is not None:
+                try:
+                    from ...memory.models import User
+
+                    with self._db_manager.get_sync_session() as db_session:
+                        stable_user = db_session.get(User, UUID(str(stable_user_id)))
+                        if stable_user is not None:
+                            return stable_user.username
+                        # A new cookie's stable subject is authoritative.  Do
+                        # not authenticate the mutable legacy username when it
+                        # no longer resolves to that same user.
+                        return None
+                except Exception:
+                    if raise_on_db_error:
+                        raise
+                    return None
+            if stable_user_id:
+                return None
             return session_data.get("u")
         except (BadSignature, SignatureExpired):
             return None
@@ -1069,11 +1218,14 @@ class AuthMixin:
             if not bearer:
                 return None
             if bearer.startswith(LONG_LIVED_TOKEN_PREFIX):
-                return await self._get_user_info_from_long_lived_token(
+                user_info = await self._get_user_info_from_long_lived_token(
                     bearer,
                     allow_password_reset=allow_password_reset,
                     raise_on_db_error=raise_on_db_error,
                 )
+                if user_info is not None:
+                    return {**user_info, "_authority_source": "bearer"}
+                return None
             if not AUTH_SERVICE_AVAILABLE:
                 return None
             payload = get_auth_service().verify_token(bearer)
@@ -1130,7 +1282,27 @@ class AuthMixin:
                 if user and user.is_active and (
                     allow_password_reset or not user.is_password_reset_required
                 ):
-                    return user.to_dict()
+                    user_info = user.to_dict()
+                    if bearer_supplied:
+                        authority_source = "bearer"
+                    else:
+                        internal_key = request.headers.get("x-internal-auth")
+                        valid_internal = bool(
+                            internal_key
+                            and internal_key == os.environ.get("INTERNAL_API_KEY", "")
+                        )
+                        forwarded_source = request.headers.get(
+                            "x-forwarded-authority-source", ""
+                        )
+                        if valid_internal:
+                            authority_source = (
+                                "web_session"
+                                if forwarded_source == "web_session"
+                                else "internal"
+                            )
+                        else:
+                            authority_source = "web_session"
+                    return {**user_info, "_authority_source": authority_source}
                 return None
             finally:
                 await session.close()

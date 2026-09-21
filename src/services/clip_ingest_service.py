@@ -27,6 +27,7 @@ from .clip_ingest_policy import is_film_docs_node
 from .clip_ingest_storage import ClipIngestStorage, ClipUpload
 from .docs_acl import can_write_node
 from .docs_graph_service import DocsGraphService, normalize_docs_title_identity
+from .managed_docs_policy import assert_managed_docs_tree_mutation_allowed
 from .url_ingest_service import UrlFetchResult
 
 
@@ -46,6 +47,12 @@ class ClipTarget:
     routing_hint: str
     fallback: bool
     node: KnowledgeNode
+    docs_library_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        # Backward compatibility only: production constructors pass the scalar.
+        if self.docs_library_id is None:
+            self.docs_library_id = getattr(self.node, "docs_library_id", None)
 
 
 @dataclass
@@ -95,6 +102,15 @@ class ClipSavePlan:
     # 候補探索だけを省略し、target直下のtopic子に対して自動分類経路と
     # 同じPhase 3統合判定・保存を行う。
     explicit_target: bool = False
+    # ``existing_node`` may be expired/detached as soon as the planner
+    # provider boundary releases its short-lived AsyncSession.  Finalization
+    # and worker rebind therefore use this immutable scalar identity.
+    existing_node_id: UUID | None = None
+
+    def __post_init__(self) -> None:
+        # Snapshot at plan construction time while the ORM row is still attached.
+        if self.existing_node_id is None:
+            self.existing_node_id = getattr(self.existing_node, "id", None)
 
 
 @dataclass
@@ -467,6 +483,14 @@ _TITLE_UNSUPPORTED_MATERIAL_RE = re.compile(
     r"機能がある|機能を持つ|有料|無料|能力|性能)",
     re.IGNORECASE,
 )
+_TITLE_LABEL_LIMIT = 80
+_TITLE_EXPLANATORY_PREFIX_RE = re.compile(
+    r"^(?:全体として(?:は)?|結論として(?:は)?|まとめると|要するに|つまり)"
+)
+_TITLE_PROSE_ENDING_RE = re.compile(
+    r"(?:である|であり|であった|だった|でした|です|ます|ました|"
+    r"している|されている|となる|になる|できる|できない)$"
+)
 # Routing is intentionally a small, bounded exploration rather than a
 # monolithic save-plan classification call.  Keep this value low enough for
 # inexpensive/low-capability models and to guarantee termination when a model
@@ -755,7 +779,7 @@ class ClipIngestService:
             ambiguous = False
 
         # 対象配下だけを探索する。Docs全体へ候補探索を広げない。
-        target_library_id = target.node.docs_library_id
+        target_library_id = target.docs_library_id
         child_conditions = [
             KnowledgeNode.parent_id == target.node_id,
             KnowledgeNode.archived_at.is_(None),
@@ -778,6 +802,12 @@ class ClipIngestService:
                 or getattr(child, "docs_library_id", target_library_id) == target_library_id
             )
         ]
+        children_by_id: dict[str, KnowledgeNode] = {
+            str(child.id): child for child in children
+        }
+        child_node_ids: dict[str, UUID] = {
+            str(child.id): child.id for child in children
+        }
         canonical_urls = {item.final_url or item.requested_url for item in fetch_results}
         requested_urls = {item.requested_url for item in fetch_results}
         input_urls = set(input_source_urls)
@@ -792,6 +822,7 @@ class ClipIngestService:
             else {}
         )
         duplicate_existing: KnowledgeNode | None = None
+        duplicate_existing_id: UUID | None = None
         has_uploads = bool(uploads)
         for child in children:
             evidence = child_evidence.get(str(getattr(child, "id", "")), {})
@@ -808,10 +839,12 @@ class ClipIngestService:
                 # The attachment hashes are checked later; for now retain the
                 # candidate so a new upload can append to it.
                 duplicate_existing = child
+                duplicate_existing_id = child.id
                 if not has_uploads:
                     return ClipSavePlan(
                         target=target, action="skip", topic=child.title,
-                        existing_node=child, confidence=confidence,
+                        existing_node=child, existing_node_id=duplicate_existing_id,
+                        confidence=confidence,
                         used_supplemental_urls=selected_supplemental_urls,
                         input_source_urls=list(input_source_urls),
                         explicit_target=explicit_target is not None,
@@ -876,6 +909,7 @@ class ClipIngestService:
             legacy_fallback_source=source,
         )
         existing = None
+        existing_node_id: UUID | None = None
         action = "create"
         if children:
             # Existing Docs content and the planner response are untrusted
@@ -931,17 +965,17 @@ class ClipIngestService:
                 integration["action"] == "append"
                 and float(integration["confidence"]) >= self.append_min_confidence
             ):
-                existing = next(
-                    (child for child in children if str(child.id) == integration["existing_node_id"]),
-                    None,
-                )
+                selected_id = str(integration["existing_node_id"] or "")
+                existing = children_by_id.get(selected_id)
                 if existing is not None:
                     action = "append"
+                    existing_node_id = child_node_ids.get(selected_id)
         # A URL duplicate with at least one new upload must never be converted
         # into an unconditional skip.  Reuse the URL node as the append target
         # when the planner returned skip or an unrelated create decision.
         if duplicate_existing is not None and has_uploads:
             existing = duplicate_existing
+            existing_node_id = duplicate_existing_id
             action = "append"
         if action == "create" and not is_v4_canonical:
             promoted_topic, promoted_summary_title, promoted_details, promoted = (
@@ -999,14 +1033,31 @@ class ClipIngestService:
             )
             if promoted:
                 knowledge_items = [promoted]
+        # Legacy v2/v3 keeps the historical rule: an item identical to title
+        # evidence is not materialized again as summary/knowledge.
+        #
+        # Canonical v4 is different: title_evidence may be a longer factual
+        # proposition used only to ground a shorter title paraphrase. That
+        # proposition remains reusable knowledge, so only v4 excludes title
+        # evidence itself from this duplicate set.
+        #
+        # Exact duplicates of materialized verbatim blocks remain blocked in
+        # every schema.
+        dedupe_title_evidence = [
+            str(block.get("content") or "")
+            for block in verbatim_blocks
+        ]
+        if not is_v4_canonical:
+            dedupe_title_evidence = [
+                *parsed.get("_validated_title_evidence", []),
+                *dedupe_title_evidence,
+            ]
+
         knowledge_items = self._deduplicate_knowledge_items(
             knowledge_items,
             topic=topic,
             title_detail=title_detail,
-            title_evidence=[
-                *parsed.get("_validated_title_evidence", []),
-                *(str(block.get("content") or "") for block in verbatim_blocks),
-            ],
+            title_evidence=dedupe_title_evidence,
         )
         # Text-only saves must never silently create a title-only topic when a
         # local/compatible model returns a valid but empty semantic plan.  The
@@ -1059,6 +1110,7 @@ class ClipIngestService:
             typed_blocks=verbatim_blocks,
             verbatim_blocks=verbatim_blocks,
             existing_node=existing,
+            existing_node_id=existing_node_id,
             confidence=confidence,
             used_supplemental_urls=selected_supplemental_urls,
             input_source_urls=list(input_source_urls),
@@ -1080,20 +1132,33 @@ class ClipIngestService:
         node = await self.session.get(KnowledgeNode, target_node_id)
         if node is None or node.archived_at is not None:
             raise ClipIngestError("指定された保存先のDocsノードが存在しないか、アーカイブ済みです")
+        node_library_id = node.docs_library_id
         # A personal library is owner-private.  Project-canonical nodes are
         # the one deliberate exception: their project ACL (checked below)
         # grants access to members even though the physical row lives in the
         # project owner's Personal Library.  The library lookup is optional for
         # rolling test/deployment adapters that predate DocsLibrary; when a
         # row is present it is always authoritative.
-        library = await self.session.get(DocsLibrary, node.docs_library_id)
+        library = await self.session.get(DocsLibrary, node_library_id)
         if library is not None:
-            if library.id != node.docs_library_id:
+            if library.id != node_library_id:
                 raise ClipIngestError("指定された保存先のDocs workspaceが不正です")
             is_personal = str(getattr(library, "library_type", "personal") or "personal") == "personal"
             owner_id = getattr(library, "owner_user_id", None)
             if is_personal and owner_id != user_id and getattr(node, "project_id", None) is None:
                 raise ClipIngestError("他ユーザーのDocs workspaceは保存先に指定できません")
+        try:
+            await assert_managed_docs_tree_mutation_allowed(
+                self.session,
+                node,
+                tool_name="clip_ingest",
+            )
+        except PermissionError as exc:
+            # Clip ingest is a generic writer.  It may never append to or
+            # create below a system-managed subtree (including when a stale
+            # target row has lost its own system_key but still has a managed
+            # ancestor).
+            raise ClipIngestError("システム管理Docsはクリップ取り込み先にできません") from exc
         try:
             writable = await can_write_node(
                 self.session,
@@ -1116,6 +1181,7 @@ class ClipIngestService:
             routing_hint="",
             fallback=False,
             node=node,
+            docs_library_id=node_library_id,
         )
 
     @classmethod
@@ -1388,7 +1454,7 @@ class ClipIngestService:
             select(KnowledgeNode).where(
                 KnowledgeNode.id == plan.target.node_id,
                 KnowledgeNode.docs_library_id
-                == getattr(plan.target.node, "docs_library_id", None),
+                == plan.target.docs_library_id,
                 KnowledgeNode.archived_at.is_(None),
             ).with_for_update()
         )
@@ -1398,19 +1464,28 @@ class ClipIngestService:
                 for row in locked_result.scalars().all()
                 if getattr(row, "id", None) == plan.target.node_id
                 and (
-                    getattr(plan.target.node, "docs_library_id", None) is None
+                    plan.target.docs_library_id is None
                     or getattr(
                         row,
                         "docs_library_id",
-                        getattr(plan.target.node, "docs_library_id", None),
+                        plan.target.docs_library_id,
                     )
-                    == getattr(plan.target.node, "docs_library_id", None)
+                    == plan.target.docs_library_id
                 )
             ),
             None,
         )
         if locked_target is None:
             raise ClipIngestError("保存直前の取り込み先検証に失敗しました")
+        try:
+            await assert_managed_docs_tree_mutation_allowed(
+                self.session,
+                locked_target,
+                tool_name="clip_ingest",
+                source_refs=refs,
+            )
+        except PermissionError as exc:
+            raise ClipIngestError("システム管理Docsはクリップ取り込み先にできません") from exc
         if plan.explicit_target:
             # Re-check the owner boundary after the row lock.  DocsGraphService
             # performs the final write ACL check; this guard prevents a stale
@@ -1427,6 +1502,7 @@ class ClipIngestService:
         if await is_film_docs_node(self.session, locked_target):
             raise ClipIngestError("Film配下はクリップ取り込み先にできません")
         plan.target.node = locked_target
+        plan.target.docs_library_id = getattr(locked_target, "docs_library_id", None)
         if plan.explicit_target:
             # The target may have been renamed between picker resolution and
             # this FOR UPDATE read.  Result labels must reflect the locked
@@ -1480,6 +1556,7 @@ class ClipIngestService:
                 source_keys and source_keys.intersection(existing_source_keys)
             ):
                 plan.existing_node = child
+                plan.existing_node_id = getattr(child, "id", None)
                 if not uploads:
                     return self._result(
                         plan,
@@ -1493,11 +1570,11 @@ class ClipIngestService:
                 break
 
         if plan.action == "append":
-            if plan.existing_node is None:
+            if plan.existing_node_id is None:
                 raise ClipIngestError("追記対象が登録済み取り込み先の直下ではありません")
             locked_existing_result = await self.session.execute(
                 select(KnowledgeNode).where(
-                    KnowledgeNode.id == plan.existing_node.id,
+                    KnowledgeNode.id == plan.existing_node_id,
                     KnowledgeNode.docs_library_id == locked_target.docs_library_id,
                     KnowledgeNode.parent_id == locked_target.id,
                     KnowledgeNode.archived_at.is_(None),
@@ -1507,7 +1584,7 @@ class ClipIngestService:
                 (
                     row
                     for row in locked_existing_result.scalars().all()
-                    if getattr(row, "id", None) == plan.existing_node.id
+                    if getattr(row, "id", None) == plan.existing_node_id
                     and getattr(row, "parent_id", None) == locked_target.id
                     and (
                         getattr(row, "docs_library_id", locked_target.docs_library_id)
@@ -1523,7 +1600,17 @@ class ClipIngestService:
                 raise ClipIngestError(
                     "追記対象が登録済み取り込み先の直下ではありません"
                 )
+            try:
+                await assert_managed_docs_tree_mutation_allowed(
+                    self.session,
+                    locked_existing,
+                    tool_name="clip_ingest",
+                    source_refs=refs,
+                )
+            except PermissionError as exc:
+                raise ClipIngestError("システム管理Docsはクリップ取り込み先にできません") from exc
             plan.existing_node = locked_existing
+            plan.existing_node_id = getattr(locked_existing, "id", None)
             next_body_json = self._body_json_for_plan(
                 getattr(plan.existing_node, "body_json", None),
                 plan,
@@ -1701,6 +1788,14 @@ class ClipIngestService:
                     raise ClipIngestError(
                         f"登録済み取り込み先が削除済み、アーカイブ済み、またはアクセス不能です: {node_id}"
                     )
+            try:
+                await assert_managed_docs_tree_mutation_allowed(
+                    self.session,
+                    node,
+                    tool_name="clip_ingest",
+                )
+            except PermissionError as exc:
+                raise ClipIngestError("システム管理Docsはクリップ取り込み先にできません") from exc
             if await is_film_docs_node(self.session, node):
                 continue
             if node_id in seen:
@@ -1715,6 +1810,7 @@ class ClipIngestService:
                 routing_hint=self._clean_text(raw.get("routing_hint"), 1000),
                 fallback=fallback,
                 node=node,
+                docs_library_id=node_library_id,
             ))
         if fallback_count > 1:
             raise ClipIngestError("未分類時の保存先が複数設定されています")
@@ -2339,13 +2435,15 @@ class ClipIngestService:
             ]),
             "",
             "タイトル・本文の規則:",
-            "- topic/subjectはsourceから後で再利用したい中心知識を表す。優先順位は、(1)中心的な手法・知見・疑問・構図・ワークフロー・設定目的、(2)その知識を識別するために必要な製品/モデル名、(3)使用モデル・実行環境・作者・出典などのmetadata。",
+            "- topic/subjectは一覧・検索・ツリーで中心知識を識別するための短いtitle labelにする。事実説明・条件・結論・knowledge propositionそのものをsubjectへ入れない。例: Anima 3.8B、Anima 3.8B - Qwen3.5 4B併用、真上から横向きの顔を見せる構図、RTX 5090での推論設定。",
+            "- 短い疑問形の見出しは許可する。末尾が ? / ？ であることだけを理由にsubject/title_detailを拒否しない。",
+            "- title_detailも短い識別補助だけにする。subject/title_detailへ入れなかった再利用可能な事実・説明・手順・条件・結論はknowledge_itemsへ保持し、titleを短くしたことを理由に捨てない。",
             "- model:...、model=...、使用モデル:、checkpoint:、provider:、author:、source:、作者名や@handleだけの行はshort_literals/setting/provenanceとして保存し、それだけを理由にsubjectへ昇格させない。sourceがそのモデル/人物/環境自体を説明している場合だけ、中心知識として必要な範囲でsubjectへ含める。",
             "- forum/board/thread/title/date/author/score/ID/レス番号/URLなどの掲示板メタデータ、区切り線、引用番号、sage、削除表示はprovenance/noiseであり、topic/knowledge_itemsへ昇格させない。",
             "- 公式・著者のrecommendationと投稿者のrecommendation/criticismは別々の命題として扱う。誰の発言か、推奨か批判か、対象と極性を落としたり一つへ平均化したりしない。",
             "- subject/title_detailの根拠行をtitle_evidenceで必ず指定する。根拠のない説明は空にする。title_evidenceは単一source rangeを選び、中心語と主要述語がその範囲内にある自然な要約だけを返す。",
             "- titleへ根拠にない製品名・数値・version・能力を追加しない。表記を自然に言い換えても、根拠内の中心語/主要述語を保持し、別source rangeをまたいだ寄せ集めや自由なsemantic fuzzy matchはしない。",
-            "- subjectだけでは識別しづらく、根拠がある場合はtitle_detailを返す。区切り文字は付けない。",
+            "- subjectだけでは識別しづらく、短い識別補助が必要で、その補助も同じ単一source rangeにgroundedな場合だけtitle_detailを返す。区切り文字は付けない。",
             "- content_modeは通常要約summary、原文だけverbatim、要約と原文の両方mixed。",
             "- 複数行プロンプト、コード、台詞、逐語引用、整形依存データ、500字超の行は"
             "verbatim_rangesで元sourceの行範囲を指定する。原文自体をJSONへ転記しない。",
@@ -3308,8 +3406,42 @@ class ClipIngestService:
         return ""
 
     @classmethod
+    def _is_title_like_label(cls, value: Any) -> bool:
+        """Return whether text is shaped like a compact root title label.
+
+        This is deliberately a style gate, not a Japanese grammar classifier.
+        Question marks are permitted.  Only strong long-prose signals are
+        rejected here; factual grounding remains in the existing title gates.
+        """
+
+        text = cls._clean_text(value, _TITLE_LIMIT)
+        if not text or len(text) > _TITLE_LABEL_LIMIT:
+            return False
+        if cls._is_research_control_wrapper(text):
+            return False
+        if _TITLE_EXPLANATORY_PREFIX_RE.search(text):
+            return False
+
+        is_question = bool(re.search(r"[?？]$", text))
+        if len(text) >= 18 and ("…" in text or "..." in text):
+            return False
+        if len(text) >= 18 and re.search(r"[。.!！]$", text):
+            return False
+        if len(text) >= 20 and re.search(r"[、,;；]", text):
+            return False
+
+        bare = re.sub(r"[。.!！?？]+$", "", text).strip()
+        if (
+            len(text) >= 18
+            and not is_question
+            and _TITLE_PROSE_ENDING_RE.search(bare)
+        ):
+            return False
+        return True
+
+    @classmethod
     def _central_title_line_score(cls, value: Any) -> int:
-        """Score a source line as a reusable central-knowledge title."""
+        """Score a source line as a compact reusable root title label."""
 
         text = cls._clean_text(value, _TITLE_LIMIT)
         if not text:
@@ -3320,17 +3452,22 @@ class ClipIngestService:
             or cls._is_research_control_wrapper(text)
             or re.fullmatch(r"https?://\S+", text, re.IGNORECASE)
             or re.fullmatch(r"[\"'「『].*[\"'」』]", text)
+            or not cls._is_title_like_label(text)
         ):
             return -1
-        # A single ``こうかな？`` line is a useful question only when it is
-        # substantive; keep short conversational headers from winning.
-        if len(text) < 8 and not re.search(r"[?？。.!！]", text):
-            return -1
-        score = 1
-        score += 3 * sum(marker in text for marker in _TITLE_CENTRAL_MARKERS)
-        score += int(len(text) >= 18)
-        score += int(bool(re.search(r"[。.!！?？]", text)))
-        score += int(bool(re.search(r"(?:は|が|を|で|に|として|という)", text)))
+        score = 100
+        if len(text) <= 24:
+            score += 12
+        elif len(text) <= 48:
+            score += 8
+        else:
+            score += 4
+        if re.search(r"[A-Za-z][A-Za-z0-9._-]*|\d", text):
+            score += 3
+        if any(marker in text for marker in _TITLE_CENTRAL_MARKERS):
+            score += 2
+        if re.search(r"[-–—/:：]", text):
+            score += 1
         return score
 
     @classmethod
@@ -3339,46 +3476,30 @@ class ClipIngestService:
         parsed: dict[str, Any],
         source_catalog: dict[str, dict[str, str]],
     ) -> tuple[str, str] | None:
-        """Select one central-knowledge title and its single source range."""
+        """Select one compact source title label and its single source range."""
 
+        del parsed
         records = cls._title_source_lines(source_catalog)
         if not records:
             return None
         candidates: list[tuple[int, int, str, str]] = []
-        # Planner-provided semantic units are preferred when they map to one
-        # concrete source line; this keeps a safe natural paraphrase instead
-        # of blindly copying a heading.
-        raw_items = parsed.get("knowledge_items")
-        if not isinstance(raw_items, list):
-            raw_items = []
-        for raw_item in raw_items:
-            item = cls._clean_text(raw_item, _TITLE_LIMIT)
-            if (
-                not item
-                or cls._title_subject_is_metadata(item, source_catalog)
-                or cls._central_title_line_score(item) < 0
-            ):
-                continue
-            for source_id, line_number, line in records:
-                if not cls._title_semantic_grounding(item, line):
-                    continue
-                score = cls._central_title_line_score(item)
-                # A planner semantic unit is useful as a safe paraphrase, but
-                # the source's own high-signal central line should win when
-                # available (for example the overall composition/design line
-                # in the golden prompt clip).
-                candidates.append((score + 2, 0 if source_id == "source:0" else 1, item, f"{source_id}\n{line_number}:{line}"))
-                break
         for source_id, line_number, line in records:
+            if source_id.startswith("attachment:"):
+                continue
             score = cls._central_title_line_score(line)
             if score < 0:
                 continue
-            candidates.append((score, 0 if source_id == "source:0" else 1, line, f"{source_id}\n{line_number}:{line}"))
+            candidates.append(
+                (
+                    score,
+                    0 if source_id == "source:0" else 1,
+                    line,
+                    f"{source_id}\n{line_number}:{line}",
+                )
+            )
         if not candidates:
             return None
-        # Preserve source order for ties.  The source line itself is returned
-        # as the evidence text; the caller stores only its validated range.
-        _, source_priority, text, evidence_key = max(
+        _, _, text, evidence_key = max(
             candidates,
             key=lambda item: (item[0], -item[1]),
         )
@@ -3395,25 +3516,23 @@ class ClipIngestService:
     ) -> str:
         content = source_catalog.get("source:0", {}).get("content", "")
         scored: list[tuple[int, int, str]] = []
-        fallback_lines: list[str] = []
-        for raw_line in content.split("\n"):
+        for index, raw_line in enumerate(content.split("\n")):
             line = cls._plain_line(raw_line)
             if (
                 not line
                 or cls._is_semantic_noise_line(line)
                 or (skip_research_wrapper and cls._is_research_control_wrapper(line))
                 or re.fullmatch(r"https?://\S+", line)
+                or not cls._is_title_like_label(line)
             ):
                 continue
             score = cls._central_title_line_score(line)
             if score < 0:
                 continue
-            fallback_lines.append(line)
-            scored.append((score, len(fallback_lines), line))
+            scored.append((score, index, line))
         if scored:
             return max(scored, key=lambda item: (item[0], -item[1]))[2][:120]
-        if fallback_lines:
-            return fallback_lines[0][:120]
+
         for raw_line in content.split("\n"):
             line = raw_line.strip()
             if not re.fullmatch(r"https?://\S+", line):
@@ -3421,6 +3540,7 @@ class ClipIngestService:
             parts = urlsplit(line)
             slug = unquote(parts.path.rstrip("/").split("/")[-1]).strip()
             return (slug or parts.hostname or "取り込みメモ")[:120]
+
         for source_id, item in source_catalog.items():
             if not source_id.startswith("attachment:"):
                 continue
@@ -3459,6 +3579,10 @@ class ClipIngestService:
             for source_id, start_line, end_line, _ in evidence_ranges
         ]
         subject = cls._clean_text(parsed.get("subject"), 160)
+        detail_candidate = cls._clean_text(
+            parsed.get("title_detail"),
+            _TITLE_LIMIT,
+        )
         # A title must be explained by one validated source range.  Never
         # join two ranges (or two source bodies) to make a chimera title look
         # grounded.  Empty evidence intentionally falls through to the
@@ -3466,14 +3590,51 @@ class ClipIngestService:
         subject_grounded = len(evidence_ranges) == 1 and (
             cls._title_semantic_grounding(subject, evidence_ranges[0][3])
         )
+        detail_grounded = len(evidence_ranges) == 1 and (
+            cls._title_semantic_grounding(
+                detail_candidate,
+                evidence_ranges[0][3],
+            )
+        )
         subject_rejected = cls._title_subject_is_metadata(subject, source_catalog)
+        detail_rejected = cls._title_subject_is_metadata(
+            detail_candidate,
+            source_catalog,
+        )
         forum_title_supported = cls._forum_title_candidate_supported(
             subject,
-            cls._clean_text(parsed.get("title_detail"), _TITLE_LIMIT),
+            detail_candidate,
             parsed,
             source_catalog,
         )
-        if not subject or subject_rejected or (not subject_grounded and not forum_title_supported):
+
+        # Keep the existing server-only forum exception intact.  Its own
+        # strict model/numeric/polarity checks remain authoritative and may
+        # intentionally support a longer comparison title.
+        subject_usable = bool(
+            subject
+            and not subject_rejected
+            and (
+                forum_title_supported
+                or (
+                    cls._is_title_like_label(subject)
+                    and subject_grounded
+                )
+            )
+        )
+        detail_usable_as_subject = bool(
+            detail_candidate
+            and not detail_rejected
+            and cls._is_title_like_label(detail_candidate)
+            and detail_grounded
+        )
+        detail_promoted = False
+
+        if not subject_usable and detail_usable_as_subject:
+            subject = detail_candidate
+            detail_candidate = ""
+            detail_promoted = True
+        elif not subject_usable:
             central = cls._central_title_candidate(parsed, source_catalog)
             if central is not None:
                 subject, evidence_key = central
@@ -3514,14 +3675,22 @@ class ClipIngestService:
                 evidence_ranges = []
                 parsed["_validated_title_evidence"] = []
                 parsed["_validated_title_evidence_ranges"] = []
-        detail = cls._clean_text(parsed.get("title_detail"), _TITLE_LIMIT)
+
+        detail = "" if detail_promoted else detail_candidate
+        final_forum_title_supported = cls._forum_title_candidate_supported(
+            subject,
+            detail,
+            parsed,
+            source_catalog,
+        )
         if (
             not detail
             or cls._title_subject_is_metadata(detail, source_catalog)
             or (
-                not forum_title_supported
+                not final_forum_title_supported
                 and (
-                    len(evidence_ranges) != 1
+                    not cls._is_title_like_label(detail)
+                    or len(evidence_ranges) != 1
                     or not cls._title_semantic_grounding(detail, evidence_ranges[0][3])
                 )
             )
@@ -5596,8 +5765,28 @@ class ClipIngestService:
         source_catalog: dict[str, dict[str, str]] | None = None,
         topic_context: str = "",
         topic_anchor: str = "",
+        exact_title_evidence: list[str] | None = None,
     ) -> list[str]:
-        """Normalize v4 independent semantic units."""
+        """Normalize independent semantic units.
+
+        ``exact_title_evidence`` is supplied only for canonical v4 plans.
+        When an item is exactly the already-validated single-line title
+        evidence, retry the normal knowledge validator without the
+        title-derived topic prefilter. All factual, polarity, entity,
+        unsupported-fact, and forum grounding checks still run normally.
+        """
+
+        exact_title_evidence_identities = {
+            cls._identity(
+                cls._clean_text(
+                    evidence,
+                    _KNOWLEDGE_ITEM_LINE_LIMIT,
+                )
+            )
+            for evidence in (exact_title_evidence or [])
+            if evidence and "\n" not in str(evidence)
+        }
+        exact_title_evidence_identities.discard("")
 
         items: list[str] = []
         seen_identities: set[str] = set()
@@ -5608,6 +5797,25 @@ class ClipIngestService:
                 topic_context=topic_context,
                 topic_anchor=topic_anchor,
             )
+
+            raw_identity = cls._identity(
+                cls._clean_text(
+                    raw,
+                    _KNOWLEDGE_ITEM_LINE_LIMIT,
+                )
+            )
+            if (
+                not text
+                and raw_identity
+                and raw_identity in exact_title_evidence_identities
+            ):
+                text = cls._normalize_knowledge_item_text(
+                    raw,
+                    source_catalog,
+                    topic_context="",
+                    topic_anchor="",
+                )
+
             if not text:
                 continue
             identity = cls._identity(text)
@@ -5632,7 +5840,9 @@ class ClipIngestService:
     ) -> list[str]:
         """Build canonical v4 knowledge items from any supported wire plan."""
 
-        if parsed.get("_canonical_schema_version") == 4:
+        is_v4_canonical = parsed.get("_canonical_schema_version") == 4
+
+        if is_v4_canonical:
             raw_items = parsed.get("knowledge_items") or []
             if not raw_items and (legacy_summary or legacy_details):
                 raw_items = [legacy_summary, *(legacy_details or [])]
@@ -5649,11 +5859,17 @@ class ClipIngestService:
                 else cls._detail_list(parsed.get("details"))
             )
             raw_items = [summary, *details]
+
         return cls._knowledge_item_list(
             raw_items,
             source_catalog=source_catalog,
             topic_context=topic_context,
             topic_anchor=topic_anchor,
+            exact_title_evidence=(
+                parsed.get("_validated_title_evidence", [])
+                if is_v4_canonical
+                else []
+            ),
         )
 
     @classmethod

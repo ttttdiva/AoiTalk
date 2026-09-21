@@ -40,6 +40,10 @@ import {
   type TaskAttachment,
   type TaskReference,
 } from "@/lib/task-api";
+import {
+  taskBrowseScopeToQuery,
+  type TaskBrowseScope,
+} from "@/lib/task-browse-scope";
 import { uploadFailureToastOptions } from "@/lib/upload-failure";
 import {
   getTaskDisplayEndAt,
@@ -50,6 +54,7 @@ import { useProject } from "@/contexts/project-context";
 import { cn } from "@/lib/utils";
 
 import { RecurringDeleteDialog } from "@/components/tasks/task-detail/recurring-delete-dialog";
+import { RecurringDateChangeDialog } from "@/components/tasks/task-detail/recurring-date-change-dialog";
 import { SubtaskSection } from "@/components/tasks/task-detail/subtask-section";
 import { TaskAttachmentsSection } from "@/components/tasks/task-detail/task-attachments-section";
 import { TaskDetailHeader } from "@/components/tasks/task-detail/task-detail-header";
@@ -88,6 +93,7 @@ interface TaskDetailModalProps {
   entryFocus?: TimeEntry | null;
   occurrenceContext?: RecurringOccurrenceContext | null;
   readOnly?: boolean;
+  browseScope?: TaskBrowseScope | null;
 }
 
 type FetchTaskOptions = {
@@ -106,6 +112,13 @@ type DraftInitialReloadState = {
   taskId: string;
   attachmentsPending: boolean;
   referencesPending: boolean;
+};
+
+type PendingRecurringDateChange = {
+  taskId: string;
+  occurrenceIdentity: string;
+  startAt: string | null;
+  endAt: string | null;
 };
 
 function mergeTaskItems<T extends { id: string }>(
@@ -163,7 +176,12 @@ export function TaskDetailModal({
   entryFocus,
   occurrenceContext,
   readOnly = false,
+  browseScope = null,
 }: TaskDetailModalProps) {
+  const browseQuery = useMemo(
+    () => taskBrowseScopeToQuery(browseScope),
+    [browseScope],
+  );
   const { allProjects, spaces } = useProject();
   const [createdTaskId, setCreatedTaskId] = useState<string | null>(null);
   const [task, setTask] = useState<Task | null>(null);
@@ -175,6 +193,8 @@ export function TaskDetailModal({
   const [occurrenceStatusOverride, setOccurrenceStatusOverride] = useState<
     string | null
   >(null);
+  const [pendingRecurringDateChange, setPendingRecurringDateChange] =
+    useState<PendingRecurringDateChange | null>(null);
   const [inferredOccurrenceContext, setInferredOccurrenceContext] =
     useState<RecurringOccurrenceContext | null>(null);
   const [tags, setTags] = useState<Tag[]>([]);
@@ -251,6 +271,15 @@ export function TaskDetailModal({
   const effectiveTaskId = taskId ?? createdTaskId;
   const activeOccurrenceContext =
     occurrenceContext ?? inferredOccurrenceContext;
+  const activeOccurrenceIdentity = activeOccurrenceContext?.start_at
+    ? `${effectiveTaskId ?? ""}:${activeOccurrenceContext.occurrence_id ?? ""}:${activeOccurrenceContext.original_start_at ?? activeOccurrenceContext.start_at}`
+    : null;
+
+  // 発生回・タスクが切り替わったら、前の発生回用の保留日時を破棄する。
+  // ダイアログの適用前に別タスクへ移動しても、旧変更が誤送信されない。
+  useEffect(() => {
+    setPendingRecurringDateChange(null);
+  }, [activeOccurrenceIdentity]);
 
   useEffect(() => {
     setOccurrenceDateOverride(null);
@@ -365,6 +394,74 @@ export function TaskDetailModal({
     lifecycleGenerationRef: persistenceLifecycleRef,
     taskMetadataRef,
   });
+
+  const requestRecurringDateRangeChange = useCallback(
+    (values: { startAt: string | null; endAt: string | null }) => {
+      if (
+        readOnly ||
+        !effectiveTaskId ||
+        !activeOccurrenceContext?.start_at ||
+        !activeOccurrenceIdentity
+      ) {
+        return;
+      }
+      setPendingRecurringDateChange({
+        taskId: effectiveTaskId,
+        occurrenceIdentity: activeOccurrenceIdentity,
+        startAt: values.startAt,
+        endAt: values.endAt,
+      });
+    },
+    [
+      activeOccurrenceContext?.start_at,
+      activeOccurrenceIdentity,
+      effectiveTaskId,
+      readOnly,
+    ],
+  );
+
+  const pendingRecurringDateChangeForCurrent =
+    pendingRecurringDateChange &&
+    pendingRecurringDateChange.taskId === effectiveTaskId &&
+    pendingRecurringDateChange.occurrenceIdentity === activeOccurrenceIdentity
+      ? pendingRecurringDateChange
+      : null;
+
+  const applyRecurringDateChange = useCallback(
+    (mode: "single" | "future") => {
+      const pending = pendingRecurringDateChange;
+      if (
+        !pending ||
+        pending.taskId !== effectiveTaskId ||
+        pending.occurrenceIdentity !== activeOccurrenceIdentity
+      ) {
+        setPendingRecurringDateChange(null);
+        return;
+      }
+      // 先にクリアしておくことで、連打・閉じる操作・タスク切替中でも
+      // 同じ保留値を二重送信しない。
+      setPendingRecurringDateChange(null);
+      void moveOccurrenceDateRange(
+        { startAt: pending.startAt, endAt: pending.endAt },
+        mode,
+      );
+    },
+    [
+      activeOccurrenceIdentity,
+      effectiveTaskId,
+      moveOccurrenceDateRange,
+      pendingRecurringDateChange,
+    ],
+  );
+
+  const handleApplyRecurringDateChangeSingle = useCallback(
+    () => applyRecurringDateChange("single"),
+    [applyRecurringDateChange],
+  );
+  const handleApplyRecurringDateChangeFuture = useCallback(
+    () => applyRecurringDateChange("future"),
+    [applyRecurringDateChange],
+  );
 
   const ensureRecurrenceTaskId = useCallback(async () => {
     const draftLifecycle = draftLifecycleRef.current;
@@ -691,11 +788,15 @@ export function TaskDetailModal({
       const shouldShowLoading = options.showLoading ?? true;
       if (shouldShowLoading) setLoading(true);
       try {
-        const t = await taskApi.getTask(requestedTaskId);
+        const t = browseQuery
+          ? await taskApi.getTask(requestedTaskId, browseQuery)
+          : await taskApi.getTask(requestedTaskId);
         if (!isCurrentRequest()) return;
         let occurrenceForView = activeOccurrenceContext;
         if (!occurrenceForView && t.has_recurrence) {
-          occurrenceForView = await fetchCurrentOccurrenceContext(t);
+          occurrenceForView = browseQuery
+            ? await fetchCurrentOccurrenceContext(t, browseQuery)
+            : await fetchCurrentOccurrenceContext(t);
           if (!isCurrentRequest()) return;
           setInferredOccurrenceContext(occurrenceForView);
         }
@@ -713,7 +814,9 @@ export function TaskDetailModal({
         setComments(t.comments || []);
         try {
           const nextAttachments =
-            await taskApi.listAttachments(requestedTaskId);
+            browseQuery
+              ? await taskApi.listAttachments(requestedTaskId, browseQuery)
+              : await taskApi.listAttachments(requestedTaskId);
           if (!isCurrentRequest()) return;
           const nextAttachmentIds = new Set(
             nextAttachments.map((attachment) => attachment.id),
@@ -749,7 +852,9 @@ export function TaskDetailModal({
           completeDraftInitialReload("attachmentsPending");
         }
         try {
-          const nextReferences = await taskApi.listReferences(requestedTaskId);
+          const nextReferences = browseQuery
+            ? await taskApi.listReferences(requestedTaskId, browseQuery)
+            : await taskApi.listReferences(requestedTaskId);
           if (!isCurrentRequest()) return;
           const nextReferenceIds = new Set(
             nextReferences.flatMap(referenceTombstoneKeys),
@@ -794,9 +899,15 @@ export function TaskDetailModal({
         if (!isCurrentRequest()) return;
         setDraftTagIds((t.tags || []).map((tag) => tag.id));
         if (t.project_id) {
-          const tagList = await taskApi.listTags(t.project_id);
-          if (!isCurrentRequest()) return;
-          setTags(tagList);
+          if (browseScope) {
+            // Browse detail already carries the task's in-scope tags. Avoid a
+            // Space-wide tag catalog request that could reveal sibling metadata.
+            setTags(t.tags || []);
+          } else {
+            const tagList = await taskApi.listTags(t.project_id);
+            if (!isCurrentRequest()) return;
+            setTags(tagList);
+          }
         }
       } catch (err) {
         if (isCurrentRequest()) console.error("タスク取得失敗:", err);
@@ -806,6 +917,8 @@ export function TaskDetailModal({
     },
     [
       activeOccurrenceContext,
+      browseScope,
+      browseQuery,
       effectiveTaskId,
       occurrenceStatusOverride,
       onTaskLoaded,
@@ -890,6 +1003,7 @@ export function TaskDetailModal({
     setTask,
     ensureTaskId: ensureRecurrenceTaskId,
     lifecycleGeneration: draftLifecycleRef.current,
+    browseScope: browseQuery,
   });
 
   const { elapsedSeconds, timerLoading, handleTimer } = useTaskTimer({
@@ -1029,8 +1143,13 @@ export function TaskDetailModal({
     draftSlashUpdatePromiseRef.current = null;
     setCreatedTaskId(null);
     setDraftTagIds([]);
+    setPendingRecurringDateChange(null);
     resetRecurrenceState();
   }, [open, resetRecurrenceState]);
+
+  useEffect(() => {
+    if (readOnly) setPendingRecurringDateChange(null);
+  }, [readOnly]);
 
   useEffect(() => {
     if (!readOnly) return;
@@ -1188,6 +1307,7 @@ export function TaskDetailModal({
 
   const handleReadOnlyAwareDialogOpenChange = useCallback(
     (nextOpen: boolean) => {
+      if (!nextOpen) setPendingRecurringDateChange(null);
       if (readOnly) {
         onOpenChange(nextOpen);
         return;
@@ -1303,6 +1423,7 @@ export function TaskDetailModal({
                 applyLocalDraftUpdate={applyLocalDraftUpdate}
                 buildDateTaskUpdate={buildDateTaskUpdate}
                 moveOccurrenceDateRange={moveOccurrenceDateRange}
+                onRecurringDateRangeChange={requestRecurringDateRangeChange}
                 resolveTagUpdates={resolveTagUpdates}
                 handleRenameTag={handleRenameTag}
                 handleChangeTagColor={handleChangeTagColor}
@@ -1485,6 +1606,14 @@ export function TaskDetailModal({
         onDeleteSingle={handleDeleteSingleOccurrence}
         onDeleteFuture={handleDeleteFutureOccurrences}
         onDeleteSeries={handleDeleteRecurringSeries}
+      />
+      <RecurringDateChangeDialog
+        open={!readOnly && pendingRecurringDateChangeForCurrent !== null}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) setPendingRecurringDateChange(null);
+        }}
+        onApplySingle={handleApplyRecurringDateChangeSingle}
+        onApplyFuture={handleApplyRecurringDateChangeFuture}
       />
     </>
   );

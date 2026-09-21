@@ -47,6 +47,11 @@ import { hasExplicitSessionRoute } from "@/lib/chat-session-route";
 import { awaitSessionLlmSettingsReady } from "@/lib/session-llm-settings-save-queue";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
 import { toast } from "sonner";
+import {
+  DEFAULT_GENERATION_PROFILE,
+  normalizeGenerationProfile,
+  type GenerationProfile,
+} from "@/lib/generation-profile";
 
 const DISPATCH_FAILURE_MESSAGE =
   "応答生成を開始できませんでした。送信内容が保存されたかは確認できません。接続を確認し、会話を再読み込みしてからもう一度実行してください。";
@@ -60,7 +65,8 @@ export type PendingMessage = {
   sessionId: string;
   content: string;
   clientMessageId: string;
-  projectId?: string;
+  /** null explicitly suppresses the selected Project for Help turns. */
+  projectId?: string | null;
   files?: File[];
   mentions?: MentionItem[];
   generationProfile?: string;
@@ -77,6 +83,80 @@ function createClientMessageId(): string {
     return crypto.randomUUID();
   }
   return `client-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/**
+ * Resolve the mode that a branch/rerun should use without promoting it to
+ * autonomous work implicitly.
+ *
+ * The user-message row is the most specific source.  Older rows may not have
+ * a persisted profile yet, so accept the session's server-owned context as a
+ * compatibility fallback and finally use the bounded chat default.  Every
+ * candidate is validated against the known profile enum; arbitrary metadata
+ * must never select a more privileged execution mode.
+ */
+export function resolveBranchGenerationProfile(
+  sourceMessage: Pick<ConversationMessage, "metadata">,
+  session?: Pick<ConversationSession, "context"> | null,
+): GenerationProfile {
+  const metadata = sourceMessage?.metadata;
+  const metadataRecord =
+    metadata && typeof metadata === "object"
+      ? (metadata as Record<string, unknown>)
+      : {};
+  const generationMetrics =
+    metadataRecord.generation_metrics &&
+    typeof metadataRecord.generation_metrics === "object" &&
+    !Array.isArray(metadataRecord.generation_metrics)
+      ? (metadataRecord.generation_metrics as Record<string, unknown>)
+      : {};
+  const generation =
+    metadataRecord.generation &&
+    typeof metadataRecord.generation === "object" &&
+    !Array.isArray(metadataRecord.generation)
+      ? (metadataRecord.generation as Record<string, unknown>)
+      : {};
+
+  const candidates: unknown[] = [
+    metadataRecord.generation_profile,
+    metadataRecord.generationProfile,
+    generation.generation_profile,
+    generation.generationProfile,
+    generation.profile,
+    generationMetrics.generation_profile,
+    generationMetrics.generationProfile,
+  ];
+
+  const context = session?.context;
+  if (context && typeof context === "object" && !Array.isArray(context)) {
+    const contextRecord = context as Record<string, unknown>;
+    const chat =
+      contextRecord.chat &&
+      typeof contextRecord.chat === "object" &&
+      !Array.isArray(contextRecord.chat)
+        ? (contextRecord.chat as Record<string, unknown>)
+        : {};
+    const chatLlmSettings =
+      contextRecord.chat_llm_settings &&
+      typeof contextRecord.chat_llm_settings === "object" &&
+      !Array.isArray(contextRecord.chat_llm_settings)
+        ? (contextRecord.chat_llm_settings as Record<string, unknown>)
+        : {};
+    candidates.push(
+      contextRecord.generation_profile,
+      contextRecord.generationProfile,
+      chat.generation_profile,
+      chat.generationProfile,
+      chatLlmSettings.generation_profile,
+      chatLlmSettings.generationProfile,
+    );
+  }
+
+  for (const candidate of candidates) {
+    const normalized = normalizeGenerationProfile(candidate);
+    if (normalized) return normalized;
+  }
+  return DEFAULT_GENERATION_PROFILE;
 }
 
 type UseChatMessagingArgs = {
@@ -209,7 +289,10 @@ export function useChatMessaging({
   });
   const branchSwitchInFlightRef = useRef<string | null>(null);
 
-  const { handleDeepResearchMessage } = useDeepResearchMessage({
+  const {
+    handleDeepResearchMessage,
+    retryDeepResearchAssistantPersistence,
+  } = useDeepResearchMessage({
     router,
     activeSessionId,
     activeSessionIdRef,
@@ -240,16 +323,17 @@ export function useChatMessaging({
       appContext?: ChatAppContextSelection | null,
       mentions?: MentionItem[],
     ) => {
+      const helpSubmission = commandCapabilities?.includes("aoitalk_help") === true;
       const result = await chatApi.dispatchMessage(sessionId, {
         message: content,
         project_id: projectId,
-        app_id: appContext?.appId ?? null,
-        app_target_id: appContext?.targetId ?? null,
+        app_id: helpSubmission ? null : appContext?.appId ?? null,
+        app_target_id: helpSubmission ? null : appContext?.targetId ?? null,
         generation_profile: generationProfile,
         planning_policy: loadStoredPlanningPolicy(
           typeof window !== "undefined" ? window.localStorage : null,
         ),
-        include_project_context: includeProjectContext,
+        include_project_context: helpSubmission ? false : includeProjectContext,
         response_model: responseModel,
         client_message_id: clientMessageId,
         command_capabilities: commandCapabilities,
@@ -298,7 +382,9 @@ export function useChatMessaging({
     void (async () => {
       const accepted = await sendMessage(
         pending.content,
-        pending.projectId ?? effectiveProjectId,
+        pending.projectId === null
+          ? undefined
+          : pending.projectId ?? effectiveProjectId,
         pending.files,
         pending.mentions,
         pending.generationProfile,
@@ -373,6 +459,7 @@ export function useChatMessaging({
       if (isSending) return "failed" as ChatComposerSendResult;
       const clientMessageId = createClientMessageId();
       const hasCommandCapabilities = Boolean(commandCapabilities?.length);
+      const isHelpSubmission = commandCapabilities?.includes("aoitalk_help") === true;
       const isDeepResearchSubmission =
         deepResearchEnabled && !hasCommandCapabilities;
       if (activeSessionId && !isDeepResearchSubmission) {
@@ -382,7 +469,9 @@ export function useChatMessaging({
           clientMessageId,
         });
       }
-      const messageProjectId = isStoryChatSession
+      const messageProjectId = isHelpSubmission
+        ? undefined
+        : isStoryChatSession
         ? undefined
         : resolveMessageProjectId({
             content,
@@ -390,6 +479,10 @@ export function useChatMessaging({
             sessionProjectId: currentSession?.project_id,
             fallbackProjectId: effectiveProjectId,
           });
+      const messageIncludeProjectContext = isHelpSubmission
+        ? false
+        : includeProjectContext;
+      const messageAppContext = isHelpSubmission ? null : appContext;
       if (isDeepResearchSubmission) {
         if (files?.length) {
           if (activeSessionId) {
@@ -439,6 +532,9 @@ export function useChatMessaging({
       }
       const provisionalSessionId = `${OPTIMISTIC_NEW_CHAT_SESSION_PREFIX}${clientMessageId}`;
       let optimisticSessionId = sessionId ?? provisionalSessionId;
+      const optimisticGenerationProfile = normalizeGenerationProfile(
+        generationProfile,
+      );
 
       // 送信処理が REST / WebSocket / 設定保存のいずれを選ぶ場合でも、
       // 最初の server await より前にこの submission 専用の user bubble を
@@ -453,6 +549,9 @@ export function useChatMessaging({
           clientMessageId,
           files,
           commandCapabilities,
+          optimisticGenerationProfile
+            ? { generation_profile: optimisticGenerationProfile }
+            : {},
         ),
       });
 
@@ -473,8 +572,8 @@ export function useChatMessaging({
             canPersistInitialMessage
               ? { content, client_message_id: clientMessageId }
               : undefined,
-            appContext
-              ? { appId: appContext.appId, targetId: appContext.targetId }
+            messageAppContext
+              ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
             generationReadyMain,
           );
@@ -569,14 +668,14 @@ export function useChatMessaging({
               sessionId,
               content,
               clientMessageId,
-              projectId: messageProjectId,
+              projectId: isHelpSubmission ? null : messageProjectId,
               files,
               mentions,
               generationProfile,
-              includeProjectContext,
+              includeProjectContext: messageIncludeProjectContext,
               commandCapabilities,
               toolsRequired,
-              appContext,
+              appContext: messageAppContext,
             });
           } else {
             try {
@@ -595,7 +694,7 @@ export function useChatMessaging({
                     }
                   : undefined,
                 toolsRequired,
-                appContext,
+                messageAppContext,
                 mentions,
               );
               markWaitingResponse(sessionId, clientMessageId);
@@ -681,14 +780,14 @@ export function useChatMessaging({
             sessionId,
             content,
             clientMessageId,
-            projectId: messageProjectId,
+            projectId: isHelpSubmission ? null : messageProjectId,
             files,
             mentions,
             generationProfile,
-            includeProjectContext,
+            includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            appContext,
+            appContext: messageAppContext,
           });
         } else {
           try {
@@ -702,7 +801,7 @@ export function useChatMessaging({
               commandCapabilities,
               undefined,
               toolsRequired,
-              appContext,
+              messageAppContext,
               mentions,
             );
             markWaitingResponse(sessionId, clientMessageId);
@@ -748,15 +847,15 @@ export function useChatMessaging({
             loadStoredPlanningPolicy(
               typeof window !== "undefined" ? window.localStorage : null,
             ),
-            includeProjectContext,
+            messageIncludeProjectContext,
             undefined,
             undefined,
             sessionId,
             clientMessageId,
             commandCapabilities,
             toolsRequired,
-            appContext
-              ? { appId: appContext.appId, targetId: appContext.targetId }
+            messageAppContext
+              ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
           );
         } catch (err) {
@@ -784,14 +883,14 @@ export function useChatMessaging({
             sessionId,
             content,
             clientMessageId,
-            projectId: messageProjectId,
+            projectId: isHelpSubmission ? null : messageProjectId,
             files,
             mentions,
             generationProfile,
-            includeProjectContext,
+            includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            appContext,
+            appContext: messageAppContext,
           });
         } else {
           bumpSession(sessionId);
@@ -819,15 +918,15 @@ export function useChatMessaging({
             loadStoredPlanningPolicy(
               typeof window !== "undefined" ? window.localStorage : null,
             ),
-            includeProjectContext,
+            messageIncludeProjectContext,
             undefined,
             undefined,
             sessionId,
             clientMessageId,
             commandCapabilities,
             toolsRequired,
-            appContext
-              ? { appId: appContext.appId, targetId: appContext.targetId }
+            messageAppContext
+              ? { appId: messageAppContext.appId, targetId: messageAppContext.targetId }
               : null,
           );
         } catch (err) {
@@ -855,14 +954,14 @@ export function useChatMessaging({
             sessionId,
             content,
             clientMessageId,
-            projectId: messageProjectId,
+            projectId: isHelpSubmission ? null : messageProjectId,
             files,
             mentions,
             generationProfile,
-            includeProjectContext,
+            includeProjectContext: messageIncludeProjectContext,
             commandCapabilities,
             toolsRequired,
-            appContext,
+            appContext: messageAppContext,
           });
         } else {
           bumpSession(sessionId);
@@ -886,7 +985,7 @@ export function useChatMessaging({
             commandCapabilities,
             undefined,
             toolsRequired,
-            appContext,
+            messageAppContext,
             mentions,
           );
           markWaitingResponse(sessionId, clientMessageId);
@@ -967,6 +1066,11 @@ export function useChatMessaging({
       const commandCapabilities = commandCapabilitiesFromMessageMetadata(
         sourceMessage.metadata,
       );
+      const isHelpBranch = commandCapabilities.includes("aoitalk_help");
+      const generationProfile = resolveBranchGenerationProfile(
+        sourceMessage,
+        currentSession,
+      );
       // 添付付きメッセージの再実行では元の添付を引き継ぐ。バイナリは保存されて
       // いないため、バックエンドがプロジェクト内パスから実体を読み直す。
       const attachments = attachmentsFromMessageMetadata(sourceMessage.metadata);
@@ -980,9 +1084,9 @@ export function useChatMessaging({
         const result = await chatApi.dispatchMessage(activeSessionId, {
           message: content,
           client_message_id: branchClientMessageId,
-          project_id: effectiveProjectId,
-          generation_profile: "autonomous_work",
-          include_project_context: includeProjectContext,
+          project_id: isHelpBranch ? undefined : effectiveProjectId,
+          generation_profile: generationProfile,
+          include_project_context: isHelpBranch ? false : includeProjectContext,
           edit_message_id: sourceMessage.id,
           response_model: responseModel,
           command_capabilities:
@@ -1162,6 +1266,7 @@ export function useChatMessaging({
     bumpSessionForAssistant,
     handleCreateGroupChat,
     handleSendMessage,
+    retryDeepResearchAssistantPersistence,
     handleEditMessage,
     handleRerunMessage,
     handleSwitchBranch,

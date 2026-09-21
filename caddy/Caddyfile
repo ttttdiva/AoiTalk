@@ -36,12 +36,13 @@ http://127.0.0.1 {
 }
 
 {$AOITALK_CADDY_SITE_LABEL:localhost:6002} {
-	# Windows personalではservice_managerがHTTPS catch-allとIPv4 bindを渡す。
-	# Linux nativeでは名前付きsite labelを渡し、従来の自動HTTPSを維持する。
+	# Windowsの明示overrideまたはcanonical lego pair解決時だけ、
+	# service_managerがcatch-all/IPv4 bindを注入する。未指定時は名前付きsiteの
+	# Caddy-native automatic/internal HTTPSを使い、Linux/Composeの意味論も維持する。
 	{$AOITALK_CADDY_BIND_DIRECTIVE:}
 
-	# Windowsのrun.bat起動ではservice_managerが既存の公開証明書を指定する。
-	# Linux/Composeでは未設定のまま展開され、従来どおりCaddyの自動HTTPSを使う。
+	# 明示された場合だけ証明書directiveを展開する。未指定なら空行となり、
+	# Caddy自身の証明書管理へ委譲する。
 	{$AOITALK_CADDY_TLS_DIRECTIVE:}
 
 	# HTTP/3を広告していた期間に既存クライアントが保持したAlt-Svcを破棄させる。
@@ -119,6 +120,10 @@ http://127.0.0.1 {
 	# Unified Voice Session HTTP and WebSocket endpoints are authoritative in
 	# FastAPI, including cookie-authenticated browser requests without an
 	# Authorization header.  reverse_proxy preserves WebSocket upgrades.
+	handle /api/pc-bridge/* {
+		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
+	}
+
 	handle /api/voice-sessions* {
 		reverse_proxy {$AOITALK_CADDY_FASTAPI_UPSTREAM:127.0.0.1:3000}
 	}

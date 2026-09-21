@@ -23,6 +23,14 @@ from urllib.parse import urljoin, urlsplit
 
 import httpx
 
+from ..services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    PrivacyReviewDenied,
+    get_privacy_policy_context,
+)
+
 logger = logging.getLogger(__name__)
 
 # 接続テスト・読み取りのデフォルトタイムアウト（秒）。
@@ -439,11 +447,47 @@ class RemoteServerConnector:
         base_url: str,
         auth_token: Optional[str],
         timeout: float = _DEFAULT_TIMEOUT,
+        *,
+        config: Any | None = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
+        user_id: str | None = None,
+        session_id: str | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._auth_token = auth_token
         self._timeout = timeout
+        self._config = config
+        self._privacy_gateway_override = privacy_gateway
+        self._privacy_user_id = str(user_id or "")
+        self._privacy_session_id = str(session_id or "")
         self._capabilities_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+
+    def _privacy_gateway(self) -> OutboundPrivacyGateway:
+        if self._privacy_gateway_override is not None:
+            return self._privacy_gateway_override
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        session_id = self._privacy_session_id or str(
+            session_context.get("session_id")
+            or session_context.get("id")
+            or ""
+        )
+        return OutboundPrivacyGateway(
+            self._config,
+            user_id=self._privacy_user_id,
+            session_id=session_id,
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    @staticmethod
+    def _egress_descriptor(*, action: str, destination: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="remote_connector",
+            destination=destination,
+            provider="aoi_talk_remote",
+        )
 
     @staticmethod
     def _private_targets_allowed() -> bool:
@@ -594,6 +638,149 @@ class RemoteServerConnector:
         max_bytes: Optional[int] = None,
         request_headers: Optional[Dict[str, str]] = None,
     ) -> RemoteRawStream:
+        """Open one remote file stream through the outbound privacy gate."""
+
+        gateway = self._privacy_gateway()
+        current_url = self._url(path)
+        current_params: Optional[Dict[str, Any]] = dict(params or {})
+        current_method = method.upper()
+        current_json = dict(json_body) if isinstance(json_body, dict) else json_body
+        redirect_count = 0
+        try:
+            while True:
+                destination = str(
+                    httpx.URL(current_url).copy_merge_params(current_params)
+                    if current_params
+                    else current_url
+                )
+                approved_payload: dict[str, Any] = {}
+
+                async def sender(protected_payload: Any) -> RemoteRawStream:
+                    protected_path = path
+                    protected_params: Dict[str, Any] = {}
+                    protected_json: Optional[Dict[str, Any]] = None
+                    if isinstance(protected_payload, dict):
+                        if isinstance(protected_payload.get("path"), str):
+                            protected_path = protected_payload["path"]
+                        if isinstance(protected_payload.get("params"), dict):
+                            protected_params = dict(protected_payload["params"])
+                        if isinstance(protected_payload.get("json_body"), dict):
+                            protected_json = dict(protected_payload["json_body"])
+                    if protected_path != path:
+                        raise RemoteConnectorError(
+                            "remote route changes are not permitted"
+                        )
+                    approved_payload["value"] = {
+                        "path": protected_path,
+                        "params": protected_params,
+                        "json_body": protected_json,
+                    }
+                    request_url = str(
+                        httpx.URL(current_url).copy_merge_params(protected_params)
+                        if protected_params
+                        else current_url
+                    )
+                    # ``path`` is the logical route selected by the caller;
+                    # redirects update ``current_url`` while retaining this
+                    # route only as reviewed metadata.  Every actual request
+                    # is opened with redirects disabled.
+                    return await self._open_raw_stream_unprotected(
+                        current_method,
+                        protected_path,
+                        params=None,
+                        json_body=protected_json,
+                        max_bytes=max_bytes,
+                        request_headers=request_headers,
+                        follow_redirects=False,
+                        url_override=request_url,
+                    )
+
+                stream = await gateway.execute(
+                    {
+                        "path": path,
+                        "params": dict(current_params or {}),
+                        "json_body": (
+                            dict(current_json)
+                            if isinstance(current_json, dict)
+                            else current_json
+                        ),
+                    },
+                    provider="aoi_talk_remote",
+                    descriptor=self._egress_descriptor(
+                        action=f"remote.{current_method.lower()}.stream",
+                        destination=destination,
+                    ),
+                    sender=sender,
+                    base_url=destination,
+                    source_kind="remote_download",
+                )
+                location = stream.headers.get("location") if stream.headers else None
+                if (
+                    stream.status_code not in _REDIRECT_STATUS_CODES
+                    or not location
+                ):
+                    return stream
+                if "value" in approved_payload:
+                    approved = approved_payload["value"]
+                    if isinstance(approved, dict):
+                        current_json = approved.get("json_body")
+                if redirect_count >= _MAX_REDIRECTS:
+                    await stream.aclose()
+                    raise RemoteConnectorError("remote returned too many redirects")
+                try:
+                    redirected_url = httpx.URL(urljoin(current_url, location))
+                except (ValueError, httpx.InvalidURL) as exc:
+                    await stream.aclose()
+                    raise RemoteConnectorError(
+                        f"remote redirect URL is invalid: {exc}"
+                    ) from exc
+                if (
+                    httpx.URL(current_url).scheme == "https"
+                    and redirected_url.scheme == "http"
+                ):
+                    await stream.aclose()
+                    raise RemoteConnectorError(
+                        "remote redirect attempted to downgrade HTTPS"
+                    )
+                old_url = httpx.URL(current_url)
+                current_url = str(redirected_url)
+                current_params = {}
+                redirect_count += 1
+                if (
+                    stream.status_code in {302, 303}
+                    and current_method != "HEAD"
+                ) or (
+                    stream.status_code == 301
+                    and current_method == "POST"
+                ):
+                    current_method = "GET"
+                    current_json = None
+                if (
+                    self._origin(old_url) != self._origin(redirected_url)
+                    and current_method not in {"GET", "HEAD"}
+                ):
+                    await stream.aclose()
+                    raise RemoteConnectorError(
+                        "remote attempted a cross-origin write redirect"
+                    )
+                await stream.aclose()
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise RemoteConnectorError(
+                "remote download payload was blocked by privacy policy"
+            ) from exc
+
+    async def _open_raw_stream_unprotected(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        max_bytes: Optional[int] = None,
+        request_headers: Optional[Dict[str, str]] = None,
+        follow_redirects: bool = False,
+        url_override: Optional[str] = None,
+    ) -> RemoteRawStream:
         """ファイル応答を逐次中継するためのハンドルを開く。
 
         ハンドルは response/client を保持したまま返される。呼び出し側は
@@ -601,7 +788,7 @@ class RemoteServerConnector:
         を含む全経路で ``await stream.aclose()`` を呼び出すこと。デフォルトでは
         body size に上限を設けず、必要な呼び出し側だけ ``max_bytes`` を指定する。
         """
-        url = self._url(path)
+        url = str(url_override or self._url(path))
         try:
             logical_url = httpx.URL(url)
             if params is not None:
@@ -670,6 +857,20 @@ class RemoteServerConnector:
                         response.status_code in _REDIRECT_STATUS_CODES
                         and location
                     ):
+                        if not follow_redirects:
+                            # Return the redirect snapshot to the caller so a
+                            # privacy-wrapped adapter can open the next hop
+                            # in a fresh gateway transaction.
+                            response_headers = self._stream_response_headers(response)
+                            return RemoteRawStream(
+                                response=response,
+                                client=client,
+                                status_code=response.status_code,
+                                headers=response_headers,
+                                max_bytes=max_bytes,
+                                read_timeout=self._timeout,
+                                request_url=str(target.logical_url),
+                            )
                         if redirect_count >= _MAX_REDIRECTS:
                             raise RemoteConnectorError(
                                 "remote returned too many redirects"
@@ -773,6 +974,7 @@ class RemoteServerConnector:
         params: Optional[Dict[str, Any]] = None,
         json_body: Optional[Dict[str, Any]] = None,
         max_bytes: int,
+        follow_redirects: bool = False,
     ) -> _BufferedResponse:
         try:
             logical_url = httpx.URL(url)
@@ -816,6 +1018,12 @@ class RemoteServerConnector:
                             response.status_code in _REDIRECT_STATUS_CODES
                             and location
                         ):
+                            if not follow_redirects:
+                                return _BufferedResponse(
+                                    status_code=response.status_code,
+                                    headers=dict(response.headers),
+                                    content=b"",
+                                )
                             if redirect_count >= _MAX_REDIRECTS:
                                 raise RemoteConnectorError(
                                     "remote returned too many redirects"
@@ -884,6 +1092,147 @@ class RemoteServerConnector:
         except httpx.HTTPError as exc:
             raise RemoteConnectorError(f"request to {url} failed: {exc}") from exc
 
+    async def _send_bounded_via_privacy(
+        self,
+        method: str,
+        url: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        max_bytes: int,
+        action: str,
+        source_kind: str,
+    ) -> _BufferedResponse:
+        """Protect query/body data before one remote connector request.
+
+        Authentication headers and the remote profile itself are control-plane
+        values and are attached by ``_send_bounded`` after the gateway has
+        approved the user/project payload.  The sender closure is intentionally
+        part of the gateway transaction so no unprotected fallback wire call
+        can occur after redaction/review failure.
+        """
+
+        gateway = self._privacy_gateway()
+        current_url = url
+        current_params: Optional[Dict[str, Any]] = dict(params or {})
+        current_method = method.upper()
+        current_json = dict(json_body) if isinstance(json_body, dict) else json_body
+        redirect_count = 0
+        try:
+            while True:
+                # Query parameters are included in the destination for the
+                # actual wire request, while remaining separately reviewable
+                # in the transaction payload on the first hop.
+                destination = str(
+                    httpx.URL(current_url).copy_merge_params(current_params)
+                    if current_params
+                    else current_url
+                )
+                approved_payload: dict[str, Any] = {}
+
+                async def sender(protected_payload: Any) -> _BufferedResponse:
+                    if isinstance(protected_payload, dict):
+                        protected_params = protected_payload.get("params")
+                        protected_json = protected_payload.get("json_body")
+                    else:
+                        protected_params = current_params
+                        protected_json = current_json
+                    final_params = (
+                        dict(protected_params)
+                        if isinstance(protected_params, dict)
+                        else {}
+                    )
+                    final_json = (
+                        dict(protected_json)
+                        if isinstance(protected_json, dict)
+                        else None
+                    )
+                    approved_payload["value"] = {
+                        "params": final_params,
+                        "json_body": final_json,
+                    }
+                    request_url = str(
+                        httpx.URL(current_url).copy_merge_params(final_params)
+                        if final_params
+                        else current_url
+                    )
+                    return await self._send_bounded(
+                        current_method,
+                        request_url,
+                        params=None,
+                        json_body=final_json,
+                        max_bytes=max_bytes,
+                        follow_redirects=False,
+                    )
+
+                response = await gateway.execute(
+                    {
+                        "params": dict(current_params or {}),
+                        "json_body": (
+                            dict(current_json)
+                            if isinstance(current_json, dict)
+                            else current_json
+                        ),
+                    },
+                    provider="aoi_talk_remote",
+                    descriptor=self._egress_descriptor(
+                        action=action,
+                        destination=destination,
+                    ),
+                    sender=sender,
+                    base_url=destination,
+                    source_kind=source_kind,
+                )
+                location = response.headers.get("location")
+                if (
+                    response.status_code not in _REDIRECT_STATUS_CODES
+                    or not location
+                ):
+                    return response
+                if "value" in approved_payload:
+                    approved = approved_payload["value"]
+                    if isinstance(approved, dict):
+                        current_json = approved.get("json_body")
+                if redirect_count >= _MAX_REDIRECTS:
+                    raise RemoteConnectorError("remote returned too many redirects")
+                try:
+                    redirected_url = httpx.URL(urljoin(current_url, location))
+                except (ValueError, httpx.InvalidURL) as exc:
+                    raise RemoteConnectorError(
+                        f"remote redirect URL is invalid: {exc}"
+                    ) from exc
+                if (
+                    httpx.URL(current_url).scheme == "https"
+                    and redirected_url.scheme == "http"
+                ):
+                    raise RemoteConnectorError(
+                        "remote redirect attempted to downgrade HTTPS"
+                    )
+                old_url = httpx.URL(current_url)
+                current_url = str(redirected_url)
+                current_params = {}
+                redirect_count += 1
+                if (
+                    response.status_code in {302, 303}
+                    and current_method != "HEAD"
+                ) or (
+                    response.status_code == 301
+                    and current_method == "POST"
+                ):
+                    current_method = "GET"
+                    current_json = None
+                if (
+                    self._origin(old_url) != self._origin(redirected_url)
+                    and current_method not in {"GET", "HEAD"}
+                ):
+                    raise RemoteConnectorError(
+                        "remote attempted a cross-origin write redirect"
+                    )
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise RemoteConnectorError(
+                "remote payload was blocked by privacy policy"
+            ) from exc
+
     async def _request(
         self,
         method: str,
@@ -893,12 +1242,14 @@ class RemoteServerConnector:
         json_body: Optional[Dict[str, Any]] = None,
     ) -> Any:
         url = self._url(path)
-        response = await self._send_bounded(
+        response = await self._send_bounded_via_privacy(
             method,
             url,
             params=params,
             json_body=json_body,
             max_bytes=_MAX_JSON_RESPONSE_BYTES,
+            action=f"remote.{method.lower()}",
+            source_kind="remote_api_request",
         )
         if response.status_code == 401:
             raise RemoteConnectorError("remote authentication failed (401)")
@@ -920,11 +1271,13 @@ class RemoteServerConnector:
     ) -> RemoteRawResponse:
         """JSONに変換せず、許可済みファイル応答を中継する。"""
         url = self._url(path)
-        response = await self._send_bounded(
+        response = await self._send_bounded_via_privacy(
             method,
             url,
             params=params,
             max_bytes=_MAX_RAW_RESPONSE_BYTES,
+            action=f"remote.{method.lower()}.raw",
+            source_kind="remote_raw_request",
         )
         if response.status_code == 401:
             raise RemoteConnectorError("remote authentication failed (401)")

@@ -4,9 +4,15 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { NextResponse } from "next/server";
 import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { knowledgeAttachments } from "@/db/schema";
+import { knowledgeAttachments, knowledgeNodes, projects } from "@/db/schema";
 import { getSession } from "@/lib/auth";
 import { requireDocsNode } from "@/lib/server/knowledge-docs-utils";
+import {
+  assertGenericDocsMutationAllowed,
+  lockAndAssertGenericDocsMutationAllowed,
+  ManagedDocsAccessError,
+  ManagedDocsMutationError,
+} from "@/lib/server/managed-docs-policy";
 
 function workspaceRoots() {
   return Array.from(new Set([
@@ -126,6 +132,17 @@ export async function DELETE(
   const access = await requireDocsNode(attachment.nodeId, user, "write");
   if (!access) return NextResponse.json({ detail: "添付ファイルを削除できません" }, { status: 404 });
 
+  // Deleting an attachment mutates the Docs node's content.  Protect the
+  // target and every ancestor, including legacy managed Guide descendants.
+  try {
+    await assertGenericDocsMutationAllowed(access.node);
+  } catch (error) {
+    if (error instanceof ManagedDocsMutationError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    throw error;
+  }
+
   const resolvedAttachment = await resolveAttachmentPath(attachment.filePath);
   if (!resolvedAttachment) {
     return NextResponse.json({ detail: "添付ファイルの実体が不正です" }, { status: 404 });
@@ -157,7 +174,43 @@ export async function DELETE(
   }
 
   try {
-    await db.delete(knowledgeAttachments).where(eq(knowledgeAttachments.id, id));
+    if (typeof db.transaction !== "function") {
+      await db.delete(knowledgeAttachments).where(eq(knowledgeAttachments.id, id));
+    } else {
+      await db.transaction(async (tx) => {
+        // Lock the project (when this is a project-bound node) before the
+        // attachment/node rows. Generic Docs writes and task bindings share
+        // this Project->node ordering to avoid ACL/node deadlocks.
+        await lockAndAssertGenericDocsMutationAllowed(access.node, tx, user);
+        const [lockedAttachment] = await tx
+          .select()
+          .from(knowledgeAttachments)
+          .where(eq(knowledgeAttachments.id, id))
+          .limit(1)
+          .for("update");
+        if (!lockedAttachment) throw new Error("添付ファイルが見つかりません");
+        const [lockedNode] = await tx
+          .select()
+          .from(knowledgeNodes)
+          .where(eq(knowledgeNodes.id, lockedAttachment.nodeId))
+          .limit(1)
+          .for("update");
+        if (!lockedNode) throw new Error("Docs nodeが見つかりません");
+        const postPolicyPointers = await tx
+          .select({ id: projects.id })
+          .from(projects)
+          .where(eq(projects.knowledgeNodeId, lockedNode.id));
+        const postPolicySystemKey = String(lockedNode.systemKey ?? "").trim();
+        if (
+          postPolicyPointers.length > 0
+          || postPolicySystemKey === "project_information_root"
+          || postPolicySystemKey.startsWith("project_information:")
+        ) {
+          throw new ManagedDocsMutationError("project_information");
+        }
+        await tx.delete(knowledgeAttachments).where(eq(knowledgeAttachments.id, id));
+      });
+    }
   } catch (error) {
     if (quarantinedPath) {
       try {
@@ -165,6 +218,12 @@ export async function DELETE(
       } catch (restoreError) {
         console.error("Failed to restore Docs attachment after metadata failure", storedPath, restoreError);
       }
+    }
+    if (error instanceof ManagedDocsAccessError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
+    }
+    if (error instanceof ManagedDocsMutationError) {
+      return NextResponse.json({ detail: error.message }, { status: error.status });
     }
     console.error("Failed to remove Docs attachment metadata", id, error);
     return NextResponse.json({ detail: "添付ファイル情報を削除できません" }, { status: 500 });

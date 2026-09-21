@@ -30,16 +30,103 @@ import { MovePicker } from "../../../components/docs/move-picker";
 import { ClipIngestDialog } from "../../../components/docs/clip-ingest-dialog";
 import { DocsTaskBinding } from "../../../components/docs/task-binding";
 import { DocBlockEditor } from "../../../components/docs/verbatim-blocks";
-import { docsRepo } from "../../../repositories/docs";
+import {
+  adoptDocsNodeServerConflict,
+  docsRepo,
+} from "../../../repositories/docs";
+import { docsApi } from "../../../lib/docs-api";
 import { useNetworkStore } from "../../../stores/network";
 import { runSync } from "../../../sync/engine";
+import {
+  getOutboxConflict,
+  rebaseOutboxConflict,
+  type OutboxConflictReference,
+} from "../../../repositories/outbox";
 import type { DocsNode, DocsSupertag } from "../../../types/api";
+
+type ConflictField = "title" | "description" | "body_text" | "body_json";
+
+function parseConflictPayload(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
+  }
+  if (typeof value !== "string" || !value.trim()) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+function formatConflictValue(value: unknown): string {
+  if (value == null || value === "") return "（空）";
+  if (typeof value === "string") return value;
+  try {
+    const text = JSON.stringify(value);
+    return text.length > 600 ? `${text.slice(0, 600)}…` : text;
+  } catch {
+    return String(value);
+  }
+}
+
+function docsScopeKey(node: DocsNode | null): string | null {
+  if (!node?.workspace_id) return null;
+  return `${node.workspace_id}|project:${node.project_id ?? ""}`;
+}
+
+function conflictReasonMessage(reason?: string): string {
+  switch (reason) {
+    case "auth_scope_changed":
+      return "アカウントが切り替わったため、競合の解決を中止しました。再読み込みしてください。";
+    case "docs_scope_missing":
+    case "docs_scope_mismatch":
+    case "docs_scope_not_writable":
+    case "node_not_writable":
+      return "Docsの権限が変わったため、競合を解決できません。最新の権限を確認してください。";
+    case "server_scope_missing":
+    case "server_scope_mismatch":
+    case "server_id_mismatch":
+      return "サーバー版のDocsスコープを確認できないため、競合を解決できません。再同期してください。";
+    case "missing_server_snapshot":
+    case "server_version_missing":
+      return "サーバー版が取得できないため、競合を解決できません。再同期してください。";
+    case "outbox_replaced":
+      return "端末で新しい編集が発生したため、古い競合操作は適用しませんでした。画面を更新してください。";
+    default:
+      return "競合を解決できませんでした。最新状態を取得して再試行してください。";
+  }
+}
+
+function conflictFieldValue(
+  field: ConflictField,
+  localPayload: Record<string, unknown>,
+  localNode: DocsNode | null,
+  serverPayload: Record<string, unknown>,
+): { local: unknown; server: unknown } {
+  const localFallback: Record<ConflictField, unknown> = {
+    title: localNode?.title ?? "",
+    description: localNode?.description ?? "",
+    body_text: localNode?.body_text ?? "",
+    body_json: localNode?.body_json ?? null,
+  };
+  const serverKey = field;
+  const localKey = field;
+  return {
+    local: localPayload[localKey] ?? localFallback[field],
+    server: serverPayload[serverKey],
+  };
+}
 
 export default function DocsNodeScreen() {
   const router = useRouter();
   const params = useLocalSearchParams<{ nodeId: string; created?: string }>();
   const nodeId = params.nodeId;
-  const online = useNetworkStore((state) => state.online);
+  // Docs APIs use the AoiTalk server path; Internet reachability is unrelated
+  // when the server is hosted on the same LAN.
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const [node, setNode] = useState<DocsNode | null>(null);
   const [tags, setTags] = useState<DocsSupertag[]>([]);
   const [backlinks, setBacklinks] = useState<DocsNode[]>([]);
@@ -53,6 +140,9 @@ export default function DocsNodeScreen() {
   const [reloadToken, setReloadToken] = useState(0);
   const [moveTargetId, setMoveTargetId] = useState<string | null>(null);
   const [clipIngestVisible, setClipIngestVisible] = useState(false);
+  const [conflict, setConflict] = useState<OutboxConflictReference | null>(null);
+  const [conflictBusy, setConflictBusy] = useState(false);
+  const [conflictMessage, setConflictMessage] = useState<string | null>(null);
   const draftsInitialized = useRef(false);
   const initialFocusApplied = useRef(false);
   const titleInputRef = useRef<{ focus: () => void } | null>(null);
@@ -73,6 +163,35 @@ export default function DocsNodeScreen() {
   const titleDraftRevisionRef = useRef(0);
   const descDraftRevisionRef = useRef(0);
   const revalidateFlightRef = useRef<Promise<void> | null>(null);
+
+  const protectedProjectNode = Boolean(
+    node
+    && (() => {
+      const systemKey = typeof node.system_key === "string" ? node.system_key.trim() : "";
+      return systemKey === "project_information_root"
+        || systemKey.startsWith("project_information:");
+    })(),
+  );
+  const conflictLocalPayload = conflict
+    ? parseConflictPayload(conflict.payload)
+    : {};
+  const conflictServerPayload = conflict
+    ? parseConflictPayload(conflict.conflictPayload)
+    : {};
+  const conflictFields: ConflictField[] = [
+    "title",
+    "description",
+    "body_text",
+    "body_json",
+  ];
+  const conflictWritable = Boolean(
+    conflict
+    && node
+    && !protectedProjectNode
+    && !node.read_only
+    && node.access !== "read"
+    && conflict.docsScopeKey,
+  );
 
   const bump = useCallback(() => setReloadToken((value) => value + 1), []);
   const loadNode = useCallback(async (
@@ -112,9 +231,43 @@ export default function DocsNodeScreen() {
       });
 
     try {
-      const loaded = await docsRepo.getNode(nodeId);
-      if (!isCurrent()) return null;
+      // A remote Clip/search/today result may be navigated to before the
+      // staged Docs pull has promoted its row.  Use the ACL-checked canonical
+      // node endpoint as a read-through fallback instead of showing a false
+      // "not found" screen; the API adapter applies the snapshot itself.
+      let loaded = await docsRepo.getNode(nodeId);
+      if (!loaded && online) {
+        try {
+          loaded = (await docsApi.getNode(nodeId)).node;
+        } catch {
+          // Keep the existing null/empty state when the canonical read is
+          // unavailable or the node is not visible to this account.
+        }
+      }
+      if (!isCurrent()) {
+        return null;
+      }
       setNode(loaded);
+      if (!loaded) {
+        setConflict(null);
+        setConflictMessage(null);
+      } else if (typeof getOutboxConflict === "function") {
+        // Conflicts are read through the account/scope-bound outbox helper;
+        // never infer one from a sibling project that happens to share UUIDs.
+        try {
+          const loadedConflict = await getOutboxConflict(
+            "knowledge_nodes",
+            nodeId,
+            { docsScopeKey: docsScopeKey(loaded) },
+          );
+          if (isCurrent()) {
+            setConflict(loadedConflict);
+            if (loadedConflict) setConflictMessage(null);
+          }
+        } catch {
+          if (isCurrent()) setConflict(null);
+        }
+      }
       if (loaded) {
         if (
           !draftsInitialized.current ||
@@ -155,7 +308,7 @@ export default function DocsNodeScreen() {
     } finally {
       if (isCurrent()) setLoading(false);
     }
-  }, [nodeId]);
+  }, [nodeId, online]);
 
   const revalidateNode = useCallback(
     (generation: number): Promise<void> => {
@@ -215,6 +368,9 @@ export default function DocsNodeScreen() {
     descDraftRevisionRef.current += 1;
     setTitleDraft("");
     setDescDraft("");
+    setConflict(null);
+    setConflictMessage(null);
+    setConflictBusy(false);
     setTitleEditing(false);
   }, [nodeId]);
   useEffect(() => {
@@ -252,6 +408,15 @@ export default function DocsNodeScreen() {
 
   const saveTitle = useCallback(async () => {
     if (!node) return;
+    if (protectedProjectNode) {
+      // Project metadata is the title authority.  The mobile page does not
+      // own a project-name cache, so restore the last server-provided title
+      // and never enqueue a generic canonical-root rename/clear.
+      titleDraftRef.current = node.title ?? "";
+      titleDirtyRef.current = false;
+      setTitleDraft(titleDraftRef.current);
+      return;
+    }
     const next = titleDraftRef.current.replace(/[\r\n]+/g, " ").slice(0, 500);
     if (next !== titleDraftRef.current) {
       titleDraftRef.current = next;
@@ -275,7 +440,7 @@ export default function DocsNodeScreen() {
     } finally {
       titleSaveCountRef.current -= 1;
     }
-  }, [node, nodeId]);
+  }, [node, nodeId, protectedProjectNode]);
 
   const submitTitle = useCallback(async () => {
     await saveTitle();
@@ -305,6 +470,76 @@ export default function DocsNodeScreen() {
       descSaveCountRef.current -= 1;
     }
   }, [node, nodeId]);
+
+  const resolveServerConflict = useCallback(async () => {
+    const reference = conflict;
+    if (!reference || !node || protectedProjectNode) return;
+    if (node.read_only || node.access === "read" || !reference.docsScopeKey) {
+      setConflictMessage(conflictReasonMessage("node_not_writable"));
+      return;
+    }
+    setConflictBusy(true);
+    setConflictMessage(null);
+    try {
+      if (typeof adoptDocsNodeServerConflict !== "function") {
+        throw new Error("競合解決機能を利用できません");
+      }
+      const result = await adoptDocsNodeServerConflict(reference);
+      if (!result.ok) {
+        setConflictMessage(conflictReasonMessage(result.reason));
+        return;
+      }
+      setConflict(null);
+      setConflictMessage(null);
+      const generation = loadGeneration.current;
+      await loadNode(generation, true);
+      await outlineRef.current?.reloadFromRepository();
+    } catch (error) {
+      setConflictMessage(
+        error instanceof Error && error.message
+          ? error.message
+          : conflictReasonMessage(),
+      );
+    } finally {
+      setConflictBusy(false);
+    }
+  }, [conflict, loadNode, node, nodeId, protectedProjectNode]);
+
+  const reapplyDeviceConflict = useCallback(async () => {
+    const reference = conflict;
+    if (!reference || !node || protectedProjectNode) return;
+    if (node.read_only || node.access === "read" || !reference.docsScopeKey) {
+      setConflictMessage(conflictReasonMessage("node_not_writable"));
+      return;
+    }
+    setConflictBusy(true);
+    setConflictMessage(null);
+    try {
+      if (typeof rebaseOutboxConflict !== "function") {
+        throw new Error("競合解決機能を利用できません");
+      }
+      const result = await rebaseOutboxConflict(reference);
+      if (!result.ok) {
+        setConflictMessage(conflictReasonMessage(result.reason));
+        return;
+      }
+      // The local node/payload remains untouched.  Only the outbox base and
+      // conflict marker changed, so the next sync can safely push the device
+      // edit against the accepted server version.
+      setConflict(null);
+      setConflictMessage(null);
+      const generation = loadGeneration.current;
+      await loadNode(generation, true);
+    } catch (error) {
+      setConflictMessage(
+        error instanceof Error && error.message
+          ? error.message
+          : conflictReasonMessage(),
+      );
+    } finally {
+      setConflictBusy(false);
+    }
+  }, [conflict, loadNode, node, protectedProjectNode]);
 
   const archiveSelf = useCallback(async () => {
     await docsRepo.archiveNode(nodeId);
@@ -373,7 +608,7 @@ export default function DocsNodeScreen() {
                 <ActivityIndicator size="small" color="#7c3aed" />
               </View>
             ) : (
-              titleEditing ? (
+              titleEditing && !protectedProjectNode ? (
                 <TextInput
                   ref={(input: { focus: () => void } | null) => {
                     titleInputRef.current = input;
@@ -408,6 +643,7 @@ export default function DocsNodeScreen() {
                   accessibilityLabel="ページタイトルを編集"
                   style={styles.titleDisplay}
                   onPress={() => {
+                    if (protectedProjectNode) return;
                     setTitleEditing(true);
                     requestAnimationFrame(() => titleInputRef.current?.focus());
                   }}
@@ -422,6 +658,77 @@ export default function DocsNodeScreen() {
                 </Pressable>
               )
             )}
+            {conflict ? (
+              <Surface
+                testID="docs-sync-conflict"
+                style={styles.conflictCard}
+                elevation={0}
+              >
+                <Text style={styles.conflictTitle}>同期競合</Text>
+                <Text style={styles.conflictDescription}>
+                  端末編集とサーバー編集が同じ項目で競合しています。どちらを残すか選択してください。
+                </Text>
+                {conflictFields.map((field) => {
+                  const values = conflictFieldValue(
+                    field,
+                    conflictLocalPayload,
+                    node,
+                    conflictServerPayload,
+                  );
+                  if (
+                    values.server === undefined
+                    && values.local === undefined
+                  ) return null;
+                  const labels: Record<ConflictField, string> = {
+                    title: "タイトル",
+                    description: "概要",
+                    body_text: "本文",
+                    body_json: "本文データ",
+                  };
+                  return (
+                    <View key={field} style={styles.conflictValueRow}>
+                      <Text style={styles.conflictFieldLabel}>{labels[field]}</Text>
+                      <Text style={styles.conflictValue}>
+                        端末: {formatConflictValue(values.local)}
+                      </Text>
+                      <Text style={styles.conflictValue}>
+                        サーバー: {formatConflictValue(values.server)}
+                      </Text>
+                    </View>
+                  );
+                })}
+                <View style={styles.conflictActions}>
+                  <Button
+                    compact
+                    mode="outlined"
+                    textColor="#89b4fa"
+                    disabled={!conflictWritable || conflictBusy}
+                    loading={conflictBusy}
+                    onPress={() => void resolveServerConflict()}
+                  >
+                    サーバー版を採用
+                  </Button>
+                  <Button
+                    compact
+                    mode="contained"
+                    buttonColor="#7c3aed"
+                    disabled={!conflictWritable || conflictBusy}
+                    loading={conflictBusy}
+                    onPress={() => void reapplyDeviceConflict()}
+                  >
+                    端末編集を再適用
+                  </Button>
+                </View>
+                {!conflictWritable ? (
+                  <Text style={styles.conflictWarning}>
+                    権限またはDocsスコープが変わったため、解決操作を無効にしています。
+                  </Text>
+                ) : null}
+                {conflictMessage ? (
+                  <Text style={styles.conflictWarning}>{conflictMessage}</Text>
+                ) : null}
+              </Surface>
+            ) : null}
             {tags.length > 0 ? (
               <Text style={styles.tagSummary} numberOfLines={1}>
                 {tags.map((tag) => `#${tag.name}`).join("  ")}
@@ -444,9 +751,13 @@ export default function DocsNodeScreen() {
           <Dialog.ScrollArea style={styles.dialogScrollArea}>
             <ScrollView contentContainerStyle={styles.propertiesContent} keyboardShouldPersistTaps="handled">
               <Text style={styles.sectionLabel}>タグ</Text>
-              <TagPicker nodeId={nodeId} tags={tags} onChanged={bump} />
+              <TagPicker nodeId={nodeId} tags={tags} onChanged={bump} readOnly={protectedProjectNode} />
               <Text style={styles.sectionLabel}>フィールド</Text>
-              <FieldEditor nodeId={nodeId} reloadToken={reloadToken} />
+              {protectedProjectNode ? (
+                <Text style={styles.readOnlyNote}>Project正本のフィールドは専用画面で管理されます。</Text>
+              ) : (
+                <FieldEditor nodeId={nodeId} reloadToken={reloadToken} />
+              )}
               <Text style={styles.sectionLabel}>概要</Text>
               <TextInput
                 value={descDraft}
@@ -509,19 +820,21 @@ export default function DocsNodeScreen() {
               >
                 {showArchived ? "アーカイブ済みを隠す" : "アーカイブ済みを表示"}
               </Button>
-              <Button
-                mode="outlined"
-                icon="folder-move-outline"
-                onPress={() => {
-                  setPropertiesVisible(false);
-                  setMoveTargetId(nodeId);
-                }}
-              >
-                このページを移動
-              </Button>
-              <Button mode="outlined" icon="archive-outline" textColor="#f38ba8" onPress={() => void archiveSelf()}>
+              {!protectedProjectNode ? (
+                <Button
+                  mode="outlined"
+                  icon="folder-move-outline"
+                  onPress={() => {
+                    setPropertiesVisible(false);
+                    setMoveTargetId(nodeId);
+                  }}
+                >
+                  このページを移動
+                </Button>
+              ) : null}
+              {!protectedProjectNode ? <Button mode="outlined" icon="archive-outline" textColor="#f38ba8" onPress={() => void archiveSelf()}>
                 このページをアーカイブ
-              </Button>
+              </Button> : null}
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
@@ -539,6 +852,8 @@ export default function DocsNodeScreen() {
       <ClipIngestDialog
         visible={clipIngestVisible}
         onDismiss={() => setClipIngestVisible(false)}
+        targetNodeId={nodeId}
+        projectId={node?.project_id ?? null}
         onOpenNode={(openNodeId) => {
           setClipIngestVisible(false);
           router.push(`/(tabs)/docs/${openNodeId}`);
@@ -564,11 +879,34 @@ const styles = StyleSheet.create({
   titleDisplayText: { color: "#cdd6f4", fontSize: 21, fontWeight: "700" },
   titlePlaceholder: { color: "#6c7086", fontSize: 21, fontWeight: "700" },
   tagSummary: { color: "#a6adc8", fontSize: 12, paddingHorizontal: 12, paddingBottom: 5 },
+  conflictCard: {
+    backgroundColor: "#2a1f35",
+    borderColor: "#c084fc",
+    borderWidth: 1,
+    borderRadius: 8,
+    marginHorizontal: 10,
+    marginBottom: 10,
+    padding: 10,
+    gap: 6,
+  },
+  conflictTitle: { color: "#f9e2af", fontSize: 16, fontWeight: "700" },
+  conflictDescription: { color: "#cdd6f4", fontSize: 12, lineHeight: 18 },
+  conflictValueRow: {
+    borderTopColor: "#45405a",
+    borderTopWidth: StyleSheet.hairlineWidth,
+    paddingTop: 5,
+    gap: 2,
+  },
+  conflictFieldLabel: { color: "#c084fc", fontSize: 12, fontWeight: "700" },
+  conflictValue: { color: "#a6adc8", fontSize: 12, lineHeight: 17 },
+  conflictActions: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 4 },
+  conflictWarning: { color: "#f38ba8", fontSize: 12, lineHeight: 17 },
   dialog: { backgroundColor: "#1e1e2e", maxHeight: "88%" },
   dialogTitle: { color: "#cdd6f4" },
   dialogScrollArea: { maxHeight: 620, borderColor: "#313244" },
   propertiesContent: { paddingVertical: 8, gap: 12 },
   sectionLabel: { color: "#c084fc", fontSize: 12, fontWeight: "700", marginTop: 4 },
+  readOnlyNote: { color: "#a6adc8", fontSize: 12, lineHeight: 18 },
   descInput: { backgroundColor: "#181825" },
   backlinkTitle: { color: "#cdd6f4", fontSize: 14 },
 });

@@ -5,6 +5,8 @@ import os
 import random
 import datetime
 import requests
+from types import SimpleNamespace
+from collections.abc import Mapping
 from ..core import tool
 from ...services.outbound_privacy_service import (
     OutboundPrivacyGateway,
@@ -34,6 +36,72 @@ def _weather_gateway() -> OutboundPrivacyGateway:
         session_id=str(getattr(turn, "session_id", None) or ""),
         session_context=inherited.session_context,
         project_metadata=inherited.project_metadata,
+    )
+
+
+def _weather_descriptor(destination: str):
+    try:
+        from ...services.outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="weather_query",
+            transport="requests.get",
+            destination=destination,
+            provider="openweather",
+            tool="get_weather_info",
+            model="",
+        )
+    except ImportError:  # pragma: no cover - old stripped embeds
+        return SimpleNamespace(
+            action="weather_query",
+            transport="requests.get",
+            destination=destination,
+            provider="openweather",
+            tool="get_weather_info",
+            model="",
+        )
+
+
+def _weather_request(
+    gateway: OutboundPrivacyGateway,
+    *,
+    base_url: str,
+    location: str,
+    api_key: str,
+):
+    """Send one weather query through the canonical outbound transaction."""
+
+    execute_sync = getattr(gateway, "execute_sync", None)
+    if not callable(execute_sync):
+        raise PrivacyError("outbound privacy gateway does not support execution")
+
+    def send(protected_payload):
+        if not isinstance(protected_payload, Mapping):
+            raise PrivacyError("privacy protection returned no protected payload")
+        safe_location = str(protected_payload.get("q") or "").strip()
+        if not safe_location:
+            raise PrivacyError("privacy protection returned no protected location")
+        # Credentials are configuration-owned and intentionally captured by
+        # the sender, never included in the model-facing privacy payload.
+        return requests.get(
+            base_url,
+            params={
+                "q": safe_location,
+                "appid": api_key,
+                "units": "metric",
+                "lang": "ja",
+            },
+            timeout=5,
+            allow_redirects=False,
+        )
+
+    return execute_sync(
+        {"q": location},
+        provider="openweather",
+        descriptor=_weather_descriptor(base_url),
+        sender=send,
+        base_url=base_url,
+        source_kind="weather_query",
     )
 
 
@@ -112,33 +180,26 @@ def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
         
         # Debug: print locations to try
         print(f"[Tool] get_weather_info 試行する地名: {location_to_try}")
+
+        try:
+            gateway = _weather_gateway()
+        except Exception:
+            return "天気情報の取得はプライバシー保護に失敗したため停止しました。"
         
         # Try each location variant
         response = None
         for loc in location_to_try:
             try:
-                protected = _weather_gateway().protect_sync(
-                    {"q": loc},
-                    provider="openweather",
+                response = _weather_request(
+                    gateway,
                     base_url=base_url,
-                    source_kind="weather_query",
+                    location=loc,
+                    api_key=api_key,
                 )
-                safe_location = (
-                    str(protected.payload.get("q") or loc)
-                    if isinstance(protected.payload, dict)
-                    else loc
-                )
-            except Exception as exc:
-                return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
-            params = {
-                "q": safe_location,
-                "appid": api_key,
-                "units": "metric",
-                "lang": "ja"
-            }
-            
+            except Exception:
+                return "天気情報の取得はプライバシー保護に失敗したため停止しました。"
+
             print(f"[Tool] get_weather_info APIコール試行: {loc}")
-            response = requests.get(base_url, params=params, timeout=5)
             if response.status_code == 200:
                 print(f"[Tool] get_weather_info 成功: {loc}")
                 break
@@ -148,23 +209,16 @@ def get_weather_info_impl(location: str = "東京", when: str = "今") -> str:
         if response is None or response.status_code != 200:
             # Last resort: try with "Japan" suffix
             try:
-                protected = _weather_gateway().protect_sync(
-                    {"q": f"{location_to_try[0]},JP"},
-                    provider="openweather",
+                last_try = f"{location_to_try[0]},JP"
+                response = _weather_request(
+                    gateway,
                     base_url=base_url,
-                    source_kind="weather_query",
+                    location=last_try,
+                    api_key=api_key,
                 )
-                safe_last = (
-                    str(protected.payload.get("q") or f"{location_to_try[0]},JP")
-                    if isinstance(protected.payload, dict)
-                    else f"{location_to_try[0]},JP"
-                )
-            except Exception as exc:
-                return f"天気情報の取得はプライバシーポリシーにより停止しました: {exc}"
-            last_try = safe_last
-            params["q"] = last_try
+            except Exception:
+                return "天気情報の取得はプライバシー保護に失敗したため停止しました。"
             print(f"[Tool] get_weather_info 最終試行: {last_try}")
-            response = requests.get(base_url, params=params, timeout=5)
             if response.status_code == 200:
                 print(f"[Tool] get_weather_info 成功: {last_try}")
         

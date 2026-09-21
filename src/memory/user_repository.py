@@ -15,9 +15,51 @@ from sqlalchemy import select, delete, update, and_, or_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
-from .models import App, Project, Space, User
+from .models import App, ExternalIdentityBinding, Project, Space, User
 
 logger = logging.getLogger(__name__)
+
+
+async def _ensure_personal_docs_for_user(
+    session: AsyncSession,
+    user_id: UUID | str | None,
+) -> None:
+    """Materialize the canonical Personal Docs Guide in the user transaction.
+
+    Production sessions always use PostgreSQL and therefore must propagate a
+    Guide lifecycle failure so account creation rolls back atomically. A few
+    focused SQLite repository tests intentionally create only the ``users``
+    table; skip the hook when the Docs schema is absent rather than changing
+    that lightweight fixture contract.
+    """
+
+    if user_id is None or not isinstance(session, AsyncSession):
+        return
+    try:
+        bind = session.get_bind()
+        dialect = str(getattr(getattr(bind, "dialect", None), "name", ""))
+    except Exception:
+        dialect = ""
+    if dialect == "sqlite":
+        try:
+            from sqlalchemy import inspect as sqlalchemy_inspect
+
+            has_docs_library = await session.run_sync(
+                lambda sync_session: sqlalchemy_inspect(sync_session).has_table(
+                    "docs_libraries"
+                )
+            )
+        except Exception:
+            # Do not weaken the PostgreSQL production path. If a SQLite
+            # fixture cannot be inspected, let the normal lifecycle call
+            # surface the real schema error instead of silently succeeding.
+            has_docs_library = True
+        if not has_docs_library:
+            return
+
+    from ..services.docs_workspace import ensure_docs_library
+
+    await ensure_docs_library(session, owner_user_id=UUID(str(user_id)))
 
 
 class UserDeletionBlockedError(RuntimeError):
@@ -34,6 +76,10 @@ class LastAdminError(RuntimeError):
 
 class UserConflictError(ValueError):
     """Raised when a username/email uniqueness constraint is hit."""
+
+
+class ExternalIdentityCredentialError(ValueError):
+    """Raised when local credential management targets an external account."""
 
 
 class UserRepository:
@@ -53,7 +99,7 @@ class UserRepository:
         return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
 
     @staticmethod
-    def verify_password(password: str, password_hash: str) -> bool:
+    def verify_password(password: str, password_hash: Optional[str]) -> bool:
         """Verify a password against its hash
 
         Args:
@@ -63,6 +109,9 @@ class UserRepository:
         Returns:
             bool: True if password matches
         """
+        if not isinstance(password_hash, str) or not password_hash:
+            # External (AD) users intentionally have no local hash.
+            return False
         try:
             return bcrypt.checkpw(
                 password.encode('utf-8'),
@@ -139,6 +188,7 @@ class UserRepository:
         user = User(
             username=username,
             password_hash=UserRepository.hash_password(password),
+            auth_source="local",
             email=email,
             display_name=display_name or username,
             role=role,
@@ -148,7 +198,35 @@ class UserRepository:
 
         session.add(user)
         try:
-            if commit:
+            # UUID defaults are assigned on flush. Ensure the Guide sees the
+            # durable owner id and remains in the same transaction as the
+            # account row; ``commit=False`` callers can include both in their
+            # existing outer transaction.
+            flush = getattr(session, "flush", None)
+            if callable(flush):
+                await flush()
+                await _ensure_personal_docs_for_user(session, user.id)
+
+            from ..services.verification_provenance import register_current_entity
+            from ..verification.context import get_current_verification_context
+
+            # Preserve the lightweight/mock session contract for ordinary
+            # account creation.  A verification context requires a flush so
+            # the generated UUID can be registered in the same transaction.
+            if get_current_verification_context() is not None:
+                if not callable(flush):
+                    raise RuntimeError("verification user creation requires session.flush")
+                tagged_settings = await register_current_entity(
+                    session,
+                    entity_type="user",
+                    entity_id=user.id,
+                    metadata=user.user_settings,
+                )
+                if tagged_settings is not None:
+                    user.user_settings = tagged_settings
+                if commit:
+                    await session.commit()
+            elif commit:
                 await session.commit()
             else:
                 await session.flush()
@@ -199,6 +277,329 @@ class UserRepository:
         query = select(User).where(User.username == username)
         result = await session.execute(query)
         return result.scalar_one_or_none()
+
+    @staticmethod
+    def normalize_ad_external_id(value: UUID | str | bytes | bytearray) -> UUID:
+        """Normalize an AD ``objectGUID`` to a UUID.
+
+        LDAP commonly returns ``objectGUID`` as 16 little-endian bytes; the
+        UUID text form uses RFC-4122 byte order.  Accept both forms here so
+        every caller persists one canonical identity value.
+        """
+
+        if isinstance(value, UUID):
+            return value
+        if isinstance(value, (bytes, bytearray)):
+            if len(value) != 16:
+                raise ValueError("AD objectGUID must contain exactly 16 bytes")
+            return UUID(bytes_le=bytes(value))
+        try:
+            return UUID(str(value).strip())
+        except (ValueError, AttributeError, TypeError) as exc:
+            raise ValueError("AD objectGUID must be a UUID") from exc
+
+    @staticmethod
+    def normalize_ad_authority(authority: str) -> str:
+        """Return the canonical authority key used by identity bindings."""
+
+        if not isinstance(authority, str):
+            raise ValueError("AD authority must be a string")
+        normalized = authority.strip().lower()
+        if not normalized or len(normalized) > 255:
+            raise ValueError("AD authority must be 1-255 characters")
+        if any(
+            ord(character) < 0x20
+            or ord(character) == 0x7F
+            or character.isspace()
+            for character in normalized
+        ):
+            raise ValueError("AD authority contains invalid characters")
+        return normalized
+
+    @staticmethod
+    async def _update_ad_user_profile(
+        session: AsyncSession,
+        user: User,
+        *,
+        username: str,
+        email: Optional[str],
+        display_name: Optional[str],
+    ) -> User:
+        """Apply safe presentation updates without changing identity source."""
+
+        username = username.strip()
+        if not username or len(username) > 100:
+            raise ValueError("Username must be 1-100 characters")
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in username):
+            raise ValueError("Username contains invalid characters")
+        if email is not None:
+            email = email.strip() or None
+            if len(email or "") > 255:
+                raise ValueError("Email must be at most 255 characters")
+            if email is not None and any(
+                ord(character) < 0x20 or ord(character) == 0x7F for character in email
+            ):
+                raise ValueError("Email contains invalid characters")
+        if display_name is not None:
+            display_name = display_name.strip() or None
+            if len(display_name or "") > 100:
+                raise ValueError("Display name must be at most 100 characters")
+            if display_name is not None and any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in display_name
+            ):
+                raise ValueError("Display name contains invalid characters")
+
+        if username != user.username:
+            collision = await session.scalar(
+                select(User).where(
+                    and_(
+                        func.lower(User.username) == username.lower(),
+                        User.id != user.id,
+                    )
+                )
+            )
+            if collision is not None:
+                # Never attach an AD identity to an unrelated local account
+                # merely because the directory username matches it.
+                raise UserConflictError(
+                    f"Username '{username}' already belongs to another user"
+                )
+            user.username = username
+
+        if email is not None and email != user.email:
+            collision = await session.scalar(
+                select(User).where(
+                    and_(
+                        func.lower(User.email) == email.lower(),
+                        User.id != user.id,
+                    )
+                )
+            )
+            if collision is not None:
+                raise UserConflictError(f"Email '{email}' already belongs to another user")
+            user.email = email
+        if display_name is not None:
+            user.display_name = display_name
+
+        # Keep the local shadow row in the AD invariant state.  These are
+        # idempotent assignments for existing AD rows and are also enforced by
+        # the database CHECK/trigger.
+        user.auth_source = "ad"
+        user.password_hash = None
+        user.is_password_reset_required = False
+        user.last_login = datetime.utcnow()
+        user.updated_at = datetime.utcnow()
+        return user
+
+    @staticmethod
+    async def provision_ad_user(
+        session: AsyncSession,
+        *,
+        authority: str,
+        external_id: UUID | str | bytes | bytearray,
+        username: str,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        role: str = "user",
+        is_active: bool = True,
+        commit: bool = True,
+    ) -> User:
+        """Get or atomically create the local shadow for one AD identity.
+
+        The only durable external identity is ``(source='ad', authority,
+        objectGUID)``.  Existing local rows are never linked by username or
+        email; a collision is surfaced as :class:`UserConflictError`.
+        ``commit=False`` lets the login route include this mutation in its
+        existing transaction (throttle/audit/session handling).
+        """
+
+        authority = UserRepository.normalize_ad_authority(authority)
+        external_id = UserRepository.normalize_ad_external_id(external_id)
+        # ``normalize_ad_external_id`` treats binary objectGUID values as AD's
+        # little-endian representation.  Do not probe an RFC-4122/network-byte
+        # alternate: two different GUIDs can be byte-swapped counterparts, and
+        # an alternate lookup could therefore bind a valid directory identity
+        # to another user's local shadow account.
+        if not isinstance(username, str) or not username.strip() or len(username.strip()) > 100:
+            raise ValueError("Username must be 1-100 characters")
+        username = username.strip()
+        if any(ord(character) < 0x20 or ord(character) == 0x7F for character in username):
+            raise ValueError("Username contains invalid characters")
+        if role not in {"admin", "user"}:
+            raise ValueError("Role must be 'admin' or 'user'")
+        if type(is_active) is not bool:
+            raise ValueError("is_active must be a boolean")
+        if email is not None and (
+            not isinstance(email, str) or len(email.strip()) > 255
+        ):
+            raise ValueError("Email must be at most 255 characters")
+        if email is not None and any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in email
+        ):
+            raise ValueError("Email contains invalid characters")
+        if display_name is not None and (
+            not isinstance(display_name, str) or len(display_name.strip()) > 100
+        ):
+            raise ValueError("Display name must be at most 100 characters")
+        if display_name is not None and any(
+            ord(character) < 0x20 or ord(character) == 0x7F for character in display_name
+        ):
+            raise ValueError("Display name contains invalid characters")
+
+        binding_query = (
+            select(ExternalIdentityBinding)
+            .where(
+                and_(
+                    ExternalIdentityBinding.source == "ad",
+                    ExternalIdentityBinding.authority == authority,
+                    ExternalIdentityBinding.external_id == external_id,
+                )
+            )
+            .with_for_update()
+            .limit(1)
+        )
+        binding = await session.scalar(binding_query)
+        if binding is not None:
+            user = await session.scalar(
+                select(User)
+                .where(User.id == binding.user_id)
+                .with_for_update()
+                .limit(1)
+            )
+            if user is None or getattr(user, "auth_source", "local") != "ad":
+                raise UserConflictError("External identity binding points to an invalid user")
+            user = await UserRepository._update_ad_user_profile(
+                session,
+                user,
+                username=username,
+                email=email,
+                display_name=display_name,
+            )
+            await _ensure_personal_docs_for_user(session, user.id)
+            if commit:
+                await session.commit()
+            else:
+                await session.flush()
+            await session.refresh(user)
+            setattr(user, "_ad_created", False)
+            return user
+
+        # A same-name local account is intentionally a hard collision.  It is
+        # never safe to infer identity from mutable username/email attributes.
+        existing_username = await session.scalar(
+            select(User)
+            .where(func.lower(User.username) == username.lower())
+            .limit(1)
+        )
+        if existing_username is not None:
+            raise UserConflictError(
+                f"Username '{username}' already belongs to another user"
+            )
+
+        user = User(
+            username=username,
+            email=email.strip() or None if isinstance(email, str) else email,
+            display_name=(
+                display_name.strip() or username
+                if isinstance(display_name, str)
+                else username
+            ),
+            password_hash=None,
+            auth_source="ad",
+            role=role,
+            is_active=is_active,
+            is_password_reset_required=False,
+            last_login=datetime.utcnow(),
+        )
+        binding = ExternalIdentityBinding(
+            user=user,
+            source="ad",
+            authority=authority,
+            external_id=external_id,
+        )
+
+        # Use a SAVEPOINT where available so a concurrent unique-key winner
+        # does not abort the caller's outer login/audit transaction.  The
+        # second lookup then returns the one canonical row.
+        begin_nested = getattr(session, "begin_nested", None)
+        try:
+            if callable(begin_nested):
+                async with begin_nested():
+                    session.add(user)
+                    session.add(binding)
+                    await session.flush()
+            else:
+                session.add(user)
+                session.add(binding)
+                await session.flush()
+        except IntegrityError as exc:
+            if not callable(begin_nested):
+                rollback = getattr(session, "rollback", None)
+                if callable(rollback):
+                    await rollback()
+            winner = await session.scalar(binding_query)
+            if winner is not None:
+                winner_user = await session.scalar(
+                    select(User)
+                    .where(User.id == winner.user_id)
+                    .with_for_update()
+                    .limit(1)
+                )
+                if winner_user is not None and getattr(winner_user, "auth_source", "local") == "ad":
+                    winner_user = await UserRepository._update_ad_user_profile(
+                        session,
+                        winner_user,
+                        username=username,
+                        email=email,
+                        display_name=display_name,
+                    )
+                    await _ensure_personal_docs_for_user(session, winner_user.id)
+                    if commit:
+                        await session.commit()
+                    else:
+                        await session.flush()
+                    await session.refresh(winner_user)
+                    setattr(winner_user, "_ad_created", False)
+                    return winner_user
+            raise UserConflictError(
+                "AD identity or username already belongs to another user"
+            ) from exc
+
+        await session.flush()
+        await _ensure_personal_docs_for_user(session, user.id)
+        if commit:
+            await session.commit()
+        await session.refresh(user)
+        setattr(user, "_ad_created", True)
+        return user
+
+    @staticmethod
+    async def get_or_create_ad_user(
+        session: AsyncSession,
+        *,
+        authority: str,
+        external_id: UUID | str | bytes | bytearray,
+        username: str,
+        email: Optional[str] = None,
+        display_name: Optional[str] = None,
+        role: str = "user",
+        is_active: bool = True,
+        commit: bool = True,
+    ) -> User:
+        """Compatibility alias for :meth:`provision_ad_user`."""
+
+        return await UserRepository.provision_ad_user(
+            session,
+            authority=authority,
+            external_id=external_id,
+            username=username,
+            email=email,
+            display_name=display_name,
+            role=role,
+            is_active=is_active,
+            commit=commit,
+        )
 
     @staticmethod
     async def get_by_id_locked(
@@ -378,6 +779,12 @@ class UserRepository:
         if not user.is_active:
             return None
 
+        # This repository is the local bcrypt adapter only.  AD credentials
+        # must be verified by the canonical external-auth service and must
+        # never fall back to a local hash (which is absent by contract).
+        if getattr(user, "auth_source", "local") != "local":
+            return None
+
         if not UserRepository.verify_password(password, user.password_hash):
             return None
 
@@ -412,6 +819,21 @@ class UserRepository:
         """
         if not isinstance(new_password, str) or not 6 <= len(new_password) <= 1024:
             raise ValueError("Password must be 6-1024 characters")
+        # Reject external identities before doing any bcrypt work.  The
+        # submitted value is a local-password concern only; an AD account
+        # must never even enter the local credential mutation path.
+        scalar = getattr(session, "scalar", None)
+        if callable(scalar):
+            try:
+                target = await scalar(
+                    select(User).where(User.id == user_id).limit(1)
+                )
+            except Exception:
+                target = None
+            if target is not None and getattr(target, "auth_source", "local") == "ad":
+                raise ExternalIdentityCredentialError(
+                    "Active Directory users do not have local passwords"
+                )
         values: Dict[str, Any] = {
             "password_hash": UserRepository.hash_password(new_password),
             "session_version": func.coalesce(User.session_version, 1) + 1,
@@ -422,11 +844,32 @@ class UserRepository:
 
         result = await session.execute(
             update(User)
-            .where(User.id == user_id)
+            # Keep this write path local-only.  The database trigger is the
+            # final guard, while the predicate avoids even attempting a
+            # password mutation for an AD-owned account.
+            .where(and_(User.id == user_id, User.auth_source == "local"))
             .values(**values)
             .returning(User.id)
         )
         if result.scalar_one_or_none() is None:
+            # Distinguish a missing user from an external account where
+            # callers need a safe, actionable rejection.  Lightweight test
+            # doubles may not implement ``scalar``; in that case preserve
+            # the historical ``False`` result.
+            scalar = getattr(session, "scalar", None)
+            if callable(scalar):
+                try:
+                    target = await scalar(
+                        select(User).where(User.id == user_id).limit(1)
+                    )
+                except Exception:
+                    target = None
+                if target is not None and getattr(target, "auth_source", "local") == "ad":
+                    if commit:
+                        await session.rollback()
+                    raise ExternalIdentityCredentialError(
+                        "Active Directory users do not have local passwords"
+                    )
             if commit:
                 await session.rollback()
             return False
@@ -498,6 +941,14 @@ class UserRepository:
         )
         if not user:
             return None
+
+        if (
+            getattr(user, "auth_source", "local") == "ad"
+            and "is_password_reset_required" in kwargs
+        ):
+            raise ExternalIdentityCredentialError(
+                "Active Directory users do not support local password resets"
+            )
 
         # ``account_lifecycle`` is administrator-managed.  A caller may pass
         # a full settings document that preserves the current lifecycle (the
@@ -587,6 +1038,10 @@ class UserRepository:
         )
         if not user:
             return None
+        if getattr(user, "auth_source", "local") == "ad":
+            raise ExternalIdentityCredentialError(
+                "Active Directory users do not support local password resets"
+            )
         if not bool(user.is_active):
             raise ValueError(
                 "無効または削除済みのユーザーには再設定リンクを発行できません"
@@ -621,6 +1076,10 @@ class UserRepository:
             .with_for_update()
             .limit(1)
         )
+        if user is not None and getattr(user, "auth_source", "local") == "ad":
+            raise ExternalIdentityCredentialError(
+                "Active Directory users do not support local password resets"
+            )
         if (
             not user
             or not bool(user.is_active)
@@ -673,12 +1132,18 @@ class UserRepository:
         user.user_settings = settings
         changed = (
             bool(getattr(user, "is_active", False))
-            or not bool(getattr(user, "is_password_reset_required", False))
+            or (
+                getattr(user, "auth_source", "local") == "local"
+                and not bool(getattr(user, "is_password_reset_required", False))
+            )
             or not isinstance(previous_lifecycle, dict)
             or previous_lifecycle.get("state") != "deleted"
         )
         user.is_active = False
-        user.is_password_reset_required = True
+        # AD owns the credential lifecycle; disabling the shadow account must
+        # not set a local reset marker (and the DB check/trigger rejects it).
+        if getattr(user, "auth_source", "local") == "local":
+            user.is_password_reset_required = True
         if changed:
             user.session_version = (getattr(user, "session_version", None) or 1) + 1
         user.updated_at = datetime.utcnow()
@@ -716,6 +1181,15 @@ class UserRepository:
         )
         if not user:
             return False
+
+        if getattr(user, "auth_source", "local") == "ad":
+            # AD identities are durable ownership principals.  Keep the row
+            # and immutable binding for audit/ownership continuity; callers
+            # may use ``soft_delete_user`` to disable the account instead.
+            raise UserDeletionBlockedError(
+                "Active Directory users cannot be permanently deleted",
+                [{"label": "External identity binding", "count": 1}],
+            )
 
         if (
             callable(getattr(session, "execute", None))

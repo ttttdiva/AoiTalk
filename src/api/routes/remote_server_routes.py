@@ -225,6 +225,8 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
             connector = RemoteServerConnector(
                 base_url=record.base_url,
                 auth_token=record.get_auth_token(),
+                config=getattr(server, "config", None),
+                user_id=str(user_id),
             )
             try:
                 capabilities = await connector.test_connection()
@@ -248,5 +250,4 @@ def register_remote_server_routes(app: FastAPI, server: "WebChatServer") -> None
             )
         finally:
             await session.close()
-
 

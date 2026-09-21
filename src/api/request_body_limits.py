@@ -31,6 +31,13 @@ _APP_SOURCE_IMPORT_PATH = re.compile(
 )
 _X_COOKIE_PATH = "/api/users/me/x-cookie"
 _X_COOKIE_BODY_MAX_BYTES = 2 * 1024 * 1024
+_CREDENTIAL_PACKAGE_BODY_MAX_BYTES = 2 * MIB + _SMALL_MULTIPART_OVERHEAD_BYTES
+_CREDENTIAL_OPERATION_PATH = re.compile(
+    r"^/api/operations/media/(?:characters/[^/]+/platform-connections|"
+    r"platform-accounts/[^/]+/credential(?:/(?:rotate|verify|disable))?)$"
+)
+_MEETING_PROCESSING_AUDIO_BYTES = 500 * MIB
+_MEETING_PROCESSING_PATH = "/api/v1/meeting-processing/jobs"
 
 
 class _MultipartBodyTooLarge(MultiPartException):
@@ -66,6 +73,8 @@ def multipart_body_limit_for_path(path: str) -> int:
     normalized = path.rstrip("/") or "/"
     if normalized == _X_COOKIE_PATH:
         return _X_COOKIE_BODY_MAX_BYTES
+    if _CREDENTIAL_OPERATION_PATH.fullmatch(normalized):
+        return _CREDENTIAL_PACKAGE_BODY_MAX_BYTES
     if normalized == "/api/documents/upload" or _TASK_ATTACHMENT_PATH.fullmatch(
         normalized
     ):
@@ -81,6 +90,11 @@ def multipart_body_limit_for_path(path: str) -> int:
         return 250 * MIB + _APP_IMPORT_MULTIPART_OVERHEAD_BYTES
     if normalized == "/api/skill-recordings":
         return 500 * MIB + _SMALL_MULTIPART_OVERHEAD_BYTES
+    if normalized == _MEETING_PROCESSING_PATH:
+        return (
+            _MEETING_PROCESSING_AUDIO_BYTES
+            + _SMALL_MULTIPART_OVERHEAD_BYTES
+        )
     # Legacy upload endpoints without their own bound remain compatible up to
     # this finite process-wide ceiling instead of accepting an unlimited spool.
     return DEFAULT_MULTIPART_BODY_MAX_BYTES
@@ -92,6 +106,8 @@ def raw_body_limit_for_path(path: str) -> int | None:
     normalized = path.rstrip("/") or "/"
     if normalized == _X_COOKIE_PATH:
         return _X_COOKIE_BODY_MAX_BYTES
+    if _CREDENTIAL_OPERATION_PATH.fullmatch(normalized):
+        return _CREDENTIAL_PACKAGE_BODY_MAX_BYTES
     return None
 
 

@@ -92,6 +92,21 @@ export function LlmMediaModelTabs({
   );
   const showClipIngestEffort =
     !clipIngestInherit && clipIngestEffortOptions.length > 0;
+  const inheritedProvider = catalog.providers.find(
+    (item) => item.id === catalog.current.provider,
+  );
+  const inheritedModel = inheritedProvider?.models.find(
+    (item) => item.id === catalog.current.model,
+  );
+  const inheritedModelLabel =
+    inheritedModel?.label || catalog.current.model || "未選択";
+  const inheritedImageCapability = inheritedModel?.media?.image;
+  const inheritedImageCapabilityLabel =
+    inheritedImageCapability === true
+      ? "画像対応"
+      : inheritedImageCapability === false
+        ? "画像非対応"
+        : "画像対応状況不明";
 
   return (
     <>
@@ -132,6 +147,22 @@ export function LlmMediaModelTabs({
             </AppSelect>
           </div>
         </div>
+        {classDrafts.vision.inherit && (
+          <div
+            className="rounded-lg border border-border/70 bg-muted/30 px-3 py-2 text-xs"
+            data-testid="vision-inherited-model-status"
+          >
+            <span className="font-medium">現在の言語モデル: {inheritedModelLabel}</span>
+            <span className="ml-2 text-muted-foreground">
+              （{inheritedImageCapabilityLabel}）
+            </span>
+            {inheritedImageCapability === false && (
+              <p className="mt-1 text-muted-foreground">
+                このモデルには画像を直接送りません。画像を使う場合は、上のプロバイダーから画像対応モデルを選択してください。
+              </p>
+            )}
+          </div>
+        )}
         <div className="flex items-center justify-between gap-2">
           <Label className="text-xs">画像の送信方法</Label>
           <AppSelect value={imageMode} onChange={(event) => setImageMode(event.target.value as "auto" | "always" | "off")} disabled={savingRouting} className="h-8 rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none dark:bg-input/30">

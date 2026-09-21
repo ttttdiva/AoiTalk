@@ -37,6 +37,7 @@ test.describe("ナビゲーション", () => {
       { label: "Docs", path: "/docs", title: "Docs" },
       { label: "Files", path: "/filer", title: "Files" },
       { label: "プロジェクト", path: "/projects", title: "プロジェクト" },
+      { label: "Operations", path: "/operations", title: "Operations" },
       { label: "シナリオ", path: "/scenarios", title: "Story" },
       { label: "TRPG", path: "/trpg", title: "TRPG" },
       { label: "設定", path: "/settings", title: "設定" },

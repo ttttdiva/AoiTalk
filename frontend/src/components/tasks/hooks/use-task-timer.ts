@@ -93,7 +93,13 @@ export function useTaskTimer({
   useEffect(() => {
     if (!open) return;
     const handleKeydown = (e: KeyboardEvent) => {
-      if (e.altKey && (e.key === "s" || e.key === "S")) {
+      if (
+        e.altKey &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        (e.key === "s" || e.key === "S")
+      ) {
         e.preventDefault();
         handleTimer();
       }

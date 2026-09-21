@@ -8,12 +8,35 @@
 import logging
 import random
 from typing import List, Optional
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy import select, update as sa_update
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_project_id(value: str | None) -> UUID | None:
+    """Normalize a project query/body value without raising an existence oracle."""
+
+    raw = str(value or "").strip()
+    if not raw or raw.casefold() in {"none", "all"}:
+        return None
+    try:
+        return UUID(raw)
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _looks_like_builtin_masking_token(value: object) -> bool:
+    """Detect a literal token for fail-closed partial-worker behavior."""
+
+    if not isinstance(value, str):
+        return False
+    parts = value.strip().split(None, 1)
+    return bool(parts and parts[0].casefold() == "/masking")
 
 
 # ── リクエストモデル ──
@@ -38,13 +61,23 @@ class GroupRespondRequest(BaseModel):
 # ── ファクトリ関数 ──
 
 
-def create_group_chat_router(require_auth, get_current_user, config=None) -> APIRouter:
+def create_group_chat_router(
+    require_auth,
+    get_current_user,
+    config=None,
+    masking_handler=None,
+) -> APIRouter:
     """グループチャットルーターを作成する。
 
     Args:
         require_auth: 認証依存関数
         get_current_user: リクエストからユーザー情報を取得する関数
         config: アプリケーション設定
+        masking_handler: Optional trusted server-owned ``/masking`` handler.
+            The main WebChatServer supplies its request-bound helper here so
+            this legacy group endpoint cannot route a masking turn through a
+            GroupChatManager/provider.  Keeping it optional preserves import
+            compatibility for small test/embedding routers.
 
     Returns:
         APIRouter
@@ -84,31 +117,72 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
         """Return active users that can be invited to a shared chat."""
         try:
             from ..memory.database import get_database_manager
-            from ..memory.user_repository import UserRepository
+            from ..memory.models import Project, User
+            from ..memory.project_repository import ProjectRepository
+            from ..services.project_permissions import normalize_project_member_permissions
 
             current = await _current_user(request)
+            project_id = _parse_project_id(
+                request.query_params.get("project_id") if request else None
+            )
+            if project_id is None:
+                return JSONResponse({"users": []})
+            try:
+                actor_id = UUID(str(current.get("id")))
+            except (TypeError, ValueError, AttributeError):
+                return JSONResponse({"users": []})
             db_manager = get_database_manager()
             db_session = await db_manager.get_session()
             try:
-                users, _ = await UserRepository.list_users(
+                project = await db_session.get(Project, project_id)
+                if project is None or project.deleted_at is not None:
+                    return JSONResponse({"users": []})
+                if not await ProjectRepository.has_permission(
                     db_session,
-                    limit=200,
-                    include_inactive=False,
+                    project_id=project_id,
+                    user_id=actor_id,
+                    permission="read",
+                ):
+                    return JSONResponse({"users": []})
+                user_result = await db_session.execute(
+                    select(User)
+                    .where(User.is_active.is_(True))
+                    .order_by(User.username)
+                    .limit(200)
                 )
+                users = list(user_result.scalars().all())
+                allowed_users = []
+                for user in users:
+                    if user.id == actor_id:
+                        continue
+                    if user.id == project.owner_id:
+                        allowed_users.append(user)
+                        continue
+                    member = await ProjectRepository.get_member(
+                        db_session,
+                        project_id,
+                        user.id,
+                    )
+                    permissions = normalize_project_member_permissions(
+                        getattr(member, "permissions", None)
+                        if member is not None
+                        else None
+                    )
+                    if permissions.get("read") is True:
+                        allowed_users.append(user)
             finally:
                 await db_session.close()
             return JSONResponse(
                 {
                     "users": [
                         user.to_dict(include_sensitive=False)
-                        for user in users
-                        if str(user.id) != str(current.get("id"))
+                        for user in allowed_users
                     ]
                 }
             )
         except Exception as e:
-            logger.error("ユーザー候補取得エラー: %s", e)
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.warning("ユーザー候補取得を拒否: %s", e)
+            return JSONResponse({"users": []})
 
     @router.post("/group")
     async def create_group_session(
@@ -135,17 +209,73 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
         try:
             user_info = await _current_user(request)
             user_id = str(user_info.get("id") or "default_user")
+            try:
+                actor_uuid = UUID(user_id)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise HTTPException(status_code=403, detail="アクセス拒否") from exc
 
-            repo = ConversationRepository()
+            # Validate the Project scope and every invited user before any
+            # conversation row is created.  Projectless sessions may still
+            # use characters/agents, but cannot invite arbitrary users.
+            normalized_project_uuid = _parse_project_id(payload.project_id)
+            normalized_project_id = (
+                str(normalized_project_uuid)
+                if normalized_project_uuid is not None
+                else None
+            )
+            from ..memory.database import get_database_manager
+            from ..memory.models import Project, User
+            from ..memory.project_repository import ProjectRepository
+            from ..services.project_permissions import normalize_project_member_permissions
 
-            # project_id の正規化
-            normalized_project_id = payload.project_id
-            if payload.project_id and payload.project_id.lower() in [
-                "none",
-                "all",
-                "",
-            ]:
-                normalized_project_id = None
+            db_manager = get_database_manager()
+            db_session = await db_manager.get_session()
+            repo = ConversationRepository(db_session)
+            if normalized_project_uuid is None and any(
+                str(invited).strip() and str(invited) != user_id
+                for invited in payload.user_ids
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Project scope is required for user invitations",
+                )
+            project = None
+            if normalized_project_uuid is not None:
+                project = await db_session.get(Project, normalized_project_uuid)
+                if project is None or project.deleted_at is not None:
+                    raise HTTPException(status_code=404, detail="アクセス拒否")
+                if not await ProjectRepository.has_permission(
+                    db_session,
+                    project_id=normalized_project_uuid,
+                    user_id=actor_uuid,
+                    permission="write",
+                ):
+                    raise HTTPException(status_code=404, detail="アクセス拒否")
+
+                for invited_user_id in dict.fromkeys(payload.user_ids):
+                    if not invited_user_id or str(invited_user_id) == user_id:
+                        continue
+                    try:
+                        invited_uuid = UUID(str(invited_user_id))
+                    except (TypeError, ValueError, AttributeError) as exc:
+                        raise HTTPException(status_code=404, detail="アクセス拒否") from exc
+                    invited_user = await db_session.get(User, invited_uuid)
+                    if invited_user is None or not bool(getattr(invited_user, "is_active", False)):
+                        raise HTTPException(status_code=404, detail="アクセス拒否")
+                    if invited_uuid == project.owner_id:
+                        continue
+                    member = await ProjectRepository.get_member(
+                        db_session,
+                        normalized_project_uuid,
+                        invited_uuid,
+                    )
+                    permissions = normalize_project_member_permissions(
+                        getattr(member, "permissions", None)
+                        if member is not None
+                        else None
+                    )
+                    if member is None or permissions.get("read") is not True:
+                        raise HTTPException(status_code=404, detail="アクセス拒否")
 
             # セッションの作成（character_name は先頭キャラを代表値として使用）
             primary_character = payload.character_names[0] if payload.character_names else "group"
@@ -164,27 +294,18 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
                 status="joined",
             )
 
-            # グループチャットフラグとキャラクター一覧を更新
-            from sqlalchemy import update as sa_update
             from ..memory.models import ConversationSession
-            from ..memory.database import get_database_manager
-            import uuid
-
-            db_manager = get_database_manager()
-            db_session = await db_manager.get_session()
-            try:
-                stmt = (
-                    sa_update(ConversationSession)
-                    .where(ConversationSession.id == session.id)
-                    .values(
-                        is_group_chat=True,
-                        group_character_names=payload.character_names,
-                    )
+            # グループチャットフラグとキャラクター一覧を更新
+            stmt = (
+                sa_update(ConversationSession)
+                .where(ConversationSession.id == session.id)
+                .values(
+                    is_group_chat=True,
+                    group_character_names=payload.character_names,
                 )
-                await db_session.execute(stmt)
-                await db_session.commit()
-            finally:
-                await db_session.close()
+            )
+            await db_session.execute(stmt)
+            await db_session.commit()
 
             for invited_user_id in dict.fromkeys(payload.user_ids):
                 if invited_user_id and invited_user_id != user_id:
@@ -273,6 +394,12 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
         except Exception as e:
             logger.error(f"グループセッション作成エラー: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if "db_session" in locals() and db_session is not None:
+                try:
+                    await db_session.close()
+                except Exception:
+                    pass
 
     # ─── POST /api/conversations/{session_id}/group-respond ─── グループ応答生成 ───
 
@@ -290,8 +417,17 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
         try:
             user_info = await _current_user(request)
             user_id = str(user_info.get("id") or "default_user")
+            try:
+                actor_uuid = UUID(user_id)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise HTTPException(status_code=403, detail="アクセス拒否") from exc
 
-            repo = ConversationRepository()
+            from ..memory.database import get_database_manager
+            from ..memory.project_repository import ProjectRepository
+
+            db_manager = get_database_manager()
+            db_session = await db_manager.get_session()
+            repo = ConversationRepository(db_session)
             session = await repo.get_session_by_id(session_id)
 
             if not session:
@@ -300,10 +436,118 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
                 )
             if not await repo.user_has_session_write_access(session_id, user_id):
                 raise HTTPException(status_code=403, detail="アクセス拒否")
+            if getattr(session, "project_id", None) is not None:
+                try:
+                    project_uuid = UUID(str(session.project_id))
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise HTTPException(status_code=403, detail="アクセス拒否") from exc
+                if not await ProjectRepository.has_permission(
+                    db_session,
+                    project_id=project_uuid,
+                    user_id=actor_uuid,
+                    permission="write",
+                ):
+                    raise HTTPException(status_code=403, detail="アクセス拒否")
             if not session.is_group_chat:
                 raise HTTPException(
                     status_code=400,
                     detail="このセッションはグループチャットではありません",
+                )
+
+            # This endpoint predates the shared WebSocket/REST dispatch path.
+            # Keep the same trusted built-in boundary here: a literal
+            # ``/masking`` request must never be persisted as an ordinary
+            # group turn or sent to GroupChatManager.  Auth/session/project
+            # ACL checks above deliberately run first.
+            try:
+                from ..services.masking_service import parse_masking_command
+
+                masking_command = parse_masking_command(payload.message)
+            except Exception:
+                masking_command = None
+            if masking_command is None and _looks_like_builtin_masking_token(
+                payload.message
+            ):
+                # A literal server-owned command must never degrade into a
+                # GroupChatManager/provider turn when an older worker lacks
+                # the canonical parser.
+                raise HTTPException(
+                    status_code=503,
+                    detail="Masking operation is not ready",
+                )
+            if masking_command is not None:
+                if not callable(masking_handler):
+                    raise HTTPException(
+                        status_code=503,
+                        detail="Masking operation is not ready",
+                    )
+                # ``db_session`` is held only for the ACL read above.  Close
+                # it before the request-bound helper opens its own persistence
+                # unit; this also prevents a response write from observing a
+                # stale transaction snapshot on SQLite.
+                try:
+                    await db_session.close()
+                except Exception:
+                    pass
+                try:
+                    result = await masking_handler(
+                        {
+                            "message": payload.message,
+                            "session_id": session_id,
+                            "project_id": (
+                                str(getattr(session, "project_id", None))
+                                if getattr(session, "project_id", None)
+                                else None
+                            ),
+                            "_sender_user_id": user_id,
+                            "_sender_display_name": _display_name(user_info),
+                            "attachments": [],
+                        },
+                        masking_command,
+                    )
+                except PermissionError as exc:
+                    logger.warning("Group masking authorization failed")
+                    raise HTTPException(status_code=403, detail="アクセス拒否") from exc
+                except ValueError as exc:
+                    logger.warning("Group masking validation failed")
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Invalid masking request",
+                    ) from exc
+                except Exception as exc:
+                    # Masking errors may include source-path details from the
+                    # local transformer.  Never expose those through this
+                    # legacy endpoint's generic exception handler.
+                    logger.warning("Group masking operation failed")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Masking operation failed",
+                    ) from exc
+                safe_result = result if isinstance(result, dict) else {}
+                return JSONResponse(
+                    {
+                        # The helper's success flag is a protocol boolean;
+                        # truthy strings from a legacy/fake response must not
+                        # turn an unverified projection into a success.
+                        "success": safe_result.get("success") is True,
+                        "responses": [
+                            {
+                                # Keep the legacy response envelope usable by
+                                # clients that render only ``responses``.
+                                # ``message``/``attachments`` come from the
+                                # trusted helper and contain the masked
+                                # projection only.
+                                "content": str(safe_result.get("message") or ""),
+                                "character_slug": "masking",
+                                "character_name": "Masking / マスキング",
+                                "attachments": list(
+                                    safe_result.get("attachments") or []
+                                ),
+                            }
+                        ],
+                        "masking": safe_result,
+                    },
+                    status_code=200,
                 )
 
             # ユーザーメッセージを保存
@@ -320,6 +564,18 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
             messages = await repo.get_session_messages(session_id, limit=50)
             history = []
             for msg in messages:
+                try:
+                    from ..services.privacy_masking_projection import (
+                        is_privacy_masking_source,
+                    )
+
+                    if is_privacy_masking_source(msg):
+                        continue
+                except Exception:
+                    # If the structural marker helper is unavailable, fail
+                    # closed for group provider history rather than risk
+                    # replaying a raw masking source.
+                    continue
                 meta = msg.message_metadata or {}
                 char_name = meta.get("character_name", "")
                 if msg.role == "assistant" and char_name:
@@ -379,5 +635,11 @@ def create_group_chat_router(require_auth, get_current_user, config=None) -> API
         except Exception as e:
             logger.error(f"グループ応答生成エラー: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+        finally:
+            if "db_session" in locals() and db_session is not None:
+                try:
+                    await db_session.close()
+                except Exception:
+                    pass
 
     return router

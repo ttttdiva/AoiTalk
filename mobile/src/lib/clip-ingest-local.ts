@@ -13,6 +13,11 @@ import { docsRepo } from "../repositories/docs";
 import type { ClipIngestDocBlockInput } from "../repositories/docs";
 import type { ClipIngestResult } from "./docs-api";
 import {
+  completeLocalClipIngestOperation,
+  getSucceededLocalClipIngestResult,
+  type ClipIngestOperationIdentity,
+} from "../repositories/pending-clip-ingest";
+import {
   generateMobileLlmReply,
   getConfiguredClipIngestMobileLlmSettings,
 } from "./mobile-llm";
@@ -174,6 +179,7 @@ interface LlmPlan {
   shortLiterals: ShortLiteral[];
   verbatimRanges: VerbatimRange[];
   excerpts: Array<{ label: string; lines: string[] }>;
+  canonicalV4: boolean;
   legacySchema: boolean;
 }
 
@@ -446,7 +452,9 @@ export function buildLocalContentPrompt(
     `直接取得: ${JSON.stringify(evidence)}`,
     "",
     "タイトル・本文の規則:",
-    "- topic/subjectはsourceから後で再利用したい中心知識（手法・知見・疑問・構図・ワークフロー・設定目的）を優先し、その識別に必要な製品/モデル名を次に選ぶ。title_detailは中心知識の自然な短い説明で、根拠行をtitle_evidenceで示す。",
+    "- topic/subjectは一覧・検索・ツリーで中心知識を識別するための短いtitle labelにする。事実説明・条件・結論・knowledge propositionそのものをsubjectへ入れない。例: Anima 3.8B、Anima 3.8B - Qwen3.5 4B併用、真上から横向きの顔を見せる構図、RTX 5090での推論設定。",
+    "- 短い疑問形の見出しは許可する。末尾が ? / ？ であることだけを理由にsubject/title_detailを拒否しない。",
+    "- title_detailも短い識別補助だけにする。subject/title_detailへ入れなかった再利用可能な事実・説明・手順・条件・結論はknowledge_itemsへ保持し、titleを短くしたことを理由に捨てない。",
     "- 使用モデル、実行環境、作者、出典などのmetadata（model: / model= / 使用モデル: / checkpoint: / provider: / author: / source: 等）は、それ自体を説明するclipでない限りtopic/subjectへ昇格させず、short_literals・setting・provenanceへ残す。『プロンプト知見』『シルル』のようなgeneric heading/作者行もtopicにしない。",
     "- title_evidenceは単一source rangeを根拠にし、subject/title_detailの中心語・主要述語がその範囲に存在する場合だけ採用する。範囲にない製品名、数値、version、能力を補わず、自由なsemantic fuzzy matchはしない。根拠のないtitle_detailは空にする。subjectとtitle_detailの区切りはコード側で付ける。",
     "- knowledge_itemsはsourceを見返さなくても直接再利用できる具体的な意味単位を1行1件、最大8件・各480字以内で返す。summary/detailsは返さず、この配列だけを正本にする。",
@@ -761,6 +769,7 @@ export function parseLocalPlan(raw: string): LlmPlan {
     shortLiterals,
     verbatimRanges,
     excerpts,
+    canonicalV4: isCanonicalV4,
     legacySchema,
   };
 }
@@ -1485,6 +1494,36 @@ function isTopicGenericHeading(value: string): boolean {
   return TOPIC_GENERIC_HEADING_PATTERN.test(topicLineText(value));
 }
 
+const TITLE_LABEL_LIMIT = 80;
+const TITLE_EXPLANATORY_PREFIX_PATTERN =
+  /^(?:全体として(?:は)?|結論として(?:は)?|まとめると|要するに|つまり)/;
+const TITLE_PROSE_ENDING_PATTERN =
+  /(?:である|であり|であった|だった|でした|です|ます|ました|している|されている|となる|になる|できる|できない)$/;
+
+function isTitleLikeLabel(value: string): boolean {
+  const text = cleanLine(value, TITLE_LIMIT).trim();
+  if (!text || text.length > TITLE_LABEL_LIMIT) return false;
+  if (isResearchControlWrapper(text)) return false;
+  if (TITLE_EXPLANATORY_PREFIX_PATTERN.test(text)) return false;
+
+  const isQuestion = /[?？]$/.test(text);
+  if (text.length >= 18 && (text.includes("…") || text.includes("..."))) {
+    return false;
+  }
+  if (text.length >= 18 && /[。.!！]$/.test(text)) return false;
+  if (text.length >= 20 && /[、,;；]/.test(text)) return false;
+
+  const bare = text.replace(/[。.!！?？]+$/g, "").trim();
+  if (
+    text.length >= 18
+    && !isQuestion
+    && TITLE_PROSE_ENDING_PATTERN.test(bare)
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function titleCandidateOccursInLine(candidate: string, line: string): boolean {
   const value = cleanLine(candidate, TITLE_LIMIT);
   const text = topicLineText(line);
@@ -1601,14 +1640,16 @@ function metadataOnlyTitleSubject(
   return metadataOccurrence && !substantiveOccurrence;
 }
 
-function fallbackSubjectScore(line: string, index: number): number {
+function fallbackSubjectScore(line: string): number {
   const text = topicLineText(line);
-  let score = index === 0 ? 2 : 0;
-  if (/(?:全体として|構図|設計)/i.test(text)) score += 6;
-  else if (TOPIC_CENTER_MARKER_PATTERN.test(text)) score += 2;
-  if (text.length >= 8) score += Math.min(text.length, 120) / 40;
-  if (/[。.!！?？]$/.test(text)) score += 1;
-  if ((text.match(/[A-Za-z][A-Za-z0-9._-]*/g) ?? []).length) score += 0.5;
+  if (!text || !isTitleLikeLabel(line)) return -1;
+  let score = 100;
+  if (text.length <= 24) score += 12;
+  else if (text.length <= 48) score += 8;
+  else score += 4;
+  if (/[A-Za-z][A-Za-z0-9._-]*|\d/.test(text)) score += 3;
+  if (TOPIC_CENTER_MARKER_PATTERN.test(text)) score += 2;
+  if (/[-–—/:：]/.test(text)) score += 1;
   return score;
 }
 
@@ -1623,10 +1664,12 @@ function fallbackSubject(source: string, urls: string[]): string {
       && !isTopicGenericHeading(line)
       && !isResearchControlWrapper(line)
       && !/^["'「『].*["'」』]$/.test(line)
+      && isTitleLikeLabel(line)
+      && fallbackSubjectScore(line) >= 0
     ));
   if (candidates.length) {
     candidates.sort((left, right) => {
-      const score = fallbackSubjectScore(right.line, right.index) - fallbackSubjectScore(left.line, left.index);
+      const score = fallbackSubjectScore(right.line) - fallbackSubjectScore(left.line);
       return score || left.index - right.index;
     });
     return candidates[0].line;
@@ -1688,15 +1731,17 @@ function normalizedPlanTitle(
   const detailGrounded = Boolean(detailCandidate)
     && singleEvidence.some((item) => titleGroundedInRange(detailCandidate, item));
   const subjectUsable = subjectGrounded
+    && isTitleLikeLabel(subjectCandidate)
     && !metadataOnlyTitleSubject(subjectCandidate, source)
     && !isTopicGenericHeading(subjectCandidate);
   const detailUsable = detailGrounded
+    && isTitleLikeLabel(detailCandidate)
     && !metadataOnlyTitleSubject(detailCandidate, source)
     && !isTopicGenericHeading(detailCandidate);
 
-  // A model/environment/author heading is metadata, not the topic.  If the
-  // planner supplied a grounded central detail, promote it to subject;
-  // otherwise choose a substantive center line from the input.
+  // Metadata and explanatory prose are not root titles. Preserve the
+  // existing single-range/security validation and promote only a grounded,
+  // compact title_detail; otherwise choose a compact source label or URL/memo.
   const subject = subjectUsable
     ? subjectCandidate
     : detailUsable
@@ -1741,16 +1786,17 @@ function deduplicateKnowledgeItem(
   evidence: string[],
   sourceText: string,
 ): string {
-  // Apply only the source/meta guard from deduplicateSummary.  Knowledge
-  // items may intentionally repeat a title token while adding a condition
-  // (for example "RTX5090環境では…"); substring-based summary deduplication
-  // would incorrectly discard that reusable condition.
+  // Apply only the source/meta guard from deduplicateSummary. Knowledge
+  // items may intentionally repeat a title token while adding a condition;
+  // only an exact identity duplicate is removed here.
   const retained = deduplicateSummary(item, "", "", [], sourceText);
   if (!retained) return "";
+
   const itemIdentity = identity(retained);
   const exactDuplicates = [topic, detail, ...evidence]
     .map(identity)
     .filter(Boolean);
+
   return exactDuplicates.includes(itemIdentity) ? "" : retained;
 }
 
@@ -1805,20 +1851,72 @@ function normalizeKnowledgeItems(
     ? [sourceBodies]
     : [...sourceBodies];
   const joinedSource = sources.join("\n");
-  const topicContext = groundedTopicContext(plan.subject, plan.titleDetail, sources);
+  const topicContext = groundedTopicContext(
+    plan.subject,
+    plan.titleDetail,
+    sources,
+  );
+
+  // Only canonical v4 may retain a proposition that is also the exact
+  // single-line title evidence. v2/v3 retain the historical identity-drop
+  // semantics.
+  const exactTitleEvidenceIdentities = plan.canonicalV4
+    ? new Set(
+        evidence
+          .filter((value) => Boolean(value) && !value.includes("\n"))
+          .map((value) => identity(cleanLine(value, SUMMARY_LIMIT)))
+          .filter((value) => value.length > 0),
+      )
+    : new Set<string>();
+
+  const dedupeEvidence = plan.canonicalV4 ? [] : evidence;
+
   const result: string[] = [];
   const seen = new Set<string>();
+
   for (const raw of plan.knowledgeItems) {
-    const item = normalizeKnowledgeItemText(raw, sources, topicContext, topicAnchor);
+    let item = normalizeKnowledgeItemText(
+      raw,
+      sources,
+      topicContext,
+      topicAnchor,
+    );
+
+    const rawIdentity = identity(cleanLine(raw, SUMMARY_LIMIT));
+    if (
+      !item
+      && rawIdentity
+      && exactTitleEvidenceIdentities.has(rawIdentity)
+    ) {
+      // Do not bypass the knowledge security validator. Retry that same
+      // validator with only the title-derived topic prefilter removed.
+      item = normalizeKnowledgeItemText(
+        raw,
+        sources,
+        "",
+        "",
+      );
+    }
+
     if (!item) continue;
-    const retained = deduplicateKnowledgeItem(item, topic, detail, evidence, joinedSource);
+
+    const retained = deduplicateKnowledgeItem(
+      item,
+      topic,
+      detail,
+      dedupeEvidence,
+      joinedSource,
+    );
     if (!retained) continue;
+
     const key = identity(retained);
     if (!key || seen.has(key)) continue;
+
     seen.add(key);
     result.push(retained);
     if (result.length >= KNOWLEDGE_ITEM_LIMIT) break;
   }
+
   return result;
 }
 
@@ -2095,7 +2193,7 @@ function makeVerbatimBlock(
   };
 }
 
-function localSourceRefs(
+export function localSourceRefs(
   urls: string[],
   blocks: LocalVerbatimBlock[],
 ): Array<Record<string, unknown>> {
@@ -2107,12 +2205,13 @@ function localSourceRefs(
     .filter((url): url is string => Boolean(url));
   const refs: Array<Record<string, unknown>> = [
     { source_id: "source:0", source_type: "input", used: true },
-    ...safeUrls.map((url, index) => ({
-      source_id: `source:${index + 1}`,
-      source_type: "direct",
+    // The local path never fetches URL bodies.  Keep each URL attached to the
+    // original input source instead of claiming a direct acquisition.
+    ...safeUrls.map((url) => ({
+      source_id: "source:0",
+      source_type: "input",
       url,
-      used: false,
-      acquisition_status: "empty_body",
+      used: true,
     })),
     ...blocks.map((block) => ({
       source_id: canonicalSourceId(block.source_id),
@@ -2419,6 +2518,8 @@ export interface LocalClipIngestOptions {
    * 未分類の保存先へ残す。入力を失わないことを優先する。
    */
   allowWithoutLlm?: boolean;
+  /** Durable operation identity, persisted before this function runs. */
+  operation?: ClipIngestOperationIdentity;
 }
 
 const OFFLINE_TOPIC_LIMIT = 120;
@@ -2465,6 +2566,7 @@ function buildOfflinePlan(source: string, urls: string[]): LlmPlan {
       label: "オフライン取り込み原文",
     }],
     excerpts: [],
+    canonicalV4: false,
     legacySchema: false,
   };
 }
@@ -2480,6 +2582,13 @@ export async function runLocalClipIngest(
 ): Promise<ClipIngestResult> {
   const allowUnfetchedUrls = options.allowUnfetchedUrls === true;
   const allowWithoutLlm = options.allowWithoutLlm === true;
+
+  // A committed receipt is authoritative.  Return it before any LLM or Docs
+  // reads so replay/restart cannot regenerate a second tree.
+  if (options.operation) {
+    const committed = await getSucceededLocalClipIngestResult(options.operation);
+    if (committed) return committed;
+  }
 
   // ---- ここから下、ノード作成までは副作用が無い。失敗はすべて「実行不可」。 ----
   const settings = await beforeSideEffects("モバイルLLM設定の読み取りに失敗", () =>
@@ -2636,11 +2745,6 @@ export async function runLocalClipIngest(
     );
   }
 
-  const failedUrls = urls.map((url) => ({
-    url,
-    error: "端末ではリンク先本文を取得していません",
-    acquisition_status: "empty_body",
-  }));
   const targetLabel = target.label || targetNode.title || "取り込み先";
   const sourceRefs = localSourceRefs(urls, blocks);
 
@@ -2648,7 +2752,7 @@ export async function runLocalClipIngest(
     findDuplicateChild(targetNode.id, urls),
   );
   if (duplicate) {
-    return {
+    const result: ClipIngestResult = {
       target_id: targetNode.id,
       target_label: targetLabel,
       action: "duplicate_skip",
@@ -2658,10 +2762,13 @@ export async function runLocalClipIngest(
       open_node_title: duplicate.title,
       direct_urls: [],
       supplemental_urls: [],
-      failed_urls: failedUrls,
+      failed_urls: [],
       used_urls: [],
       unconfirmed: plan.unconfirmed,
     };
+    return options.operation
+      ? completeLocalClipIngestOperation(options.operation, result)
+      : result;
   }
 
   const sortOrder = await beforeSideEffects("挿入位置の決定に失敗", () =>
@@ -2684,6 +2791,40 @@ export async function runLocalClipIngest(
   if (urls.length) {
     outline.push({ text: "元リンク（本文を取得できず内容は未確認）", children: urls });
   }
+
+  // Validate all lossless block invariants BEFORE any SQLite persistence.  A
+  // failure here is side-effect free and cannot leave a tree that replay later
+  // duplicates.
+  for (const expected of blocks) {
+    const normalized = normalizeNewlines(expected.content);
+    if (
+      normalized !== expected.content
+      || sha256(normalized) !== expected.sha256
+      || Array.from(normalized).length !== expected.char_count
+      || normalized.split("\n").length !== expected.line_count
+      || normalized.split("\n").filter((line) => line === "").length
+        !== expected.blank_line_count
+    ) {
+      throw new Error("原文ブロックの完全性検証に失敗しました");
+    }
+  }
+
+  const resultBase: ClipIngestResult = {
+    target_id: targetNode.id,
+    target_label: targetLabel,
+    action: "create",
+    changed_node_id: null,
+    changed_node_title: null,
+    open_node_id: "",
+    open_node_title: "",
+    direct_urls: [],
+    supplemental_urls: [],
+    // An unfetched URL is input provenance, not a failed acquisition.
+    failed_urls: [],
+    used_urls: [],
+    unconfirmed: plan.unconfirmed,
+  };
+
   const node = await docsRepo.createClipIngestTree({
     parentId: targetNode.id,
     rootPageId: targetNode.root_page_id ?? targetNode.id,
@@ -2694,6 +2835,9 @@ export async function runLocalClipIngest(
       clip_ingest: {
         schema_version: 4,
         content_mode: plan.contentMode,
+        ...(options.operation
+          ? { operation_key: options.operation.operationKey }
+          : {}),
       },
     },
     sourceRefs,
@@ -2716,37 +2860,21 @@ export async function runLocalClipIngest(
         blank_line_count: block.blank_line_count,
       },
     })),
+    ...(options.operation
+      ? {
+          operation: {
+            ...options.operation,
+            result: resultBase as unknown as Record<string, unknown>,
+          },
+        }
+      : {}),
   });
-  // `createClipIngestTree` materializes each block as an ordinary child node.
-  // Re-check the exact input before returning so future callers cannot pass a
-  // non-LF or accidentally empty block into the local writer.  The hash is
-  // retained in clip_ingest/source_refs as provenance, never as immutable UI
-  // content.
-  for (const expected of blocks) {
-    const normalized = normalizeNewlines(expected.content);
-    if (
-      normalized !== expected.content
-      || sha256(normalized) !== expected.sha256
-      || Array.from(normalized).length !== expected.char_count
-      || normalized.split("\n").length !== expected.line_count
-      || normalized.split("\n").filter((line) => line === "").length !== expected.blank_line_count
-    ) {
-      throw new Error("原文ブロックの完全性検証に失敗しました");
-    }
-  }
 
   return {
-    target_id: targetNode.id,
-    target_label: targetLabel,
-    action: "create",
+    ...resultBase,
     changed_node_id: node.id,
     changed_node_title: node.title,
     open_node_id: node.id,
     open_node_title: node.title,
-    direct_urls: [],
-    supplemental_urls: [],
-    failed_urls: failedUrls,
-    used_urls: [],
-    unconfirmed: plan.unconfirmed,
   };
 }

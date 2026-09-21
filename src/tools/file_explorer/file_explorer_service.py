@@ -358,14 +358,19 @@ def clear_folder_thumbnail(folder_path: str, is_admin: bool = False) -> Dict[str
     return {"success": True, "folder_path": folder_path}
 
 
+def _is_protected_explorer_entry_name(name: str) -> bool:
+    return name.casefold() in {".git", ".trash"}
+
+
 def _sanitize_name(name: str) -> str:
     """Sanitize file/directory name to prevent path traversal"""
     # Remove path separators and dangerous characters
     name = re.sub(r'[/\\:*?"<>|]', "", name)
-    name = name.strip(". ")
+    name = name.strip()
+    name = name.rstrip(". ")
     if len(name) > 200:
-        name = name[:200]
-    if not name:
+        name = name[:200].rstrip(". ")
+    if not name or name in {".", ".."}:
         name = "unnamed"
     return name
 
@@ -373,11 +378,14 @@ def _sanitize_name(name: str) -> str:
 def _sanitize_relative_file_path(path: str) -> Tuple[List[str], str]:
     """Sanitize a browser-supplied relative file path for folder uploads."""
     raw_parts = path.replace("\\", "/").split("/")
-    safe_parts = [
-        _sanitize_name(part)
-        for part in raw_parts
-        if part and part not in {".", ".."}
-    ]
+    safe_parts: List[str] = []
+    for part in raw_parts:
+        if not part or part in {".", ".."}:
+            continue
+        sanitized = _sanitize_name(part)
+        if _is_protected_explorer_entry_name(sanitized):
+            raise ValueError("protected explorer path segment")
+        safe_parts.append(sanitized)
 
     if not safe_parts:
         return [], "unnamed_file"
@@ -500,7 +508,10 @@ def _resolve_upload_target_context(
     if not valid:
         return None, None, "無効なパスです"
 
-    safe_dirs, safe_name = _sanitize_relative_file_path(filename)
+    try:
+        safe_dirs, safe_name = _sanitize_relative_file_path(filename)
+    except ValueError:
+        return None, None, "無効なアップロード先です"
     file_path = target_dir.joinpath(*safe_dirs, safe_name)
 
     # The destination directory is the boundary for an administrator's
@@ -843,7 +854,7 @@ def list_directory(path: str = "", is_admin: bool = False) -> Dict[str, Any]:
         for item in sorted(
             target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())
         ):
-            if item.name.startswith("."):
+            if _is_protected_explorer_entry_name(item.name):
                 continue
 
             # Never expose metadata or navigation for aliases inside a
@@ -883,7 +894,9 @@ def list_directory(path: str = "", is_admin: bool = False) -> Dict[str, Any]:
                     nav_path = item_path
                 try:
                     item_count = sum(
-                        1 for _ in effective.iterdir() if not _.name.startswith(".")
+                        1
+                        for _ in effective.iterdir()
+                        if not _is_protected_explorer_entry_name(_.name)
                     )
                 except (PermissionError, OSError):
                     item_count = 0
@@ -990,6 +1003,8 @@ def create_directory(path: str, name: str, is_admin: bool = False) -> Dict[str, 
         return {"success": False, "error": "親ディレクトリが存在しません"}
 
     safe_name = _sanitize_name(name)
+    if _is_protected_explorer_entry_name(safe_name):
+        return {"success": False, "error": "無効な名前です"}
     new_dir = parent / safe_name
 
     if new_dir.exists():
@@ -1174,6 +1189,8 @@ def _write_directory_contents_to_archive(
     """Write a directory tree while preserving empty directories."""
     wrote_entry = False
     for child in sorted(source.rglob("*"), key=lambda p: str(p).lower()):
+        if _is_hidden_under(child, source):
+            continue
         if _is_link_or_reparse(child):
             continue
         rel = child.relative_to(source)
@@ -1345,7 +1362,7 @@ def _safe_archive_member_parts(name: str) -> Optional[Tuple[str, ...]]:
     parts = PurePosixPath(raw_name).parts
     if not parts or any(
         part in {"", ".", ".."}
-        or part.casefold() == ".git"
+        or _is_protected_explorer_entry_name(part)
         or ":" in part
         or part.endswith((" ", "."))
         or part.split(".", 1)[0].casefold() in WINDOWS_RESERVED_NAMES
@@ -1381,6 +1398,13 @@ def _archive_stem(path: Path) -> str:
         if lower_name.endswith(suffix):
             return name[: -len(suffix)] or "archive"
     return path.stem or "archive"
+
+
+def _safe_archive_extract_root_name(archive_path: Path) -> str:
+    root_name = _sanitize_name(_archive_stem(archive_path))
+    if _is_protected_explorer_entry_name(root_name):
+        raise ValueError("protected explorer archive root")
+    return root_name
 
 
 def _safe_archive_target(extract_root: Path, name: str, *, is_dir: bool) -> Path:
@@ -1631,7 +1655,7 @@ def extract_archives(
     try:
         for archive_path, archive_format in archives:
             extract_root = _next_available_path(
-                dest, _sanitize_name(_archive_stem(archive_path))
+                dest, _safe_archive_extract_root_name(archive_path)
             )
             created_roots.append(extract_root)
             if archive_format == "zip":
@@ -1715,6 +1739,50 @@ def _tree_contains_link_or_reparse(root: Path) -> bool:
     return False
 
 
+def _path_exists_without_following(path: Path) -> bool:
+    """Return whether a directory entry exists, including dangling links."""
+    try:
+        return os.path.lexists(os.fspath(path))
+    except (OSError, ValueError):
+        # An entry that cannot be inspected must not be treated as a free path
+        # which failure cleanup could later remove.
+        return True
+
+
+def _cleanup_failed_transfer_target(path: Path, *, existed_before: bool) -> None:
+    """Remove only a transfer target created by the failed operation.
+
+    ``copytree``/``copy2`` can leave a partially populated target.  Never
+    remove a path that was already present, and remove links/reparse points as
+    leaves so cleanup cannot follow them.  Cleanup is best effort so the
+    original I/O error remains the reported one.
+    """
+    if existed_before or not _path_exists_without_following(path):
+        return
+
+    try:
+        item_stat = path.lstat()
+        is_reparse = bool(
+            getattr(item_stat, "st_file_attributes", 0)
+            & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+        )
+        if stat.S_ISLNK(item_stat.st_mode) or is_reparse:
+            try:
+                path.unlink()
+            except (IsADirectoryError, PermissionError):
+                # Windows directory junctions are removed with rmdir; this
+                # operation removes the junction itself and does not recurse.
+                path.rmdir()
+        elif stat.S_ISDIR(item_stat.st_mode):
+            # shutil.rmtree does not traverse symlinks/junctions.  The root
+            # link/reparse case was handled above so this is a real directory.
+            shutil.rmtree(str(path), onerror=_remove_readonly)
+        else:
+            path.unlink()
+    except (FileNotFoundError, OSError, RuntimeError):
+        pass
+
+
 def rename_item(path: str, new_name: str, is_admin: bool = False) -> Dict[str, Any]:
     """
     Rename a file or directory.
@@ -1735,6 +1803,8 @@ def rename_item(path: str, new_name: str, is_admin: bool = False) -> Dict[str, A
         return {"success": False, "error": "ルートディレクトリは名前変更できません"}
 
     safe_name = _sanitize_name(new_name)
+    if _is_protected_explorer_entry_name(safe_name):
+        return {"success": False, "error": "無効な名前です"}
     new_path = target.parent / safe_name
 
     if new_path.exists():
@@ -1874,12 +1944,18 @@ def copy_item(
 
     # Web/UI callers keep the historical auto-rename behavior. Agent callers use
     # reuse_identical so a retry never creates _copy1/_copy2 duplicates.
-    if new_path.exists():
+    target_existed_before = _path_exists_without_following(new_path)
+    if target_existed_before:
         if conflict_strategy == "reuse_identical":
-            if src.is_file() and new_path.is_file() and filecmp.cmp(
-                src,
-                new_path,
-                shallow=False,
+            if (
+                not _is_link_or_reparse(new_path)
+                and src.is_file()
+                and new_path.is_file()
+                and filecmp.cmp(
+                    src,
+                    new_path,
+                    shallow=False,
+                )
             ):
                 return {
                     "success": True,
@@ -1899,9 +1975,11 @@ def copy_item(
         base = src.stem
         ext = src.suffix
         counter = 1
-        while new_path.exists():
+        while _path_exists_without_following(new_path):
             new_path = dest / f"{base}_copy{counter}{ext}"
             counter += 1
+
+        target_existed_before = _path_exists_without_following(new_path)
 
     try:
         if src.is_dir():
@@ -1919,6 +1997,9 @@ def copy_item(
             "new_name": new_path.name,
         }
     except Exception as e:
+        _cleanup_failed_transfer_target(
+            new_path, existed_before=target_existed_before
+        )
         return {"success": False, "error": f"コピーに失敗: {str(e)}"}
 
 
@@ -1984,7 +2065,7 @@ def _is_inside_root(target: Path, root: Path) -> bool:
 
 
 def _is_hidden_under(item: Path, base: Path) -> bool:
-    """base からの相対パーツに `.` 始まりが含まれるか。
+    """base からの相対パーツに保護エントリ名が含まれるか。
 
     再帰検索で `.trash/<token>/payload/xxx` のような隠しディレクトリの
     子孫を除外するために使う（`item.name` だけでは祖先を判定できない）。
@@ -1993,7 +2074,7 @@ def _is_hidden_under(item: Path, base: Path) -> bool:
         parts = item.relative_to(base).parts
     except ValueError:
         parts = (item.name,)
-    return any(part.startswith(".") for part in parts)
+    return any(_is_protected_explorer_entry_name(part) for part in parts)
 
 
 def _sanitize_trash_token(token: str) -> str:
@@ -2350,7 +2431,9 @@ def get_file_info(path: str, is_admin: bool = False) -> Dict[str, Any]:
             info["icon"] = "📁"
             try:
                 info["item_count"] = sum(
-                    1 for _ in target.iterdir() if not _.name.startswith(".")
+                    1
+                    for _ in target.iterdir()
+                    if not _is_protected_explorer_entry_name(_.name)
                 )
             except:
                 info["item_count"] = 0
@@ -2593,7 +2676,7 @@ def get_directory_tree(max_depth: int = 3, root_path: str = "") -> Dict[str, Any
         try:
             children = []
             for item in sorted(path.iterdir(), key=lambda p: p.name.lower()):
-                if item.name.startswith("."):
+                if _is_protected_explorer_entry_name(item.name):
                     continue
                 if _is_link_or_reparse(item):
                     continue
@@ -2640,13 +2723,25 @@ def walk_workspace_tree(
     entries: list[dict[str, Any]] = []
     truncated = False
     resolved_root = root.resolve()
+    resolved_target = target.resolve()
+    try:
+        resolved_target.relative_to(resolved_root)
+        traversal_boundary = resolved_root
+    except ValueError:
+        # Absolute paths are accepted only through the caller's trusted admin
+        # mode.  For an approved external root, keep recursion inside that root
+        # instead of incorrectly requiring every child to live under AoiTalk's
+        # workspace directory.
+        if not is_admin:
+            return {"success": False, "error": "Invalid workspace path."}
+        traversal_boundary = resolved_target
 
     def is_safe_child(item: Path) -> bool:
         """Reject links/junctions that resolve outside the authorized workspace."""
         try:
             if _is_link_or_reparse(item):
                 return False
-            item.resolve().relative_to(resolved_root)
+            item.resolve().relative_to(traversal_boundary)
             return True
         except (OSError, RuntimeError, ValueError):
             return False
@@ -2662,7 +2757,7 @@ def walk_workspace_tree(
             return
 
         for item in children:
-            if item.name.startswith("."):
+            if _is_protected_explorer_entry_name(item.name):
                 continue
             if len(entries) >= max_entries:
                 truncated = True
@@ -2685,7 +2780,9 @@ def walk_workspace_tree(
             if is_dir:
                 try:
                     entry["item_count"] = sum(
-                        1 for child in item.iterdir() if not child.name.startswith(".")
+                        1
+                        for child in item.iterdir()
+                        if not _is_protected_explorer_entry_name(child.name)
                     )
                 except (OSError, PermissionError):
                     entry["item_count"] = None
@@ -2749,7 +2846,7 @@ def search_workspace_entries(
     # `*` / `?` を含むクエリは glob、含まなければ従来通りの部分一致で扱う。
     use_glob = not regex and ("*" in query_text or "?" in query_text)
     extension_filter = {
-        str(item).lower() if str(item).startswith(".") else f".{str(item).lower()}"
+        str(item).lower() if str(item)[:1] == "." else f".{str(item).lower()}"
         for item in (extensions or [])
         if str(item or "").strip()
     }
@@ -2811,7 +2908,9 @@ def search_workspace_entries(
             if is_dir:
                 try:
                     result["item_count"] = sum(
-                        1 for child in item.iterdir() if not child.name.startswith(".")
+                        1
+                        for child in item.iterdir()
+                        if not _is_protected_explorer_entry_name(child.name)
                     )
                 except (OSError, PermissionError):
                     result["item_count"] = None

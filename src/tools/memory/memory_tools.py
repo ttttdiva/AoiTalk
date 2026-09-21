@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.memory.config import MemoryConfig
 from src.memory.manager import ConversationMemoryManager
-from src.services.context_memory_service import _keywords
+from src.services.scoped_memory_service import _keywords
 
 
 _memory_manager: Optional[ConversationMemoryManager] = None

@@ -25,11 +25,16 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   taskApi,
+  type MoveOccurrencePayload,
   type RecurringOccurrenceContext,
   type Scope,
   type Task,
   type TaskOccurrence,
 } from "@/lib/task-api";
+import {
+  taskBrowseScopeToQuery,
+  type TaskBrowseScope,
+} from "@/lib/task-browse-scope";
 import { listRemoteTaskOccurrences } from "@/lib/remote-servers";
 import { listRemoteTasks, toRemoteTask } from "@/lib/remote-tasks";
 import { decorateRemoteOccurrence } from "@/lib/remote-resource";
@@ -41,6 +46,7 @@ import {
 import { useTaskCompletionRefresh } from "@/hooks/use-task-completion-refresh";
 import { formatDateTimeLocal } from "@/components/tasks/task-form-utils";
 import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
+import { RecurringDateChangeDialog } from "@/components/tasks/task-detail/recurring-date-change-dialog";
 import {
   TaskContextMenu,
   useTaskContextMenu,
@@ -58,6 +64,7 @@ import {
   type RemoteTaskDialogTarget,
 } from "@/components/tasks/remote-task-dialog";
 import { CalendarWorkspaceNavigation } from "@/components/tasks/calendar-workspace-navigation";
+import { TaskBrowseScopePicker } from "@/components/tasks/task-browse-scope-picker";
 import {
   useWorkspaceShellRegistration,
 } from "@/components/layout/shell-context";
@@ -122,6 +129,11 @@ interface CalendarEvent {
     docsFieldName?: string | null;
   };
 }
+
+type PendingRecurringCalendarDateChange = {
+  taskId: string;
+  payload: Omit<MoveOccurrencePayload, "mode">;
+};
 
 const FC_PLUGINS = [
   dayGridPlugin,
@@ -227,6 +239,12 @@ export default function CalendarView() {
     selectedProject,
     selectedSpace,
     allProjects,
+    accessibleProjects,
+    accessibleSpaces,
+    projects,
+    spaces,
+    participatingProjects,
+    participatingSpaces,
   } = useProject();
   const { resolvedTheme } = useTheme();
   const calendarRef = useRef<FullCalendar>(null);
@@ -235,6 +253,7 @@ export default function CalendarView() {
     useState<HTMLElement | null>(null);
   const router = useRouter();
   const [scope, setScope] = useState<ScopeMode>("project");
+  const [browseScope, setBrowseScope] = useState<TaskBrowseScope | null>(null);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [occurrences, setOccurrences] = useState<TaskOccurrence[]>([]);
   const [docsCalendarItems, setDocsCalendarItems] = useState<
@@ -266,7 +285,60 @@ export default function CalendarView() {
   const lastKeyboardNavigationRef = useRef(0);
   const [remoteDialogTarget, setRemoteDialogTarget] =
     useState<RemoteTaskDialogTarget | null>(null);
+  const [pendingRecurringDateChange, setPendingRecurringDateChange] =
+    useState<PendingRecurringCalendarDateChange | null>(null);
+  const pendingRecurringDateRevertRef = useRef<(() => void) | null>(null);
   const closeTaskContextMenu = contextMenu.close;
+
+  const browseProjects = useMemo(
+    () => accessibleProjects ?? allProjects ?? projects ?? [],
+    [accessibleProjects, allProjects, projects],
+  );
+  const browseSpaces = useMemo(
+    () => accessibleSpaces ?? spaces ?? [],
+    [accessibleSpaces, spaces],
+  );
+  const clearBrowseScope = useCallback(() => {
+    setBrowseScope(null);
+    setSelectedTaskId(null);
+    setDetailTaskId(null);
+    setSelectedOccurrenceContext(null);
+    setDraftTask(null);
+    setRemoteDialogTarget(null);
+    closeTaskContextMenu();
+  }, [closeTaskContextMenu]);
+  const handleScopeChange = useCallback(
+    (nextScope: ScopeMode) => {
+      clearBrowseScope();
+      setScope(nextScope);
+    },
+    [clearBrowseScope],
+  );
+  const handleBrowseScopeChange = useCallback(
+    (nextScope: TaskBrowseScope | null) => {
+      if (nextScope) {
+        setSelectedTaskId(null);
+        setDetailTaskId(null);
+        setSelectedOccurrenceContext(null);
+        setDraftTask(null);
+        setRemoteDialogTarget(null);
+        closeTaskContextMenu();
+      }
+      setBrowseScope(nextScope);
+    },
+    [closeTaskContextMenu],
+  );
+  const normalSelectionRef = useRef({ selectedProjectId, selectedSpaceId });
+  useEffect(() => {
+    const previous = normalSelectionRef.current;
+    if (
+      previous.selectedProjectId !== selectedProjectId ||
+      previous.selectedSpaceId !== selectedSpaceId
+    ) {
+      clearBrowseScope();
+    }
+    normalSelectionRef.current = { selectedProjectId, selectedSpaceId };
+  }, [clearBrowseScope, selectedProjectId, selectedSpaceId]);
 
   const projectsById = useMemo(
     () => new Map(allProjects.map((project) => [project.id, project] as const)),
@@ -281,14 +353,79 @@ export default function CalendarView() {
     [projectsById],
   );
 
-  const calendarRemoteContext =
-    selectedProject?.source === "remote"
+  const calendarRemoteContext = browseScope
+    ? null
+    : selectedProject?.source === "remote"
       ? selectedProject
       : selectedSpace?.source === "remote"
         ? selectedSpace
         : null;
+  // The project context provider may recreate its selected objects on every
+  // render. Keep the data-fetch callback keyed by the values that affect the
+  // request rather than by those object identities, otherwise the fetch effect
+  // can spin indefinitely after a browse-scope change.
+  const selectedProjectSource = selectedProject?.source ?? null;
+  const selectedProjectResourceId = selectedProject?.resource_id ?? null;
+  const selectedProjectRemoteServerId = selectedProject?.remote_server_id ?? null;
+  const selectedProjectRemoteServerName =
+    selectedProject?.remote_server_name ?? null;
+  const selectedProjectRemoteServerColor =
+    selectedProject?.remote_server_color ?? null;
+  const selectedProjectRemoteServerBaseUrl =
+    selectedProject?.remote_server_base_url ?? null;
+  const selectedSpaceSource = selectedSpace?.source ?? null;
+  const selectedSpaceResourceId = selectedSpace?.resource_id ?? null;
+  const selectedSpaceRemoteServerId = selectedSpace?.remote_server_id ?? null;
+  const selectedSpaceRemoteServerName =
+    selectedSpace?.remote_server_name ?? null;
+  const selectedSpaceRemoteServerColor =
+    selectedSpace?.remote_server_color ?? null;
+  const selectedSpaceRemoteServerBaseUrl =
+    selectedSpace?.remote_server_base_url ?? null;
+  const selectedProjectFetchContext = useMemo(
+    () =>
+      selectedProjectSource
+        ? {
+            source: selectedProjectSource,
+            resource_id: selectedProjectResourceId,
+            remote_server_id: selectedProjectRemoteServerId,
+            remote_server_name: selectedProjectRemoteServerName,
+            remote_server_color: selectedProjectRemoteServerColor,
+            remote_server_base_url: selectedProjectRemoteServerBaseUrl,
+          }
+        : null,
+    [
+      selectedProjectSource,
+      selectedProjectResourceId,
+      selectedProjectRemoteServerId,
+      selectedProjectRemoteServerName,
+      selectedProjectRemoteServerColor,
+      selectedProjectRemoteServerBaseUrl,
+    ],
+  );
+  const selectedSpaceFetchContext = useMemo(
+    () =>
+      selectedSpaceSource
+        ? {
+            source: selectedSpaceSource,
+            resource_id: selectedSpaceResourceId,
+            remote_server_id: selectedSpaceRemoteServerId,
+            remote_server_name: selectedSpaceRemoteServerName,
+            remote_server_color: selectedSpaceRemoteServerColor,
+            remote_server_base_url: selectedSpaceRemoteServerBaseUrl,
+          }
+        : null,
+    [
+      selectedSpaceSource,
+      selectedSpaceResourceId,
+      selectedSpaceRemoteServerId,
+      selectedSpaceRemoteServerName,
+      selectedSpaceRemoteServerColor,
+      selectedSpaceRemoteServerBaseUrl,
+    ],
+  );
   const calendarReadOnly = Boolean(
-    calendarRemoteContext || selectedProject?.can_write === false,
+    browseScope || calendarRemoteContext || selectedProject?.can_write === false,
   );
 
   const detailTask = useMemo(
@@ -303,8 +440,14 @@ export default function CalendarView() {
       isProjectReadOnly(detailTask?.project_id),
   );
 
-  const calendarScopeLabel =
-    scope === "all"
+  const browseScopeResource = browseScope
+    ? browseScope.kind === "project"
+      ? browseProjects.find((project) => project.id === browseScope.id)
+      : browseSpaces.find((space) => space.id === browseScope.id)
+    : null;
+  const calendarScopeLabel = browseScope
+    ? `参照: ${browseScopeResource?.name ?? browseScope.id}`
+    : scope === "all"
       ? "All projects"
       : scope === "space"
         ? selectedSpace
@@ -334,10 +477,16 @@ export default function CalendarView() {
         showDocsLayer={showDocsLayer}
         hideRecurring={hideRecurring}
         showClosed={showClosed}
-        onScopeChange={setScope}
+        onScopeChange={handleScopeChange}
         onShowDocsLayerChange={setShowDocsLayer}
         onHideRecurringChange={setHideRecurring}
         onShowClosedChange={setShowClosed}
+        browseScope={browseScope}
+        browseProjects={browseProjects}
+        browseSpaces={browseSpaces}
+        participatingProjects={participatingProjects ?? projects ?? []}
+        participatingSpaces={participatingSpaces ?? spaces ?? []}
+        onBrowseScopeChange={handleBrowseScopeChange}
         currentDate={currentDate}
         onDateChange={(date) => calendarRef.current?.getApi().gotoDate(date)}
         onPreviousMonth={() => navigateMiniMonth(-1)}
@@ -349,6 +498,24 @@ export default function CalendarView() {
   useEffect(() => {
     if (calendarReadOnly) closeTaskContextMenu();
   }, [calendarReadOnly, closeTaskContextMenu]);
+
+  useEffect(() => {
+    if (calendarReadOnly && pendingRecurringDateChange) {
+      const revert = pendingRecurringDateRevertRef.current;
+      pendingRecurringDateRevertRef.current = null;
+      setPendingRecurringDateChange(null);
+      revert?.();
+    }
+  }, [calendarReadOnly, pendingRecurringDateChange]);
+
+  useEffect(
+    () => () => {
+      const revert = pendingRecurringDateRevertRef.current;
+      pendingRecurringDateRevertRef.current = null;
+      revert?.();
+    },
+    [],
+  );
 
   useEffect(() => {
     setCalendarMirrorParent(document.body);
@@ -497,11 +664,12 @@ export default function CalendarView() {
   }, [selectedTaskId, draftTask]);
 
   const scopeArg = useMemo<Scope | null>(() => {
+    if (browseScope) return taskBrowseScopeToQuery(browseScope) ?? null;
     if (scope === "all") return {};
     if (scope === "space")
       return selectedSpaceId ? { space_id: selectedSpaceId } : null;
     return selectedProjectId ? { project_id: selectedProjectId } : null;
-  }, [scope, selectedProjectId, selectedSpaceId]);
+  }, [browseScope, scope, selectedProjectId, selectedSpaceId]);
   const canRenderCalendar = prefsLoaded && scopeArg !== null;
 
   const fetchData = useCallback(
@@ -514,22 +682,29 @@ export default function CalendarView() {
       setLoading(true);
       setCalendarError(null);
       try {
-        const remoteContext =
-          selectedProject?.source === "remote"
-            ? selectedProject
-            : selectedSpace?.source === "remote"
-              ? selectedSpace
+        const remoteContext = browseScope
+          ? null
+          : selectedProjectFetchContext?.source === "remote"
+            ? selectedProjectFetchContext
+            : selectedSpaceFetchContext?.source === "remote"
+              ? selectedSpaceFetchContext
               : null;
         const remoteProfileId = remoteContext?.remote_server_id;
-        const remoteScope =
-          scope === "project" && selectedProject?.source === "remote"
-            ? { project_id: selectedProject.resource_id }
-            : scope === "space" && selectedSpace?.source === "remote"
-              ? { space_id: selectedSpace.resource_id }
-              : selectedProject?.source === "remote"
-                ? { project_id: selectedProject.resource_id }
-                : selectedSpace?.source === "remote"
-                  ? { space_id: selectedSpace.resource_id }
+        const remoteScope: { project_id?: string; space_id?: string } =
+          scope === "project" &&
+          selectedProjectFetchContext?.source === "remote" &&
+          selectedProjectFetchContext.resource_id
+            ? { project_id: selectedProjectFetchContext.resource_id }
+            : scope === "space" &&
+                selectedSpaceFetchContext?.source === "remote" &&
+                selectedSpaceFetchContext.resource_id
+              ? { space_id: selectedSpaceFetchContext.resource_id }
+              : selectedProjectFetchContext?.source === "remote" &&
+                  selectedProjectFetchContext.resource_id
+                ? { project_id: selectedProjectFetchContext.resource_id }
+                : selectedSpaceFetchContext?.source === "remote" &&
+                    selectedSpaceFetchContext.resource_id
+                  ? { space_id: selectedSpaceFetchContext.resource_id }
                   : {};
         const remoteTasksPromise = remoteProfileId
           ? listRemoteTasks(remoteProfileId, remoteScope).then((items) =>
@@ -539,7 +714,7 @@ export default function CalendarView() {
                     id: remoteProfileId,
                     name: remoteContext?.remote_server_name ?? "Remote",
                     display_color: remoteContext?.remote_server_color,
-                    base_url: remoteContext?.remote_server_base_url,
+                    base_url: remoteContext?.remote_server_base_url ?? "",
                   },
                   task,
                 ),
@@ -557,7 +732,7 @@ export default function CalendarView() {
               ),
             )
           : Promise.resolve([] as TaskOccurrence[]);
-        const localDocsPromise = remoteProfileId
+        const localDocsPromise = browseScope || remoteProfileId
           ? Promise.resolve([] as DocsCalendarItem[])
           : fetch(
               `/api/docs/calendar-items?${new URLSearchParams({
@@ -622,7 +797,13 @@ export default function CalendarView() {
         }
       }
     },
-    [scopeArg, scope, selectedProject, selectedSpace],
+    [
+      browseScope,
+      scopeArg,
+      scope,
+      selectedProjectFetchContext,
+      selectedSpaceFetchContext,
+    ],
   );
 
   useTaskCompletionRefresh(fetchData);
@@ -749,7 +930,9 @@ export default function CalendarView() {
             ...(task.source === "remote" ? ["event-remote"] : []),
           ],
           editable:
-            task.source !== "remote" && !isProjectReadOnly(task.project_id),
+            !calendarReadOnly &&
+            task.source !== "remote" &&
+            !isProjectReadOnly(task.project_id),
           extendedProps: {
             taskId: task.id,
             projectId: task.project_id,
@@ -765,7 +948,9 @@ export default function CalendarView() {
             occurrenceSourceKind: null,
             isRemote: task.source === "remote",
             isReadOnly:
-              task.source === "remote" || isProjectReadOnly(task.project_id),
+              calendarReadOnly ||
+              task.source === "remote" ||
+              isProjectReadOnly(task.project_id),
             remoteServerId: task.remote_server_id,
             remoteServerName: task.remote_server_name,
             remoteBaseUrl: task.remote_server_base_url,
@@ -798,6 +983,7 @@ export default function CalendarView() {
             ...(occurrence.source === "remote" ? ["event-remote"] : []),
           ],
           editable:
+            !calendarReadOnly &&
             occurrence.source !== "remote" &&
             !isProjectReadOnly(occurrence.project_id),
           extendedProps: {
@@ -820,6 +1006,7 @@ export default function CalendarView() {
             occurrenceSourceKind: occurrence.source_kind,
             isRemote: occurrence.source === "remote",
             isReadOnly:
+              calendarReadOnly ||
               occurrence.source === "remote" ||
               isProjectReadOnly(occurrence.project_id),
             remoteServerId: occurrence.remote_server_id,
@@ -828,7 +1015,7 @@ export default function CalendarView() {
         };
       });
 
-    const docsEvents: CalendarEvent[] = showDocsLayer
+    const docsEvents: CalendarEvent[] = showDocsLayer && !browseScope
       ? docsCalendarItems.map((item) => ({
           id: `docs-${item.id}`,
           // 1ノードが複数のdateフィールドを持つ場合に見分けが付くよう、フィールド名を併記する
@@ -871,6 +1058,8 @@ export default function CalendarView() {
     occurrences,
     docsCalendarItems,
     showDocsLayer,
+    browseScope,
+    calendarReadOnly,
     showClosed,
     hideRecurring,
     resolvedTheme,
@@ -974,6 +1163,7 @@ export default function CalendarView() {
                   (info.event.extendedProps.occurrenceOriginalStartAt as
                     | string
                     | null) ?? null,
+                all_day: info.event.allDay,
                 source_kind:
                   (info.event.extendedProps.occurrenceSourceKind as
                     | string
@@ -1035,9 +1225,51 @@ export default function CalendarView() {
     [calendarReadOnly, contextMenu, tasks],
   );
 
+  const revertPendingRecurringDateChange = useCallback(() => {
+    const revert = pendingRecurringDateRevertRef.current;
+    pendingRecurringDateRevertRef.current = null;
+    setPendingRecurringDateChange(null);
+    revert?.();
+  }, []);
+
+  const handleRecurringDateChange = useCallback(
+    async (mode: "single" | "future") => {
+      const pending = pendingRecurringDateChange;
+      if (!pending) return;
+
+      const revert = pendingRecurringDateRevertRef.current;
+      pendingRecurringDateRevertRef.current = null;
+      setPendingRecurringDateChange(null);
+
+      if (calendarReadOnly) {
+        revert?.();
+        return;
+      }
+
+      try {
+        await taskApi.moveOccurrence(pending.taskId, {
+          ...pending.payload,
+          mode,
+        });
+        // Keep the existing lightweight refresh semantics: a successful
+        // mutation should not be reverted merely because the follow-up list
+        // refresh happens to fail.
+        fetchData();
+      } catch (err) {
+        console.error("繰り返しカレンダー予定の日時更新に失敗:", err);
+        revert?.();
+      }
+    },
+    [calendarReadOnly, fetchData, pendingRecurringDateChange],
+  );
+
   const handleEventDrop = useCallback(
     async (info: EventDropArg) => {
+      if (pendingRecurringDateRevertRef.current) {
+        revertPendingRecurringDateChange();
+      }
       if (
+        calendarReadOnly ||
         info.event.extendedProps.isRemote ||
         info.event.extendedProps.isReadOnly
       ) {
@@ -1066,7 +1298,7 @@ export default function CalendarView() {
           | undefined;
 
         if (occurrenceStartAt && nextStart) {
-          await taskApi.moveOccurrence(taskId, {
+          const payload: Omit<MoveOccurrencePayload, "mode"> = {
             occurrence_id:
               (info.event.extendedProps.occurrenceId as string | null) ?? null,
             occurrence_start_at: occurrenceStartAt,
@@ -1087,7 +1319,14 @@ export default function CalendarView() {
             }),
             status: (info.event.extendedProps.status as string | null) ?? null,
             all_day: info.event.allDay,
-          });
+          };
+          // FullCalendar has already previewed the move.  Keep its revert
+          // callback until the scope dialog is resolved; a previous pending
+          // preview must be restored before replacing it.
+          pendingRecurringDateRevertRef.current?.();
+          pendingRecurringDateRevertRef.current = info.revert;
+          setPendingRecurringDateChange({ taskId, payload });
+          return;
         } else {
           await taskApi.updateTask(taskId, {
             start_at:
@@ -1107,12 +1346,16 @@ export default function CalendarView() {
         info.revert();
       }
     },
-    [fetchData],
+    [calendarReadOnly, fetchData, revertPendingRecurringDateChange],
   );
 
   const handleEventResize = useCallback(
     async (info: EventResizeDoneArg) => {
+      if (pendingRecurringDateRevertRef.current) {
+        revertPendingRecurringDateChange();
+      }
       if (
+        calendarReadOnly ||
         info.event.extendedProps.isRemote ||
         info.event.extendedProps.isReadOnly
       ) {
@@ -1127,7 +1370,7 @@ export default function CalendarView() {
           | null
           | undefined;
         if (occurrenceStartAt && info.event.start) {
-          await taskApi.moveOccurrence(taskId, {
+          const payload: Omit<MoveOccurrencePayload, "mode"> = {
             occurrence_id:
               (info.event.extendedProps.occurrenceId as string | null) ?? null,
             occurrence_start_at: occurrenceStartAt,
@@ -1148,7 +1391,11 @@ export default function CalendarView() {
             }),
             status: (info.event.extendedProps.status as string | null) ?? null,
             all_day: info.event.allDay,
-          });
+          };
+          pendingRecurringDateRevertRef.current?.();
+          pendingRecurringDateRevertRef.current = info.revert;
+          setPendingRecurringDateChange({ taskId, payload });
+          return;
         } else {
           await taskApi.updateTask(taskId, {
             start_at:
@@ -1168,7 +1415,7 @@ export default function CalendarView() {
         info.revert();
       }
     },
-    [fetchData],
+    [calendarReadOnly, fetchData, revertPendingRecurringDateChange],
   );
 
   useEffect(() => {
@@ -1224,7 +1471,7 @@ export default function CalendarView() {
       data-shell-region="calendar-canvas"
     >
       <div className="flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border bg-card px-3 py-2 md:hidden">
-        <Tabs value={scope} onValueChange={(v) => setScope(v as ScopeMode)}>
+        <Tabs value={scope} onValueChange={(v) => handleScopeChange(v as ScopeMode)}>
           <TabsList className="h-8">
             <TabsTrigger value="project" className="text-xs">
               Project
@@ -1253,7 +1500,8 @@ export default function CalendarView() {
         <div className="ml-auto flex items-center gap-3">
           <label className="flex cursor-pointer select-none items-center gap-1.5 text-xs text-muted-foreground">
             <Checkbox
-              checked={showDocsLayer}
+              checked={showDocsLayer && !browseScope}
+              disabled={Boolean(browseScope)}
               onCheckedChange={(checked) => setShowDocsLayer(!!checked)}
             />
             Docs Items
@@ -1273,6 +1521,15 @@ export default function CalendarView() {
             Show Completed
           </label>
         </div>
+        <TaskBrowseScopePicker
+          className="w-full basis-full"
+          browseScope={browseScope}
+          projects={browseProjects}
+          spaces={browseSpaces}
+          participatingProjects={participatingProjects ?? projects ?? []}
+          participatingSpaces={participatingSpaces ?? spaces ?? []}
+          onBrowseScopeChange={handleBrowseScopeChange}
+        />
       </div>
 
       <div
@@ -1307,7 +1564,7 @@ export default function CalendarView() {
             buttonText={FC_BUTTON_TEXT}
             events={calendarEvents}
             eventDisplay="block"
-            editable
+            editable={!calendarReadOnly}
             eventClick={handleEventClick}
             eventDrop={handleEventDrop}
             eventResize={handleEventResize}
@@ -1527,6 +1784,7 @@ export default function CalendarView() {
                           (info.event.extendedProps
                             .occurrenceOriginalStartAt as string | null) ??
                           null,
+                        all_day: info.event.allDay,
                         source_kind:
                           (info.event.extendedProps.occurrenceSourceKind as
                             | string
@@ -1590,6 +1848,15 @@ export default function CalendarView() {
           window.dispatchEvent(new Event("task-list-refresh"));
         }}
         occurrenceContext={selectedOccurrenceContext}
+        browseScope={browseScope}
+      />
+      <RecurringDateChangeDialog
+        open={!!pendingRecurringDateChange}
+        onOpenChange={(open) => {
+          if (!open) revertPendingRecurringDateChange();
+        }}
+        onApplySingle={() => void handleRecurringDateChange("single")}
+        onApplyFuture={() => void handleRecurringDateChange("future")}
       />
       <TaskContextMenu
         menu={contextMenu.menu}

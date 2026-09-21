@@ -32,6 +32,91 @@ import {
 
 type ProjectOption = { id: string; name: string };
 
+export interface SkillReviewContent {
+  name: string;
+  description: string;
+  prompt_template: string;
+  trigger_mode: string;
+}
+
+interface SkillContentReviewFieldsProps {
+  value: SkillReviewContent;
+  onChange: (value: SkillReviewContent) => void;
+  readOnly?: boolean;
+  nameReadOnly?: boolean;
+  promptLabel?: string;
+  promptPlaceholder?: string;
+}
+
+export function SkillContentReviewFields({
+  value,
+  onChange,
+  readOnly = false,
+  nameReadOnly = false,
+  promptLabel = "スキル本文（Markdown）",
+  promptPlaceholder = "# スキルの手順...",
+}: SkillContentReviewFieldsProps) {
+  return (
+    <>
+      <div className="space-y-1">
+        <Label className="text-xs">名前</Label>
+        <Input
+          value={value.name}
+          onChange={(event) =>
+            onChange({ ...value, name: event.target.value })
+          }
+          disabled={readOnly || nameReadOnly}
+          placeholder="my-skill"
+        />
+      </div>
+
+      <div className="space-y-1">
+        <Label className="text-xs">説明</Label>
+        <Input
+          value={value.description}
+          onChange={(event) =>
+            onChange({ ...value, description: event.target.value })
+          }
+          disabled={readOnly}
+          placeholder="このスキルの説明"
+        />
+      </div>
+
+      <div className="space-y-1">
+        <Label className="text-xs">トリガーモード</Label>
+        <AppSelect
+          value={value.trigger_mode}
+          onChange={(event) =>
+            onChange({ ...value, trigger_mode: event.target.value })
+          }
+          disabled={readOnly}
+          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+        >
+          <option value="manual">手動</option>
+          <option value="auto">自動</option>
+          <option value="both">両方</option>
+        </AppSelect>
+      </div>
+
+      <div className="space-y-1">
+        <Label className="text-xs">{promptLabel}</Label>
+        <LongTextEditor
+          value={value.prompt_template}
+          onChange={(promptTemplate) =>
+            onChange({ ...value, prompt_template: promptTemplate })
+          }
+          readOnly={readOnly}
+          minHeight={180}
+          maxHeight={360}
+          placeholder={promptPlaceholder}
+          fontFamily="monospace"
+          fontSize={12}
+        />
+      </div>
+    </>
+  );
+}
+
 interface SkillRecordingReviewProps {
   recordingId: string;
   draft: SkillRecordingDraft;
@@ -158,49 +243,20 @@ export function SkillRecordingReview({
         に反映されません。
       </p>
 
-      <div className="space-y-1">
-        <Label className="text-xs">名前</Label>
-        <Input
-          value={name}
-          onChange={(e) => setName(e.target.value)}
-          placeholder="my-skill"
-        />
-      </div>
-
-      <div className="space-y-1">
-        <Label className="text-xs">説明</Label>
-        <Input
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          placeholder="このスキルの説明"
-        />
-      </div>
-
-      <div className="space-y-1">
-        <Label className="text-xs">トリガーモード</Label>
-        <AppSelect
-          value={triggerMode}
-          onChange={(e) => setTriggerMode(e.target.value)}
-          className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
-        >
-          <option value="manual">手動</option>
-          <option value="auto">自動</option>
-          <option value="both">両方</option>
-        </AppSelect>
-      </div>
-
-      <div className="space-y-1">
-        <Label className="text-xs">スキル本文（Markdown）</Label>
-        <LongTextEditor
-          value={markdown}
-          onChange={setMarkdown}
-          minHeight={180}
-          maxHeight={360}
-          placeholder="# スキルの手順..."
-          fontFamily="monospace"
-          fontSize={12}
-        />
-      </div>
+      <SkillContentReviewFields
+        value={{
+          name,
+          description,
+          prompt_template: markdown,
+          trigger_mode: triggerMode,
+        }}
+        onChange={(next) => {
+          setName(next.name);
+          setDescription(next.description);
+          setMarkdown(next.prompt_template);
+          setTriggerMode(next.trigger_mode);
+        }}
+      />
 
       {draft.bound_tools.length > 0 && (
         <div className="space-y-1">

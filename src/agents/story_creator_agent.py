@@ -82,7 +82,7 @@ _STORY_CREATOR_SYSTEM_PROMPT = """\
 class StoryCreatorAgent(BaseAgent):
     """シナリオ作成支援エージェント"""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-5.6-luna"):
         super().__init__(model=model)
 
     def _create_agent(self) -> Agent:

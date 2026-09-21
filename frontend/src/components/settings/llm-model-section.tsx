@@ -22,13 +22,16 @@ import { Separator } from "@/components/ui/separator";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { formatBytes } from "@/lib/utils";
 import { LlmMediaModelTabs } from "./llm-media-model-tabs";
+import { LlmProjectAutomationRouting } from "./llm-project-automation-routing";
 import { LlmAgentTeamRouting } from "./llm-agent-team-routing";
 import { LlmModelGroupsPanel } from "./llm-model-groups-panel";
 import { LlmProviderVisibilitySettings } from "./llm-provider-visibility-settings";
 import { OpenRouterProviderRouting } from "./openrouter-provider-routing";
 import { FreeTeamSettingsPanel } from "./free-team-settings-panel";
 import { LlmExternalPrivacySettings } from "./llm-external-privacy-settings";
+import { LlmCloudAdvisorSettings } from "./llm-cloud-advisor-settings";
 import { LlamaCppRuntimePanel } from "./llama-cpp-runtime-panel";
+import { ManagedLocalRuntimePanel } from "./managed-local-runtime-panel";
 import { useLlmModelSection } from "./llm-model-section-state";
 import {
   hasDeploymentMetadata,
@@ -41,21 +44,25 @@ import {
   providerHint,
   providerSourceLabel,
   llamaCppRuntimeProfileForModel,
+  managedLocalRuntimeForSelection,
   shouldShowLlamaCppRuntimePanel,
 } from "./llm-model-section-types";
 
-export function LlmModelSection() {
-  const [activeSection, setActiveSection] = useState<"base" | "routing" | "agent" | "privacy">("base");
+export function LlmModelSection({ isAdmin = true }: { isAdmin?: boolean } = {}) {
+  const [activeSection, setActiveSection] = useState<"base" | "routing" | "agent" | "privacy" | "cloud">("base");
   const {
     expanded, setExpanded, catalog, provider, model, customModel, loading, refreshing, saving,
     pulling, pullInput, setPullInput, task, deletingModel, modelSearch, setModelSearch, setModelPage,
     baseUrl, setBaseUrl, apiKey, setApiKey, reasoningEffort, setReasoningEffort,
     llamaCppDraft, setLlamaCppDraft, llamaCppError,
+    llamaCppModelRootState, llamaCppModelRootLoading, llamaCppModelRootSaving,
+    llamaCppModelRootError, saveLlamaCppModelRoot,
     delegationEnabled, setDelegationEnabled,
     orchestrationMode, setOrchestrationMode, chatgptWeb, setChatgptWeb,
     externalPrivacy, setExternalPrivacy, imageMode,
     setImageMode, videoMode, setVideoMode, mageVl, setMageVl, modelTab, setModelTab,
     classDrafts, setClassDrafts, savingRouting,
+    projectAutomationDraft, setProjectAutomationDraft, projectAutomationProviders,
     selectedProvider, selectedModelId, selectedModel, current, providerOptions,
     visionProvider, audioProvider,
     clipIngestProvider, clipIngestProviders,
@@ -64,7 +71,11 @@ export function LlmModelSection() {
     handleCustomModelChange, handleCustomModelConfirm, handleProviderChange,
     handleProviderSettingsSave, handleLlamaCppSettingsSave, startPull, percent, hasProviderSettings, showConnectionSettings,
     showReasoningEffort, deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings, engineChangeError,
+    localRuntimeStatus, localRuntimeTask, localRuntimeLoading, localRuntimePreparing,
+    startLocalRuntimePrepare,
     agentTeamConfig, setAgentTeamConfig,
+    cloudAdvisor, setCloudAdvisor, cloudAdvisorProviderIds,
+    saveCloudAdvisorSettings,
   } = useLlmModelSection();
 
   useEffect(() => {
@@ -119,11 +130,28 @@ export function LlmModelSection() {
       selectedModel,
       llamaCppRuntimeSettings,
     );
+  const managedLocalRuntime = managedLocalRuntimeForSelection(
+    selectedProvider,
+    selectedModel,
+    selectedModelId,
+  );
+  const showManagedLocalRuntimePanel = Boolean(managedLocalRuntime);
+  const managedLocalRuntimeSettings = managedLocalRuntime === "freetoken"
+    ? selectedProvider?.settings?.freetoken
+      ?? selectedProvider?.settings?.runtime_settings
+      ?? null
+    : managedLocalRuntime === "llama_cpp"
+      ? selectedProvider?.settings?.runtime_settings
+        ?? selectedProvider?.settings?.llama_cpp
+        ?? null
+      : null;
+  const managedLocalRuntimeProfile = selectedModel?.runtime_profile ?? null;
   const sectionItems = [
     { id: "base" as const, label: "Base Model", description: "Providerとモデル" },
     { id: "routing" as const, label: "Routing", description: "用途別の経路" },
     { id: "agent" as const, label: "Agent Team", description: "Team構成" },
     { id: "privacy" as const, label: "Privacy & Advanced", description: "保護とRuntime" },
+    { id: "cloud" as const, label: "Cloud Advisor", description: "クラウド相談" },
   ];
 
   const openSection = (section: typeof activeSection) => {
@@ -197,7 +225,7 @@ export function LlmModelSection() {
               <div
                 role="tablist"
                 aria-label="言語モデル設定"
-                className="sticky top-0 z-10 grid grid-cols-2 gap-1 rounded-md border border-border bg-card/95 p-1 shadow-sm backdrop-blur md:grid-cols-4"
+                className="sticky top-0 z-10 grid grid-cols-2 gap-1 rounded-md border border-border bg-card/95 p-1 shadow-sm backdrop-blur md:grid-cols-5"
               >
                 {sectionItems.map((item) => (
                   <button
@@ -269,9 +297,9 @@ export function LlmModelSection() {
                   LLMエンジン変更に失敗しました: {engineChangeError}
                 </p>
               )}
-              <Tabs value={modelTab} onValueChange={(value) => setModelTab(value as "language" | "vision" | "audio" | "video" | "clip_ingest")}>
+              <Tabs value={modelTab} onValueChange={(value) => setModelTab(value as "language" | "vision" | "audio" | "video" | "clip_ingest" | "project_automation")}>
                 {activeSection === "routing" && (
-                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4" aria-label="用途別Routing一覧">
+                  <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5" aria-label="用途別Routing一覧">
                     {[
                       {
                         id: "vision" as const,
@@ -295,12 +323,20 @@ export function LlmModelSection() {
                         label: "Clip Ingest",
                         route: classDrafts.clip_ingest.inherit ? "Base Modelを継承" : `${classDrafts.clip_ingest.provider} / ${classDrafts.clip_ingest.customModel || classDrafts.clip_ingest.model}`,
                       },
+                      {
+                        id: "project_automation" as const,
+                        label: "Project Automation",
+                        route: projectAutomationDraft.inherit
+                          ? "Base Modelを継承"
+                          : `${projectAutomationDraft.provider || "未設定"} / ${projectAutomationDraft.customModel || projectAutomationDraft.model || "未設定"}`,
+                      },
                     ].map((item) => (
                       <button
                         key={item.id}
                         type="button"
                         onClick={() => setModelTab(item.id)}
                         aria-pressed={modelTab === item.id}
+                        data-testid={item.id === "project_automation" ? "routing-card-project-automation" : undefined}
                         className={`min-h-16 rounded-sm border border-l-2 px-3 py-2 text-left transition-colors ${modelTab === item.id ? "border-l-primary bg-primary/10" : "border-l-transparent bg-muted/35 hover:bg-muted"}`}
                       >
                         <span className="block text-xs font-medium">{item.label}</span>
@@ -309,12 +345,13 @@ export function LlmModelSection() {
                     ))}
                   </div>
                 )}
-                 <TabsList variant="line" className={`w-full justify-start gap-1 rounded-none border-b border-border p-0 ${activeSection === "agent" || activeSection === "privacy" ? "hidden" : ""}`}>
+                 <TabsList variant="line" className={`w-full justify-start gap-1 rounded-none border-b border-border p-0 ${activeSection === "agent" || activeSection === "privacy" || activeSection === "cloud" ? "hidden" : ""}`}>
                   {activeSection === "base" && <TabsTrigger value="language">基本モデル</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="vision">画像認識</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="audio">音声認識</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="video">動画認識</TabsTrigger>}
                   {activeSection === "routing" && <TabsTrigger value="clip_ingest">クリップ取り込み</TabsTrigger>}
+                  {activeSection === "routing" && <TabsTrigger value="project_automation">Project Automation</TabsTrigger>}
                 </TabsList>
 
                 {activeSection === "routing" && <LlmMediaModelTabs
@@ -338,6 +375,15 @@ export function LlmModelSection() {
                   mediaProviders={mediaProviders}
                   saveRoutingSettings={saveRoutingSettings}
                 />}
+                {activeSection === "routing" && (
+                  <LlmProjectAutomationRouting
+                    draft={projectAutomationDraft}
+                    setDraft={setProjectAutomationDraft}
+                    providers={projectAutomationProviders}
+                    saving={savingRouting}
+                    onSave={() => saveRoutingSettings("project_automation")}
+                  />
+                )}
                 <TabsContent value="language" className={activeSection === "base" ? "mt-3 space-y-3" : "hidden"}>
               <div className={modelTab === "language" ? "grid gap-3 md:grid-cols-[220px_1fr]" : "hidden"}>
                 <div className="space-y-1">
@@ -410,6 +456,18 @@ export function LlmModelSection() {
                     </p>
                   )}
               </div>}
+
+              {showManagedLocalRuntimePanel && (
+                <ManagedLocalRuntimePanel
+                  status={localRuntimeStatus}
+                  task={localRuntimeTask}
+                  loading={localRuntimeLoading}
+                  preparing={localRuntimePreparing}
+                  runtimeSettings={managedLocalRuntimeSettings}
+                  runtimeProfile={managedLocalRuntimeProfile}
+                  onStart={startLocalRuntimePrepare}
+                />
+              )}
                 </TabsContent>
               </Tabs>
 
@@ -418,23 +476,88 @@ export function LlmModelSection() {
                     <h3 className="text-sm font-medium">Privacy & Advanced</h3>
                     <p className="text-[11px] text-muted-foreground">外部送信の保護、Provider表示、固有Routing、ローカルRuntimeを管理します。</p>
                   </div>
-                  <LlmProviderVisibilitySettings providers={providerOptions} />
+                  <LlmProviderVisibilitySettings
+                    providers={catalog?.providers ?? []}
+                    globalVisibility={catalog?.provider_visibility}
+                    isAdmin={isAdmin}
+                  />
 
                   {provider === "openrouter" && (
                     <OpenRouterProviderRouting model={model} />
                   )}
 
-                  {showLlamaCppPanel && (
-                    <LlamaCppRuntimePanel
-                      selectedModelId={selectedModelId}
-                      runtimeProfile={llamaCppRuntimeProfile}
-                      runtimeSettings={llamaCppRuntimeSettings}
-                      draft={llamaCppDraft}
-                      setDraft={setLlamaCppDraft}
-                      saving={saving}
-                      error={llamaCppError}
-                      onSave={handleLlamaCppSettingsSave}
-                    />
+                  {provider === "openai_compatible_local" && (
+                    <div className="space-y-3">
+                      <section
+                        aria-label="llama.cpp model root設定"
+                        className="space-y-3 rounded-md border border-emerald-500/30 bg-emerald-50/30 p-3 dark:bg-emerald-950/10"
+                      >
+                        <div className="space-y-1">
+                          <h3 className="text-xs font-semibold">llama.cpp model root</h3>
+                          <p className="text-[10px] text-muted-foreground">
+                            managed modelの保存・検出先です。実行ファイルのruntime rootとは分離されています。
+                          </p>
+                        </div>
+                        <div className="space-y-1">
+                          <Label className="text-xs" htmlFor="llama-cpp-model-root">モデル保存先（任意のdirectory）</Label>
+                          <Input
+                            id="llama-cpp-model-root"
+                            aria-label="llama.cpp model root"
+                            value={llamaCppDraft.model_root ?? ""}
+                            onChange={(event) => setLlamaCppDraft((current) => ({
+                              ...current,
+                              model_root: event.target.value,
+                            }))}
+                            placeholder="空欄で既定値を使用"
+                            disabled={!isAdmin || llamaCppModelRootLoading || llamaCppModelRootSaving || saving}
+                          />
+                          <p className="text-[10px] text-muted-foreground">
+                            空欄で保存するとrepository-localの既定値へ戻ります。環境変数由来の有効値は入力欄へ自動コピーしません。
+                          </p>
+                        </div>
+                        <div className="grid gap-1 text-[10px] text-muted-foreground sm:grid-cols-3">
+                          <p>現在: <code className="break-all">{llamaCppModelRootState?.model_root || "未取得"}</code></p>
+                          <p>既定: <code className="break-all">{llamaCppModelRootState?.model_root_default || "未取得"}</code></p>
+                          <p>source: <code>{llamaCppModelRootState?.model_root_source || "未取得"}</code></p>
+                        </div>
+                        {llamaCppModelRootError && (
+                          <p role="alert" className="rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+                            {llamaCppModelRootError}
+                          </p>
+                        )}
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void saveLlamaCppModelRoot()}
+                            disabled={!isAdmin || llamaCppModelRootLoading || llamaCppModelRootSaving || saving}
+                          >
+                            {llamaCppModelRootSaving ? <Loader2 className="mr-1 size-3 animate-spin" /> : null}
+                            model rootを保存
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => void saveLlamaCppModelRoot("")}
+                            disabled={!isAdmin || llamaCppModelRootLoading || llamaCppModelRootSaving || saving}
+                          >
+                            既定値に戻す
+                          </Button>
+                        </div>
+                      </section>
+                      {showLlamaCppPanel && (
+                        <LlamaCppRuntimePanel
+                          selectedModelId={selectedModelId}
+                          runtimeProfile={llamaCppRuntimeProfile}
+                          runtimeSettings={llamaCppRuntimeSettings}
+                          draft={llamaCppDraft}
+                          setDraft={setLlamaCppDraft}
+                          saving={saving}
+                          error={llamaCppError}
+                          onSave={handleLlamaCppSettingsSave}
+                        />
+                      )}
+                    </div>
                   )}
 
                   {selectedProvider?.selection_kind === "routing_profile" && (
@@ -448,6 +571,27 @@ export function LlmModelSection() {
                     saving={savingRouting}
                     localModelOptions={localPrivacyModelOptions}
                   />
+              </div>
+
+              <div className={activeSection === "cloud" ? "block" : "hidden"} aria-hidden={activeSection !== "cloud"}>
+                <LlmCloudAdvisorSettings
+                  value={cloudAdvisor}
+                  onChange={setCloudAdvisor}
+                  onSave={saveCloudAdvisorSettings}
+                  saving={savingRouting}
+                  privacy={externalPrivacy}
+                  chatgptWeb={chatgptWeb}
+                  providerOptions={cloudAdvisorProviderIds.map((id) => ({
+                    id,
+                    label: id === "openai"
+                      ? "OpenAI"
+                      : id === "deepinfra"
+                        ? "DeepInfra"
+                        : id === "chatgpt-web" || id === "chatgpt_web"
+                          ? "Web ChatGPT"
+                          : id,
+                  }))}
+                />
               </div>
 
               <div className={activeSection === "base" ? "block" : "hidden"} aria-hidden={activeSection !== "base"}>

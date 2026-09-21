@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import logging
 import inspect
+import json
 import re
 import hashlib
 from collections.abc import Mapping
 from dataclasses import asdict
-from datetime import datetime
+from datetime import date, datetime
 from os import PathLike
 from typing import Any, AsyncContextManager, Awaitable, Callable, Literal, Optional
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import select, text
+from sqlalchemy import and_, select, text
 from sqlalchemy.exc import IntegrityError
 
 from ..llm.generation_error import GenerationErrorKind, user_message_for_generation_kind
@@ -29,6 +30,8 @@ from ..memory.models import (
     DocsClipIngestJob,
     DocsLibrary,
     KnowledgeNode,
+    KnowledgeNodeSupertag,
+    KnowledgeSupertag,
 )
 from ..services.clip_ingest_service import ClipIngestError
 from ..services.clip_ingest_storage import ClipIngestStorage, ClipUploadError
@@ -40,10 +43,13 @@ from ..services.docs_ingest_service import (
 )
 from ..services.docs_graph_service import DocsGraphService
 from ..services.docs_acl import (
+    is_docs_node_renderable,
+    docs_node_renderable_predicate,
     docs_readable_node_predicate,
     can_read_node,
     can_write_node,
     library_can_read,
+    library_can_write,
 )
 from .http_cache import etag_json_response
 from .docs_sync import (
@@ -314,6 +320,7 @@ class DocsClipIngestJobResponse(BaseModel):
     started_at: str | None = None
     finished_at: str | None = None
     updated_at: str | None = None
+    dismissed_at: str | None = None
 
 
 class DocsClipIngestJobListResponse(BaseModel):
@@ -401,6 +408,66 @@ class ClipIngestReceiptDetailResponse(BaseModel):
 
 class ClipIngestReceiptDetailEnvelope(BaseModel):
     receipt: ClipIngestReceiptDetailResponse
+
+
+MEETING_IMPORT_ROLES = frozenset({"minutes", "memo"})
+MEETING_IMPORT_ALLOWED_PARTS = frozenset(
+    {"file", "role", "title", "meeting_date", "participants"}
+)
+MEETING_IMPORT_MAX_TITLE_LENGTH = 240
+MEETING_IMPORT_MAX_PARTICIPANTS = 100
+MEETING_IMPORT_MAX_PARTICIPANT_LENGTH = 160
+
+
+def _meeting_import_filename(value: Any) -> str:
+    """Return a safe display filename without trusting client path segments."""
+
+    text = str(value or "").replace("\\", "/")
+    name = text.rsplit("/", 1)[-1].strip()
+    if not name or "\x00" in name:
+        raise HTTPException(status_code=400, detail="ファイル名が不正です")
+    return name
+
+
+def _meeting_import_title(source_text: str, filename: str, extension: str) -> str:
+    """Use an explicit Markdown H1, then the filename stem, as title fallback."""
+
+    if extension == ".md":
+        for line in source_text.splitlines():
+            match = re.match(r"^[ \t]{0,3}#(?!#)[ \t]+(.+?)\s*$", line)
+            if not match:
+                continue
+            candidate = re.sub(r"[ \t]+#+[ \t]*$", "", match.group(1)).strip()
+            if candidate:
+                return candidate
+    stem = re.sub(r"\.[^.]*$", "", filename).strip()
+    if not stem:
+        raise HTTPException(status_code=400, detail="タイトルを決定できません")
+    return stem
+
+
+def _meeting_import_participants(value: Any) -> list[str]:
+    """Parse the bounded JSON string[] metadata field."""
+
+    if value in (None, ""):
+        return []
+    if not isinstance(value, str):
+        raise HTTPException(status_code=400, detail="participants は JSON 文字列配列で指定してください")
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="participants は JSON 文字列配列で指定してください") from exc
+    if not isinstance(parsed, list) or len(parsed) > MEETING_IMPORT_MAX_PARTICIPANTS:
+        raise HTTPException(status_code=400, detail="participants の件数が上限を超えています")
+    participants: list[str] = []
+    for item in parsed:
+        if not isinstance(item, str):
+            raise HTTPException(status_code=400, detail="participants は文字列配列で指定してください")
+        name = item.strip()
+        if not name or len(name) > MEETING_IMPORT_MAX_PARTICIPANT_LENGTH:
+            raise HTTPException(status_code=400, detail="participants の値が不正です")
+        participants.append(name)
+    return participants
 
 
 def create_docs_router(
@@ -706,7 +773,10 @@ def create_docs_router(
                 entity_id=entity_id,
                 payload=payload,
             )
-            await session.commit()
+            # ``apply_docs_operation`` owns the single commit after the graph
+            # mutation.  Committing the workspace-resolution/bootstrap phase
+            # here would leave a ghost hub/tag/pointer when the subsequent
+            # operation failed; keep both phases in the same transaction.
             try:
                 return await apply_docs_operation(
                     session,
@@ -721,6 +791,12 @@ def create_docs_router(
             except Exception as exc:  # noqa: BLE001
                 await session.rollback()
                 raise _map_error(exc) from exc
+        except Exception:
+            # Resolution failures may occur before the operation dispatcher;
+            # ensure any idempotent workspace/bootstrap writes are rolled back
+            # rather than persisted by session close.
+            await session.rollback()
+            raise
         finally:
             await session.close()
 
@@ -1227,6 +1303,7 @@ def create_docs_router(
                     await session.execute(
                         select(DocsClipIngestJob)
                         .where(DocsClipIngestJob.actor_user_id == user_id)
+                        .where(DocsClipIngestJob.dismissed_at.is_(None))
                         .order_by(DocsClipIngestJob.created_at.desc(), DocsClipIngestJob.id.desc())
                         .limit(limit)
                     )
@@ -1250,6 +1327,43 @@ def create_docs_router(
             await session.rollback()
             logger.exception("Failed to list Docs ClipIngest jobs")
             raise HTTPException(status_code=500, detail="ClipIngest jobs could not be loaded") from exc
+        finally:
+            await session.close()
+
+    @router.get(
+        "/ingest/jobs/by-idempotency-key/{idempotency_key}",
+        response_model=DocsClipIngestJobResponse,
+    )
+    async def get_clip_ingest_job_by_idempotency_key(
+        request: Request,
+        idempotency_key: str,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id = await _get_current_user(request)
+        session = await get_db_manager().get_session()
+        try:
+            row = await _find_job_by_idempotency(
+                session, user_id, idempotency_key
+            )
+            if (
+                row is None
+                or row.dismissed_at is not None
+                or not await _job_read_allowed(
+                    session, job=row, user_id=user_id
+                )
+            ):
+                raise HTTPException(
+                    status_code=404, detail="ClipIngest job not found"
+                )
+            return _serialize_clip_ingest_job(row)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.exception("Failed to load Docs ClipIngest job")
+            raise HTTPException(
+                status_code=500, detail="ClipIngest job could not be loaded"
+            ) from exc
         finally:
             await session.close()
 
@@ -1283,6 +1397,47 @@ def create_docs_router(
             await session.rollback()
             logger.exception("Failed to load Docs ClipIngest job")
             raise HTTPException(status_code=500, detail="ClipIngest job could not be loaded") from exc
+        finally:
+            await session.close()
+
+    @router.post(
+        "/ingest/jobs/{job_id}/dismiss",
+        response_model=DocsClipIngestJobResponse,
+    )
+    async def dismiss_clip_ingest_job(
+        request: Request,
+        job_id: str,
+        _auth=Depends(require_auth_dependency),
+    ):
+        user_id = await _get_current_user(request)
+        parsed_job_id = _job_id_or_404(job_id)
+        session = await get_db_manager().get_session()
+        try:
+            row = await session.scalar(
+                select(DocsClipIngestJob).where(
+                    DocsClipIngestJob.id == parsed_job_id,
+                    DocsClipIngestJob.actor_user_id == user_id,
+                )
+            )
+            if row is None or not await _job_read_allowed(
+                session, job=row, user_id=user_id
+            ):
+                raise HTTPException(status_code=404, detail="ClipIngest job not found")
+            if row.status not in ("succeeded", "failed"):
+                raise HTTPException(status_code=409, detail="ClipIngest job is not dismissable")
+            if row.dismissed_at is None:
+                now = datetime.utcnow()
+                row.dismissed_at = now
+                row.updated_at = now
+                await session.commit()
+            return _serialize_clip_ingest_job(row)
+        except HTTPException:
+            await session.rollback()
+            raise
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.exception("Failed to dismiss Docs ClipIngest job")
+            raise HTTPException(status_code=500, detail="ClipIngest job could not be dismissed") from exc
         finally:
             await session.close()
 
@@ -1448,6 +1603,245 @@ def create_docs_router(
             await session.rollback()
             logger.exception("Failed to retry Docs ClipIngest job")
             raise HTTPException(status_code=500, detail="ClipIngest retry could not be created") from exc
+        finally:
+            await session.close()
+
+    @router.post("/meeting-import")
+    async def import_meeting_document(
+        request: Request,
+        _auth=Depends(require_auth_dependency),
+    ):
+        """Import one completed Markdown/text meeting document into Docs.
+
+        This route is intentionally separate from ClipIngest.  It accepts no
+        URLs or staged uploads and never invokes an LLM/web research path;
+        the uploaded bytes become one deterministic, editable Docs node.
+        """
+
+        user_id = await _get_current_user(request)
+        try:
+            form = await request.form()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="multipart形式を読み取れません") from exc
+
+        entries: dict[str, list[Any]] = {}
+        for key, value in form.multi_items():
+            name = str(key)
+            if name not in MEETING_IMPORT_ALLOWED_PARTS:
+                raise HTTPException(status_code=400, detail=f"未対応のmultipart項目です: {name}")
+            entries.setdefault(name, []).append(value)
+        duplicate = next((name for name, values in entries.items() if len(values) != 1), None)
+        if duplicate is not None:
+            raise HTTPException(status_code=400, detail=f"multipart項目が重複しています: {duplicate}")
+        upload_values = entries.get("file", [])
+        if len(upload_values) != 1:
+            raise HTTPException(status_code=400, detail="file は1件だけ指定してください")
+        upload = upload_values[0]
+        if not isinstance(upload, UploadFile) and not (
+            hasattr(upload, "read") and hasattr(upload, "filename")
+        ):
+            raise HTTPException(status_code=400, detail="file はmultipartファイルで指定してください")
+
+        role_value = entries.get("role", [None])[0]
+        role = str(role_value or "").strip().lower()
+        if role not in MEETING_IMPORT_ROLES:
+            raise HTTPException(status_code=400, detail="role は minutes または memo を指定してください")
+
+        raw_filename = getattr(upload, "filename", None)
+        filename = _meeting_import_filename(raw_filename)
+        extension_match = re.search(r"(\.[^.]+)$", filename)
+        extension = extension_match.group(1).lower() if extension_match else ""
+        if extension not in {".md", ".txt"}:
+            raise HTTPException(status_code=400, detail="対応形式は .md または .txt です")
+        try:
+            source_bytes = await upload.read()
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=400, detail="ファイルを読み取れません") from exc
+        if not isinstance(source_bytes, (bytes, bytearray)) or len(source_bytes) == 0:
+            raise HTTPException(status_code=400, detail="空のファイルは取り込めません")
+        source_bytes = bytes(source_bytes)
+        try:
+            source_text = source_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="ファイルはUTF-8で指定してください") from exc
+
+        title_value = entries.get("title", [None])[0]
+        if title_value is not None and not isinstance(title_value, str):
+            raise HTTPException(status_code=400, detail="title は文字列で指定してください")
+        title = str(title_value or "").strip() if title_value is not None else ""
+        if not title:
+            title = _meeting_import_title(source_text.lstrip("\ufeff"), filename, extension)
+        if len(title) > MEETING_IMPORT_MAX_TITLE_LENGTH:
+            raise HTTPException(status_code=400, detail="title は240文字以内で指定してください")
+
+        meeting_date_value = entries.get("meeting_date", [None])[0]
+        if meeting_date_value is not None and not isinstance(meeting_date_value, str):
+            raise HTTPException(status_code=400, detail="meeting_date は YYYY-MM-DD で指定してください")
+        meeting_date: str | None = None
+        if meeting_date_value not in (None, ""):
+            meeting_date = str(meeting_date_value).strip()
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", meeting_date):
+                raise HTTPException(status_code=400, detail="meeting_date は YYYY-MM-DD で指定してください")
+            try:
+                date.fromisoformat(meeting_date)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="meeting_date は有効な日付で指定してください") from exc
+
+        participants = _meeting_import_participants(entries.get("participants", [None])[0])
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+        idempotency_key = f"docs-meeting-import:v1:{role}:{source_sha256}"
+        node_id = uuid5(user_id, idempotency_key)
+        meeting_import = {
+            "version": "1",
+            "role": role,
+            "source_filename": filename,
+            "source_extension": extension,
+            "source_sha256": source_sha256,
+            "idempotency_key": idempotency_key,
+            "meeting_title": title,
+            "meeting_date": meeting_date,
+            "participants": participants,
+        }
+        body_json = {
+            "format": "doc_block",
+            "block_type": "markdown",
+            "label": "議事録" if role == "minutes" else "議事メモ",
+            "content": source_text,
+            "meeting_import": meeting_import,
+        }
+
+        session = await get_db_manager().get_session()
+        try:
+            service = _docs_service(session)
+            library = await _resolve_read_workspace(
+                session,
+                service,
+                user_id=user_id,
+            )
+            if not await library_can_write(session, library, user_id):
+                raise HTTPException(status_code=403, detail="Docs workspaceへの書き込み権限がありません")
+
+            async def existing_for_id() -> KnowledgeNode | None:
+                return await session.get(KnowledgeNode, node_id)
+
+            existing = await existing_for_id()
+
+            def existing_is_exact(node: KnowledgeNode | None) -> bool:
+                if node is None or node.docs_library_id != library.id:
+                    return False
+                raw_body = node.body_json if isinstance(node.body_json, dict) else {}
+                return raw_body.get("meeting_import") == meeting_import
+
+            async def ensure_meeting_minutes_tag(node: KnowledgeNode) -> KnowledgeSupertag:
+                tag = await service.resolve_supertag(
+                    docs_library_id=library.id,
+                    tag="meeting_minutes",
+                    create=False,
+                )
+                link = await session.get(
+                    KnowledgeNodeSupertag,
+                    {"node_id": node.id, "supertag_id": tag.id},
+                )
+                if link is None:
+                    await apply_docs_operation(
+                        session,
+                        service,
+                        user_id=user_id,
+                        docs_library_id=library.id,
+                        table="knowledge_node_supertags",
+                        action="create",
+                        entity_id=str(node.id),
+                        payload={"node_id": str(node.id), "supertag_id": str(tag.id)},
+                    )
+                return tag
+
+            if existing is not None:
+                if not existing_is_exact(existing):
+                    raise HTTPException(status_code=409, detail="決定的なDocs node IDが既存データと衝突しました")
+                await ensure_meeting_minutes_tag(existing)
+                serialized = serialize_docs_node(existing)
+                return {
+                    "action": "duplicate_skip",
+                    "status": "duplicate_skip",
+                    "duplicate_skip": True,
+                    "node": serialized,
+                    "node_id": str(existing.id),
+                    "title": title,
+                    "role": role,
+                    "system_key": "meeting_minutes",
+                    "source_sha256": source_sha256,
+                    "idempotency_key": idempotency_key,
+                    "meeting_import": meeting_import,
+                }
+
+            node_payload = {
+                "id": str(node_id),
+                "title": title,
+                "body_json": body_json,
+                "node_type": "node",
+            }
+            try:
+                node_data = await apply_docs_operation(
+                    session,
+                    service,
+                    user_id=user_id,
+                    docs_library_id=library.id,
+                    table="knowledge_nodes",
+                    action="create",
+                    entity_id=str(node_id),
+                    payload=node_payload,
+                )
+            except IntegrityError:
+                await session.rollback()
+                existing = await existing_for_id()
+                if existing is None or not existing_is_exact(existing):
+                    raise HTTPException(status_code=409, detail="決定的なDocs node IDが既存データと衝突しました")
+                await ensure_meeting_minutes_tag(existing)
+                serialized = serialize_docs_node(existing)
+                return {
+                    "action": "duplicate_skip",
+                    "status": "duplicate_skip",
+                    "duplicate_skip": True,
+                    "node": serialized,
+                    "node_id": str(existing.id),
+                    "title": title,
+                    "role": role,
+                    "system_key": "meeting_minutes",
+                    "source_sha256": source_sha256,
+                    "idempotency_key": idempotency_key,
+                    "meeting_import": meeting_import,
+                }
+            node = await session.get(KnowledgeNode, node_id)
+            if node is None:
+                raise HTTPException(status_code=500, detail="取り込んだDocs nodeを確認できません")
+            await ensure_meeting_minutes_tag(node)
+            serialized = node_data if isinstance(node_data, dict) else serialize_docs_node(node)
+            return {
+                "action": "create",
+                "status": "created",
+                "duplicate_skip": False,
+                "node": serialized,
+                "node_id": str(node.id),
+                "title": title,
+                "role": role,
+                "system_key": "meeting_minutes",
+                "source_sha256": source_sha256,
+                "idempotency_key": idempotency_key,
+                "meeting_import": meeting_import,
+            }
+        except HTTPException:
+            await session.rollback()
+            raise
+        except DocsOperationError as exc:
+            await session.rollback()
+            raise _map_error(exc) from exc
+        except ValueError as exc:
+            await session.rollback()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            await session.rollback()
+            logger.exception("Docs meeting document import failed")
+            raise HTTPException(status_code=500, detail="議事録の取り込みを完了できませんでした") from exc
         finally:
             await session.close()
 
@@ -2090,11 +2484,14 @@ def create_docs_router(
                 KnowledgeSupertagField,
             )
 
-            visibility = docs_readable_node_predicate(
-                KnowledgeNode,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            visibility = and_(
+                docs_readable_node_predicate(
+                    KnowledgeNode,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(KnowledgeNode),
             )
             node_stmt = select(KnowledgeNode).where(
                 KnowledgeNode.docs_library_id == library.id,
@@ -2119,25 +2516,34 @@ def create_docs_router(
                 )).scalars().all()
             )
             field_target = aliased(KnowledgeNode)
-            field_target_visibility = docs_readable_node_predicate(
-                field_target,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            field_target_visibility = and_(
+                docs_readable_node_predicate(
+                    field_target,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(field_target),
             )
             placement_parent = aliased(KnowledgeNode)
-            placement_parent_visibility = docs_readable_node_predicate(
-                placement_parent,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            placement_parent_visibility = and_(
+                docs_readable_node_predicate(
+                    placement_parent,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(placement_parent),
             )
             edge_target = aliased(KnowledgeNode)
-            edge_target_visibility = docs_readable_node_predicate(
-                edge_target,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            edge_target_visibility = and_(
+                docs_readable_node_predicate(
+                    edge_target,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(edge_target),
             )
             full_workspace_access = await library_can_read(session, library, user_id)
             tag_filter = KnowledgeSupertag.docs_library_id == library.id
@@ -2355,37 +2761,49 @@ def create_docs_router(
                 select(KnowledgeNode).where(KnowledgeNode.id == node_uuid)
             )
             library = await session.get(DocsLibrary, node.docs_library_id) if node else None
-            if node is None or library is None or not await can_read_node(
+            if node is None or library is None or not is_docs_node_renderable(node) or not await can_read_node(
                 session, node, user_id, library=library
             ):
                 raise HTTPException(status_code=404, detail="Docs node not found")
             field_target = aliased(KnowledgeNode)
-            field_target_visibility = docs_readable_node_predicate(
-                field_target,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            field_target_visibility = and_(
+                docs_readable_node_predicate(
+                    field_target,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(field_target),
             )
             placement_parent = aliased(KnowledgeNode)
-            placement_parent_visibility = docs_readable_node_predicate(
-                placement_parent,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            placement_parent_visibility = and_(
+                docs_readable_node_predicate(
+                    placement_parent,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(placement_parent),
             )
             edge_source = aliased(KnowledgeNode)
             edge_target = aliased(KnowledgeNode)
-            edge_source_visibility = docs_readable_node_predicate(
-                edge_source,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            edge_source_visibility = and_(
+                docs_readable_node_predicate(
+                    edge_source,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(edge_source),
             )
-            edge_target_visibility = docs_readable_node_predicate(
-                edge_target,
-                docs_library_id=library.id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
+            edge_target_visibility = and_(
+                docs_readable_node_predicate(
+                    edge_target,
+                    docs_library_id=library.id,
+                    user_id=user_id,
+                    library_owner_id=getattr(library, "owner_user_id", None),
+                ),
+                docs_node_renderable_predicate(edge_target),
             )
             node_supertags = list(
                 (await session.execute(

@@ -16,7 +16,12 @@ from ..services.agent_team_service import (
     parse_structured_tool_failure,
     tool_failure_family,
 )
-from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
+from .unified_turn_runtime import (
+    RegistryToolRouter,
+    UnifiedToolCall,
+    _observable_tool_arguments,
+    observable_tool_name,
+)
 
 
 @dataclass(frozen=True)
@@ -27,6 +32,8 @@ class JsonToolCallRecord:
 
     @property
     def successful(self) -> bool:
+        if parse_structured_tool_failure(self.result) is not None:
+            return False
         lowered = self.result.strip().lower()
         return not (
             lowered.startswith("tool not found:")
@@ -94,6 +101,11 @@ def run_json_tool_loop(
         for name in (required_tool_names or set())
         if name and name.strip()
     }
+
+    # Breaker behavior is opt-in for generic JSON loops. Agent Team v3 callers
+    # pass a shared breaker explicitly; ordinary callers retain their historic
+    # configured round budget.
+    active_failure_breaker = failure_breaker
 
     def _finish(output: str) -> str | JsonToolLoopResult:
         if return_result:
@@ -176,7 +188,8 @@ def run_json_tool_loop(
         if action_type != "tool_call":
             return _finish(content)
 
-        tool_name = str(action.get("tool") or "").strip()
+        provider_tool_name = str(action.get("tool") or "").strip()
+        tool_name = observable_tool_name(registry, provider_tool_name)
         arguments = action.get("arguments") or action.get("parameters") or action.get("args") or {}
         if isinstance(arguments, str):
             try:
@@ -185,15 +198,27 @@ def run_json_tool_loop(
                 arguments = {}
         if not isinstance(arguments, dict):
             arguments = {}
-        if restore_tool_arguments is not None:
+        if restore_tool_arguments is not None and registry.get(provider_tool_name) is not None:
             arguments = _restore_tool_call_arguments(
                 restore_tool_arguments,
                 arguments,
                 tool_name=tool_name,
             )
 
+        # Keep records and the next model prompt on the canonical contract
+        # boundary. Unknown names and rejected payloads become a stable name
+        # plus an empty argument object rather than echoing provider text.
+        observable_arguments = _observable_tool_arguments(
+            registry,
+            provider_tool_name,
+            arguments,
+        )
+
         family = tool_failure_family(tool_name)
-        if failure_breaker is not None and failure_breaker.is_open(family):
+        if (
+            active_failure_breaker is not None
+            and active_failure_breaker.is_open(family)
+        ):
             tool_result = json.dumps(
                 {
                     "success": False,
@@ -206,14 +231,14 @@ def run_json_tool_loop(
         else:
             tool_result = execute_json_tool_call(
                 registry,
-                tool_name,
+                provider_tool_name,
                 arguments,
                 fallback_request=original_request,
             )
-            if failure_breaker is not None:
+            if active_failure_breaker is not None:
                 failure = parse_structured_tool_failure(tool_result)
                 if failure is not None:
-                    decision = failure_breaker.check(family, failure)
+                    decision = active_failure_breaker.check(family, failure)
                     if not decision.allowed:
                         tool_result = json.dumps(
                             {
@@ -228,11 +253,19 @@ def run_json_tool_loop(
         tool_calls.append(
             JsonToolCallRecord(
                 tool=tool_name,
-                arguments=dict(arguments),
+                arguments=dict(observable_arguments),
                 result=str(tool_result),
             )
         )
-        messages.append({"role": "assistant", "content": content})
+        safe_action = json.dumps(
+            {
+                "type": "tool_call",
+                "tool": tool_name,
+                "arguments": observable_arguments,
+            },
+            ensure_ascii=False,
+        )
+        messages.append({"role": "assistant", "content": safe_action})
         messages.append(
             {
                 "role": "user",
@@ -348,7 +381,7 @@ def execute_json_tool_call(
 ) -> str:
     tool = registry.get(tool_name)
     if tool is None:
-        return f"Tool not found: {tool_name}"
+        return "Tool not found: unavailable"
 
     normalized_args = _normalize_arguments(
         tool,
@@ -365,6 +398,11 @@ def execute_json_tool_call(
         )
     )
     if result.success:
+        return result.output
+    # Preserve machine-readable failures produced by RegistryToolRouter.
+    # JSON-loop callers and the circuit breaker need error_code/retryable/
+    # diagnostic_code rather than a flattened natural-language exception.
+    if parse_structured_tool_failure(result.output) is not None:
         return result.output
     return f"Tool execution error: {result.error or result.output}"
 

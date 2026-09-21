@@ -95,8 +95,27 @@ DIRECT_SEARCH_TOOL_HINT_NAMES: tuple[str, ...] = (
     "web_search",
     "x_search",
     "grok_x_search",
+    "docs_search",
+    "docs_query",
     "knowledge_search",
+    "knowledge_query",
+    "bm25_search",
     "search_past_chats",
+)
+
+KNOWLEDGE_ROUTING_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "inbox_search_items",
+        "docs_search",
+        "docs_read",
+        "docs_overview",
+        "docs_query",
+        "knowledge_search",
+        "knowledge_query",
+        "knowledge_read",
+        "bm25_search",
+        "search_past_chats",
+    }
 )
 
 DIRECT_MEMORY_TOOL_HINT_NAMES: tuple[str, ...] = ("search_past_chats",)
@@ -326,6 +345,11 @@ def build_tool_hint_context_sync(
     )
     project_organizer_hint = "organize_project_information_from_folder" in registry
     knowledge_search_hint = "knowledge_search" in registry
+    knowledge_routing_hint = (
+        _knowledge_routing_hint(user_input, registry)
+        if _should_hint_knowledge_routing(user_input, registry)
+        else ""
+    )
     aoi_vocabulary_hint = build_aoi_vocabulary_hint(
         user_input,
         inbox_search_available="inbox_search_items" in registry,
@@ -344,6 +368,7 @@ def build_tool_hint_context_sync(
         project_progress_review_hint=project_progress_review_hint,
         project_organizer_hint=project_organizer_hint,
         knowledge_search_hint=knowledge_search_hint,
+        knowledge_routing_hint=knowledge_routing_hint,
         aoi_vocabulary_hint=aoi_vocabulary_hint,
         deferred_pack_rules=deferred_rules,
         project_tables_pack_hint=_project_tables_pack_hint_needed(
@@ -390,6 +415,11 @@ async def build_tool_hint_context_async(
     )
     project_organizer_hint = "organize_project_information_from_folder" in registry
     knowledge_search_hint = "knowledge_search" in registry
+    knowledge_routing_hint = (
+        _knowledge_routing_hint(user_input, registry)
+        if _should_hint_knowledge_routing(user_input, registry)
+        else ""
+    )
     aoi_vocabulary_hint = build_aoi_vocabulary_hint(
         user_input,
         inbox_search_available="inbox_search_items" in registry,
@@ -408,6 +438,7 @@ async def build_tool_hint_context_async(
         project_progress_review_hint=project_progress_review_hint,
         project_organizer_hint=project_organizer_hint,
         knowledge_search_hint=knowledge_search_hint,
+        knowledge_routing_hint=knowledge_routing_hint,
         aoi_vocabulary_hint=aoi_vocabulary_hint,
         deferred_pack_rules=deferred_rules,
         project_tables_pack_hint=_project_tables_pack_hint_needed(
@@ -868,6 +899,251 @@ def _should_hint_direct_search_tools(user_input: str, registry: ToolRegistry) ->
     )
 
 
+def _retrieval_user_text(user_input: str) -> str:
+    """Unwrap only the server's command context, not markers in ordinary prose."""
+    raw = str(user_input or "").replace("\r\n", "\n")
+    if command_capabilities_from_text(raw):
+        _, marker, request = raw.partition("\nCurrent user request:\n")
+        if marker:
+            return request
+    return raw
+
+
+def knowledge_retrieval_route(user_input: str) -> str:
+    """Resolve the deterministic Knowledge retrieval lane for a request.
+
+    This is intentionally lexical and local.  It only selects prompt guidance;
+    the model still chooses the concrete tool and arguments, so no classifier
+    model call is added to the turn.
+    """
+
+    text = _retrieval_user_text(user_input).casefold()
+    if any(
+        term in text
+        for term in (
+            "件数",
+            "何件",
+            "合計",
+            "集計",
+            "カウント",
+            "平均",
+            "グループ別",
+            "全件",
+        )
+    ) or re.search(
+        r"\b(?:aggregate|counts?|how many|totals?|averages?|avg|group by|grouping|sum)\b",
+        text,
+        flags=re.ASCII,
+    ):
+        return "aggregate"
+    if any(
+        term in text
+        for term in (
+            "timeline",
+            "time line",
+            "chronolog",
+            "date range",
+            "ordered by date",
+            "時系列",
+            "タイムライン",
+            "履歴",
+            "日付順",
+            "時系列順",
+            "推移",
+        )
+    ) or re.search(r"(?:いつ.*(?:変わ|変更)|(?:変わ|変更).*いつ|\bwhen\b.*\bchang(?:e|ed)\b)", text):
+        return "timeline"
+    if any(
+        term in text
+        for term in (
+            "overview",
+            "overall picture",
+            "landscape",
+            "summarize",
+            "summarised",
+            "summarized",
+            "summarise",
+            "summary",
+            "summary of all",
+            "trend",
+            "trends",
+            "long-term trend",
+            "long term trend",
+            "全体像",
+            "概要",
+            "総覧",
+            "俯瞰",
+            "全体のまとめ",
+            "傾向",
+            "長期傾向",
+            "まとめ",
+            "まとめて",
+        )
+    ):
+        return "overview"
+    return "lookup"
+
+
+def _past_chat_lookup_requested(text: str) -> bool:
+    return bool(
+        re.search(r"\b(?:past|previous|earlier|old)\s+(?:chats?|conversations?)\b", text, flags=re.ASCII)
+        or re.search(r"(?:過去|以前|前回|前の|別の)(?:の)?(?:チャット|会話)", text)
+    )
+
+
+def _retrieval_requested(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:find|search|look up|lookup|read|show|list|retrieve|count|summari[sz]e|"
+            r"summary|overview|timeline|aggregate|how many|group by|grouping|sum|totals?|averages?|avg)\b",
+            text, flags=re.ASCII,
+        )
+        or any(term in text for term in (
+            "探し", "探す", "探せ", "検索", "読ん", "読む", "見せ", "一覧", "何件", "件数",
+            "集計", "合計", "平均", "まとめ", "概要", "全体像", "時系列", "日付順", "確認", "参照して", "いつ",
+        ))
+    )
+
+
+def _should_hint_knowledge_routing(
+    user_input: str,
+    registry: ToolRegistry,
+) -> bool:
+    """Gate Knowledge/Docs guidance by local intent and registered tools.
+
+    Natural-language Knowledge/Docs requests do not carry the trusted
+    ``web_search`` command capability.  Keep this intent gate independent from
+    ``_should_hint_direct_search_tools`` so ordinary Web-search capability
+    semantics remain unchanged.
+    """
+
+    if not any(name in registry for name in KNOWLEDGE_ROUTING_TOOL_NAMES):
+        return False
+
+    text = _retrieval_user_text(user_input).casefold()
+    if not _retrieval_requested(text):
+        return False
+
+    if _past_chat_lookup_requested(text):
+        return "search_past_chats" in registry
+    if re.search(r"\b(?:public web|on the web)\b|公開[の]?\s*[Ww][Ee][Bb]", text):
+        return False
+
+    # A request needs an explicit Knowledge/Docs corpus subject; otherwise a
+    # normal Web, filesystem, or chat request would receive Knowledge advice.
+    if re.search(
+        r"\b(?:docs?|documents?|notes?|memos?|knowledge|workspaces?)\b",
+        text,
+        flags=re.ASCII,
+    ) or any(
+        term in text
+        for term in (
+            "ナレッジ",
+            "資料",
+            "文書",
+            "ドキュメント",
+            "ノート",
+            "案件",
+            "プロジェクト",
+            "変更履歴",
+            "更新履歴",
+            "change history",
+            "revision history",
+            "changelog",
+        )
+    ):
+        return True
+    if re.search(r"メモ(?!リ)", text):
+        return True
+    # A corpus follow-up can omit its noun. Give conditional coverage advice
+    # for this narrow form instead of silently treating it as a top-k lookup.
+    return bool(re.search(r"この\s*(?:\d+|[一二三四五六七八九十]+)\s*年間.*(?:傾向|全体|まとめ)", text))
+
+
+def _knowledge_routing_hint(user_input: str, registry: ToolRegistry) -> str:
+    """Return route-specific guidance for available Knowledge/Docs tools."""
+
+    if not any(name in registry for name in KNOWLEDGE_ROUTING_TOOL_NAMES):
+        return ""
+    text = _retrieval_user_text(user_input).casefold()
+    if _past_chat_lookup_requested(text):
+        return (
+            "- 過去チャットのlookupには `search_past_chats` を使って該当する会話を確認してください。"
+            if "search_past_chats" in registry else ""
+        )
+    route = knowledge_retrieval_route(user_input)
+    available = {
+        name
+        for name in (*KNOWLEDGE_ROUTING_TOOL_NAMES, "bm25_search")
+        if name in registry and name != "search_past_chats"
+    }
+    if route == "lookup":
+        lookup_tools = available.intersection(
+            {"inbox_search_items", "docs_search", "knowledge_search", "bm25_search"}
+        )
+        if not lookup_tools:
+            return ""
+        ordered = [
+            name
+            for name in (
+                "inbox_search_items",
+                "docs_search",
+                "knowledge_search",
+                "bm25_search",
+            )
+            if name in lookup_tools
+        ]
+        return (
+            "- Knowledge lookupは "
+            + ", ".join(f"`{name}`" for name in ordered)
+            + " を対象に応じて使い分けてください。"
+        )
+    if route == "aggregate":
+        query_tools = available.intersection({"docs_query", "knowledge_query"})
+        if not query_tools:
+            return ""
+        ordered = [
+            name for name in ("docs_query", "knowledge_query") if name in query_tools
+        ]
+        return (
+            "- aggregate/件数は "
+            + " または ".join(f"`{name}`" for name in ordered)
+            + " を使い、構造化条件で取得してください。top-k検索結果の表示数を件数として数えないでください。"
+        )
+    if route == "timeline":
+        query_tools = available.intersection({"docs_query", "knowledge_query"})
+        if not query_tools:
+            return ""
+        lines = ["- timelineは先に構造化された日付フィルターと並び順を指定してください。"]
+        if "docs_query" in query_tools:
+            lines.append(
+                "`docs_query` の日付は組み込みの created_at / updated_at（作成・更新日時）です。"
+                "day_date は日次ノートの日付です。date_from / date_to は order_by で選ぶフィールドの範囲、"
+                "order は asc / desc を指定してください。"
+                "本文の出来事の日付とは異なるため、出来事の時系列は取得した本文から確認してください。"
+            )
+        if "knowledge_query" in query_tools:
+            lines.append("`knowledge_query` は文書日付の範囲と並び順を指定できます。")
+        readers = [name for name in ("docs_read", "knowledge_read", "read_file") if name in registry]
+        if readers:
+            lines.append("根拠は " + "、".join(f"`{name}`" for name in readers) + " で読み取ってください。")
+        if "docs_read" in readers:
+            lines.append("Docs本文は `docs_read(view='document')` で取得し、next_cursorとcoverage_reasonsを確認してください。")
+        return "".join(lines)
+    if not available.intersection({"docs_search", "docs_query", "knowledge_search", "knowledge_query"}):
+        return ""
+    if "docs_overview" in registry:
+        return ("- Docsのoverviewは `docs_overview` で構造化列挙と根拠ページの進捗を管理してください。"
+                "1回のtop-k検索で済ませず、next_cursorを辿り、budget_limited/incomplete_records/coverage_completeを確認してください。"
+                "取得件数を文書理解の保証として扱わないでください。")
+    return (
+        "- 対象が保存済みKnowledge/Docsの資料なら、overviewは1回のtop-k検索で済ませず、boundedな反復取得、"
+        "または利用可能な構造化列挙で必要な範囲を埋めてください。"
+        + ("Docs本文は `docs_read(view='document')` のページを読み、coverage_reasonsに残る不足を明示してください。"
+           if "docs_read" in registry else "")
+    )
+
+
 def _should_hint_direct_memory_tools(user_input: str, registry: ToolRegistry) -> bool:
     # There is no natural-language memory capability.  Keep the normal tool
     # catalog untouched and let the model choose `search_past_chats` when the
@@ -930,6 +1206,7 @@ def _build_context_block(
     project_progress_review_hint: bool = False,
     project_organizer_hint: bool = False,
     knowledge_search_hint: bool = False,
+    knowledge_routing_hint: str = "",
     aoi_vocabulary_hint: str = "",
     deferred_pack_rules: Sequence[ToolHintRule] = (),
     project_tables_pack_hint: bool = False,
@@ -950,6 +1227,7 @@ def _build_context_block(
         and not project_attachment_stewardship_hint
         and not direct_project_hint
         and not project_progress_review_hint
+        and not knowledge_routing_hint
         and not aoi_vocabulary_hint
     ):
         return autonomous_execution_guidance
@@ -972,6 +1250,8 @@ def _build_context_block(
                 "X/Twitterはまず `x_search`（Yahooリアルタイム検索）、不足する場合だけ "
                 "`grok_x_search` を使って確認してください。"
             )
+    if knowledge_routing_hint:
+        tool_lines.append(knowledge_routing_hint)
     if direct_memory_hint:
         tool_lines.append(
             "- ユーザーの好み・名前・過去の決定・以前の作業内容など、現在の会話に無い文脈が"
@@ -1097,13 +1377,14 @@ def _build_context_block(
     if guidance:
         block = f"{block}\n\n{guidance}" if block else guidance
     planning_state = get_current_planning_run_state()
-    planning_guidance = build_planning_system_guidance(
-        planning_policy=get_current_planning_policy(),
-        generation_policy=policy,
-        approved_plan=planning_state.plan if planning_state else None,
-    )
-    if planning_guidance:
-        block = f"{block}\n\n{planning_guidance}" if block else planning_guidance
+    if planning_state is not None:
+        planning_guidance = build_planning_system_guidance(
+            planning_policy=get_current_planning_policy(),
+            generation_policy=policy,
+            approved_plan=planning_state.plan,
+        )
+        if planning_guidance:
+            block = f"{block}\n\n{planning_guidance}" if block else planning_guidance
     return _clip_text(block, max_result_chars)
 
 

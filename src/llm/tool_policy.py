@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -26,6 +27,7 @@ _current_agent_team_role: ContextVar[Optional[str]] = ContextVar(
 )
 
 VALID_COMMAND_CAPABILITIES: set[str] = {
+    "aoitalk_help",
     "web_search",
     "image_generation",
     "work_intake",
@@ -99,11 +101,100 @@ PROJECT_MANAGEMENT_TOOL_NAMES: set[str] = (
     PROJECT_MANAGEMENT_READ_TOOL_NAMES | PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES
 )
 
+# Engagement Operations is intentionally a small direct surface.  Keep the
+# read/mutation split explicit so review/read-only policy blocks only the four
+# state-changing commands and never hides safe state inspection.
+OPERATIONS_READ_TOOL_NAMES: set[str] = {
+    "operations_list_connections",
+    "operations_get_opportunity",
+    "operations_get_action",
+}
+OPERATIONS_MUTATION_TOOL_NAMES: set[str] = {
+    "operations_create_opportunity",
+    "operations_record_evaluation",
+    "operations_create_application_draft",
+    "operations_propose_action",
+}
+MEDIA_OPERATIONS_READ_TOOL_NAMES: set[str] = {
+    "media_operations_get_adapter_status",
+    "media_operations_list_personas",
+    "media_operations_get_persona",
+    "media_operations_list_characters",
+    "media_operations_get_character",
+    "media_operations_get_character_dashboard",
+    "media_operations_get_character_context",
+    "media_operations_list_persona_resources",
+    "media_operations_list_platform_accounts",
+    "media_operations_get_platform_account",
+    "media_operations_list_research_routines",
+    "media_operations_list_due_research",
+    "media_operations_get_research_routine",
+    "media_operations_list_research_runs",
+    "media_operations_list_research_candidates",
+    "media_operations_list_character_candidates",
+    "media_operations_get_research_candidate",
+    "media_operations_list_research_candidate_decisions",
+    "media_operations_list_character_candidate_decisions",
+    "media_operations_list_editorial_programs",
+    "media_operations_list_due_editorial_programs",
+    "media_operations_list_content_items",
+    "media_operations_get_content_item",
+    "media_operations_list_content_variants",
+    "media_operations_get_content_variant",
+    "media_operations_get_variant_readiness",
+    "media_operations_list_creative_recipes",
+    "media_operations_get_creative_recipe",
+    "media_operations_list_generation_workspaces",
+    "media_operations_list_generation_plans",
+    "media_operations_get_generation_plan",
+    "media_operations_list_generation_runs",
+    "media_operations_get_generation_run",
+    "media_operations_list_actions",
+    "media_operations_list_metric_snapshots",
+    "media_operations_list_experiments",
+    "media_operations_get_experiment",
+    "media_operations_list_learning_proposals",
+    "media_operations_get_calendar",
+    "media_operations_get_results",
+    "media_operations_list_revenue_events",
+}
+MEDIA_OPERATIONS_MUTATION_TOOL_NAMES: set[str] = {
+    # MediaOps agent surface is proposal/read-only only.  Human approval,
+    # Generation Studio submission, reconciliation, output selection, and
+    # paid-generation acknowledgement are deliberately absent from this set
+    # and have no model-facing tool definitions.  ``create_generation_plan``
+    # records a semantic, cost-scoped intent only; it never executes a
+    # provider call.
+    "media_operations_propose_persona",
+    "media_operations_create_editorial_program",
+    "media_operations_start_research_run",
+    "media_operations_create_research_routine",
+    "media_operations_triage_research_candidate",
+    "media_operations_propose_candidate_triage",
+    "media_operations_create_content_item",
+    "media_operations_propose_content_promotion",
+    "media_operations_create_content_variant",
+    "media_operations_create_generation_plan",
+    "media_operations_propose_generation",
+    "media_operations_propose_qa",
+    "media_operations_propose_rights",
+    "media_operations_propose_action",
+    "media_operations_propose_publication",
+    "media_operations_propose_learning",
+}
+OPERATIONS_TOOL_NAMES: set[str] = (
+    OPERATIONS_READ_TOOL_NAMES
+    | OPERATIONS_MUTATION_TOOL_NAMES
+    | MEDIA_OPERATIONS_READ_TOOL_NAMES
+    | MEDIA_OPERATIONS_MUTATION_TOOL_NAMES
+)
+
 DOCS_MUTATION_TOOL_NAMES: set[str] = {
     "docs_attach_workspace_file",
     "docs_place_workspace_file",
     "docs_create_nodes",
     "docs_update_node",
+    "docs_mutate",
     "inbox_update_item",
     "docs_move_node",
     "docs_archive_node",
@@ -114,6 +205,7 @@ DOCS_READ_TOOL_NAMES: set[str] = {
     "docs_search",
     "docs_read",
     "docs_query",
+    "docs_overview",
 }
 
 DOCS_TOOL_NAMES: set[str] = DOCS_READ_TOOL_NAMES | DOCS_MUTATION_TOOL_NAMES
@@ -146,10 +238,20 @@ SEARCH_TOOL_NAMES: set[str] = {
     "x_search",
     "grok_x_search",
     "knowledge_search",
+    "knowledge_query",
     "knowledge_read",
     "knowledge_status",
     "search_past_chats",
 }
+
+KNOWLEDGE_TOOL_NAMES: frozenset[str] = frozenset(
+    {
+        "knowledge_search",
+        "knowledge_query",
+        "knowledge_read",
+        "knowledge_status",
+    }
+)
 
 FILESYSTEM_READ_TOOL_NAMES: set[str] = {
     "read_file",
@@ -241,6 +343,7 @@ def sanitize_command_capabilities(value: Any) -> tuple[str, ...]:
 
 REVIEW_COMMAND_CAPABILITIES = frozenset(
     {
+        "aoitalk_help",
         "web_search",
         "project_progress_review",
     }
@@ -381,6 +484,13 @@ def build_command_capability_context(
         guidance.append(
             "- `wbs_sync`: use direct WBS/project task synchronization tools."
         )
+    if "aoitalk_help" in sanitized:
+        guidance.extend(
+            [
+                "- `aoitalk_help`: this is a reserved, one-turn, read-only Help workflow.",
+                "- Answer only from the server-grounded AoiTalk Guide included by the request boundary; do not call tools, search, mutate Docs, access Project/App context, or carry Help mode into the next turn.",
+            ]
+        )
 
     return "\n".join(
         [
@@ -408,6 +518,23 @@ def command_capabilities_for_current_turn_text(
     sanitized = sanitize_command_capabilities(capabilities)
     lines = str(text or "").splitlines()
     first_line = lines[0].strip().casefold() if lines else ""
+    # ``/help`` is a server-reserved built-in.  It wins over every other
+    # capability (including a stale/edit-inherited value) and is recognized
+    # only as the first token so ordinary prose cannot enter Help mode.
+    first_token = first_line.split(None, 1)[0] if first_line else ""
+    # ``command_capabilities`` is transported from the browser and is not a
+    # cryptographic authority.  The Help capability is therefore accepted
+    # only when the server-visible message carries the exact reserved token;
+    # the frontend materializes that token for slash-menu selections too.
+    # This prevents an ordinary client payload from bypassing normal
+    # Project/App/context routing by merely naming ``aoitalk_help``.
+    if first_token == "/help":
+        return ("aoitalk_help",)
+    # Never trust a transported Help capability on ordinary prose.  The
+    # browser materializes the reserved token for menu/direct submissions;
+    # stripping a stale or spoofed capability here keeps normal routing and
+    # Project/App context available for every other turn.
+    sanitized = tuple(capability for capability in sanitized if capability != "aoitalk_help")
     if "work_intake" not in sanitized and first_line == "/inbox":
         sanitized = (*sanitized, "work_intake")
     return sanitized
@@ -1064,6 +1191,437 @@ def is_knowledge_search_enabled(config: Any) -> bool:
     return bool(search.get("knowledge_enabled", False))
 
 
+def _policy_config_get(config: Any, key: str, default: Any = None) -> Any:
+    """Read nested/dotted config values without making config an authority.
+
+    ``Config`` supports dotted ``get`` while most tests and integrations pass
+    plain dictionaries.  Runtime policy should tolerate either shape and
+    treat malformed values as unavailable (the caller then fails closed for
+    optional capabilities).
+    """
+
+    if config is None:
+        return default
+    getter = getattr(config, "get", None)
+    if callable(getter):
+        try:
+            value = getter(key, default)
+        except Exception:  # noqa: BLE001 - policy must remain deterministic
+            value = default
+        # A plain dict's ``get('a.b')`` returns the default even when the
+        # nested path exists, so continue with an explicit walk below.
+        if value is not default or not isinstance(config, Mapping):
+            return value
+    if isinstance(config, Mapping):
+        if key in config:
+            return config[key]
+        current: Any = config
+        for part in str(key).split("."):
+            if not isinstance(current, Mapping) or part not in current:
+                return default
+            current = current[part]
+        return current
+    return default
+
+
+def _policy_config_bool(value: Any, *, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off", ""}:
+            return False
+    return False
+
+
+def _tool_metadata_value(tool_definition: Any, key: str, default: Any = None) -> Any:
+    if isinstance(tool_definition, Mapping):
+        return tool_definition.get(key, default)
+    return getattr(tool_definition, key, default)
+
+
+_SEARCH_CAPABILITY_VALUES = frozenset(
+    {
+        "search",
+        "web_search",
+        "x_search",
+        "public_search",
+        "external_search",
+        "search_capability",
+    }
+)
+
+
+def _explicit_search_capability(value: Any) -> bool | None:
+    """Resolve an explicit search marker without inspecting tool names."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().casefold().replace("-", "_")
+        if normalized in {"true", "yes", "on", "1"}:
+            return True
+        if normalized in {"false", "no", "off", "0", "none", ""}:
+            return False
+        if normalized in _SEARCH_CAPABILITY_VALUES:
+            return True
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        markers = [_explicit_search_capability(item) for item in value]
+        if any(item is True for item in markers):
+            return True
+        if any(item is False for item in markers):
+            return False
+        return None
+    return None
+
+
+def _search_capability_marker(
+    metadata: Any,
+    *,
+    _seen: set[int] | None = None,
+) -> bool | None:
+    if metadata is None:
+        return None
+    if _seen is None:
+        _seen = set()
+    marker_id = id(metadata)
+    if marker_id in _seen:
+        return None
+    _seen.add(marker_id)
+    if isinstance(metadata, Mapping):
+        for key in ("search_capability", "is_search", "search"):
+            if key in metadata:
+                marker = _explicit_search_capability(metadata.get(key))
+                if marker is not None:
+                    return marker
+        for key in ("capability", "capabilities", "classification"):
+            if key in metadata:
+                marker = _explicit_search_capability(metadata.get(key))
+                if marker is not None:
+                    return marker
+        for key in ("metadata", "meta", "_meta", "annotations", "availability"):
+            if key in metadata:
+                marker = _search_capability_marker(
+                    metadata.get(key),
+                    _seen=_seen,
+                )
+                if marker is not None:
+                    return marker
+        return None
+    for key in (
+        "search_capability",
+        "is_search",
+        "search",
+        "capability",
+        "capabilities",
+        "classification",
+        "metadata",
+        "meta",
+        "_meta",
+        "annotations",
+        "availability",
+    ):
+        if hasattr(metadata, key):
+            marker = _search_capability_marker(
+                {key: getattr(metadata, key)},
+                _seen=_seen,
+            )
+            if marker is not None:
+                return marker
+    return None
+
+
+def tool_definition_is_search(
+    tool_name: str,
+    *,
+    tool_definition: Any = None,
+) -> bool:
+    """Return whether a tool carries an explicit search capability marker.
+
+    Built-in direct search tools remain recognized through their stable names
+    for backwards compatibility.  Custom/MCP tools are search tools only when
+    metadata explicitly opts them in; a name containing ``search`` is never
+    sufficient.
+    """
+
+    marker = _search_capability_marker(tool_definition)
+    if marker is not None:
+        return marker
+    return str(tool_name or "") in SEARCH_TOOL_NAMES
+
+
+def tool_definition_is_mutating(
+    tool_name: str,
+    text: str = "",
+    *,
+    tool_definition: Any = None,
+) -> bool:
+    """Return whether a call can mutate state based on name *or* metadata.
+
+    Metadata is checked first but never trusted to downgrade a well-known
+    mutation entrypoint.  This closes the static-name bypass for custom tools:
+    an unfamiliar name carrying ``side_effect='writes'``, a high/critical
+    risk, or an approval requirement is treated as mutation-capable in all
+    read-only phases.
+    """
+
+    side_effect = str(
+        _tool_metadata_value(tool_definition, "side_effect", "") or ""
+    ).strip().casefold()
+    risk = str(_tool_metadata_value(tool_definition, "risk", "") or "").strip().casefold()
+    requires_approval = bool(
+        _tool_metadata_value(tool_definition, "requires_approval", False)
+    )
+    metadata_mutation = bool(
+        side_effect
+        and side_effect
+        not in {"none", "read", "readonly", "read_only", "observe", "query"}
+    ) or risk in {"high", "critical", "write", "writes", "mutation", "external"} or requires_approval
+    return bool(
+        metadata_mutation
+        or _looks_like_mutation_tool_call(str(tool_name or ""), str(text or ""))
+    )
+
+
+def _approved_action_allows_current_call(
+    planning_state: Any,
+    tool_name: str,
+    tool_args: Optional[dict[str, Any]],
+) -> bool:
+    """Match only the server-owned current action, never the whole plan.
+
+    ``approved_plan_allows_tool`` intentionally remains available as a
+    compatibility projection for read/display callers, but using that broad
+    matcher at execution time would let an out-of-order mutation (or a second
+    tool with equivalent arguments) bypass the cursor.  The strict helper is
+    provided by the planning runtime foundation and is imported lazily to keep
+    module initialization acyclic.
+    """
+
+    try:
+        cursor = int((getattr(planning_state, "metadata", {}) or {}).get("approved_action_cursor", 0))
+    except (TypeError, ValueError):
+        return False
+    try:
+        from .planning_policy import approved_plan_action_allows_tool
+    except (ImportError, AttributeError):
+        return False
+    try:
+        return bool(
+            approved_plan_action_allows_tool(
+                getattr(planning_state, "plan", None),
+                cursor,
+                tool_name,
+                tool_args or {},
+            )
+        )
+    except Exception:
+        return False
+
+
+def _runtime_capability_for_tool(
+    tool_name: str,
+    *,
+    config: Any,
+    tool_definition: Any = None,
+) -> str | None:
+    """Revalidate optional capability toggles immediately before execution.
+
+    Provider registries are intentionally persistent, so registration-time
+    feature flags are only an optimization.  A disabled owner must be
+    rejected here as well as hidden by the exposure layer.  ``None`` config is
+    retained for legacy/unit callers that execute a standalone definition
+    outside a configured runtime; an explicit config always wins.
+    """
+
+    if config is None:
+        return None
+    name = str(tool_name or "").strip()
+    owner = str(_tool_metadata_value(tool_definition, "owner", "") or "").strip().casefold()
+
+    # An explicit search marker is authoritative even when a provider set a
+    # generic owner such as ``mcp:<server>``.  This is the metadata path for
+    # custom MCP names; absent a marker, existing owner/name handling below is
+    # left untouched.
+    if _search_capability_marker(tool_definition) is True:
+        owner = "search"
+
+    # Keep owner metadata as the primary source, but infer only the canonical
+    # optional groups when a legacy definition omitted ``owner``.  This is a
+    # capability gate, not a mutation classification; custom names remain
+    # governed by their explicit metadata.
+    if not owner:
+        if name.startswith("ws_"):
+            owner = "workspace"
+        elif name in {
+            "media_assistant",
+        }:
+            owner = "media"
+        elif name == "agent_team_delegate" or name == "load_agent_team":
+            owner = "agent_team"
+        elif name.startswith("search_spotify") or name.startswith("get_spotify") or name in {
+            "spotify_assistant",
+            "play_spotify_track",
+            "play_song_now",
+            "queue_song",
+            "pause_spotify",
+            "skip_spotify_track",
+            "previous_track",
+            "show_queue",
+            "clear_spotify_queue",
+            "remove_from_queue",
+            "create_playlist",
+            "create_playlist_from_queue",
+            "add_tracks_to_playlist",
+            "add_queue_to_playlist",
+            "add_playlist_to_queue",
+            "remove_tracks_from_playlist",
+            "play_playlist",
+            "setup_spotify_auth",
+            "set_spotify_auth_code",
+        }:
+            owner = "spotify"
+        elif name in {
+            "web_search",
+            "x_search",
+            "grok_x_search",
+            "knowledge_search",
+            "knowledge_query",
+            "knowledge_read",
+            "knowledge_status",
+            "webex_list_selected_spaces",
+            "webex_search_messages",
+            "webex_get_thread",
+        }:
+            owner = "search"
+        elif tool_definition_is_search(
+            name,
+            tool_definition=tool_definition,
+        ):
+            # Custom/MCP names are never classified by a substring heuristic;
+            # an explicit capability marker is required for this branch.
+            owner = "search"
+        elif name.startswith("managed_") or name in {
+            "list_managed_tools",
+            "create_managed_tool",
+            "update_managed_tool",
+            "delete_managed_tool",
+            "execute_managed_tool",
+            "promote_managed_tool",
+        }:
+            owner = "managed_tools"
+        elif name in {
+            "create_app",
+            "list_apps",
+            "get_app",
+            "get_app_context",
+            "analyze_app_business",
+            "list_app_files",
+            "read_app_file",
+            "write_app_file",
+            "delete_app_file",
+            "validate_app_manifest",
+            "update_app_manifest",
+            "app_git_status",
+            "app_git_history",
+            "app_git_diff",
+            "app_git_restore",
+            "build_app_target",
+            "test_app_target",
+            "run_app_target",
+            "package_app_target",
+            "stop_app_job",
+            "read_app_job_logs",
+            "create_app_release",
+            "export_app_release",
+            "import_app_source_bundle",
+            "fork_app",
+            "link_app_to_project",
+            "unlink_app_from_project",
+            "link_app_to_task",
+            "unlink_app_from_task",
+        }:
+            owner = "apps"
+
+    if name in {"browser_agent", "computer_use"} or owner in {"browser_agent", "computer_use"}:
+        from ..services.browser_agent_models import BrowserAgentSettings
+        try:
+            if not BrowserAgentSettings.from_config(config).enabled:
+                return "Browser Agent is disabled"
+        except ValueError:
+            return "Browser Agent configuration is invalid"
+
+    if owner == "apps" and not _policy_config_bool(
+        _policy_config_get(config, "apps.enabled", True), default=True
+    ):
+        return "apps capability is disabled in configuration"
+    if owner == "spotify" and not _policy_config_bool(
+        _policy_config_get(config, "integrations.spotify.enabled", False), default=False
+    ):
+        return "Spotify integration is disabled in configuration"
+    if owner == "search" and not _policy_config_bool(
+        _policy_config_get(config, "agents.search.enabled", True), default=True
+    ):
+        return "search capability is disabled in configuration"
+    if name in KNOWLEDGE_TOOL_NAMES and not is_knowledge_search_enabled(config):
+        return "Knowledge Source search is disabled in configuration"
+    if name == "search_past_chats":
+        if not _policy_config_bool(
+            _policy_config_get(config, "agents.search.enabled", True), default=True
+        ):
+            return "search capability is disabled in configuration"
+        memory_enabled = _policy_config_bool(
+            _policy_config_get(config, "memory.enabled", True), default=True
+        )
+        memory_search_enabled = _policy_config_bool(
+            _policy_config_get(config, "memory.enable_search", True), default=True
+        )
+        if not (memory_enabled and memory_search_enabled):
+            return "past chat search is disabled in configuration"
+    if owner == "media" and not _policy_config_bool(
+        _policy_config_get(config, "agents.media.enabled", True), default=True
+    ):
+        return "media capability is disabled in configuration"
+    if owner in {"filesystem", "project_management", "docs"} and not _policy_config_bool(
+        _policy_config_get(config, f"agents.{owner}.enabled", True), default=True
+    ):
+        return f"{owner} capability is disabled in configuration"
+    if owner == "project_management" and not _policy_config_bool(
+        _policy_config_get(config, "agents.project_management.direct_tools_enabled", True),
+        default=True,
+    ):
+        return "project-management direct tools are disabled in configuration"
+    if owner in {"skills", "skill"} and not _policy_config_bool(
+        _policy_config_get(config, "skills.enabled", True), default=True
+    ):
+        return "skills capability is disabled in configuration"
+    if owner == "managed_tools":
+        apps_enabled = _policy_config_bool(
+            _policy_config_get(config, "apps.enabled", False), default=False
+        )
+        settings = _policy_config_get(config, "apps.managed_tool_promotion", None)
+        if not apps_enabled or not isinstance(settings, Mapping) or not _policy_config_bool(
+            settings.get("enabled", False), default=False
+        ):
+            return "managed-tool promotion is disabled in configuration"
+    if owner == "agent_team":
+        try:
+            from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
+
+            if not agent_team_v3_delegation_enabled(config):
+                return "Agent Team delegation is disabled in configuration"
+        except Exception:
+            return "Agent Team delegation capability could not be validated"
+    return None
+
+
 def check_tool_call_allowed(
     tool_name: str,
     *,
@@ -1071,9 +1629,55 @@ def check_tool_call_allowed(
     tool_args: Optional[dict[str, Any]] = None,
     config: Any = None,
     agent_team_role: Optional[str] = None,
+    tool_definition: Any = None,
+    tool_metadata: Any = None,
+    side_effect: str | None = None,
+    risk: str | None = None,
+    requires_approval: bool | None = None,
 ) -> ToolPolicyDecision:
+    """Decide whether one concrete tool call may execute.
+
+    ``tool_name`` remains part of the public API for legacy callers, but it is
+    not an authority boundary.  The unified runtime passes the resolved
+    ``ToolDefinition`` so review/planning/no-mutation gates can use its
+    side-effect metadata even when a custom tool has an unfamiliar name.
+    """
     text = _combined_text(user_input, tool_args)
+    # Help is a hard provider boundary, not merely a prompt hint.  The normal
+    # server path emits a trusted command preamble; the lexical fallback is
+    # limited to the leading user token and protects direct/test callers that
+    # invoke policy before the preamble has been rendered.
+    trusted_input = str(user_input or get_current_user_input() or "")
+    trusted_help = "aoitalk_help" in command_capabilities_from_text(trusted_input)
+    first_line = trusted_input.lstrip().splitlines()[0].strip().casefold() if trusted_input.lstrip() else ""
+    if trusted_help or (first_line.split(None, 1)[0] if first_line else "") == "/help":
+        return ToolPolicyDecision(
+            False,
+            "AoiTalk Help turns are read-only and expose no tools",
+        )
     policy = get_current_generation_policy()
+
+    metadata = tool_definition if tool_definition is not None else tool_metadata
+    if metadata is None and any(
+        value is not None for value in (side_effect, risk, requires_approval)
+    ):
+        metadata = {
+            "side_effect": side_effect,
+            "risk": risk,
+            "requires_approval": requires_approval,
+        }
+    capability = _runtime_capability_for_tool(
+        tool_name,
+        config=config,
+        tool_definition=metadata,
+    )
+    if capability is not None:
+        return ToolPolicyDecision(False, capability)
+    mutation = tool_definition_is_mutating(
+        tool_name,
+        text,
+        tool_definition=metadata,
+    )
 
     planning_state = get_current_planning_run_state()
     if is_planning_cancelled_terminal():
@@ -1081,6 +1685,31 @@ def check_tool_call_allowed(
             False,
             "planning was cancelled or timed out; no tool calls are allowed",
         )
+    if planning_state is not None and planning_state.phase in {
+        PlanningRunPhase.COMPLETED,
+        PlanningRunPhase.FAILED,
+    } and mutation:
+        return ToolPolicyDecision(
+            False,
+            "approved plan execution is terminal; no further mutations are allowed",
+        )
+    if planning_state is not None and planning_state.phase in {
+        PlanningRunPhase.APPROVED,
+        PlanningRunPhase.EXECUTING,
+    } and mutation:
+        # Approval is a binding over concrete tool+argument actions, not a
+        # blanket mutation permit.  A missing/empty action list therefore
+        # remains read-only, and an argument change after approval is denied.
+        approved = _approved_action_allows_current_call(
+            planning_state,
+            tool_name,
+            tool_args,
+        )
+        if not approved:
+            return ToolPolicyDecision(
+                False,
+                "mutation is not bound to the currently approved plan action",
+            )
     if planning_state is not None and planning_state.phase in {
         PlanningRunPhase.PLANNING,
         PlanningRunPhase.AWAITING_PLAN_APPROVAL,
@@ -1090,7 +1719,7 @@ def check_tool_call_allowed(
             "submit_plan_for_approval",
             "get_current_time",
             "calculate",
-        } and _looks_like_mutation_tool_call(tool_name, text):
+        } and mutation:
             return ToolPolicyDecision(
                 False,
                 "planning phase is read-only until the plan is approved",
@@ -1106,10 +1735,7 @@ def check_tool_call_allowed(
             "subagents must escalate planning interactions to the root agent",
         )
 
-    if policy.profile == GenerationProfile.REVIEW and _looks_like_mutation_tool_call(
-        tool_name,
-        text,
-    ):
+    if policy.profile == GenerationProfile.REVIEW and mutation:
         return ToolPolicyDecision(
             False,
             "review mode does not allow mutation-capable tool calls",
@@ -1117,7 +1743,7 @@ def check_tool_call_allowed(
 
     if (
         mutation_execution_forbidden(text)
-        and _looks_like_mutation_tool_call(tool_name, text)
+        and mutation
     ):
         return ToolPolicyDecision(
             False,
@@ -1234,6 +1860,8 @@ def _looks_like_mutation_tool_call(tool_name: str, text: str) -> bool:
     if tool_name.startswith("ws_"):
         return True
     if tool_name in PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES:
+        return True
+    if tool_name in OPERATIONS_MUTATION_TOOL_NAMES:
         return True
     if tool_name in DOCS_MUTATION_TOOL_NAMES:
         return True

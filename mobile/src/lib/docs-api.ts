@@ -6,7 +6,10 @@
  * api-client が自動付与する。
  */
 
-import { fetchApi } from "./api-client";
+import {
+  fetchApi,
+  fetchApiAtServerFingerprint,
+} from "./api-client";
 import {
   applyRemoteDocsNodeSupertags,
   applyRemoteDocsNodes,
@@ -118,6 +121,163 @@ export interface ClipIngestResult {
   attachments?: Array<Record<string, unknown>>;
 }
 
+/** Durable server-side ClipIngest request. */
+export interface ClipIngestJobRequest {
+  source: string;
+  upload_ids?: string[];
+  skip_image_recognition?: boolean;
+  enable_external_research?: boolean;
+  target_node_id?: string | null;
+}
+
+/** Scope context persisted with a mobile operation and replayed as headers. */
+export interface ClipIngestRequestContext {
+  session_id?: string | null;
+  project_id?: string | null;
+}
+
+export type ClipIngestJobStatus = "queued" | "running" | "succeeded" | "failed";
+
+export interface ClipIngestJobResponse {
+  job_id: string;
+  status: ClipIngestJobStatus;
+  idempotency_key: string | null;
+  retryable: boolean;
+  result: ClipIngestResult | null;
+  error: Record<string, unknown>;
+  dismissed_at: string | null;
+  raw: Record<string, unknown>;
+}
+
+export class ClipIngestMalformedAckError extends Error {
+  readonly payload: unknown;
+
+  constructor(payload: unknown) {
+    super("ClipIngest job response is malformed");
+    this.name = "ClipIngestMalformedAckError";
+    this.payload = payload;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function stringArray(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    return null;
+  }
+  return value as string[];
+}
+
+/** Validate and normalize the result embedded in a durable job ACK. */
+export function normalizeClipIngestResult(
+  value: unknown,
+): ClipIngestResult | null {
+  if (!isRecord(value)) return null;
+  if (
+    typeof value.target_id !== "string"
+    || typeof value.target_label !== "string"
+    || typeof value.open_node_id !== "string"
+    || typeof value.open_node_title !== "string"
+    || !["create", "append", "duplicate_skip"].includes(String(value.action))
+  ) {
+    return null;
+  }
+  if (
+    value.changed_node_id !== null
+    && value.changed_node_id !== undefined
+    && typeof value.changed_node_id !== "string"
+  ) {
+    return null;
+  }
+  if (
+    value.changed_node_title !== null
+    && value.changed_node_title !== undefined
+    && typeof value.changed_node_title !== "string"
+  ) {
+    return null;
+  }
+  const directUrls = stringArray(value.direct_urls);
+  const supplementalUrls = stringArray(value.supplemental_urls);
+  const usedUrls = stringArray(value.used_urls);
+  const unconfirmed = stringArray(value.unconfirmed);
+  if (!directUrls || !supplementalUrls || !usedUrls || !unconfirmed) return null;
+  if (!Array.isArray(value.failed_urls)) return null;
+  const failedUrls = value.failed_urls.filter(isRecord) as Array<{
+    url?: string;
+    error?: string;
+    acquisition_status?: string;
+  }>;
+  if (failedUrls.length !== value.failed_urls.length) return null;
+
+  return {
+    target_id: value.target_id,
+    target_label: value.target_label,
+    action: value.action as ClipIngestResult["action"],
+    changed_node_id:
+      typeof value.changed_node_id === "string" ? value.changed_node_id : null,
+    changed_node_title:
+      typeof value.changed_node_title === "string"
+        ? value.changed_node_title
+        : null,
+    open_node_id: value.open_node_id,
+    open_node_title: value.open_node_title,
+    direct_urls: directUrls,
+    supplemental_urls: supplementalUrls,
+    failed_urls: failedUrls,
+    used_urls: usedUrls,
+    unconfirmed,
+    ...(Array.isArray(value.attachments)
+      ? {
+          attachments: value.attachments.filter(isRecord) as Array<
+            Record<string, unknown>
+          >,
+        }
+      : {}),
+  };
+}
+
+function normalizeClipIngestJob(value: unknown): ClipIngestJobResponse {
+  if (!isRecord(value)) throw new ClipIngestMalformedAckError(value);
+  const status = value.status;
+  if (
+    typeof value.job_id !== "string"
+    || !value.job_id
+    || typeof status !== "string"
+    || !["queued", "running", "succeeded", "failed"].includes(status)
+  ) {
+    throw new ClipIngestMalformedAckError(value);
+  }
+  const rawResult = value.result ?? value.result_json;
+  const result = normalizeClipIngestResult(rawResult);
+  if (status === "succeeded" && result === null) {
+    throw new ClipIngestMalformedAckError(value);
+  }
+  const rawError = value.error ?? value.error_json;
+  return {
+    job_id: value.job_id,
+    status: status as ClipIngestJobStatus,
+    idempotency_key:
+      typeof value.idempotency_key === "string" ? value.idempotency_key : null,
+    retryable: value.retryable !== false,
+    result,
+    error: isRecord(rawError) ? rawError : {},
+    dismissed_at:
+      typeof value.dismissed_at === "string" ? value.dismissed_at : null,
+    raw: value,
+  };
+}
+
+function clipIngestContextHeaders(
+  context?: ClipIngestRequestContext,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (context?.session_id) headers["X-Session-ID"] = context.session_id;
+  if (context?.project_id) headers["X-Project-ID"] = context.project_id;
+  return headers;
+}
+
 export const docsApi = {
   /**
    * GET /api/docs/tree — canonical online snapshot for one Docs library.
@@ -139,6 +299,66 @@ export const docsApi = {
     const suffix = params.toString() ? `?${params.toString()}` : "";
     const response = await fetchApi<DocsTreeResponse>(`/api/docs/tree${suffix}`);
     return response;
+  },
+
+  /** Durable ClipIngest enqueue. Results converge through the next Docs sync. */
+  async enqueueIngestJob(
+    request: ClipIngestJobRequest,
+    operationKey: string,
+    serverFingerprintOrContext?: string | ClipIngestRequestContext,
+    contextArg?: ClipIngestRequestContext,
+  ): Promise<ClipIngestJobResponse> {
+    // The journal/replay path always supplies a fingerprint.  Keep the
+    // historical `(request, key, context?)` shape for older callers while
+    // they migrate; that compatibility path is never used for durable rows.
+    const serverFingerprint =
+      typeof serverFingerprintOrContext === "string"
+        ? serverFingerprintOrContext
+        : null;
+    const context =
+      typeof serverFingerprintOrContext === "string"
+        ? contextArg
+        : serverFingerprintOrContext;
+    const options: RequestInit = {
+      method: "POST",
+      headers: {
+        "Idempotency-Key": operationKey,
+        ...clipIngestContextHeaders(context),
+      },
+      body: JSON.stringify(request),
+    };
+    const response = serverFingerprint
+      ? await fetchApiAtServerFingerprint<unknown>(
+          serverFingerprint,
+          "/api/docs/ingest/jobs",
+          options,
+        )
+      : await fetchApi<unknown>("/api/docs/ingest/jobs", options);
+    return normalizeClipIngestJob(response);
+  },
+
+  /** Actor/ACL checked exact lookup. A 404 is intentionally propagated. */
+  async findIngestJobByIdempotencyKey(
+    operationKey: string,
+    serverFingerprint?: string,
+  ): Promise<ClipIngestJobResponse> {
+    const path =
+      `/api/docs/ingest/jobs/by-idempotency-key/${encodeURIComponent(operationKey)}`;
+    const response = serverFingerprint
+      ? await fetchApiAtServerFingerprint<unknown>(serverFingerprint, path)
+      : await fetchApi<unknown>(path);
+    return normalizeClipIngestJob(response);
+  },
+
+  async getIngestJob(
+    jobId: string,
+    serverFingerprint?: string,
+  ): Promise<ClipIngestJobResponse> {
+    const path = `/api/docs/ingest/jobs/${encodeURIComponent(jobId)}`;
+    const response = serverFingerprint
+      ? await fetchApiAtServerFingerprint<unknown>(serverFingerprint, path)
+      : await fetchApi<unknown>(path);
+    return normalizeClipIngestJob(response);
   },
 
   /** GET /api/docs/nodes/{node_id} — ACL checked canonical node detail. */
@@ -200,6 +420,7 @@ export const docsApi = {
   /**
    * POST /api/docs/ingest — サーバ側でURL取得・保存先判定・保存を一括実行する。
    * 長いURL取得と複数回のLLM判定を含むため専用timeoutを使う。
+   * @deprecated Durable Clip UI uses enqueueIngestJob + exact lookup.
    */
   async ingest(source: string): Promise<{
     result: ClipIngestResult;

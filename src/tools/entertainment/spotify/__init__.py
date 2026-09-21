@@ -2,6 +2,12 @@
 Spotify統合モジュール - 分割されたモジュールの統合インターフェース
 """
 
+import logging
+
+from ....utils.logging_config import FILE_ONLY_LOG_EXTRA
+
+logger = logging.getLogger(__name__)
+
 # 認証関連
 from .auth import (
     SpotifyManager,
@@ -93,7 +99,7 @@ def initialize_spotify():
     """Spotifyモジュールを初期化"""
     result = init_spotify_manager()
     if result:
-        print("[Spotify] モジュールが正常に初期化されました")
+        logger.info("Spotify module initialized", extra=FILE_ONLY_LOG_EXTRA)
         # 自動再生監視を開始（デフォルトでは無効化）
         # start_auto_play_monitoring()
         # 自動キュー管理を初期化
@@ -101,9 +107,16 @@ def initialize_spotify():
             from ...keyword.spotify.auto_queue_manager import get_auto_queue_manager
             get_auto_queue_manager()
         except Exception as e:
-            print(f"[Spotify] 自動初期化警告: {e}")
+            logger.warning(
+                "Spotify automatic initialization warning: %s",
+                e,
+                extra=FILE_ONLY_LOG_EXTRA,
+            )
     else:
-        print("[Spotify] モジュールの初期化に失敗しました")
+        logger.warning(
+            "Spotify module initialization failed",
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
     return result
 
 # 互換性維持のためのグローバル変数エミュレーション

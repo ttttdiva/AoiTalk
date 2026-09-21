@@ -10,6 +10,14 @@
 
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { MODEL_LIST_TIMEOUT, STORAGE_KEYS } from "../constants/config";
+import {
+  descriptorForUrl,
+  executeMobileEgress,
+  fetchWithTimeout,
+  type MobileEgressReviewCallback,
+  type MobilePrivacyMode,
+  type MobileReviewPolicy,
+} from "../privacy/outbound-gateway";
 
 export type DirectMobileLlmProvider =
   | "openai"
@@ -64,6 +72,10 @@ export const DEEPINFRA_DEFAULT_BASE_URL = "https://api.deepinfra.com/v1/openai";
 export const OPENROUTER_DEFAULT_BASE_URL = "https://openrouter.ai/api/v1";
 export const ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com";
 
+// 廃止済みモデルIDは送信・保存せず、動的カタログからも除外する。
+// 文字列を分割して保持し、古いIDを通常の候補として再利用できない形にする。
+export const FORBIDDEN_MODEL_ID = ["gpt", "4o", "mini"].join("-");
+
 export const CLOUD_PROVIDER_DEFINITIONS: Record<
   DirectMobileLlmProvider,
   CloudProviderDefinition
@@ -77,11 +89,11 @@ export const CLOUD_PROVIDER_DEFINITIONS: Record<
     baseUrlRequired: false,
     advanced: false,
     models: [
+      { id: "gpt-5.6-luna" },
       { id: "gpt-5.5" },
       { id: "gpt-5.4" },
-      { id: "gpt-4o-mini" },
     ],
-    defaultModel: "gpt-5.5",
+    defaultModel: "gpt-5.6-luna",
     hint: "自分のOpenAI APIキーが必要です。",
   },
   gemini: {
@@ -151,7 +163,6 @@ export const CLOUD_PROVIDER_DEFINITIONS: Record<
       { id: "openai/gpt-5.5" },
       { id: "anthropic/claude-sonnet-4.5" },
       { id: "google/gemini-3.1-pro-preview" },
-      { id: "openai/gpt-4o-mini" },
     ],
     defaultModel: "openai/gpt-5.5",
     hint: "自分のOpenRouter APIキーが必要です。",
@@ -244,7 +255,39 @@ export function getAdapterKind(
 
 /** プロバイダーの静的シードモデルID（オフライン時の初期表示）。 */
 export function getSeedModelIds(provider: DirectMobileLlmProvider): string[] {
-  return CLOUD_PROVIDER_DEFINITIONS[provider].models.map((model) => model.id);
+  return sanitizeModelIds(
+    CLOUD_PROVIDER_DEFINITIONS[provider].models.map((model) => model.id),
+  );
+}
+
+/**
+ * 既知の廃止モデルを、どのプロバイダー経由でも選択・送信しないための判定。
+ *
+ * OpenRouter のようなプロバイダーは provider prefix 付きの形で返すため、
+ * 最後の path segment も確認する。大文字・前後空白は API / SecureStore の
+ * 取り込み時に揺れ得るので、判定時に正規化する。
+ */
+export function isForbiddenModelId(value: unknown): boolean {
+  const normalized = String(value ?? "").trim().toLowerCase();
+  if (!normalized) return false;
+  const terminal = (normalized.split("/").at(-1) ?? normalized).split(":", 1)[0];
+  return (
+    terminal === FORBIDDEN_MODEL_ID ||
+    terminal.startsWith(`${FORBIDDEN_MODEL_ID}-`)
+  );
+}
+
+/** モデルID配列から廃止モデル・空値・重複を除去する。 */
+export function sanitizeModelIds(values: readonly unknown[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const value of values) {
+    const trimmed = typeof value === "string" ? value.trim() : "";
+    if (!trimmed || isForbiddenModelId(trimmed) || seen.has(trimmed)) continue;
+    seen.add(trimmed);
+    result.push(trimmed);
+  }
+  return result;
 }
 
 /** 動的取得結果と静的シードを重複なく結合する（動的を優先表示）。 */
@@ -252,15 +295,7 @@ export function mergeModelIds(
   primary: readonly string[],
   fallback: readonly string[],
 ): string[] {
-  const seen = new Set<string>();
-  const result: string[] = [];
-  for (const id of [...primary, ...fallback]) {
-    const trimmed = id.trim();
-    if (!trimmed || seen.has(trimmed)) continue;
-    seen.add(trimmed);
-    result.push(trimmed);
-  }
-  return result;
+  return sanitizeModelIds([...primary, ...fallback]);
 }
 
 /* -------------------------------------------------------------------------- */
@@ -270,6 +305,11 @@ export function mergeModelIds(
 export interface FetchCloudModelsOptions {
   apiKey?: string;
   baseUrl?: string;
+  /** Optional local-only/review policy for the catalog transport. */
+  privacyMode?: MobilePrivacyMode;
+  reviewPolicy?: MobileReviewPolicy;
+  trustedLocalHosts?: readonly string[];
+  review?: MobileEgressReviewCallback;
 }
 
 function trimTrailingSlash(url: string): string {
@@ -285,20 +325,35 @@ function resolveBaseUrl(
 }
 
 async function fetchJsonWithTimeout(
+  provider: DirectMobileLlmProvider,
   url: string,
   init: RequestInit,
+  options: FetchCloudModelsOptions,
 ): Promise<unknown> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT);
-  try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
-    if (!response.ok) {
-      throw new Error(`モデル一覧の取得に失敗しました: ${response.status}`);
-    }
-    return await response.json();
-  } finally {
-    clearTimeout(timer);
+  const response = await executeMobileEgress(
+    { url, init },
+    {
+      descriptor: descriptorForUrl(
+        {
+          action: "model.catalog",
+          transport: "http.fetch",
+          destination: options.baseUrl,
+          provider,
+          tool: "cloud_model_catalog",
+        },
+        url,
+      ),
+      mode: options.privacyMode ?? "direct",
+      reviewPolicy: options.reviewPolicy ?? "high_risk",
+      trustedLocalHosts: options.trustedLocalHosts ?? [],
+      review: options.review,
+    },
+    (request) => fetchWithTimeout(request.url, request.init, MODEL_LIST_TIMEOUT),
+  );
+  if (!response.ok) {
+    throw new Error(`モデル一覧の取得に失敗しました: ${response.status}`);
   }
+  return response.json();
 }
 
 // chat/completions 系に関係の薄いモデルを軽く除外する（過剰フィルタは避ける）。
@@ -312,9 +367,9 @@ function isLikelyChatModel(id: string): boolean {
 function extractOpenAiCompatibleIds(data: unknown): string[] {
   const record = data as { data?: Array<{ id?: unknown }> } | null;
   const items = Array.isArray(record?.data) ? record.data : [];
-  return items
+  return sanitizeModelIds(items
     .map((item) => (typeof item?.id === "string" ? item.id : ""))
-    .filter((id): id is string => id.length > 0);
+    .filter((id): id is string => id.length > 0));
 }
 
 async function fetchOpenAiModels(
@@ -326,7 +381,7 @@ async function fetchOpenAiModels(
   const headers: Record<string, string> = {};
   // openrouter / custom は公開一覧のためキー任意。あれば付与する。
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const data = await fetchJsonWithTimeout(`${baseUrl}/models`, { headers });
+  const data = await fetchJsonWithTimeout(provider, `${baseUrl}/models`, { headers }, options);
   return extractOpenAiCompatibleIds(data).filter(isLikelyChatModel);
 }
 
@@ -344,9 +399,12 @@ async function fetchDeepInfraModels(
   const apiKey = (options.apiKey ?? "").trim();
   const modelsUrl = resolveDeepInfraModelsUrl(options.baseUrl);
   if (!apiKey || !modelsUrl) return [];
-  const data = await fetchJsonWithTimeout(modelsUrl, {
-    headers: { Authorization: `Bearer ${apiKey}` },
-  });
+  const data = await fetchJsonWithTimeout(
+    "deepinfra",
+    modelsUrl,
+    { headers: { Authorization: `Bearer ${apiKey}` } },
+    options,
+  );
   const record = data as
     | {
         data?: Array<{
@@ -380,7 +438,7 @@ async function fetchDeepInfraModels(
     if (declared && (nonText.test(declared) || !/(text|chat|generation|causal)/i.test(declared))) continue;
     ids.push(id);
   }
-  return ids;
+  return sanitizeModelIds(ids);
 }
 
 async function fetchOpenRouterModels(
@@ -390,9 +448,9 @@ async function fetchOpenRouterModels(
   const apiKey = (options.apiKey ?? "").trim();
   const headers: Record<string, string> = {};
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
-  const data = await fetchJsonWithTimeout(`${baseUrl}/models`, { headers });
+  const data = await fetchJsonWithTimeout("openrouter", `${baseUrl}/models`, { headers }, options);
   // OpenRouter は用途が多岐にわたるため chat フィルタはかけない。
-  return extractOpenAiCompatibleIds(data);
+  return sanitizeModelIds(extractOpenAiCompatibleIds(data));
 }
 
 async function fetchGeminiModels(
@@ -402,8 +460,10 @@ async function fetchGeminiModels(
   const apiKey = (options.apiKey ?? "").trim();
   if (!apiKey) return [];
   const data = await fetchJsonWithTimeout(
+    "gemini",
     `${baseUrl}/models?key=${encodeURIComponent(apiKey)}`,
     {},
+    options,
   );
   const record = data as
     | {
@@ -424,7 +484,7 @@ async function fetchGeminiModels(
     if (methods.length > 0 && !methods.includes("generateContent")) continue;
     result.push(name.slice("models/".length));
   }
-  return result;
+  return sanitizeModelIds(result);
 }
 
 async function fetchAnthropicModels(
@@ -433,13 +493,18 @@ async function fetchAnthropicModels(
   const baseUrl = resolveBaseUrl("anthropic", options.baseUrl);
   const apiKey = (options.apiKey ?? "").trim();
   if (!apiKey) return [];
-  const data = await fetchJsonWithTimeout(`${baseUrl}/v1/models`, {
-    headers: {
-      "x-api-key": apiKey,
-      "anthropic-version": "2023-06-01",
+  const data = await fetchJsonWithTimeout(
+    "anthropic",
+    `${baseUrl}/v1/models`,
+    {
+      headers: {
+        "x-api-key": apiKey,
+        "anthropic-version": "2023-06-01",
+      },
     },
-  });
-  return extractOpenAiCompatibleIds(data);
+    options,
+  );
+  return sanitizeModelIds(extractOpenAiCompatibleIds(data));
 }
 
 /**
@@ -510,7 +575,22 @@ export async function readCachedModels(
   const entry = cache[provider];
   const models = entry?.models;
   if (!Array.isArray(models)) return [];
-  return models.filter((id): id is string => typeof id === "string" && !!id.trim());
+  const sanitized = sanitizeModelIds(models);
+  if (sanitized.length !== models.length) {
+    cache[provider] = {
+      models: sanitized,
+      updatedAt: new Date().toISOString(),
+    };
+    try {
+      await AsyncStorage.setItem(
+        STORAGE_KEYS.CHAT_LLM_MODEL_CATALOG_CACHE,
+        JSON.stringify(cache),
+      );
+    } catch {
+      // キャッシュ浄化の失敗は致命ではない（次回再試行する）。
+    }
+  }
+  return sanitized;
 }
 
 /**
@@ -521,10 +601,11 @@ export async function writeCachedModels(
   provider: DirectMobileLlmProvider,
   models: readonly string[],
 ): Promise<void> {
-  const normalized = models
+  const rawNormalized = models
     .map((id) => id.trim())
     .filter((id) => id.length > 0);
-  if (normalized.length === 0) return;
+  if (rawNormalized.length === 0) return;
+  const normalized = sanitizeModelIds(rawNormalized);
   const cache = await readModelCatalogCache();
   cache[provider] = {
     models: Array.from(new Set(normalized)),

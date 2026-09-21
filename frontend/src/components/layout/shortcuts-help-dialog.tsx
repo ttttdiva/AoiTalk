@@ -155,6 +155,8 @@ const SHORTCUT_SECTIONS: ShortcutSection[] = [
     title: "その他",
     items: [
       { keys: ["Ctrl", "K"], description: "コマンドパレットを開く" },
+      { keys: ["Ctrl", "Alt", "S"], description: "スペース選択を開く" },
+      { keys: ["Ctrl", "Alt", "P"], description: "プロジェクト選択を開く" },
       { keys: ["?"], description: "ショートカット一覧を表示" },
       {
         keys: ["Alt", "Shift", "R"],

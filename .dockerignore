@@ -6,6 +6,7 @@
 # Python
 venv/
 .venv/
+.local/
 __pycache__/
 *.pyc
 *.pyo
@@ -25,8 +26,6 @@ frontend/.next/
 frontend/test-results/
 frontend/playwright-report/
 mobile/
-desktop/src-tauri/target/
-desktop/node_modules/
 test-results/
 playwright-report/
 

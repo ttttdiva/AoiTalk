@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
+from enum import Enum
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from .generation_policy import GenerationProfile, get_client_generation_policy
@@ -18,6 +20,16 @@ AsyncStreamCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 AsyncRunOnce = Callable[[str], Awaitable[str]]
 SyncRunOnce = Callable[[str], str]
 SyncEventCallback = Callable[[str, dict[str, Any]], None]
+CompletionEvidence = Mapping[str, Any]
+CompletionEvidenceProvider = Callable[[], CompletionEvidence | None]
+
+
+class SimpleTaskMutationCompletionState(str, Enum):
+    """Provider-independent semantic state for one simple task-create request."""
+
+    NOT_APPLICABLE = "not_applicable"
+    PENDING_OR_BLOCKED = "pending_or_blocked"
+    COMPLETE = "complete"
 
 DEFAULT_AGENTIC_MAX_ROUNDS = 2
 DEFAULT_WORK_MAX_ROUNDS = 120
@@ -28,6 +40,262 @@ WORK_GENERATION_PROFILES = {
     GenerationProfile.ASSISTED_WORK,
     GenerationProfile.AUTONOMOUS_WORK,
 }
+
+# These mutations have a structured result that can prove the requested task
+# state without a second model call.  Artifact/document mutations deliberately
+# stay outside this set: they retain the normal verifier path even when their
+# tool call itself reports success.
+DETERMINISTIC_TASK_MUTATION_TOOLS = frozenset(
+    {
+        "create_task",
+        "update_task",
+        "delete_task",
+        "assign_task",
+        "schedule_task",
+    }
+)
+# Completion fast-path is intentionally narrower than the mutation inventory.
+# Only ``create_task`` has a stable, fully projected receipt contract across
+# every supported provider.  Other task mutations continue through the
+# generic all-success/reviewer path until their own postcondition projection
+# is explicitly introduced.
+AUTHORITATIVE_TASK_MUTATION_TOOLS = frozenset({"create_task"})
+
+_TASK_CREATE_IMPERATIVE_MARKERS = (
+    "作って",
+    "作成して",
+    "作成してください",
+    "作成お願いします",
+    "作成をお願いします",
+    "登録して",
+    "登録してください",
+    "登録お願いします",
+    "追加して",
+    "追加してください",
+    "入れて",
+    "create task",
+    "create a task",
+    "create_task",
+    "register a task",
+    "make a task",
+    "add a task",
+)
+_TASK_COMPLEX_SCOPE_MARKERS = (
+    "excel",
+    "xlsx",
+    "xls",
+    "csv",
+    "spreadsheet",
+    "スプレッドシート",
+    "ワークスペース",
+    "フォルダ",
+    "ドキュメント",
+    "docs",
+    "wbs",
+    "工程表",
+    "案件情報",
+    "プロジェクト情報",
+    "課題管理",
+    "db",
+    "database",
+    "データベース",
+    "テーブルを",
+    "台帳",
+    "レコード",
+    "ファイルを加工",
+    "ファイルを編集",
+    "ファイルを更新",
+    "資料を加工",
+    "資料を編集",
+    "画像生成",
+    "画像を",
+    "動画生成",
+    "動画を",
+    "音声生成",
+    "音声を",
+    "web検索",
+    "ウェブ検索",
+    "アプリを",
+    "アプリで",
+    "アプリ操作",
+    "マクロ",
+    "コード修正",
+    "コードを修正",
+    "コードを書",
+    "ファイル作成",
+    "ファイルを作って",
+    "ファイルを作成",
+    "資料を作って",
+    "資料を作成",
+    "ネットで調べ",
+    "webで調べ",
+    "ウェブで調べ",
+    "メールを送って",
+    "メール送って",
+    "メッセージを送って",
+    "送信して",
+)
+_SIMPLE_TASK_POST_CREATE_BLOCKED_TOOLS = frozenset(
+    {
+        "web_search",
+        "search_web",
+        "deep_research",
+        "send_email",
+        "send_message",
+        "create_file",
+        "write_file",
+        "edit_file",
+        "delete_file",
+        "execute_command",
+        "generate_image",
+        "media_assistant",
+        "agent_team_delegate",
+        "create_record_table",
+        "sync_wbs_tasks",
+        "sync_issue_table",
+        "patch_project_information_doc",
+        "organize_project_information_from_folder",
+        "attach_project_information_reference",
+        "submit_plan_for_approval",
+    }
+)
+
+
+def _simple_task_has_unexpected_successful_mutation(
+    records: Sequence[Any] | None,
+) -> bool:
+    """Reject a simple-create proof when another task mutation succeeded.
+
+    The simple fast-path proves exactly one ``create_task`` operation.  A
+    successful update/delete/assign/schedule in the same attempt is not an
+    optional diagnostic: it is an additional side effect whose target and
+    ordering the create receipt does not prove.  Failed attempts remain in
+    the audit trail but do not poison a later, authoritative create.
+    """
+
+    unexpected = DETERMINISTIC_TASK_MUTATION_TOOLS - {"create_task"}
+    return any(
+        _extract_tool_call_name(record).casefold() in unexpected
+        and _audit_tool_call_successful(record)
+        for record in (records or ())
+    )
+
+
+def _task_create_imperative_present(text: str | None) -> bool:
+    normalized = str(text or "").casefold()
+    return any(marker.casefold() in normalized for marker in _TASK_CREATE_IMPERATIVE_MARKERS)
+
+
+def _task_post_create_followup_present(text: str | None) -> bool:
+    normalized = str(text or "").casefold()
+    create_positions = [
+        normalized.find(marker.casefold())
+        for marker in _TASK_CREATE_IMPERATIVE_MARKERS
+        if normalized.find(marker.casefold()) >= 0
+    ]
+    if not create_positions:
+        return "作成したタスク" in normalized
+    create_position = min(create_positions)
+    followup_markers = (
+        "タスクの内容を確認",
+        "作成したタスクを確認",
+        "作成後に確認",
+        "作成後に変更",
+        "作成後に修正",
+        "作成後に削除",
+        "作成後に送",
+        "その内容を確認",
+        "その内容を変更",
+        "その内容を修正",
+        "その内容を削除",
+        "その内容を送",
+        "確認してから",
+        "確認したら",
+    )
+    return any(
+        (position := normalized.find(marker.casefold())) > create_position
+        for marker in followup_markers
+        if normalized.find(marker.casefold()) >= 0
+    )
+
+
+def requested_deterministic_task_mutation_tools(text: str | None) -> set[str]:
+    """Resolve the required task mutations for the current user request.
+
+    The broad project-policy classifier intentionally recognizes words such as
+    「変更」/「削除」 anywhere in a message.  Reservation/source content often
+    contains those words (for example, a changed booking email) while the
+    requested operation is still one new task.  When an explicit create
+    imperative is present and no *task-targeted* second mutation is requested,
+    keep the semantic contract to one create operation.
+    """
+
+    try:
+        required = {
+            str(name).strip().casefold()
+            for name in project_management_required_mutation_tools(str(text or ""))
+            if str(name).strip().casefold() in DETERMINISTIC_TASK_MUTATION_TOOLS
+        }
+    except Exception:
+        return set()
+    if "create_task" not in required:
+        return required
+    if not _task_create_imperative_present(text):
+        return required
+    if any(
+        marker.casefold() in str(text or "").casefold()
+        for marker in _TASK_COMPLEX_SCOPE_MARKERS
+    ):
+        return required
+    task_targeted_secondary_markers = (
+        "既存タスク",
+        "既存のタスク",
+        "そのタスク",
+        "タスクを更新",
+        "タスクの更新",
+        "タスクを変更",
+        "タスクの変更",
+        "タスクを修正",
+        "タスクの修正",
+        "タスクを削除",
+        "タスクの削除",
+        "タスクを割り当て",
+        "タスクに割り当て",
+        "タスクを完了",
+        "タスクをクローズ",
+        "作成後に更新",
+        "作成したタスク",
+        "作成してから更新",
+        "作成してから変更",
+        "作成してから修正",
+        "作成してから削除",
+        "作成してから割り当て",
+        "作成したら更新",
+        "作成したら変更",
+        "作成したら修正",
+        "作成したら削除",
+        "作った後に更新",
+        "作った後に変更",
+        "作った後に削除",
+        "create then update",
+        "create and update",
+        "create task then",
+        "update task",
+        "modify task",
+        "change task",
+        "delete task",
+        "assign task",
+        "close task",
+    )
+    if not any(
+        marker.casefold() in str(text or "").casefold()
+        for marker in task_targeted_secondary_markers
+    ):
+        return {"create_task"}
+    # Scheduling represented by create_task fields is not a second required
+    # operation even when the surrounding request mentions a calendar.
+    required.discard("schedule_task")
+    return required
 
 # Only a trusted command context can activate the fallback plan-only check.
 # Natural words such as 「調べて」「確認して」「見て」 are ordinary user
@@ -255,6 +523,21 @@ def _audit_tool_call_names(records: Sequence[Any] | None) -> set[str]:
     return names
 
 
+def _success_marker(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().casefold() in {
+        "1",
+        "true",
+        "yes",
+        "ok",
+        "success",
+        "succeeded",
+    }
+
+
 def _audit_tool_call_successful(record: Any) -> bool:
     if isinstance(record, dict):
         explicit_success = record.get("successful")
@@ -267,6 +550,9 @@ def _audit_tool_call_successful(record: Any) -> bool:
             if record.get("output") is not None
             else record.get("model_output")
         )
+        error = record.get("error") or record.get("failure") or record.get(
+            "error_message"
+        )
     else:
         explicit_success = getattr(record, "successful", None)
         if explicit_success is None:
@@ -276,21 +562,17 @@ def _audit_tool_call_successful(record: Any) -> bool:
             result = getattr(record, "output", None)
         if result is None:
             result = getattr(record, "model_output", None)
+        error = getattr(record, "error", None) or getattr(record, "failure", None)
 
-    if isinstance(explicit_success, bool):
-        return explicit_success
-    if explicit_success is not None:
-        return str(explicit_success).strip().casefold() in {
-            "1",
-            "true",
-            "yes",
-            "ok",
-            "success",
-            "succeeded",
-        }
+    if str(error or "").strip():
+        return False
+    explicit_marker = _success_marker(explicit_success)
+    if explicit_marker is False:
+        return False
 
     if isinstance(result, dict):
-        if result.get("success") is False:
+        result_marker = _success_marker(result.get("success"))
+        if result_marker is False or str(result.get("error") or "").strip():
             return False
         return True
 
@@ -309,8 +591,10 @@ def _audit_tool_call_successful(record: Any) -> bool:
             payload = json.loads(result_text)
         except json.JSONDecodeError:
             payload = None
-        if isinstance(payload, dict) and payload.get("success") is False:
-            return False
+        if isinstance(payload, dict):
+            payload_marker = _success_marker(payload.get("success"))
+            if payload_marker is False or str(payload.get("error") or "").strip():
+                return False
     return True
 
 
@@ -343,16 +627,443 @@ def successful_empty_task_search(records: Sequence[Any] | None) -> bool | None:
         if isinstance(result, list):
             return len(result) == 0
         if isinstance(result, dict):
+            indicators: list[bool] = []
             for key in ("items", "tasks", "candidates", "results"):
+                if key in result and not isinstance(result.get(key), list):
+                    return None
                 value = result.get(key)
                 if isinstance(value, list):
-                    return len(value) == 0
+                    indicators.append(len(value) == 0)
             for key in ("count", "total"):
+                if key in result and (
+                    isinstance(result.get(key), bool)
+                    or not isinstance(result.get(key), int)
+                ):
+                    return None
                 value = result.get(key)
                 if isinstance(value, int):
-                    return value == 0
+                    indicators.append(value == 0)
+            if indicators and all(item == indicators[0] for item in indicators):
+                return indicators[0]
         return None
     return None
+
+
+def _semantic_record_result(record: Any) -> Any:
+    if isinstance(record, Mapping):
+        if record.get("result") is not None:
+            return record.get("result")
+        if record.get("output") is not None:
+            return record.get("output")
+        return record.get("model_output")
+    result = getattr(record, "result", None)
+    if result is not None:
+        return result
+    result = getattr(record, "output", None)
+    if result is not None:
+        return result
+    return getattr(record, "model_output", None)
+
+
+def _semantic_record_arguments(record: Any) -> Mapping[str, Any]:
+    value = (
+        record.get("arguments")
+        if isinstance(record, Mapping)
+        else getattr(record, "arguments", None)
+    )
+    return value if isinstance(value, Mapping) else {}
+
+
+def _decode_semantic_result(value: Any) -> Any:
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text[0] not in "[{":
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _semantic_task_payload(record: Any) -> dict[str, Any] | None:
+    payload = _decode_semantic_result(_semantic_record_result(record))
+    if not isinstance(payload, dict):
+        return None
+    if payload.get("success") is False:
+        return None
+    if not (payload.get("id") or payload.get("task_id")):
+        for key in ("task", "data", "item", "result"):
+            nested = payload.get(key)
+            if isinstance(nested, dict) and (
+                nested.get("id") or nested.get("task_id")
+            ):
+                payload = {**payload, **nested}
+                break
+    return payload
+
+
+def _search_result_unambiguous_nonempty(record: Any) -> bool:
+    """Return true only for a successful search with explicit candidates."""
+
+    if not _audit_tool_call_successful(record):
+        return False
+    payload = _decode_semantic_result(_semantic_record_result(record))
+    if isinstance(payload, list):
+        return bool(payload)
+    if not isinstance(payload, dict):
+        return False
+    for key in ("items", "tasks", "candidates", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return bool(value)
+    for key in ("count", "total"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value > 0
+    return False
+
+
+def _semantic_datetime(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        from datetime import datetime
+
+        candidate = text[:-1] + "+00:00" if text.endswith("Z") else text
+        parsed = datetime.fromisoformat(candidate)
+        return parsed.replace(tzinfo=None).isoformat()
+    except (TypeError, ValueError):
+        return " ".join(text.split()).casefold()
+
+
+def _semantic_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _simple_task_create_postcondition(record: Any) -> bool:
+    """Validate the structured receipt for a simple ``create_task`` call."""
+
+    if _extract_tool_call_name(record).casefold() != "create_task":
+        return False
+    if not _audit_tool_call_successful(record):
+        return False
+    arguments = _semantic_record_arguments(record)
+    title = str(arguments.get("title") or "").strip()
+    if not title:
+        return False
+    payload = _semantic_task_payload(record)
+    if not isinstance(payload, dict):
+        return False
+    task_id = str(payload.get("id") or payload.get("task_id") or "").strip()
+    if not task_id or str(payload.get("title") or "").strip() != title:
+        return False
+    if (
+        bool(arguments.get("auto_close_on_due"))
+        or str(arguments.get("assignee_ids") or "").strip()
+        or str(arguments.get("recurrence_rrule") or "").strip()
+    ):
+        return False
+
+    aliases: dict[str, tuple[str, ...]] = {
+        "description": ("description",),
+        "start_at": ("start_at", "starts_at"),
+        "end_at": ("end_at", "ends_at"),
+        "project_id": ("project_id", "project"),
+        "parent_task_id": ("parent_task_id", "parent_id"),
+        "all_day": ("all_day",),
+        "priority": ("priority",),
+    }
+    requested_due_date = str(arguments.get("due_date") or "").strip()
+    if requested_due_date:
+        observed = payload.get("due_date") or payload.get("start_at")
+        if not observed or str(observed).strip()[:10] != requested_due_date[:10]:
+            return False
+        if not _semantic_bool(payload.get("all_day")):
+            return False
+
+    for key, field_aliases in aliases.items():
+        expected = arguments.get(key)
+        if key == "all_day" and requested_due_date:
+            expected = True
+        if expected in (None, ""):
+            continue
+        observed_key = next((item for item in field_aliases if item in payload), None)
+        if observed_key is None:
+            return False
+        observed = payload.get(observed_key)
+        if key == "all_day":
+            if _semantic_bool(observed) != _semantic_bool(expected):
+                return False
+        elif key in {"start_at", "end_at"}:
+            if _semantic_datetime(observed) != _semantic_datetime(expected):
+                return False
+        elif key in {"project_id", "project"}:
+            observed_project_id = str(payload.get("project_id") or "").strip()
+            observed_project_name = str(
+                payload.get("project_name") or payload.get("project") or ""
+            ).strip()
+            if key == "project_id":
+                if not observed_project_id or observed_project_id.casefold() != str(
+                    expected
+                ).strip().casefold():
+                    return False
+            elif str(expected).strip().casefold() not in {
+                observed_project_id.casefold(),
+                observed_project_name.casefold(),
+            }:
+                return False
+        elif str(observed or "") != str(expected):
+            return False
+    return True
+
+
+def _simple_task_post_create_has_blocked_work(
+    records: Sequence[Any] | None,
+) -> bool:
+    items = list(records or ())
+    successful_create_indexes = [
+        index
+        for index, record in enumerate(items)
+        if _extract_tool_call_name(record).casefold() == "create_task"
+        and _audit_tool_call_successful(record)
+    ]
+    if len(successful_create_indexes) != 1:
+        return False
+    create_index = successful_create_indexes[0]
+    return any(
+        _extract_tool_call_name(record).casefold()
+        in _SIMPLE_TASK_POST_CREATE_BLOCKED_TOOLS
+        and _audit_tool_call_successful(record)
+        for record in items[create_index + 1 :]
+    )
+
+
+def _simple_task_request_is_explicit(text: str) -> bool:
+    normalized = str(text or "").casefold()
+    if not normalized:
+        return False
+    if mutation_execution_forbidden(normalized):
+        return False
+    if any(marker.casefold() in normalized for marker in _TASK_COMPLEX_SCOPE_MARKERS):
+        return False
+    if _task_post_create_followup_present(normalized):
+        return False
+    confirmation_markers = (
+        "してもいい",
+        "してもよい",
+        "しても大丈夫",
+        "作ってもいい",
+        "作ってもよい",
+        "作っていい",
+        "作って良い",
+        "作成していい",
+        "作成してよい",
+        "作成して良い",
+        "登録していい",
+        "登録してよい",
+        "登録して良い",
+        "追加していい",
+        "追加してよい",
+        "追加して良い",
+        "許可",
+        "承認",
+        "is it okay",
+        "may i",
+        "can i",
+        "should i",
+    )
+    if any(marker in normalized for marker in confirmation_markers):
+        return False
+    question_markers = (
+        "方法",
+        "使い方",
+        "教えて",
+        "できますか",
+        "できるか",
+        "確認して",
+        "確認したい",
+        "かどうか",
+        "?",
+        "？",
+    )
+    imperative_markers = (
+        "作って",
+        "作ってください",
+        "作成して",
+        "作成してください",
+        "作成お願いします",
+        "作成をお願いします",
+        "登録して",
+        "登録してください",
+        "登録お願いします",
+        "追加して",
+        "追加してください",
+        "入れて",
+        "create ",
+        "create_task",
+        "register a task",
+        "make a task",
+        "add a task",
+    )
+    conditional_markers = ("作成予定", "作る予定", "作成するつもり", "作るつもり", "作成を検討", "作成を考えて")
+    if any(marker in normalized for marker in conditional_markers) and not any(
+        marker in normalized for marker in imperative_markers
+    ):
+        return False
+    if any(marker in normalized for marker in question_markers) and not any(
+        marker in normalized for marker in imperative_markers
+    ):
+        return False
+    if any(marker in normalized for marker in ("?", "？")) and any(
+        marker in normalized
+        for marker in ("いい", "良い", "大丈夫", "可能", "できますか")
+    ):
+        return False
+    return _task_create_imperative_present(normalized)
+
+
+def simple_task_mutation_completion_state(
+    user_input: str | None,
+    audit_tool_calls: Sequence[Any] | None,
+) -> SimpleTaskMutationCompletionState:
+    """Classify a simple task-create request without provider/model state.
+
+    The helper is deliberately conservative.  It ignores unrelated records
+    *after* a proven create, but a failed/ambiguous search, a missing receipt,
+    or a second successful create keeps the state pending/blocked.  It is used
+    as the compatibility fallback when a provider has no attempt-local
+    completion ledger; TurnExecution's richer ledger remains authoritative for
+    concurrent/continuation turns.
+    """
+
+    request = str(user_input or "")
+    if not _simple_task_request_is_explicit(request):
+        return SimpleTaskMutationCompletionState.NOT_APPLICABLE
+    required = requested_deterministic_task_mutation_tools(request)
+    if "create_task" not in required:
+        return SimpleTaskMutationCompletionState.NOT_APPLICABLE
+    required.discard("schedule_task")
+    if required != {"create_task"}:
+        return SimpleTaskMutationCompletionState.NOT_APPLICABLE
+
+    records = list(audit_tool_calls or ())
+    if _simple_task_has_unexpected_successful_mutation(records):
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    create_records = [
+        record
+        for record in records
+        if _extract_tool_call_name(record).casefold() == "create_task"
+    ]
+    successful_create_indexes = {
+        index
+        for index, record in enumerate(records)
+        if _extract_tool_call_name(record).casefold() == "create_task"
+        and _audit_tool_call_successful(record)
+    }
+    successful_creates = [
+        records[index] for index in sorted(successful_create_indexes)
+    ]
+    if len(successful_creates) != 1:
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    create_index = next(iter(successful_create_indexes))
+    successful_create = records[create_index]
+    # A required create failure after a successful create is not an optional
+    # diagnostic failure and must not be collapsed into success.
+    if any(
+        not _audit_tool_call_successful(record)
+        for index, record in enumerate(records)
+        if _extract_tool_call_name(record).casefold() == "create_task"
+        if index > create_index
+    ):
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    preceding = records[:create_index]
+    if successful_empty_task_search(preceding) is not True:
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    if not _simple_task_create_postcondition(successful_create):
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    if _simple_task_post_create_has_blocked_work(records):
+        return SimpleTaskMutationCompletionState.PENDING_OR_BLOCKED
+    return SimpleTaskMutationCompletionState.COMPLETE
+
+
+def _simple_task_duplicate_search_blocked(
+    user_input: str | None,
+    audit_tool_calls: Sequence[Any] | None,
+) -> bool:
+    """Detect a malformed/failed duplicate search that must stop mutation."""
+
+    request = str(user_input or "")
+    if not _simple_task_request_is_explicit(request):
+        return False
+    required = requested_deterministic_task_mutation_tools(request)
+    required.discard("schedule_task")
+    if required != {"create_task"}:
+        return False
+    records = list(audit_tool_calls or ())
+    if _simple_task_has_unexpected_successful_mutation(records):
+        return True
+    search_indexes = [
+        index
+        for index, record in enumerate(records)
+        if _extract_tool_call_name(record).casefold()
+        in {"search_task_candidates", "list_tasks"}
+    ]
+    if not search_indexes:
+        return False
+
+    # If a create was attempted, only the latest search immediately before
+    # that create is the duplicate precondition.  A later optional search
+    # failure cannot revoke a previously proven create.
+    create_indexes = [
+        index
+        for index, record in enumerate(records)
+        if _extract_tool_call_name(record).casefold() == "create_task"
+    ]
+    if create_indexes:
+        first_create = create_indexes[0]
+        preceding_searches = [index for index in search_indexes if index < first_create]
+        if preceding_searches:
+            search_record = records[preceding_searches[-1]]
+            search_state = successful_empty_task_search(
+                records[: preceding_searches[-1] + 1]
+            )
+            if search_state is True:
+                return False
+            # A valid non-empty candidate result is a safe duplicate stop,
+            # unless the model nevertheless attempted a create afterward.
+            if search_state is False and _search_result_unambiguous_nonempty(
+                search_record
+            ):
+                return True
+            return True
+        return True
+    search_state = successful_empty_task_search(records)
+    if search_state is True:
+        return False
+    # Existing candidates are an intentional read-only outcome, not an
+    # ambiguous search failure.  Let the normal completion path report that
+    # no new task was created.
+    if search_state is False:
+        return False
+    return True
+
+
+def _completion_evidence_records_for_search(
+    completion_evidence: CompletionEvidence | None,
+    audit_tool_calls: Sequence[Any] | None,
+) -> list[Any]:
+    records: list[Any] = []
+    if isinstance(completion_evidence, Mapping):
+        for key in ("search_records", "required_tool_records", "tool_records"):
+            records.extend(_completion_evidence_records(completion_evidence.get(key)))
+    records.extend(list(audit_tool_calls or ()))
+    return records
 
 
 def required_project_mutation_tools_missing(
@@ -438,18 +1149,7 @@ def required_project_mutation_tools_missing(
     ):
         return ()
 
-    required = {
-        name
-        for name in project_management_required_mutation_tools(text)
-        if name
-        in {
-            "create_task",
-            "update_task",
-            "delete_task",
-            "assign_task",
-            "schedule_task",
-        }
-    }
+    required = requested_deterministic_task_mutation_tools(text)
     if not required:
         return ()
 
@@ -510,11 +1210,71 @@ def response_promises_unexecuted_tool(
     return False
 
 
+def _task_mutation_postcondition_failed(
+    completion_evidence: CompletionEvidence | None,
+    *,
+    user_input: str | None,
+    audit_tool_calls: Sequence[Any] | None,
+) -> bool:
+    """Return whether an attempted task mutation explicitly failed proof.
+
+    This is a narrow fail-closed breaker for a producer that knows a required
+    task mutation was attempted but could not verify its structured result
+    (for example, a requested schedule was omitted from the create receipt).
+    It intentionally does not infer failure from an absent evidence mapping or
+    from a read-only/ambiguous request.
+    """
+
+    if not isinstance(completion_evidence, Mapping):
+        return False
+    postconditions_verified = completion_evidence.get("postconditions_verified")
+    if postconditions_verified is None:
+        postconditions_verified = completion_evidence.get("postcondition_verified")
+    if postconditions_verified is None:
+        postconditions_verified = completion_evidence.get(
+            "required_mutations_satisfied"
+        )
+    if postconditions_verified is not False:
+        return False
+
+    required_names = set(
+        _completion_evidence_tool_names(completion_evidence.get("required_tools"))
+    )
+    required_names.intersection_update(DETERMINISTIC_TASK_MUTATION_TOOLS)
+    if not required_names:
+        required_names = {
+            name.casefold()
+            for name in requested_deterministic_task_mutation_tools(
+                str(user_input or "")
+            )
+        }
+    if not required_names:
+        return False
+
+    evidence_records = _completion_evidence_records(
+        completion_evidence.get("required_tool_records")
+    )
+    evidence_records.extend(
+        _completion_evidence_records(completion_evidence.get("tool_records"))
+    )
+    all_records = [*evidence_records, *list(audit_tool_calls or ())]
+    # A postcondition failure only matters after that required operation was
+    # actually attempted.  This avoids turning a plain request with no tool
+    # call, or an unrelated optional failure, into a synthetic failure claim.
+    attempted_names = {
+        _extract_tool_call_name(record).casefold()
+        for record in all_records
+        if _extract_tool_call_name(record)
+    }
+    return bool(required_names.intersection(attempted_names))
+
+
 def response_definitely_incomplete_after_review(
     response: str | None,
     *,
     user_input: str | None = None,
     audit_tool_calls: Sequence[Any] | None = None,
+    completion_evidence: CompletionEvidence | None = None,
 ) -> bool:
     """Mechanical-only reasons that may override a reviewer done decision."""
 
@@ -529,6 +1289,30 @@ def response_definitely_incomplete_after_review(
         audit_tool_calls,
     ):
         return True
+    if _task_mutation_postcondition_failed(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    ):
+        return True
+    if _response_claims_unproven_task_creation(
+        response,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+        completion_evidence=completion_evidence,
+    ):
+        return True
+    if (
+        not isinstance(completion_evidence, Mapping)
+        or completion_evidence.get("authoritative") is not True
+    ) and _simple_task_duplicate_search_blocked(
+        user_input,
+        _completion_evidence_records_for_search(
+            completion_evidence,
+            audit_tool_calls,
+        ),
+    ):
+        return True
     return response_promises_unexecuted_tool(response, audit_tool_calls)
 
 
@@ -538,6 +1322,7 @@ def apply_deterministic_incomplete_override(
     user_input: str | None,
     response: str | None,
     audit_tool_calls: Sequence[Any] | None = None,
+    completion_evidence: CompletionEvidence | None = None,
 ) -> dict[str, str]:
     """Force continuation when reviewer says done but the answer is still incomplete."""
 
@@ -547,6 +1332,7 @@ def apply_deterministic_incomplete_override(
         response,
         user_input=user_input,
         audit_tool_calls=audit_tool_calls,
+        completion_evidence=completion_evidence,
     ):
         return unfinished_work_decision(user_input, str(response or ""))
     return decision
@@ -591,6 +1377,298 @@ def tool_loop_completion_confirmed(
     return True
 
 
+def _completion_evidence_tool_names(value: Any) -> tuple[str, ...]:
+    """Normalize required-tool names carried by the attempt-local ledger."""
+
+    if isinstance(value, Mapping):
+        values: Sequence[Any] = tuple(
+            key
+            for key, satisfied in value.items()
+            if satisfied is True
+        )
+    elif isinstance(value, str):
+        values: Sequence[Any] = (value,)
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        values = value
+    else:
+        return ()
+    names: list[str] = []
+    for item in values:
+        name = str(item or "").strip().casefold()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
+
+
+def _completion_evidence_records(value: Any) -> list[Any]:
+    """Read a record list without allowing arbitrary mappings as records."""
+
+    if isinstance(value, Mapping):
+        # A mapping keyed by tool name is accepted for callers that keep a
+        # compact required-operation ledger instead of a list of records.
+        return list(value.values())
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return list(value)
+    return []
+
+
+def _latest_required_records_successful(
+    records: Sequence[Any],
+    required_names: set[str],
+) -> bool:
+    """Require the latest record for every required mutation to succeed."""
+
+    latest: dict[str, Any] = {}
+    for record in records:
+        name = _extract_tool_call_name(record).casefold()
+        if name in required_names:
+            latest[name] = record
+    return all(
+        name in latest and _audit_tool_call_successful(latest[name])
+        for name in required_names
+    )
+
+
+def _authoritative_task_mutation_completion(
+    completion_evidence: CompletionEvidence | None,
+    *,
+    user_input: str | None,
+    audit_tool_calls: Sequence[Any] | None,
+) -> tuple[bool, list[Any]]:
+    """Validate attempt-local proof for a deterministic task mutation.
+
+    ``audit_tool_calls`` is intentionally not used as the proof of
+    completion: it can include optional/superseded failures from earlier
+    continuation attempts.  The caller supplies a separate attempt-local
+    ledger where ``postconditions_verified`` (or the backwards compatible
+    ``required_mutations_satisfied`` alias) is set only after the required
+    mutation's structured result proves the requested postcondition.
+    The audit list remains available for diagnostics and the existing
+    missing-mutation guard.
+    """
+
+    if not isinstance(completion_evidence, Mapping):
+        return False, []
+    if completion_evidence.get("authoritative") is not True:
+        return False, []
+    request = str(user_input or "")
+    if request.strip() and not _simple_task_request_is_explicit(request):
+        return False, []
+    required_mutations_satisfied = completion_evidence.get(
+        "required_mutations_satisfied"
+    )
+    if required_mutations_satisfied is None:
+        required_mutations_satisfied = completion_evidence.get(
+            "postconditions_verified"
+        )
+    if required_mutations_satisfied is None:
+        required_mutations_satisfied = completion_evidence.get(
+            "postcondition_verified"
+        )
+    if required_mutations_satisfied is not True:
+        return False, []
+    # A producer may expose this optional, more explicit spelling.  If it is
+    # present, a false value must always fail closed; an absent value is
+    # covered by ``required_mutations_satisfied`` for backwards compatibility.
+    if (
+        completion_evidence.get("postcondition_verified") is False
+        or completion_evidence.get("postconditions_verified") is False
+    ):
+        return False, []
+    required_failure = completion_evidence.get("required_failure")
+    if required_failure not in (None, False, "", (), [], {}):
+        return False, []
+
+    required_names = _completion_evidence_tool_names(
+        completion_evidence.get("required_tools")
+    )
+    if not required_names or any(
+        name not in AUTHORITATIVE_TASK_MUTATION_TOOLS for name in required_names
+    ):
+        return False, []
+    requested_mutations = requested_deterministic_task_mutation_tools(request)
+    if request.strip() and set(required_names) != requested_mutations:
+        # The attempt-local ledger cannot narrow a user request from a
+        # multi-mutation operation to one create merely by omitting the other
+        # required tool.
+        return False, []
+
+    satisfied_names = _completion_evidence_tool_names(
+        completion_evidence.get("satisfied_tools")
+    )
+    if "satisfied_tools" in completion_evidence and not set(required_names).issubset(
+        satisfied_names
+    ):
+        return False, []
+
+    required_records = _completion_evidence_records(
+        completion_evidence.get("required_tool_records")
+    )
+    if not required_records:
+        # A compact producer may expose only the attempt-local ``tool_records``
+        # list.  Derive the required subset from that list; never derive it
+        # from the all-attempt audit history, which may contain stale failures.
+        attempt_candidates = _completion_evidence_records(
+            completion_evidence.get("tool_records")
+        )
+        required_records = [
+            record
+            for record in attempt_candidates
+            if _extract_tool_call_name(record).casefold() in required_names
+        ]
+    if not required_records:
+        return False, []
+
+    # Every required operation must have a concrete successful record in this
+    # logical attempt.  Optional failures elsewhere in the audit history are
+    # deliberately ignored here.
+    if not _latest_required_records_successful(
+        required_records,
+        set(required_names),
+    ):
+        return False, []
+
+    attempt_records = _completion_evidence_records(
+        completion_evidence.get("tool_records")
+    )
+    if attempt_records:
+        if not _latest_required_records_successful(
+            attempt_records,
+            set(required_names),
+        ):
+            return False, []
+    else:
+        # The required records themselves are the minimum attempt evidence for
+        # legacy producers that do not expose the full attempt list.
+        attempt_records = list(required_records)
+
+    # A create receipt cannot authorize a turn that also committed another
+    # deterministic task mutation.  Check both the attempt-local sequence and
+    # any ordered audit records supplied by the caller; optional failures are
+    # harmless, but a successful second side effect is ambiguous and must
+    # remain fail-closed.
+    if _simple_task_has_unexpected_successful_mutation(
+        [*list(audit_tool_calls or ()), *attempt_records]
+    ):
+        return False, []
+
+    if "create_task" in requested_mutations:
+        # A task create is authoritative only after the duplicate-candidate
+        # search also succeeded with no candidates.  A producer may publish
+        # that fact directly; otherwise retain the search record from the
+        # audit ledger as the independent precondition.  ``required_tool_records``
+        # intentionally contains only mutation records.
+        duplicate_search_succeeded = completion_evidence.get(
+            "duplicate_search_succeeded"
+        )
+        if duplicate_search_succeeded is not None:
+            if duplicate_search_succeeded is not True:
+                return False, []
+        explicit_search_records = _completion_evidence_records(
+            completion_evidence.get("search_records")
+        )
+        if duplicate_search_succeeded is True and explicit_search_records:
+            # The producer has already associated this successful empty search
+            # with the mutation chain.  Do not let a later optional search
+            # failure in the cumulative audit ledger replace that proof.
+            search_records = explicit_search_records
+        else:
+            search_records = explicit_search_records
+            search_records.extend(list(audit_tool_calls or ()))
+            search_records.extend(attempt_records)
+        if successful_empty_task_search(search_records) is not True:
+            return False, []
+    if _simple_task_post_create_has_blocked_work(
+        attempt_records if attempt_records else list(audit_tool_calls or ())
+    ):
+        return False, []
+
+    return True, attempt_records
+
+
+def _response_claims_unproven_task_creation(
+    response: str | None,
+    *,
+    user_input: str | None,
+    audit_tool_calls: Sequence[Any] | None,
+    completion_evidence: CompletionEvidence | None,
+) -> bool:
+    """Reject a success sentence when no authoritative create proof exists."""
+
+    request = str(user_input or "")
+    if not _simple_task_request_is_explicit(request):
+        return False
+    if requested_deterministic_task_mutation_tools(request) != {"create_task"}:
+        return False
+    semantic_completion, _ = _authoritative_task_mutation_completion(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    if completion_evidence is None:
+        semantic_completion = (
+            simple_task_mutation_completion_state(
+                user_input,
+                audit_tool_calls,
+            )
+            is SimpleTaskMutationCompletionState.COMPLETE
+        )
+    if semantic_completion:
+        return False
+    text = str(response or "").strip().casefold()
+    if not text:
+        return False
+    if any(
+        marker in text
+        for marker in (
+            "失敗",
+            "できません",
+            "できなかった",
+            "未完了",
+            "作成していません",
+            "作成しません",
+            "作成できません",
+            "not created",
+            "failed",
+            "cannot create",
+        )
+    ):
+        return False
+    return any(
+        marker in text
+        for marker in (
+            "作成しました",
+            "作成済み",
+            "作成完了",
+            "登録しました",
+            "登録済み",
+            "登録完了",
+            "登録完了しました",
+            "追加しました",
+            "追加済み",
+            "追加完了",
+            "追加完了しました",
+            "登録されています",
+            "追加されています",
+            "作成されています",
+            "タスクを作成",
+            "タスクが登録",
+            "タスクが追加",
+            "タスク登録完了",
+            "タスク追加完了",
+            "タスク作成完了",
+            "created the task",
+            "task created",
+            "task successfully created",
+            "task has been created",
+            "task is created",
+            "created successfully",
+            "registered the task",
+            "added the task",
+        )
+    )
+
+
 def agentic_review_short_circuits_done(
     *,
     client: object,
@@ -598,12 +1676,17 @@ def agentic_review_short_circuits_done(
     response: str | None,
     completion_confirmed: bool = False,
     audit_tool_calls: Sequence[Any] | None = None,
+    completion_evidence: CompletionEvidence | None = None,
 ) -> bool:
     """Skip model review only for a mechanically confirmed complete tool turn.
 
     ``completion_confirmed`` is produced by the provider/tool loop only after
-    it reached a normal final stop with successful tool executions.  It is
-    necessary but deliberately not sufficient:
+    it reached a normal final stop with successful tool executions.  An
+    attempt-local ``completion_evidence`` mapping is an explicit alternative
+    for deterministic task mutations: it can prove that the required mutation
+    and postcondition succeeded even when the all-record audit ledger contains
+    an optional/superseded failure.  It is necessary but deliberately not
+    sufficient:
 
     - there must also be a non-empty successful audit ledger for this turn;
     - empty/progress/future-action responses still require review;
@@ -617,20 +1700,90 @@ def agentic_review_short_circuits_done(
     preserving the existing fail-closed mutation/approval/planning boundary.
     """
 
-    if not completion_confirmed:
+    semantic_completion, semantic_records = _authoritative_task_mutation_completion(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    # Older/local providers do not publish the richer attempt-local mapping.
+    # Derive the same narrow semantic state from their audit records rather
+    # than allowing a generic completion boolean to claim a compact or
+    # malformed task receipt.  The full audit list is never filtered.
+    if completion_evidence is None:
+        semantic_state = simple_task_mutation_completion_state(
+            user_input,
+            audit_tool_calls,
+        )
+        if semantic_state is SimpleTaskMutationCompletionState.COMPLETE:
+            semantic_completion = True
+            semantic_records = list(audit_tool_calls or ())
+        elif _simple_task_duplicate_search_blocked(
+            user_input,
+            _completion_evidence_records_for_search(
+                completion_evidence,
+                audit_tool_calls,
+            ),
+        ):
+            # An ambiguous/failed duplicate search is a hard mutation
+            # boundary.  Do not let a provider's generic completion boolean or
+            # reviewer wording turn that state into a successful create.
+            return False
+    request_text = str(user_input or "")
+    requested_task_mutations = requested_deterministic_task_mutation_tools(
+        request_text
+    )
+    if (
+        requested_task_mutations
+        and not _simple_task_request_is_explicit(request_text)
+        and any(
+            _extract_tool_call_name(record).casefold()
+            in DETERMINISTIC_TASK_MUTATION_TOOLS
+            for record in _completion_evidence_records_for_search(
+                completion_evidence,
+                audit_tool_calls,
+            )
+        )
+    ):
+        # A task-shaped result embedded in artifact/project/multi-scope work
+        # cannot use the simple-create fast path, even if the provider's
+        # generic completion bit says the latest call stopped normally.
+        return False
+    if not completion_confirmed and not semantic_completion:
+        return False
+
+    # When TurnExecution supplies a semantic ledger for a task request, a
+    # non-authoritative ledger is an explicit statement that the required
+    # mutation/postcondition is not proven.  Do not fall back to the legacy
+    # all-success completion marker in that case (which would otherwise treat
+    # a compact ``{id: ...}`` receipt as success).  Legacy callers that do not
+    # provide an evidence mapping retain their historical behavior.
+    if (
+        isinstance(completion_evidence, Mapping)
+        and completion_evidence.get("authoritative") is not True
+        and requested_deterministic_task_mutation_tools(str(user_input or ""))
+        & DETERMINISTIC_TASK_MUTATION_TOOLS
+    ):
         return False
 
     text = str(response or "").strip()
-    if not text:
+    if not text and not semantic_completion:
         return False
 
     records = list(audit_tool_calls or ())
+    if semantic_completion and not records:
+        records = list(semantic_records)
     if not records:
         # Never trust a boolean completion marker without the run's concrete
         # tool evidence.  This also prevents stale/shared client state from
         # suppressing review.
         return False
-    if any(not _audit_tool_call_successful(record) for record in records):
+    # The ordinary completion marker still requires an all-successful audit
+    # ledger.  An attempt-local authoritative mutation proof is the explicit
+    # exception: unrelated/superseded failures remain in ``records`` for
+    # audit/UI, but do not reopen an already satisfied task request.
+    if not semantic_completion and any(
+        not _audit_tool_call_successful(record) for record in records
+    ):
         return False
 
     policy = get_client_generation_policy(client)
@@ -642,16 +1795,27 @@ def agentic_review_short_circuits_done(
         return False
 
     explicit_capabilities = command_capabilities_from_text(request)
-    if explicit_capabilities.intersection(EXPLICIT_COMPLETION_CAPABILITIES):
+    # ``task_update`` is the trusted command capability used by the structured
+    # task mutation controller.  Once its attempt-local postcondition proof is
+    # authoritative, it must not force a redundant verifier call.  Other
+    # explicit capabilities (web/artifact/progress/review work) remain
+    # verification-sensitive and keep the fail-closed reviewer pass.
+    verification_sensitive_capabilities = (
+        EXPLICIT_COMPLETION_CAPABILITIES - {"task_update"}
+    )
+    if explicit_capabilities.intersection(verification_sensitive_capabilities):
+        return False
+    if "task_update" in explicit_capabilities and not semantic_completion:
         return False
 
-    if response_looks_like_incomplete_final_answer(text):
+    if not semantic_completion and response_looks_like_incomplete_final_answer(text):
         return False
 
-    if response_definitely_incomplete_after_review(
+    if text and response_definitely_incomplete_after_review(
         text,
         user_input=user_input,
         audit_tool_calls=records,
+        completion_evidence=completion_evidence,
     ):
         return False
 
@@ -700,10 +1864,13 @@ def _review_parse_failure_decision(reason: str) -> dict[str, str | bool | None]:
             "the resulting external state, and do not answer with only a plan."
         ),
         "user_request_satisfied": False,
+        "review_protocol_error": True,
     }
 
 
-def parse_agentic_review_decision(content: str) -> dict[str, str]:
+def parse_agentic_review_decision(
+    content: str,
+) -> dict[str, str | bool | None]:
     text = str(content or "").strip()
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
@@ -733,7 +1900,22 @@ def parse_agentic_review_decision(content: str) -> dict[str, str]:
         "reason": str(payload.get("reason") or "").strip(),
         "next_request": str(payload.get("next_request") or "").strip(),
         "user_request_satisfied": user_request_satisfied,
+        "review_protocol_error": False,
     }
+
+
+def _reviewer_echoed_latest_response(
+    decision: dict[str, str | bool | None],
+    review_response: Any,
+    latest_response: Any,
+) -> bool:
+    """Fail closed when a provider ignored the verifier prompt entirely."""
+
+    if decision.get("review_protocol_error") is not True:
+        return False
+    review_text = str(review_response or "").strip()
+    latest_text = str(latest_response or "").strip()
+    return bool(review_text and latest_text and review_text == latest_text)
 
 
 def normalize_agentic_review_decision(
@@ -935,6 +2117,7 @@ async def run_agentic_completion_loop_async(
     tool_evidence_provider: Callable[[], str] | None = None,
     completion_confirmed_provider: Callable[[], bool] | None = None,
     audit_tool_calls_provider: Callable[[], Sequence[Any] | None] | None = None,
+    completion_evidence_provider: CompletionEvidenceProvider | None = None,
     run_review_once: AsyncRunOnce | None = None,
     run_continuation_once: AsyncRunOnce | None = None,
 ) -> str:
@@ -955,6 +2138,8 @@ async def run_agentic_completion_loop_async(
     response = initial_response if initial_response is not None else await run_once(context)
     max_rounds = agentic_max_rounds(client, user_input)
     review_verified = False
+    completion_evidence: CompletionEvidence | None = None
+    audit_tool_calls: Sequence[Any] | None = None
     for round_index in range(1, max_rounds + 1):
         if stream_callback:
             await stream_callback(
@@ -978,12 +2163,18 @@ async def run_agentic_completion_loop_async(
             if audit_tool_calls_provider is not None
             else None
         )
+        completion_evidence = (
+            completion_evidence_provider()
+            if completion_evidence_provider is not None
+            else None
+        )
         if agentic_review_short_circuits_done(
             client=client,
             user_input=user_input,
             response=response,
             completion_confirmed=completion_confirmed,
             audit_tool_calls=audit_tool_calls,
+            completion_evidence=completion_evidence,
         ):
             review_verified = True
             break
@@ -999,7 +2190,13 @@ async def run_agentic_completion_loop_async(
                 tool_evidence=tool_evidence or None,
             )
             review_response = await review_runner(review_prompt)
-            decision = parse_agentic_review_decision(str(review_response or ""))
+            parsed_decision = parse_agentic_review_decision(
+                str(review_response or "")
+            )
+            reviewer_echo = _reviewer_echoed_latest_response(
+                parsed_decision, review_response, response
+            )
+            decision = parsed_decision
             decision = normalize_agentic_review_decision(
                 decision,
                 user_input=user_input,
@@ -1010,7 +2207,10 @@ async def run_agentic_completion_loop_async(
                 user_input=user_input,
                 response=response,
                 audit_tool_calls=audit_tool_calls,
+                completion_evidence=completion_evidence,
             )
+        if response_promises_future_tool_use(response) and not completion_confirmed:
+            reviewer_echo = False
         if stream_callback:
             await stream_callback(
                 "agentic_review",
@@ -1022,8 +2222,37 @@ async def run_agentic_completion_loop_async(
                     "review_response": str(review_response or ""),
                 },
             )
+        if reviewer_echo:
+            break
         if decision["status"] != "continue":
             review_verified = True
+            break
+        if _task_mutation_postcondition_failed(
+            completion_evidence,
+            user_input=user_input,
+            audit_tool_calls=audit_tool_calls,
+        ) or (
+            (
+                not isinstance(completion_evidence, Mapping)
+                or completion_evidence.get("authoritative") is not True
+            )
+            and _simple_task_duplicate_search_blocked(
+                user_input,
+                _completion_evidence_records_for_search(
+                    completion_evidence,
+                    audit_tool_calls,
+                ),
+            )
+        ) or _response_claims_unproven_task_creation(
+            response,
+            user_input=user_input,
+            audit_tool_calls=audit_tool_calls,
+            completion_evidence=completion_evidence,
+        ):
+            # A required mutation was attempted but its receipt is explicitly
+            # incomplete.  Do not launch an automatic update/retry that could
+            # amplify the original mutation; surface the fail-closed result.
+            review_verified = False
             break
 
         if round_index >= max_rounds:
@@ -1060,18 +2289,59 @@ async def run_agentic_completion_loop_async(
     else:
         review_verified = False
 
-    if not review_verified:
+    # Refresh the attempt-local providers after any continuation (and even
+    # when the configured review budget is zero).  A continuation can repair a
+    # task receipt, while a pre-proven deterministic mutation must not be
+    # downgraded merely because the verifier loop had no rounds.
+    if audit_tool_calls_provider is not None:
+        audit_tool_calls = audit_tool_calls_provider()
+    if completion_evidence_provider is not None:
+        completion_evidence = completion_evidence_provider()
+
+    postcondition_failure = _task_mutation_postcondition_failed(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    semantic_completion, _ = _authoritative_task_mutation_completion(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    if postcondition_failure:
+        # Do not echo a model sentence claiming that the task was created when
+        # its receipt did not prove the requested fields.
         response = build_incomplete_work_failure_response(
             user_input=user_input,
-            latest_response=response,
+            latest_response="",
         )
-    elif response_looks_like_unfinished_work(user_input, response):
+    elif not review_verified and not semantic_completion:
+        response = build_incomplete_work_failure_response(
+            user_input=user_input,
+            latest_response=(
+                ""
+                if _response_claims_unproven_task_creation(
+                    response,
+                    user_input=user_input,
+                    audit_tool_calls=audit_tool_calls,
+                    completion_evidence=completion_evidence,
+                )
+                else response
+            ),
+        )
+    elif response_looks_like_unfinished_work(user_input, response) and not (
+        semantic_completion and not str(response or "").strip()
+    ):
         response = build_incomplete_work_failure_response(
             user_input=user_input,
             latest_response=response,
         )
 
-    if max_rounds == 0 and response_looks_like_unfinished_work(user_input, response):
+    if (
+        max_rounds == 0
+        and response_looks_like_unfinished_work(user_input, response)
+        and not (semantic_completion and not str(response or "").strip())
+    ):
         response = build_incomplete_work_failure_response(
             user_input=user_input,
             latest_response=response,
@@ -1094,6 +2364,7 @@ def run_agentic_completion_loop_sync(
     tool_evidence_provider: Callable[[], str] | None = None,
     completion_confirmed_provider: Callable[[], bool] | None = None,
     audit_tool_calls_provider: Callable[[], Sequence[Any] | None] | None = None,
+    completion_evidence_provider: CompletionEvidenceProvider | None = None,
     run_review_once: SyncRunOnce | None = None,
     run_continuation_once: SyncRunOnce | None = None,
 ) -> str:
@@ -1108,6 +2379,8 @@ def run_agentic_completion_loop_sync(
     response = initial_response if initial_response is not None else run_once(context)
     max_rounds = agentic_max_rounds(client, user_input)
     review_verified = False
+    completion_evidence: CompletionEvidence | None = None
+    audit_tool_calls: Sequence[Any] | None = None
     for round_index in range(1, max_rounds + 1):
         tool_evidence = (
             tool_evidence_provider() if tool_evidence_provider is not None else None
@@ -1122,12 +2395,18 @@ def run_agentic_completion_loop_sync(
             if audit_tool_calls_provider is not None
             else None
         )
+        completion_evidence = (
+            completion_evidence_provider()
+            if completion_evidence_provider is not None
+            else None
+        )
         if agentic_review_short_circuits_done(
             client=client,
             user_input=user_input,
             response=response,
             completion_confirmed=completion_confirmed,
             audit_tool_calls=audit_tool_calls,
+            completion_evidence=completion_evidence,
         ):
             review_verified = True
             break
@@ -1143,7 +2422,13 @@ def run_agentic_completion_loop_sync(
                 tool_evidence=tool_evidence or None,
             )
             review_response = review_runner(review_prompt)
-            decision = parse_agentic_review_decision(str(review_response or ""))
+            parsed_decision = parse_agentic_review_decision(
+                str(review_response or "")
+            )
+            reviewer_echo = _reviewer_echoed_latest_response(
+                parsed_decision, review_response, response
+            )
+            decision = parsed_decision
             decision = normalize_agentic_review_decision(
                 decision,
                 user_input=user_input,
@@ -1154,7 +2439,10 @@ def run_agentic_completion_loop_sync(
                 user_input=user_input,
                 response=response,
                 audit_tool_calls=audit_tool_calls,
+                completion_evidence=completion_evidence,
             )
+        if response_promises_future_tool_use(response) and not completion_confirmed:
+            reviewer_echo = False
         if event_callback:
             event_callback(
                 "agentic_review",
@@ -1166,8 +2454,36 @@ def run_agentic_completion_loop_sync(
                     "review_response": str(review_response or ""),
                 },
             )
+        if reviewer_echo:
+            break
         if decision["status"] != "continue":
             review_verified = True
+            break
+        if _task_mutation_postcondition_failed(
+            completion_evidence,
+            user_input=user_input,
+            audit_tool_calls=audit_tool_calls,
+        ) or (
+            (
+                not isinstance(completion_evidence, Mapping)
+                or completion_evidence.get("authoritative") is not True
+            )
+            and _simple_task_duplicate_search_blocked(
+                user_input,
+                _completion_evidence_records_for_search(
+                    completion_evidence,
+                    audit_tool_calls,
+                ),
+            )
+        ) or _response_claims_unproven_task_creation(
+            response,
+            user_input=user_input,
+            audit_tool_calls=audit_tool_calls,
+            completion_evidence=completion_evidence,
+        ):
+            # Do not issue an automatic follow-up mutation after an explicit
+            # postcondition failure; return a clear fail-closed response.
+            review_verified = False
             break
 
         if round_index >= max_rounds:
@@ -1195,18 +2511,58 @@ def run_agentic_completion_loop_sync(
     else:
         review_verified = False
 
-    if not review_verified:
+    # Refresh the terminal attempt evidence before applying fail-closed checks
+    # (the async loop above follows the same rule).
+    if audit_tool_calls_provider is not None:
+        audit_tool_calls = audit_tool_calls_provider()
+    if completion_evidence_provider is not None:
+        completion_evidence = completion_evidence_provider()
+
+    postcondition_failure = _task_mutation_postcondition_failed(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    semantic_completion, _ = _authoritative_task_mutation_completion(
+        completion_evidence,
+        user_input=user_input,
+        audit_tool_calls=audit_tool_calls,
+    )
+    if postcondition_failure:
+        # Keep an explicitly unverified task receipt fail-closed even when the
+        # final work-profile continuation was allowed to return normally; do
+        # not echo its stale success claim in the failure response.
         response = build_incomplete_work_failure_response(
             user_input=user_input,
-            latest_response=response,
+            latest_response="",
         )
-    elif response_looks_like_unfinished_work(user_input, response):
+    elif not review_verified and not semantic_completion:
+        response = build_incomplete_work_failure_response(
+            user_input=user_input,
+            latest_response=(
+                ""
+                if _response_claims_unproven_task_creation(
+                    response,
+                    user_input=user_input,
+                    audit_tool_calls=audit_tool_calls,
+                    completion_evidence=completion_evidence,
+                )
+                else response
+            ),
+        )
+    elif response_looks_like_unfinished_work(user_input, response) and not (
+        semantic_completion and not str(response or "").strip()
+    ):
         response = build_incomplete_work_failure_response(
             user_input=user_input,
             latest_response=response,
         )
 
-    if max_rounds == 0 and response_looks_like_unfinished_work(user_input, response):
+    if (
+        max_rounds == 0
+        and response_looks_like_unfinished_work(user_input, response)
+        and not (semantic_completion and not str(response or "").strip())
+    ):
         response = build_incomplete_work_failure_response(
             user_input=user_input,
             latest_response=response,

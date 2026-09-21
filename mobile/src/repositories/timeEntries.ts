@@ -1,8 +1,8 @@
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, or } from "drizzle-orm";
 import { getDb, schema } from "../db/client";
 import { decodeTokenPayload, getToken } from "../lib/auth";
 import { taskApi } from "../lib/task-api";
-import { useNetworkStore } from "../stores/network";
+import { canAttemptAoiTalkServer } from "../stores/network";
 import type { TimeEntry, TimeReport, TimeReportBucket } from "../types/api";
 import { enqueueOutbox, randomId } from "./outbox";
 import { compareTaskTimestamps, isTaskTombstoned } from "./tasks";
@@ -107,18 +107,36 @@ function withinDateRange(
 async function currentUserId(): Promise<string | null> {
   const token = await getToken();
   if (!token) return null;
-  return decodeTokenPayload(token, { ignoreExpiration: true })?.user_id ?? null;
+  const userId = decodeTokenPayload(token, { ignoreExpiration: true })?.user_id;
+  return typeof userId === "string" && userId.trim().length > 0 ? userId : null;
+}
+
+/**
+ * Local time entries are account-owned.  Anonymous rows predate the account
+ * scope column and are represented by either NULL or the empty string; they
+ * remain visible only while no token is present.  In particular, signing in
+ * must never expose one of those rows to the authenticated account.
+ */
+function localUserCondition(userId: string | null) {
+  return userId
+    ? eq(schema.timeEntries.userId, userId)
+    : or(isNull(schema.timeEntries.userId), eq(schema.timeEntries.userId, ""));
+}
+
+function belongsToUser(entry: Pick<TimeEntry, "user_id"> | null | undefined, userId: string | null): boolean {
+  const entryUserId = typeof entry?.user_id === "string" ? entry.user_id : "";
+  return userId ? entryUserId === userId : entryUserId.length === 0;
 }
 
 async function canUseServer(): Promise<boolean> {
-  const network = useNetworkStore.getState();
-  return network.online && network.serverReachable && Boolean(await getToken());
+  return canAttemptAoiTalkServer() && Boolean(await getToken());
 }
 
 async function joinTimeEntries(
   scope?: TimeEntryScope | null,
   taskId?: string | null,
 ): Promise<JoinedTimeEntryRow[]> {
+  const userId = await currentUserId();
   const db = getDb();
   let projectIds: string[] | null = null;
   const projectId = typeof scope === "string" ? scope : scope?.project_id;
@@ -149,6 +167,7 @@ async function joinTimeEntries(
     .innerJoin(schema.projects, eq(schema.tasks.projectId, schema.projects.id))
     .where(
       and(
+        localUserCondition(userId),
         projectId ? eq(schema.tasks.projectId, projectId) : undefined,
         projectIds ? inArray(schema.tasks.projectId, projectIds) : undefined,
         taskId ? eq(schema.timeEntries.taskId, taskId) : undefined,
@@ -161,11 +180,22 @@ async function joinTimeEntries(
 
 export async function applyRemoteTimeEntries(list: TimeEntry[]): Promise<void> {
   if (!list.length) return;
+  // Sync responses can contain entries from other members of a shared
+  // project.  The local time-entry cache is account-owned, so filter before
+  // touching SQLite (not only at the list/refresh boundary).  An opaque or
+  // undecodable token is fail-closed rather than being treated as anonymous.
+  const token = await getToken();
+  const userId = token ? await currentUserId() : null;
+  const scoped = list.filter((entry) => {
+    const entryUserId = typeof entry.user_id === "string" ? entry.user_id : "";
+    return token ? Boolean(userId) && entryUserId === userId : !entryUserId;
+  });
+  if (!scoped.length) return;
   const db = getDb();
   const now = new Date().toISOString();
   const ledger = await loadTombstoneLedger("time-entries:tombstones");
   let ledgerChanged = false;
-  for (const entry of list) {
+  for (const entry of scoped) {
     if (await isTaskTombstoned(entry.task_id)) continue;
     const existing = await db
       .select({ deletedAt: schema.timeEntries.deletedAt, updatedAt: schema.timeEntries.updatedAt })
@@ -369,8 +399,13 @@ export const timeEntriesRepo = {
     dateTo?: string,
   ): Promise<TimeEntry[]> {
     const list = await taskApi.listTimeEntries(scope, dateFrom, dateTo);
-    await applyRemoteTimeEntries(list);
-    return list;
+    // The API may return entries from other members of a shared project.  A
+    // mobile account cache/report is user-scoped, so do not surface or cache
+    // those records even when the server request itself succeeds.
+    const userId = await currentUserId();
+    const scoped = list.filter((entry) => belongsToUser(entry, userId));
+    await applyRemoteTimeEntries(scoped);
+    return scoped;
   },
 
   async getReport(
@@ -394,8 +429,10 @@ export const timeEntriesRepo = {
     const local = await this.getActiveLocal(taskId);
     if (local) return local;
     if (!(await canUseServer())) return null;
+    const userId = await currentUserId();
+    if (!userId) return null;
     const remote = await taskApi.getActiveTimer();
-    if (remote) {
+    if (remote && belongsToUser(remote, userId)) {
       await applyRemoteTimeEntries([remote]);
       if (!taskId || remote.task_id === taskId) return remote;
     }
@@ -564,7 +601,12 @@ export const timeEntriesRepo = {
     await db
       .update(schema.timeEntries)
       .set({ endedAt: now, updatedAt: now })
-      .where(eq(schema.timeEntries.id, active.id));
+      .where(
+        and(
+          eq(schema.timeEntries.id, active.id),
+          localUserCondition(await currentUserId()),
+        ),
+      );
     if (hasToken) {
       await enqueueOutbox({
         table: "time_entries",
@@ -603,12 +645,19 @@ export const timeEntriesRepo = {
     }
 
     const db = getDb();
+    const userId = await currentUserId();
     const before = (
       await db
         .select()
         .from(schema.timeEntries)
-        .where(eq(schema.timeEntries.id, entryId))
+        .where(
+          and(
+            eq(schema.timeEntries.id, entryId),
+            localUserCondition(userId),
+          ),
+        )
     )[0];
+    if (!before) throw new Error("Time entry not found");
     const patch: Partial<typeof schema.timeEntries.$inferInsert> = {
       updatedAt: new Date().toISOString(),
     };
@@ -626,7 +675,12 @@ export const timeEntriesRepo = {
     await db
       .update(schema.timeEntries)
       .set(patch)
-      .where(eq(schema.timeEntries.id, entryId));
+      .where(
+        and(
+          eq(schema.timeEntries.id, entryId),
+          localUserCondition(userId),
+        ),
+      );
     if (hasToken) {
       await enqueueOutbox({
         table: "time_entries",
@@ -644,6 +698,7 @@ export const timeEntriesRepo = {
   async delete(entryId: string): Promise<void> {
     const db = getDb();
     const hasToken = Boolean(await getToken());
+    const userId = await currentUserId();
     let shouldQueue = hasToken;
     if (await canUseServer()) {
       try {
@@ -658,8 +713,14 @@ export const timeEntriesRepo = {
         await db
           .select()
           .from(schema.timeEntries)
-          .where(eq(schema.timeEntries.id, entryId))
+          .where(
+            and(
+              eq(schema.timeEntries.id, entryId),
+              localUserCondition(userId),
+            ),
+          )
       )[0];
+      if (!before) throw new Error("Time entry not found");
       await enqueueOutbox({
         table: "time_entries",
         action: "delete",
@@ -672,6 +733,11 @@ export const timeEntriesRepo = {
     await db
       .update(schema.timeEntries)
       .set({ deletedAt: now, updatedAt: now })
-      .where(eq(schema.timeEntries.id, entryId));
+      .where(
+        and(
+          eq(schema.timeEntries.id, entryId),
+          localUserCondition(userId),
+        ),
+      );
   },
 };

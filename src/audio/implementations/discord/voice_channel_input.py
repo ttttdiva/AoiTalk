@@ -28,6 +28,7 @@ class VoiceChannelInput(BaseAudioInput):
         
         self.voice_client = voice_client
         self.user_id = user_id
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         
         # ユーザー別の音声バッファ
         self.audio_buffers: Dict[int, bytearray] = defaultdict(bytearray)
@@ -41,6 +42,7 @@ class VoiceChannelInput(BaseAudioInput):
         
     async def _initialize_resources(self) -> None:
         """リソースの初期化"""
+        self._loop = asyncio.get_running_loop()
         # カスタムシンクを作成してリスニング開始
         if hasattr(self.voice_client, 'listen'):
             self._audio_sink = CustomAudioSink(self)
@@ -51,6 +53,7 @@ class VoiceChannelInput(BaseAudioInput):
         # リスニングを停止
         if hasattr(self.voice_client, 'stop_listening'):
             self.voice_client.stop_listening()
+        self._loop = None
             
         # バッファをクリア
         self.audio_buffers.clear()
@@ -130,10 +133,18 @@ class VoiceChannelInput(BaseAudioInput):
         # PCMデータをfloat32に変換
         audio_array = np.frombuffer(pcm_data, dtype=np.int16).astype(np.float32) / 32768.0
         
-        # キューに追加
-        asyncio.create_task(self._audio_queue.put(audio_array))
-        
-        # コールバックを呼び出す
+        # discord-ext-voice-recv invokes sink.write() from its receive thread.
+        # asyncio.create_task() from that thread raises "no running event loop".
+        # Marshal both queue mutation and callbacks back to the owning loop.
+        loop = self._loop
+        if loop is None or loop.is_closed() or self._audio_queue is None:
+            return
+        loop.call_soon_threadsafe(self._deliver_audio, audio_array)
+
+    def _deliver_audio(self, audio_array: np.ndarray) -> None:
+        if not self._active or self._audio_queue is None:
+            return
+        self._audio_queue.put_nowait(audio_array)
         self._invoke_callback(audio_array)
 
 

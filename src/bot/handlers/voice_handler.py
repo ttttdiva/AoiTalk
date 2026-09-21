@@ -219,7 +219,10 @@ class VoiceHandler:
             voice_client = await channel.connect(
                 cls=voice_recv.VoiceRecvClient,
                 timeout=20.0,
-                reconnect=False,
+                # Let discord.py recover transient voice websocket failures.
+                # Disabling reconnect makes a short Discord/network hiccup
+                # permanently kill the receive path until a manual /join.
+                reconnect=True,
             )
             logger.info(f"Voice client type: {type(voice_client)}")
 

@@ -77,6 +77,11 @@ export interface AppFile {
   [key: string]: unknown;
 }
 
+export interface AppFilesResponse {
+  files: AppFile[];
+  release_id?: string;
+}
+
 export interface AppJob {
   id: string;
   app_id: string;
@@ -286,11 +291,19 @@ export class AppsApiError extends Error {
 
 async function appsApiError(response: Response): Promise<AppsApiError> {
   const detail = await response.json().catch(() => ({ detail: response.statusText }));
-  const message = typeof detail?.detail === "string"
-    ? detail.detail
-    : typeof detail?.message === "string"
-      ? detail.message
-      : response.statusText;
+  const detailRecord = detail && typeof detail === "object" && !Array.isArray(detail)
+    ? detail as Record<string, unknown>
+    : undefined;
+  const nestedDetail = detailRecord?.detail && typeof detailRecord.detail === "object" && !Array.isArray(detailRecord.detail)
+    ? detailRecord.detail as Record<string, unknown>
+    : undefined;
+  const message = typeof detailRecord?.detail === "string"
+    ? detailRecord.detail
+    : typeof detailRecord?.message === "string"
+      ? detailRecord.message
+      : typeof nestedDetail?.message === "string"
+        ? nestedDetail.message
+        : response.statusText;
   return new AppsApiError(message || `API Error: ${response.status}`, response.status, detail);
 }
 
@@ -348,7 +361,7 @@ export const appsApi = {
       json(input),
     ),
   getTargets: (appId: string, projectId?: string) => appsApiFetch<{ targets: AppTarget[] }>(`/apps/${appId}/targets${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
-  getFiles: (appId: string, projectId?: string) => appsApiFetch<{ files: AppFile[] }>(`/apps/${appId}/files${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
+  getFiles: (appId: string, projectId?: string) => appsApiFetch<AppFilesResponse>(`/apps/${appId}/files${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ""}`),
   previewSourceImport: (appId: string, input: { files: AppSourceImportFile[]; expected_revision?: string | null; root_mode?: "strip_common" | "preserve" }, projectId?: string) => {
     const formData = new FormData();
     input.files.forEach(({ file, relativePath }) => {

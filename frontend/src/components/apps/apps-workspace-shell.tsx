@@ -4,11 +4,11 @@ import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import useSWR from "swr";
-import { Boxes, Plus, Search } from "lucide-react";
+import { Boxes, Download, Plus, Search } from "lucide-react";
 import { buttonVariants } from "@/components/ui/button";
 import { AppSelect } from "@/components/ui/app-select";
 import { Input } from "@/components/ui/input";
-import { appsApi, type AppSummary, type ProjectAppBinding } from "@/lib/apps-api";
+import { appsApi, permissionAtLeast, type AppSummary, type ProjectAppBinding } from "@/lib/apps-api";
 import { useWorkspaceShellRegistration } from "@/components/layout/shell-context";
 import { AppIdentityIcon } from "@/components/apps/app-identity-icon";
 import { getAppVisualIdentity } from "@/lib/app-visual-identity";
@@ -68,6 +68,16 @@ export function AppsWorkspaceShell({
     [projectAppsData?.apps],
   );
   const boundAppIds = useMemo(() => new Set(projectApps.map((binding) => binding.app_id)), [projectApps]);
+  const activeProjectBinding = useMemo(
+    () => projectApps.find((binding) => binding.app_id === activeAppId),
+    [activeAppId, projectApps],
+  );
+  const activeProjectApp = activeProjectBinding?.app;
+  const canDownloadActiveApp = Boolean(
+    embedded
+      && activeProjectApp
+      && permissionAtLeast(activeProjectBinding?.permission, "runner"),
+  );
 
   const apps = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -238,7 +248,21 @@ export function AppsWorkspaceShell({
           )}
         </div>
       )}
-      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto" data-shell-region="apps-workspace-content">{children}</div>
+      <div className="min-h-0 min-w-0 flex-1 overflow-y-auto" data-shell-region="apps-workspace-content">
+        {canDownloadActiveApp && activeProjectApp && (
+          <div className="sticky top-0 z-20 flex justify-end border-b border-border/80 bg-background/95 px-4 py-2 backdrop-blur">
+            <a
+              href={appsApi.downloadArchive(activeProjectApp.id, projectId || undefined, { git: true, dependencies: true, runtime: true, credentials: true })}
+              download
+              className={buttonVariants({ variant: "outline", size: "sm", className: "h-8 px-3" })}
+              title={`${activeProjectApp.name} を軽量・安全設定でダウンロード`}
+            >
+              <Download className="size-3.5" /> ダウンロード
+            </a>
+          </div>
+        )}
+        {children}
+      </div>
     </div>
   );
 }

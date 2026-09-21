@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from openai import OpenAI
 from ...services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     PrivacyError,
     get_privacy_policy_context,
@@ -524,13 +525,6 @@ class NanobananaProService:
                 usage_context=usage_context,
                 resolved_context=resolved_context,
             )
-            protected = privacy_gateway.protect_sync(
-                {"prompt": prompt},
-                provider="openai",
-                source_kind="nanobanana_image",
-            )
-            if isinstance(protected.payload, Mapping):
-                prompt = str(protected.payload.get("prompt") or prompt)
         except Exception as exc:
             # The prompt must never reach OpenAI without a resolved privacy
             # policy.  Keep the slash command usable as a summary-only reply.
@@ -542,19 +536,47 @@ class NanobananaProService:
             return None, prompt
 
         if self._client is None:
-            self._client = OpenAI(api_key=api_key)
+            # Keep one provider attempt per reviewed egress transaction;
+            # otherwise the SDK can replay a prompt after a transient error
+            # without re-running privacy review.
+            self._client = OpenAI(api_key=api_key, max_retries=0)
 
         import time
 
         started = time.monotonic()
         try:
             logger.info("Generating Nanobanana Pro hero image via OpenAI Images API")
-            response = self._client.images.generate(
+            descriptor = EgressDescriptor(
+                action="image.generate",
+                transport="openai.images",
+                destination="https://api.openai.com/v1/images/generations",
+                provider="openai",
+                tool="nanobanana",
                 model="gpt-image-1",
-                prompt=prompt,
-                size="1024x1024",
-                quality="high",
-                response_format="b64_json"
+            )
+
+            def send_image_request(protected_payload: Any) -> Any:
+                if not isinstance(protected_payload, Mapping):
+                    raise PrivacyError("privacy protection returned no image prompt")
+                outbound_prompt = str(protected_payload.get("prompt") or "")
+                if not outbound_prompt:
+                    raise PrivacyError("image generation prompt is empty")
+                return self._client.images.generate(
+                    model="gpt-image-1",
+                    prompt=outbound_prompt,
+                    size="1024x1024",
+                    quality="high",
+                    response_format="b64_json",
+                )
+
+            response = privacy_gateway.execute_sync(
+                {"prompt": prompt},
+                provider="openai",
+                descriptor=descriptor,
+                sender=send_image_request,
+                base_url="https://api.openai.com/v1",
+                source_kind="nanobanana_image",
+                model="gpt-image-1",
             )
             image_data = response.data[0].b64_json
             image_bytes = base64.b64decode(image_data)

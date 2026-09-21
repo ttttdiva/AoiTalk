@@ -14,6 +14,9 @@ Docsノードの本文正本は `knowledge_nodes` の子ノード階層で表現
   `body_json.blank=true` の組み合わせに限る。この組み合わせを満たさない任意の空title
   KnowledgeNode（legacy/import由来を含む）は引き続き保存・表示してはならない。空paragraph
   に可視ラベルを補うことも禁止し、titleとbody_textのmirror原則は空文字同士で維持する。
+  `body_json` は暗号化保存されるため、一覧・子・outline・共有のSQL投影は
+  `knowledge_nodes.is_explicit_blank`（writerがmarkerから導出する非機密discriminator）を
+  使う。migrationのcrypto-aware backfillが完了しない環境では空行をfail-closedで表示しない。
 - 短い1行のprompt、command、URL、引用は通常の編集可能nodeとして保存してよい。複数行、
   整形依存、長い行を含むClipIngest原文も、`markdown` または `code` の typed child
   KnowledgeNodeとして保存する。表示本文をreadonlyの `body_json.verbatim_blocks` /
@@ -34,7 +37,7 @@ Docsノードの本文正本は `knowledge_nodes` の子ノード階層で表現
 - 1ノードは1主張にする。
 - 理由や補足は子ノードへ落とす。
 - 「ラベル: 値」は親ノードと属性ごとの子ノードに分解する。
-- title は500字以下にする。
+- 整理時のtitleは原則500字以下の自己完結した主張にする。既存Web編集との保存互換上、writerは改行なし20,000字まで受け入れる。保存時に黙って切り詰めたり前後空白を削除したりしない。
 
 system-managed な構造化レコードは、検索・関連付け・原文保持に使う型付きFieldを正本にしてよい。
 
@@ -58,6 +61,9 @@ typed childへmaterializeする。block順序、label、content、hash/char/line
 
 - ルートの `案件情報` (`system_key=project_information_root`) は1件だけにする。
 - 各案件の正本は `案件情報` の子にし、`system_key=project_information:<project_id>` を付ける。
+  Projectの `knowledge_node_id`、Personal Library、hub親/root、`project_info` tag が正本identityであり、
+  generic Docsのrename/move/archive/delete/supertag操作では変更できない。完了・削除済みProjectや
+  orphan/duplicateは専用のowner/admin cleanup APIで明示的に子孫ごと処理する。
 - 会議メモは案件正本配下の `会議メモ`、メール原本は案件正本配下の非表示管理領域 `メール管理` に置く。引用チェーンは個別メッセージへ分割し、Inbox本文から該当メッセージへ直接リンクできるようにする。
 - `/inbox` の管理ノードは各プロジェクトの案件情報正本直下に `Inbox` として1件だけ置き、その子を1受付=1つの `Inbox項目` とする。
 - default Inbox projectには案件情報正本を作らない。プロジェクトに属さない従来のDocsルート `Inbox` は一時投入先であり、`/inbox` の管理ノードとして使わない。

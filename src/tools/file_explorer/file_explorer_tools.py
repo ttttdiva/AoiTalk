@@ -18,6 +18,8 @@ from .file_explorer_service import (
     delete_item,
     move_item,
     get_file_info,
+    _sanitize_name,
+    _sanitize_relative_file_path,
     walk_workspace_tree,
 )
 
@@ -206,39 +208,26 @@ def _is_storage_scope_root(path: str) -> bool:
     )
 
 
-def _enterprise_project_write_error(*paths: str) -> Dict[str, Any] | None:
-    """Keep generic agent writes out of project storage in Enterprise.
+def _enterprise_project_write_error(
+    *paths: str,
+    operation: str = "作成",
+) -> Dict[str, Any] | None:
+    """Delegate managed-storage protection to the canonical OS-tools guard.
 
-    Project API writers perform the row-lock, strict usage scan, quota check,
-    atomic write, and counter update as one protocol.  These legacy tools do
-    not have a database transaction context, so accepting project paths here
-    would silently bypass that protocol.
+    The file-explorer tools are a legacy mutation surface, so they must use
+    exactly the same Enterprise managed-namespace policy as ``os_operations``.
+    Keep this adapter lazy to avoid the file-explorer/service import cycle and
+    check every path supplied by a multi-path operation (for example both the
+    source and destination of move/copy).
     """
     try:
-        from ...features import Features
-
-        if not Features.is_enterprise():
-            return None
-        from ..os_operations.tools import _get_user_files_root
-
-        project_root = Path(os.path.abspath(_get_user_files_root())) / "_projects"
-        for raw_path in paths:
-            candidate = Path(os.path.abspath(str(raw_path or "")))
-            try:
-                candidate.relative_to(project_root)
-            except ValueError:
-                continue
-            return {
-                "success": False,
-                "error": (
-                    "Enterpriseではプロジェクト保存領域への汎用agent書き込みを"
-                    "無効化しています。プロジェクトのファイルAPIを使用してください。"
-                ),
-            }
+        from ..os_operations.tools import (
+            _enterprise_project_write_error as canonical_guard,
+        )
     except Exception:
-        # A profile-detection failure must not turn this compatibility layer
-        # into a broad write bypass.  Fail closed even if this helper is used
-        # outside the normal registry path.
+        # A failed import must not silently turn the compatibility surface into
+        # an unmanaged writer.  Match the canonical helper's fail-closed
+        # contract when this module is loaded in a stripped build.
         return {
             "success": False,
             "error": (
@@ -246,7 +235,53 @@ def _enterprise_project_write_error(*paths: str) -> Dict[str, Any] | None:
                 "拒否しました。"
             ),
         }
+
+    for path in paths:
+        try:
+            error = canonical_guard(str(path or ""), operation)
+        except Exception:
+            # Keep legacy callers fail-closed if a future canonical guard
+            # cannot evaluate a path safely.
+            return {
+                "success": False,
+                "error": (
+                    "Enterprise状態を安全に確認できないため、汎用agent書き込みを"
+                    "拒否しました。"
+                ),
+            }
+        if error:
+            return error
     return None
+
+
+def _create_directory_target(parent: str, name: str) -> str | None:
+    """Return the child path that ``create_directory`` will actually write."""
+
+    try:
+        return str(Path(parent) / _sanitize_name(name))
+    except (TypeError, ValueError):
+        # Keep malformed input on the service's existing validation/error path;
+        # the parent is still checked by the caller before invoking it.
+        return None
+
+
+def _upload_file_target(parent: str, filename: str) -> str | None:
+    """Return the final upload path after service-level name sanitisation."""
+
+    try:
+        safe_dirs, safe_name = _sanitize_relative_file_path(filename)
+    except (AttributeError, TypeError, ValueError):
+        # Invalid names are rejected by ``upload_file`` itself.  Do not change
+        # that legacy response merely because this preflight cannot derive a
+        # child path to inspect.
+        return None
+    return str(Path(parent).joinpath(*safe_dirs, safe_name))
+
+
+def _transfer_target(source: str, destination: str) -> str:
+    """Return the child destination used by ``move_item``/``copy_item``."""
+
+    return str(Path(destination) / Path(source).name)
 
 
 @tool
@@ -282,7 +317,14 @@ def create_workspace_directory(path: str, name: str) -> Dict[str, Any]:
         resolved, error = _authorized_workspace_path(path, "作成")
     if error or not resolved:
         return error or {"success": False, "error": "パスを解決できませんでした。"}
-    project_write_error = _enterprise_project_write_error(resolved)
+    target = _create_directory_target(resolved, name)
+    guard_paths = [resolved]
+    if target is not None:
+        guard_paths.append(target)
+    project_write_error = _enterprise_project_write_error(
+        *guard_paths,
+        operation="作成",
+    )
     if project_write_error:
         return project_write_error
     return create_directory(resolved, name, is_admin=True)
@@ -325,7 +367,14 @@ def upload_workspace_file(path: str, filename: str, content_base64: str) -> Dict
         resolved, error = _authorized_workspace_path(path, "作成")
     if error or not resolved:
         return error or {"success": False, "error": "パスを解決できませんでした。"}
-    project_write_error = _enterprise_project_write_error(resolved)
+    target = _upload_file_target(resolved, filename)
+    guard_paths = [resolved]
+    if target is not None:
+        guard_paths.append(target)
+    project_write_error = _enterprise_project_write_error(
+        *guard_paths,
+        operation="作成",
+    )
     if project_write_error:
         return project_write_error
     return upload_file(resolved, filename, content, is_admin=True)
@@ -356,7 +405,10 @@ def delete_workspace_item(path: str) -> Dict[str, Any]:
         resolved, error = _authorized_workspace_path(path, "削除")
     if error or not resolved:
         return error or {"success": False, "error": "パスを解決できませんでした。"}
-    project_write_error = _enterprise_project_write_error(resolved)
+    project_write_error = _enterprise_project_write_error(
+        resolved,
+        operation="削除",
+    )
     if project_write_error:
         return project_write_error
     if not str(path or "").strip() or _is_storage_scope_root(resolved):
@@ -406,7 +458,12 @@ def move_workspace_item(src: str, dest: str) -> Dict[str, Any]:
             "success": False,
             "error": "ユーザーまたはプロジェクトの保存領域ルートは移動できません。",
         }
-    project_write_error = _enterprise_project_write_error(resolved_src, resolved_dest)
+    project_write_error = _enterprise_project_write_error(
+        resolved_src,
+        resolved_dest,
+        _transfer_target(resolved_src, resolved_dest),
+        operation="移動",
+    )
     if project_write_error:
         return project_write_error
     return move_item(resolved_src, resolved_dest, is_admin=True)
@@ -433,7 +490,12 @@ def _copy_workspace_item_impl(src: str, dest: str) -> Dict[str, Any]:
             return dest_error or {"success": False, "error": "コピー先を解決できませんでした。"}
     if not str(src or "").strip() or _is_storage_scope_root(resolved_src):
         return {"success": False, "error": "保存領域ルートはコピーできません。"}
-    project_write_error = _enterprise_project_write_error(resolved_dest)
+    project_write_error = _enterprise_project_write_error(
+        resolved_src,
+        resolved_dest,
+        _transfer_target(resolved_src, resolved_dest),
+        operation="コピー",
+    )
     if project_write_error:
         return project_write_error
     return copy_item(

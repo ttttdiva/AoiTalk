@@ -10,7 +10,10 @@
     "web": "expo start --web",
     "lint": "eslint src --ext .ts,.tsx",
     "typecheck": "tsc --noEmit",
+    "pretest": "npm run test:sync-recovery",
     "test": "jest --runInBand",
+    "test:chat-native": "jest --runInBand --config jest.chat-native.config.cjs",
+    "test:sync-recovery": "node --test tests/api-client-sync-recovery.test.cjs",
     "db:generate": "drizzle-kit generate",
     "api:typegen": "node scripts/generate-api-types.mjs"
   },

@@ -1,12 +1,10 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { Checkbox } from "@/components/ui/checkbox";
-import { useUserSettings } from "@/contexts/user-settings-context";
 import {
-  LLM_PROVIDER_VISIBILITY_KEY,
   isProviderHidden,
   normalizeHiddenProviderIds,
   normalizeProviderId,
@@ -26,34 +24,96 @@ function providerVisibilityLabel(provider: LlmProviderCatalog): string {
   );
 }
 
+type GlobalSettingsPayload = {
+  settings?: Record<string, unknown>;
+};
+
+/**
+ * Render the global provider visibility controls. The catalog is deliberately
+ * not filtered here: an admin must always be able to find and re-enable a
+ * provider that is currently hidden. The backend's existing /api/settings
+ * administrator gate is authoritative; the disabled control is only a UX
+ * affordance for non-admins.
+ */
 export function LlmProviderVisibilitySettings({
   providers,
+  globalVisibility,
+  isAdmin = true,
 }: {
   providers: LlmProviderCatalog[];
+  globalVisibility?: unknown;
+  isAdmin?: boolean;
 }) {
-  const { settings, patch } = useUserSettings();
+  const [hiddenProviderIds, setHiddenProviderIds] = useState<string[]>(() =>
+    normalizeHiddenProviderIds(globalVisibility),
+  );
   const [saving, setSaving] = useState(false);
+  const [loaded, setLoaded] = useState(globalVisibility !== undefined);
+
+  useEffect(() => {
+    if (globalVisibility === undefined) return;
+    setHiddenProviderIds(normalizeHiddenProviderIds(globalVisibility));
+    setLoaded(true);
+  }, [globalVisibility]);
+
+  useEffect(() => {
+    let active = true;
+    fetch("/api/python-proxy/settings", { credentials: "include" })
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`API Error: ${response.status}`);
+        return (await response.json()) as GlobalSettingsPayload;
+      })
+      .then((payload) => {
+        if (!active) return;
+        setHiddenProviderIds(
+          normalizeHiddenProviderIds(payload.settings ?? payload),
+        );
+        setLoaded(true);
+      })
+      .catch(() => {
+        // The catalog metadata remains a valid initial snapshot. Keep the
+        // controls usable if this auxiliary GET is unavailable.
+        if (active) setLoaded(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   async function handleProviderVisibilityChange(
     providerId: string,
     checked: boolean | "indeterminate",
   ) {
-    if (saving) return;
+    if (saving || !isAdmin) return;
     const normalizedId = normalizeProviderId(providerId);
     if (!normalizedId) return;
 
-    const hiddenProviderIds = new Set(normalizeHiddenProviderIds(settings));
-    if (checked === true) hiddenProviderIds.delete(normalizedId);
-    else hiddenProviderIds.add(normalizedId);
+    const next = new Set(hiddenProviderIds);
+    if (checked === true) next.delete(normalizedId);
+    else next.add(normalizedId);
+    const nextIds = Array.from(next);
+    const previousIds = hiddenProviderIds;
+    setHiddenProviderIds(nextIds);
 
     setSaving(true);
     try {
-      await patch({
-        [LLM_PROVIDER_VISIBILITY_KEY]: {
-          hidden_provider_ids: Array.from(hiddenProviderIds),
-        },
+      const response = await fetch("/api/python-proxy/settings", {
+        method: "PATCH",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: "llm_provider_visibility.hidden_provider_ids",
+          value: nextIds,
+        }),
       });
+      if (!response.ok) {
+        const detail = (await response.json().catch(() => null)) as
+          | { detail?: string }
+          | null;
+        throw new Error(detail?.detail || `API Error: ${response.status}`);
+      }
     } catch (error) {
+      setHiddenProviderIds(previousIds);
       toast.error(
         error instanceof Error
           ? error.message
@@ -68,11 +128,9 @@ export function LlmProviderVisibilitySettings({
     <details className="rounded-md border">
       <summary className="flex cursor-pointer items-center justify-between gap-2 p-3 text-xs font-medium">
         <span className="min-w-0">
-          <span className="block truncate">
-            ヘッダーのLLMプロバイダー表示
-          </span>
+          <span className="block truncate">ヘッダーのLLMプロバイダー表示</span>
           <span className="mt-1 block text-[10px] text-muted-foreground">
-            非表示にするプロバイダーを管理
+            管理者が全ユーザー共通の表示を管理
           </span>
         </span>
         {saving && (
@@ -85,13 +143,16 @@ export function LlmProviderVisibilitySettings({
 
       <div className="space-y-3 border-t p-3">
         <p className="text-[10px] text-muted-foreground">
-          チェックを外したプロバイダーは、ヘッダーのLLMエンジン選択から非表示になります。
-          接続設定、APIキー、現在のモデル設定は削除されません。
+          チェックを外したプロバイダーは通常のチャット選択肢から非表示になります。
+          接続設定、APIキー、現在のモデル設定、API利用権限は変更されません。
+          {isAdmin ? "" : "（表示設定の変更は管理者のみ可能です。）"}
         </p>
 
         <div className="grid gap-2 sm:grid-cols-2">
           {providers.map((provider) => {
-            const hidden = isProviderHidden(provider.id, settings);
+            const hidden = isProviderHidden(provider.id, {
+              hidden_provider_ids: hiddenProviderIds,
+            });
             const label = providerVisibilityLabel(provider);
             return (
               <div
@@ -103,7 +164,7 @@ export function LlmProviderVisibilitySettings({
                   onCheckedChange={(checked) =>
                     void handleProviderVisibilityChange(provider.id, checked)
                   }
-                  disabled={saving}
+                  disabled={!loaded || saving || !isAdmin}
                   aria-label={`${label}を表示`}
                   className="mt-0.5"
                 />

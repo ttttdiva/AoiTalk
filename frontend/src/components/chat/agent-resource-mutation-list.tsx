@@ -18,7 +18,7 @@ import type { AgentResourceMutation } from "@/lib/chat-api";
 import {
   AGENT_RESOURCE_OPERATION_LABELS,
   agentResourceMutationDate,
-  dedupeAgentResourceMutations,
+  compactAgentResourceMutationsForChatCards,
   formatAgentResourceMutationDate,
 } from "@/lib/agent-resource-mutations";
 import { cn } from "@/lib/utils";
@@ -181,7 +181,7 @@ export function AgentResourceMutationList({
     pollTimeoutMs: 30_000,
   });
   const mutations = useMemo(
-    () => dedupeAgentResourceMutations(run?.resource_mutations),
+    () => compactAgentResourceMutationsForChatCards(run?.resource_mutations),
     [run?.resource_mutations],
   );
 

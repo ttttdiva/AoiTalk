@@ -22,6 +22,7 @@ import type { SubmittedSteeringInstruction } from "@/components/chat/chat-compos
 import { createLocalUserMessage } from "@/lib/chat-local-messages";
 import type {
   ExternalModelPromptRequest,
+  ExternalModelPromptResponseInput,
   ToolPermissionRequest,
   ToolPermissionScope,
 } from "@/components/chat/chat-permission-dialogs";
@@ -53,11 +54,8 @@ type UseChatGenerationControlsArgs = {
     sessionId?: string | null,
   ) => void;
   sendExternalModelPromptResponse: (
-    requestId: string,
-    approved: boolean,
-    editedPrompt: string,
-    sessionId?: string | null,
-  ) => void;
+    input: ExternalModelPromptResponseInput,
+  ) => boolean | void;
   stopGeneration: (sessionId: string) => boolean;
   sendSteering: (
     content: string,
@@ -144,12 +142,20 @@ export function useChatGenerationControls({
         setExternalModelPromptDraft("");
         return;
       }
-      sendExternalModelPromptResponse(
-        externalModelPromptRequest.requestId,
+      const sent = sendExternalModelPromptResponse({
+        requestId: externalModelPromptRequest.requestId,
         approved,
-        approved ? externalModelPromptDraft : "",
-        externalModelPromptRequest.sessionId,
-      );
+        // Do not trim or otherwise rewrite the user's final payload.  The
+        // server candidate is copied into the draft byte-for-byte and the
+        // response must echo the exact final text selected by the user.
+        finalPayload: approved ? externalModelPromptDraft : "",
+        reviewNonce: externalModelPromptRequest.reviewNonce,
+        bindingDigest: externalModelPromptRequest.bindingDigest,
+        targetSessionId: externalModelPromptRequest.sessionId,
+      });
+      if (sent === false) {
+        toast.error("外部モデル送信を確認できる接続がないため、送信を拒否しました");
+      }
       setExternalModelPromptRequest(null);
       setExternalModelPromptDraft("");
     },

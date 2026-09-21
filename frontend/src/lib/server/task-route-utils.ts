@@ -1,6 +1,6 @@
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "@/db";
-import { projectMembers, projects, tags, users } from "@/db/schema";
+import { projectMembers, projects, spaces, tags, users } from "@/db/schema";
 import {
   parseDisplayDateAsDbTimestamp,
   serializeDbTimestamp,
@@ -13,6 +13,23 @@ export type SessionUser = { id: string; role?: string | null };
 export type ProjectMembership = {
   role: string | null;
   permissions?: unknown;
+};
+
+export class TaskBrowseScopeError extends Error {
+  constructor(
+    readonly status: 400 | 404,
+    message: string,
+  ) {
+    super(message);
+    this.name = "TaskBrowseScopeError";
+  }
+}
+
+export type ResolvedTaskReadScope = {
+  projectIds: string[];
+  explicit: boolean;
+  browseProjectId: string | null;
+  browseSpaceId: string | null;
 };
 
 const UUID_PATTERN =
@@ -276,6 +293,162 @@ export async function getReadableProjectIds(
         hasProjectPermission(permissionsByProject.get(row.projectId), "read"),
     )
     .map((row) => row.projectId);
+}
+
+function parseBrowseValue(
+  params: URLSearchParams,
+  name: "browse_project_id" | "browse_space_id",
+): string | null {
+  if (!params.has(name)) return null;
+  const values = params.getAll(name);
+  if (values.length !== 1 || !values[0]?.trim()) {
+    throw new TaskBrowseScopeError(400, `Invalid ${name}`);
+  }
+  const value = normalizeOptionalUuid(values[0]);
+  if (!value) throw new TaskBrowseScopeError(400, `Invalid ${name}`);
+  return value;
+}
+
+function isReservedInboxProject(row: {
+  ownerId: string;
+  slug: string;
+  projectMetadata?: unknown;
+}): boolean {
+  return (
+    row.slug === `inbox-project-${row.ownerId}` ||
+    (Boolean(row.projectMetadata) &&
+      typeof row.projectMetadata === "object" &&
+      !Array.isArray(row.projectMetadata) &&
+      (row.projectMetadata as Record<string, unknown>).isInboxDefault === true)
+  );
+}
+
+function isReservedInboxSpace(row: { ownerId: string; slug: string }): boolean {
+  return row.slug === `inbox-${row.ownerId}`;
+}
+
+/** Return whether a request carries any explicit browse marker. */
+export function hasTaskBrowseScopeParams(params: URLSearchParams): boolean {
+  return (
+    params.has("browse_project_id") ||
+    params.has("browse_space_id") ||
+    params.has("browse") ||
+    params.has("browse_scope")
+  );
+}
+
+/**
+ * Resolve an aggregate/detail read scope without changing the legacy
+ * participation-based path. Explicit browse targets are always concrete and
+ * re-authorized against the current database state.
+ */
+export async function resolveReadScope(
+  user: SessionUser,
+  params: URLSearchParams,
+): Promise<ResolvedTaskReadScope> {
+  for (const marker of ["browse", "browse_scope"]) {
+    if (params.has(marker)) {
+      throw new TaskBrowseScopeError(400, `Invalid ${marker}`);
+    }
+  }
+  const browseProjectId = parseBrowseValue(params, "browse_project_id");
+  const browseSpaceId = parseBrowseValue(params, "browse_space_id");
+  if (browseProjectId && browseSpaceId) {
+    throw new TaskBrowseScopeError(
+      400,
+      "browse_project_id and browse_space_id are mutually exclusive",
+    );
+  }
+
+  const projectId = params.get("project_id");
+  const spaceId = params.get("space_id");
+  if (
+    (browseProjectId || browseSpaceId) &&
+    (params.has("project_id") || params.has("space_id"))
+  ) {
+    throw new TaskBrowseScopeError(
+      400,
+      "browse scope cannot be combined with project_id or space_id",
+    );
+  }
+
+  if (!browseProjectId && !browseSpaceId) {
+    return {
+      projectIds: await getParticipatingProjectIds(user.id, {
+        projectId,
+        spaceId: projectId ? null : spaceId,
+      }),
+      explicit: false,
+      browseProjectId: null,
+      browseSpaceId: null,
+    };
+  }
+
+  if (browseProjectId) {
+    const [project] = await db
+      .select({
+        id: projects.id,
+        ownerId: projects.ownerId,
+        slug: projects.slug,
+        projectMetadata: projects.projectMetadata,
+      })
+      .from(projects)
+      .where(and(eq(projects.id, browseProjectId), isNull(projects.deletedAt)))
+      .limit(1);
+    if (!project || (isReservedInboxProject(project) && project.ownerId !== user.id)) {
+      throw new TaskBrowseScopeError(404, "Browse target not found");
+    }
+    const readable = await getReadableProjectIds(user.id, {
+      projectId: browseProjectId,
+    });
+    if (!readable.includes(browseProjectId)) {
+      throw new TaskBrowseScopeError(404, "Browse target not found");
+    }
+    return {
+      projectIds: [browseProjectId],
+      explicit: true,
+      browseProjectId,
+      browseSpaceId: null,
+    };
+  }
+
+  const [space] = await db
+    .select({ id: spaces.id, ownerId: spaces.ownerId, slug: spaces.slug })
+    .from(spaces)
+    .where(eq(spaces.id, browseSpaceId!))
+    .limit(1);
+  if (!space || (isReservedInboxSpace(space) && space.ownerId !== user.id)) {
+    throw new TaskBrowseScopeError(404, "Browse target not found");
+  }
+  const readable = await getReadableProjectIds(user.id, {
+    spaceId: browseSpaceId!,
+  });
+  const readableRows = readable.length
+    ? await db
+        .select({
+          id: projects.id,
+          ownerId: projects.ownerId,
+          slug: projects.slug,
+          projectMetadata: projects.projectMetadata,
+        })
+        .from(projects)
+        .where(and(inArray(projects.id, readable), isNull(projects.deletedAt)))
+    : [];
+  const projectIds = readableRows
+    .filter(
+      (project) =>
+        !isReservedInboxProject(project) || project.ownerId === user.id,
+    )
+    .map((project) => project.id);
+  if (projectIds.length === 0 && space.ownerId !== user.id && user.role !== "admin") {
+    throw new TaskBrowseScopeError(404, "Browse target not found");
+  }
+  return {
+    projectIds,
+    explicit: true,
+    browseProjectId: null,
+    browseSpaceId,
+  };
 }
 
 /** Operational (participating) project scope; excludes global-admin-only access. */

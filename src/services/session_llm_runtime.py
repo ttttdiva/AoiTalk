@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import copy
+import inspect
 from dataclasses import dataclass
 from typing import Any
 
+from ..llm.openai_compatible_local_profiles import managed_local_runtime_for_model
 from .conversation_session_selection import (
     read_session_llm_settings,
     session_loaded_team_ids,
@@ -38,6 +40,7 @@ _SESSION_LLAMA_CPP_RUNTIME_KEYS = (
     "mtp_enabled",
 )
 _SESSION_LLAMA_CPP_COMPUTED_KEYS = (
+    "profile_id",
     "mtp_model_path",
     "mtp_supported",
     "mtp_available",
@@ -45,7 +48,25 @@ _SESSION_LLAMA_CPP_COMPUTED_KEYS = (
     "mtp_reason",
     "mtp_artifact_path",
     "mtp_resolved_model_path",
+    "mtp_variant_model_path",
     "mtp_mode",
+)
+
+_SESSION_LLAMA_CPP_FREETOKEN_MASK_KEYS = (
+    "executable",
+    "model_path",
+    "model_root",
+    "model_alias",
+    "host",
+    "port",
+    "context_size",
+    "gpu_layers",
+    "extra_args",
+    "auto_start",
+    "readiness_timeout",
+    "reasoning_effort",
+    *_SESSION_LLAMA_CPP_RUNTIME_KEYS,
+    *_SESSION_LLAMA_CPP_COMPUTED_KEYS,
 )
 
 
@@ -55,6 +76,32 @@ def _session_registry_key(*, user_id: str | None, session_id: str | None) -> str
         return ""
     clean_user = str(user_id or "").strip()
     return f"{clean_user}:{clean_session}" if clean_user else clean_session
+
+
+def release_session_agent_team_registry(
+    user_id: str | None,
+    session_id: str | None,
+) -> None:
+    """Release the process-local manual Team projection for one session.
+
+    The durable conversation row is the source of truth for manual Team
+    selection.  This in-memory projection is therefore removed only after a
+    successful durable delete.  Keep key construction in
+    :func:`_session_registry_key` so the release path cannot drift from the
+    restore/bind paths (and never clear another user's session).
+    """
+
+    session_key = _session_registry_key(user_id=user_id, session_id=session_id)
+    if not session_key:
+        return
+
+    from ..llm.runtime_tool_registry import (
+        _LOADED_AGENT_TEAM_IDS_BY_SESSION,
+        _LOADED_AGENT_TEAM_IDS_LOCK,
+    )
+
+    with _LOADED_AGENT_TEAM_IDS_LOCK:
+        _LOADED_AGENT_TEAM_IDS_BY_SESSION.pop(session_key, None)
 
 
 def restore_session_agent_team_registry(
@@ -159,9 +206,14 @@ def _normalize_effort(value: Any) -> str:
 
 
 def _client_route_effort(client: Any) -> str:
-    provider, _ = _client_provider_model(client)
+    provider, model = _client_provider_model(client)
     config = getattr(client, "config", None)
     if config is None or not hasattr(config, "get"):
+        return ""
+    if (
+        provider == "openai_compatible_local"
+        and managed_local_runtime_for_model(config, model) == "freetoken"
+    ):
         return ""
     key_by_provider = {
         "openai": "openai.reasoning_effort",
@@ -188,15 +240,20 @@ def _effective_client_effort(client: Any) -> str:
 
 
 def _session_effort_override(config: Any) -> str | None:
-    del config
     main_override = session_main_route_override()
     if not main_override:
+        return None
+    provider = str(main_override.get("provider") or "").strip().lower()
+    model = str(main_override.get("model") or "").strip()
+    if (
+        provider == "openai_compatible_local"
+        and model
+        and managed_local_runtime_for_model(config, model) == "freetoken"
+    ):
         return None
     effort = _normalize_effort(main_override.get("effort"))
     if effort:
         return effort
-    provider = str(main_override.get("provider") or "").strip().lower()
-    model = str(main_override.get("model") or "").strip()
     if provider and model:
         return None
     return None
@@ -242,8 +299,26 @@ def _overlay_session_llama_cpp_mtp_runtime(turn_client: Any, model: str) -> None
     if config is None or not hasattr(config, "get"):
         return
     target_model = str(model or "").strip()
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        target_model,
+    )
     local = config.get("openai_compatible_local", {})
     local = copy.deepcopy(local) if isinstance(local, dict) else {}
+    local["model"] = target_model
+    setter = getattr(config, "set", None)
+
+    if managed_runtime == "freetoken":
+        local["llama_cpp"] = {}
+        if callable(setter):
+            setter("openai_compatible_local", local)
+            for key in _SESSION_LLAMA_CPP_FREETOKEN_MASK_KEYS:
+                setter(
+                    f"openai_compatible_local.llama_cpp.{key}",
+                    None,
+                )
+        return
+
     llama_cpp = local.get("llama_cpp")
     llama_cpp = copy.deepcopy(llama_cpp) if isinstance(llama_cpp, dict) else {}
     if target_model.casefold() == "local-model":
@@ -262,21 +337,99 @@ def _overlay_session_llama_cpp_mtp_runtime(turn_client: Any, model: str) -> None
             resolved = _llama_cpp_settings(config, model=target_model)
         except Exception:
             resolved = {}
+            # A failed target resolution must not leave the previous profile's
+            # computed MTP paths/status in the request-scoped overlay.  Keep
+            # the base config intact for diagnostics, but explicitly mask all
+            # user-owned/computed MTP keys so a later retry cannot launch a
+            # stale embedded variant.
+            for key in (
+                *_SESSION_LLAMA_CPP_RUNTIME_KEYS,
+                *_SESSION_LLAMA_CPP_COMPUTED_KEYS,
+            ):
+                llama_cpp[key] = None
         for key in (
             *_SESSION_LLAMA_CPP_RUNTIME_KEYS,
             *_SESSION_LLAMA_CPP_COMPUTED_KEYS,
         ):
             if key in resolved:
                 llama_cpp[key] = resolved[key]
-    local["model"] = target_model
     local["llama_cpp"] = llama_cpp
-    setter = getattr(config, "set", None)
     if callable(setter):
         setter("openai_compatible_local", local)
 
 
+def _session_managed_local_model_already_ready(
+    config: Any,
+    *,
+    model: str,
+    managed_runtime: str | None,
+) -> bool:
+    """Return whether a managed session target advertises its exact alias.
+
+    Session target construction can run after a managed local server has
+    already finished loading.  In that case the strict ensure path would
+    repeat launch/conflict handling even though the endpoint is usable.  This
+    probe intentionally performs only configuration resolution and a
+    read-only ``/v1/models`` request; any missing, malformed, or failed probe
+    is treated as *not ready* so the existing strict ensure path remains the
+    source of truth for recovery.
+
+    ``managed_runtime`` is supplied by the caller rather than inferred here
+    so this helper cannot accidentally classify stale nested configuration as
+    a managed target.  Model IDs are compared case-sensitively: a merely
+    similar or case-folded alias must not bypass readiness validation.
+    """
+
+    selected_model = str(model or "").strip()
+    if not selected_model or managed_runtime not in {"llama_cpp", "freetoken"}:
+        return False
+
+    try:
+        # Import through the service-manager facade so its hot-core probes
+        # remain monkeypatchable for tests and diagnostics.  The facade's
+        # llama model-ID helper is the exact (case-preserving) /v1/models
+        # probe; for FreeToken use the underlying generic helper directly.
+        import src.service_manager as service_manager
+
+        if managed_runtime == "freetoken":
+            settings = service_manager._freetoken_settings(
+                config,
+                model=selected_model,
+            )
+            base_url = service_manager._freetoken_base_url(
+                config,
+                model=selected_model,
+            )
+            from src.service_manager._local_llm_servers import (
+                _local_openai_model_ids_exact,
+            )
+
+            model_ids = _local_openai_model_ids_exact(base_url)
+        else:
+            settings = service_manager._llama_cpp_settings(
+                config,
+                model=selected_model,
+            )
+            base_url = service_manager._llama_cpp_base_url(
+                config,
+                model=selected_model,
+            )
+            model_ids = service_manager._llama_cpp_model_ids_exact(base_url)
+
+        if not isinstance(settings, dict):
+            return False
+        expected_alias = str(settings.get("model_alias") or "").strip()
+        if not expected_alias or isinstance(model_ids, str):
+            return False
+        return expected_alias in model_ids
+    except Exception:
+        # Readiness is an optimization only.  Keep the strict ensure path
+        # when resolution/probing is inconclusive or the endpoint is absent.
+        return False
+
+
 def ensure_session_turn_local_server(turn_client: Any) -> None:
-    """Prepare a managed llama.cpp server for a session turn client.
+    """Prepare a managed local server for a session turn client.
 
     SimpleNamespace mocks with ``config`` / ``model_name`` are enough to
     reach ``ensure_openai_compatible_local_server``.  ``local-model`` and
@@ -291,28 +444,54 @@ def ensure_session_turn_local_server(turn_client: Any) -> None:
         return
     if model_name.strip().casefold() == "local-model":
         return
-    from src.service_manager import (
-        ensure_openai_compatible_local_server,
-        llama_cpp_managed_launch_configuration_error,
-    )
 
-    # Session targets are request-scoped and therefore cannot rely on the
-    # global engine-switch preflight.  Reject a registered managed profile
-    # whose GGUF cannot be resolved before the first chat request; otherwise
-    # the user sees a generic connection error only after submitting a turn.
-    launch_error = llama_cpp_managed_launch_configuration_error(
+    selected_model = model_name.strip()
+    managed_runtime = managed_local_runtime_for_model(
         config,
-        model=model_name.strip(),
+        selected_model,
     )
-    if launch_error:
-        raise RuntimeError(
-            "選択したsession用llama.cpp runtimeを準備できません。 "
-            f"{launch_error}"
+    from src.service_manager import ensure_openai_compatible_local_server
+
+    if managed_runtime == "freetoken":
+        from src.service_manager import (
+            freetoken_managed_launch_configuration_error,
         )
+        launch_error = freetoken_managed_launch_configuration_error(
+            config,
+            model=selected_model,
+        )
+        if launch_error:
+            raise RuntimeError(
+                "選択したsession用FreeToken runtimeを準備できません。 "
+                f"{launch_error}"
+            )
+    else:
+        from src.service_manager import (
+            llama_cpp_managed_launch_configuration_error,
+        )
+
+        # Preserve the existing llama.cpp/session preflight for registered
+        # GGUF profiles and custom managed llama-server targets.
+        launch_error = llama_cpp_managed_launch_configuration_error(
+            config,
+            model=selected_model,
+        )
+        if launch_error:
+            raise RuntimeError(
+                "選択したsession用llama.cpp runtimeを準備できません。 "
+                f"{launch_error}"
+            )
+
+    if _session_managed_local_model_already_ready(
+        config,
+        model=selected_model,
+        managed_runtime=managed_runtime,
+    ):
+        return
 
     ensure_openai_compatible_local_server(
         config,
-        model=model_name.strip(),
+        model=selected_model,
         raise_on_launch_error=True,
         force_restart=False,
     )
@@ -326,6 +505,11 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
     provider = str(route.get("provider") or "").strip().lower()
     model = str(route.get("model") or "").strip()
     effort = str(route.get("effort") or route.get("reasoning_effort") or "").strip()
+    if (
+        provider == "openai_compatible_local"
+        and managed_local_runtime_for_model(config, model) == "freetoken"
+    ):
+        effort = ""
     turn_client = create_llm_client_for_target(
         config,
         provider=provider,
@@ -346,6 +530,7 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
         "current_tool_required",
         "_native_tools_enabled",
         "_system_prompt_override",
+        "_isolated_system_prompt_override",
         "current_edit_message_id",
         "generation_policy",
         "planning_policy",
@@ -362,7 +547,46 @@ def build_session_turn_client(source_client: Any, config: Any) -> Any:
             setattr(turn_client, attr, getattr(source_client, attr))
     source_history = getattr(source_client, "history_manager", None)
     if source_history is not None:
-        turn_client.history_manager = source_history
+        # Production provider clients all use HistoryManager-compatible
+        # objects. Lightweight embeddings/tests may expose only add_message;
+        # never replace a fully initialized target HistoryManager with an
+        # object that cannot satisfy the target's session-sync contract.
+        required_history_methods = (
+            "clear",
+            "add_message",
+            "get_all",
+            "get_model_messages",
+        )
+        if all(
+            callable(getattr(source_history, name, None))
+            for name in required_history_methods
+        ):
+            turn_client.history_manager = source_history
+
+    isolated_prompt = str(
+        getattr(source_client, "_isolated_system_prompt_override", "") or ""
+    ).strip()
+    if isolated_prompt:
+        set_isolated_system_prompt = getattr(
+            turn_client,
+            "set_isolated_system_prompt",
+            None,
+        )
+        if callable(set_isolated_system_prompt):
+            result = set_isolated_system_prompt(isolated_prompt)
+            if inspect.isawaitable(result):
+                close = getattr(result, "close", None)
+                if callable(close):
+                    close()
+                raise RuntimeError(
+                    "Session turn target isolated system prompt setter is async"
+                )
+        elif hasattr(turn_client, "system_prompt"):
+            turn_client.system_prompt = isolated_prompt
+        else:
+            raise RuntimeError(
+                "Session turn target cannot install isolated system prompt"
+            )
 
     # The registry contains provider/client-bound closures such as contextual
     # pack loaders and delegates.  Never transplant it from the long-lived
@@ -395,6 +619,7 @@ __all__ = [
     "bind_session_llm_runtime_from_context",
     "build_session_turn_client",
     "reset_session_llm_runtime",
+    "release_session_agent_team_registry",
     "restore_session_agent_team_registry",
     "session_route_differs_from_client",
 ]

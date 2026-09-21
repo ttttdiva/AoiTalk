@@ -17,6 +17,7 @@ from sqlalchemy import (
     Boolean,
     UniqueConstraint,
     Index,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import relationship
@@ -255,6 +256,9 @@ class ConversationMessage(Base):
     # embedding removed - using Qdrant for vector search instead
 
     message_metadata = Column(JSON, default=dict)
+    # Server-issued/client-stable identity used to make retried message
+    # writes idempotent.  It is nullable for legacy/system messages.
+    client_message_id = Column(String(512), nullable=True)
     sender_type = Column(String(32), nullable=True)
     sender_id = Column(String(200), nullable=True)
     sender_display_name = Column(String(200), nullable=True)
@@ -272,6 +276,16 @@ class ConversationMessage(Base):
     branch_index = Column(Integer, default=0)  # Index among sibling branches
     is_active_branch = Column(Boolean, default=True)  # Currently displayed branch
 
+    __table_args__ = (
+        Index(
+            "uq_conversation_messages_session_client_message_id",
+            "session_id",
+            "client_message_id",
+            unique=True,
+            postgresql_where=text("client_message_id IS NOT NULL"),
+        ),
+    )
+
     # Relationship to session
     session = relationship(
         "ConversationSession",
@@ -286,6 +300,7 @@ class ConversationMessage(Base):
             "role": self.role,
             "content": self.content,
             "metadata": _public_message_metadata(self.message_metadata or {}),
+            "client_message_id": self.client_message_id,
             "sender_type": self.sender_type,
             "sender_id": self.sender_id,
             "sender_display_name": self.sender_display_name,

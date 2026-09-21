@@ -6,7 +6,10 @@ import logging
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import FileResponse
+from ...services import generated_media_service
+from ...services.generated_media_storage import get_media_root, media_relative_path
+from ...services.storage_io import StorageError, storage_io
+from .storage_stream import storage_download_response
 
 from ...services.generated_media_service import (
     get_media_record,
@@ -45,13 +48,15 @@ def build_generated_media_router(
         if not await user_can_access_media(user_id, media):
             raise HTTPException(status_code=403, detail="Access denied")
 
-        file_path = resolve_media_file(media)
-        if file_path is None:
-            raise HTTPException(status_code=404, detail="画像が見つかりません")
-
-        return FileResponse(
-            path=str(file_path),
-            media_type=media.mime_type or "application/octet-stream",
-        )
+        try:
+            root = get_media_root(generated_media_service.STORAGE_ROOT)
+            file_path = await storage_io.run(root.io_key, lambda: resolve_media_file(media))
+            if file_path is None:
+                raise HTTPException(status_code=404, detail="画像が見つかりません")
+            return await storage_download_response(
+                root, media_relative_path(media.relative_path), request, inline=True,
+            )
+        except StorageError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail()) from exc
 
     return router

@@ -74,7 +74,13 @@ def register(mcp: FastMCP, get_audio_player, get_stream_manager):
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                search_results = ydl.extract_info(f"ytsearch5:{query}", download=False)
+                manager = get_stream_manager()
+                search_query = f"ytsearch5:{query}"
+                search_results = manager.execute_yt_dlp(
+                    search_query,
+                    lambda target: ydl.extract_info(target, download=False),
+                    action="youtube.search",
+                )
                 if not search_results or 'entries' not in search_results or not search_results['entries']:
                     return f"「{query}」に関する動画が見つかりませんでした。"
 

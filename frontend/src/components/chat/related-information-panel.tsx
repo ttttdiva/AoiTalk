@@ -128,6 +128,7 @@ export function RelatedInformationPanel({
   const [tasksLoading, setTasksLoading] = useState(Boolean(sessionId));
   const [tasksError, setTasksError] = useState<string | null>(null);
   const [tasksSessionId, setTasksSessionId] = useState<string | null>(sessionId);
+  const [loadedTasksSessionId, setLoadedTasksSessionId] = useState<string | null>(null);
   const tasksRequestRef = useRef<RelatedTaskRequest | null>(null);
   const tasksSessionIdRef = useRef<string | null>(sessionId);
   const activeSessionIdRef = useRef(sessionId);
@@ -153,6 +154,7 @@ export function RelatedInformationPanel({
       setTasks([]);
       setTasksError(null);
       setTasksSessionId(null);
+      setLoadedTasksSessionId(null);
       tasksSessionIdRef.current = null;
       onTasksChange?.([]);
       setTasksLoading(false);
@@ -166,6 +168,7 @@ export function RelatedInformationPanel({
     if (tasksSessionIdRef.current !== sessionId) {
       tasksSessionIdRef.current = sessionId;
       setTasksSessionId(sessionId);
+      setLoadedTasksSessionId(null);
       setTasks([]);
       setTasksError(null);
       onTasksChange?.([]);
@@ -198,6 +201,7 @@ export function RelatedInformationPanel({
         const next = Array.isArray(data.tasks) ? data.tasks : [];
         setTasksError(null);
         setTasks(next);
+        setLoadedTasksSessionId(sessionId);
         onTasksChange?.(next);
       } catch (error) {
         if (!isCurrentRequest()) return;
@@ -257,6 +261,7 @@ export function RelatedInformationPanel({
   );
   const tasksPending =
     Boolean(sessionId) && (tasksLoading || tasksSessionId !== sessionId);
+  const tasksInitialLoading = tasksPending && loadedTasksSessionId !== sessionId;
   const refreshing = tasksLoading || agentRunLoading;
   const resources = useMemo(
     () =>
@@ -542,7 +547,7 @@ export function RelatedInformationPanel({
               </div>
             </div>
           )}
-          {tasksPending && (
+          {tasksInitialLoading && (
             <p
               role="status"
               className="flex items-center gap-2 px-2 py-2 text-xs text-text-secondary"
@@ -553,7 +558,7 @@ export function RelatedInformationPanel({
                 : "関連タスクを読み込み中…"}
             </p>
           )}
-          {taskResources.length === 0 && !tasksPending && !tasksError ? (
+          {taskResources.length === 0 && !tasksInitialLoading && !tasksError ? (
             <p className="px-2 py-1 text-xs text-text-secondary">
               このチャットに関連するタスクはありません
             </p>

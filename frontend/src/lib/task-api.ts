@@ -184,8 +184,26 @@ export type RecurringOccurrenceContext = {
   start_at: string;
   end_at?: string | null;
   original_start_at?: string | null;
+  all_day?: boolean | null;
   source_kind: string;
   status?: string | null;
+};
+
+/** 繰り返しタスクの日時変更を適用する範囲。 */
+export type RecurringOccurrenceMutationMode = "single" | "future";
+
+/** 繰り返しタスクの1回分の日時変更 payload。 */
+export type MoveOccurrencePayload = {
+  occurrence_id?: string | null;
+  occurrence_start_at: string;
+  occurrence_end_at?: string | null;
+  original_start_at?: string | null;
+  next_start_at: string;
+  next_end_at?: string | null;
+  status?: string | null;
+  all_day?: boolean;
+  /** 省略時は API 側で single として扱う。 */
+  mode?: RecurringOccurrenceMutationMode;
 };
 
 export type TimeEntry = {
@@ -264,6 +282,12 @@ export type Project = {
   aliases?: string[];
   space_id?: string | null;
   knowledge_node_id?: string | null;
+  knowledge_node_id_raw?: string | null;
+  knowledge_node_id_valid?: boolean;
+  knowledge_node_id_validated?: boolean;
+  owner_id?: string | null;
+  owner_user_id?: string | null;
+  deleted_at?: string | null;
   is_completed?: boolean;
   can_write?: boolean;
   /** Explicit server-side capability required by the Project PATCH route. */
@@ -541,7 +565,13 @@ function normalizeRecurrenceResponse(rule: RecurrenceRule): RecurrenceRule {
   };
 }
 
-export type Scope = { project_id?: string; space_id?: string };
+export type Scope = {
+  project_id?: string;
+  space_id?: string;
+  /** Explicit route-local browse target; exactly one browse key is required. */
+  browse_project_id?: string;
+  browse_space_id?: string;
+};
 
 function buildScopeQuery(scope: Scope | string | undefined): URLSearchParams {
   const params = new URLSearchParams();
@@ -550,6 +580,10 @@ function buildScopeQuery(scope: Scope | string | undefined): URLSearchParams {
   } else if (scope) {
     if (scope.project_id) params.set("project_id", scope.project_id);
     if (scope.space_id) params.set("space_id", scope.space_id);
+    if (scope.browse_project_id)
+      params.set("browse_project_id", scope.browse_project_id);
+    if (scope.browse_space_id)
+      params.set("browse_space_id", scope.browse_space_id);
   }
   return params;
 }
@@ -564,8 +598,13 @@ export const taskApi = {
       tasks.map(normalizeTaskResponse),
     );
   },
-  getTask: (taskId: string) =>
-    request<Task>(`/api/tasks/${taskId}`).then(normalizeTaskResponse),
+  getTask: (taskId: string, scope?: Scope) => {
+    const params = buildScopeQuery(scope);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<Task>(`/api/tasks/${taskId}${query}`).then(
+      normalizeTaskResponse,
+    );
+  },
   createTask: (data: Record<string, unknown>) =>
     request<Task>("/api/tasks", {
       method: "POST",
@@ -606,10 +645,13 @@ export const taskApi = {
     }),
 
   // Recurrence
-  getRecurrence: (taskId: string) =>
-    request<RecurrenceRule | null>(`/api/tasks/${taskId}/recurrence`).then(
-      (rule) => (rule ? normalizeRecurrenceResponse(rule) : null),
-    ),
+  getRecurrence: (taskId: string, scope?: Scope) => {
+    const params = buildScopeQuery(scope);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<RecurrenceRule | null>(
+      `/api/tasks/${taskId}/recurrence${query}`,
+    ).then((rule) => (rule ? normalizeRecurrenceResponse(rule) : null));
+  },
   saveRecurrence: (
     taskId: string,
     data: {
@@ -635,8 +677,11 @@ export const taskApi = {
     request<void>(`/api/tasks/${taskId}/recurrence`, { method: "DELETE" }),
 
   // Tags
-  listTags: (projectId: string) =>
-    request<Tag[]>(`/api/projects/${projectId}/tags`),
+  listTags: (projectId: string, scope?: Scope) => {
+    const params = buildScopeQuery(scope);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<Tag[]>(`/api/projects/${projectId}/tags${query}`);
+  },
   createTag: (projectId: string, data: { name: string; color?: string }) =>
     request<Tag>(`/api/projects/${projectId}/tags`, {
       method: "POST",
@@ -709,8 +754,11 @@ export const taskApi = {
     }),
 
   // Attachments
-  listAttachments: (taskId: string) =>
-    request<TaskAttachment[]>(`/api/tasks/${taskId}/attachments`),
+  listAttachments: (taskId: string, scope?: Scope) => {
+    const params = buildScopeQuery(scope);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<TaskAttachment[]>(`/api/tasks/${taskId}/attachments${query}`);
+  },
   uploadAttachment: (taskId: string, file: File) => {
     const form = new FormData();
     form.append("file", file);
@@ -723,8 +771,11 @@ export const taskApi = {
     request<void>(`/api/tasks/${taskId}/attachments/${attachmentId}`, {
       method: "DELETE",
     }),
-  listReferences: (taskId: string) =>
-    request<TaskReference[]>(`/api/tasks/${taskId}/references`),
+  listReferences: (taskId: string, scope?: Scope) => {
+    const params = buildScopeQuery(scope);
+    const query = params.toString() ? `?${params.toString()}` : "";
+    return request<TaskReference[]>(`/api/tasks/${taskId}/references${query}`);
+  },
   addReference: (
     taskId: string,
     data: {
@@ -793,16 +844,7 @@ export const taskApi = {
   },
   moveOccurrence: (
     taskId: string,
-    data: {
-      occurrence_id?: string | null;
-      occurrence_start_at: string;
-      occurrence_end_at?: string | null;
-      original_start_at?: string | null;
-      next_start_at: string;
-      next_end_at?: string | null;
-      status?: string | null;
-      all_day?: boolean;
-    },
+    data: MoveOccurrencePayload,
   ) =>
     request<{
       success: boolean;

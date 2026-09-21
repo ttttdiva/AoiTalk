@@ -131,6 +131,7 @@ export function GlobalRail() {
                 render={
                   <Link
                     href={tab.href}
+                    prefetch={false}
                     aria-label={tab.title}
                     aria-current={active ? "page" : undefined}
                     className={`ao-global-rail-button ${active ? "is-active" : ""}`}

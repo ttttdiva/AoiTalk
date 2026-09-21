@@ -21,10 +21,11 @@ import {
 } from "../lib/auth";
 import { enqueueAuthScopeExclusive } from "../lib/auth-scope-queue";
 import { taskApi } from "../lib/task-api";
+import { isParticipatingProject, participatingScopeSpaces } from "../lib/project-list-visibility";
 import { getDb, schema } from "../db/client";
 import { projectsRepo } from "../repositories/projects";
 import { shouldRunFullFetch } from "../repositories/tasks";
-import { useNetworkStore } from "./network";
+import { canAttemptAoiTalkServer } from "./network";
 import type { Project, Space } from "../types/api";
 
 export interface RefreshProjectsOptions {
@@ -209,13 +210,18 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
 
     try {
       // ローカル先読みは即時表示。projects/spaces とも SQLite を正とする。
-      let list = await projectsRepo.listLocal();
+      const token = await getToken();
+      if (!isCurrentGeneration()) return;
+      const authScope = getTokenAuthScope(token);
+      let list = (await projectsRepo.listLocal()).filter((project) =>
+        isParticipatingProject(project, authScope),
+      );
       if (!isCurrentGeneration()) return;
       let spaces = await listLocalSpaces();
       if (!isCurrentGeneration()) return;
-      set({ spaces, projects: list, loaded: true });
+      set({ spaces: participatingScopeSpaces(spaces, list, authScope), projects: list, loaded: true });
 
-      const hasToken = Boolean(await getToken());
+      const hasToken = Boolean(token);
       if (!isCurrentGeneration()) return;
       const restoreSelection = async () => {
         const storedSpaceId = await getSelectedSpaceId();
@@ -224,7 +230,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         if (!isCurrentGeneration()) return false;
         const currentProjectId = get().selectedProjectId;
         const currentSpaceId = get().selectedSpaceId;
-        if (storedSpaceId && spaces.find((s) => s.id === storedSpaceId)) {
+        if (storedSpaceId && get().spaces.find((s) => s.id === storedSpaceId)) {
           if (currentSpaceId !== storedSpaceId) {
             set({ selectedSpaceId: storedSpaceId, selectedProjectId: null });
           }
@@ -234,7 +240,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
           if (currentProjectId !== storedId) {
             set({ selectedProjectId: storedId, selectedSpaceId: null });
           }
-        } else if (!hasToken && list.length > 0) {
+        } else if (!hasToken && storedId === null && !storedSpaceId && list.length > 0) {
           const firstId = list[0].id;
           if (currentProjectId !== firstId) {
             set({ selectedProjectId: firstId, selectedSpaceId: null });
@@ -248,7 +254,7 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
             }
             if (!isCurrentGeneration()) return false;
           }
-        } else if (currentProjectId !== null || storedId) {
+        } else if (currentProjectId !== null || currentSpaceId !== null || storedId || storedSpaceId) {
           set({ selectedProjectId: null, selectedSpaceId: null });
           if (
             !(await saveProjectSelectionForGeneration(
@@ -258,6 +264,8 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
           ) {
             return false;
           }
+          if (!isCurrentGeneration()) return false;
+          await saveSelectedSpaceId("");
           if (!isCurrentGeneration()) return false;
         }
         return true;
@@ -269,10 +277,10 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
         return;
       }
 
-      const network = useNetworkStore.getState();
-      // serverReachable は直近の別API失敗で stale になり得る。端末がオンラインで
-      // 認証済みなら一覧APIを直接試し、通信層の実応答で到達性を更新する。
-      const canServer = hasToken && network.online;
+      // `online` only describes Internet reachability.  The API can be on the
+      // same LAN, so project refreshes use the actual AoiTalk network-path
+      // gate; a recent transport failure remains a short-lived retry throttle.
+      const canServer = hasToken && canAttemptAoiTalkServer();
 
       // フル取得は空初回・明示refresh・60秒throttleのみ。
       if (
@@ -289,11 +297,13 @@ export const useProjectStore = create<ProjectStoreState>((set, get) => ({
           projectsRepo.refresh().catch(() => null),
         ]);
         if (!isCurrentGeneration()) return;
-        if (freshProjects) list = freshProjects;
+        if (freshProjects) list = freshProjects.filter((project) =>
+          isParticipatingProject(project, authScope),
+        );
         if (freshSpaces) spaces = freshSpaces;
         if (!isCurrentGeneration()) return;
         lastProjectFullFetchAt = Date.now();
-        set({ spaces, projects: list });
+        set({ spaces: participatingScopeSpaces(spaces, list, authScope), projects: list });
       }
 
       await restoreSelection();

@@ -1,12 +1,17 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
-import { tags, projects } from "@/db/schema";
-import { eq, and } from "drizzle-orm";
+import { tags, projects, taskTags, tasks } from "@/db/schema";
+import { eq, and, isNull } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import {
   getAccessibleProject,
   getWritableProject,
 } from "@/lib/server/project-access";
+import {
+  hasTaskBrowseScopeParams,
+  resolveReadScope,
+  TaskBrowseScopeError,
+} from "@/lib/server/task-route-utils";
 
 async function resolveSpaceId(projectId: string): Promise<string | null> {
   const [p] = await db
@@ -18,7 +23,7 @@ async function resolveSpaceId(projectId: string): Promise<string | null> {
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const user = await getSession();
@@ -27,6 +32,25 @@ export async function GET(
   }
 
   const { id } = await params;
+  let browse = false;
+  const searchParams = new URL(request.url).searchParams;
+  if (hasTaskBrowseScopeParams(searchParams)) {
+    try {
+      const scope = await resolveReadScope(user, searchParams);
+      browse = scope.explicit;
+      if (browse && !scope.projectIds.includes(id)) {
+        return NextResponse.json({ detail: "権限がありません" }, { status: 404 });
+      }
+    } catch (error) {
+      if (error instanceof TaskBrowseScopeError) {
+        return NextResponse.json(
+          { detail: error.message },
+          { status: error.status },
+        );
+      }
+      throw error;
+    }
+  }
   const access = await getAccessibleProject(id, user.id);
   if (!access) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
@@ -37,7 +61,30 @@ export async function GET(
     return NextResponse.json([]);
   }
 
-  const rows = await db.select().from(tags).where(eq(tags.spaceId, spaceId));
+  const rows = browse
+    ? await db
+        .select({ tag: tags })
+        .from(tags)
+        .innerJoin(taskTags, eq(taskTags.tagId, tags.id))
+        .innerJoin(tasks, eq(tasks.id, taskTags.taskId))
+        .where(
+          and(
+            eq(tags.spaceId, spaceId),
+            eq(tasks.projectId, id),
+            isNull(tasks.deletedAt),
+          ),
+        )
+        .then((items) => {
+          const seen = new Set<string>();
+          return items
+            .map((item) => item.tag)
+            .filter((tag) => {
+              if (seen.has(tag.id)) return false;
+              seen.add(tag.id);
+              return true;
+            });
+        })
+    : await db.select().from(tags).where(eq(tags.spaceId, spaceId));
 
   const result = rows.map((t) => ({
     id: t.id,
@@ -61,6 +108,12 @@ export async function POST(
   }
 
   const { id } = await params;
+  if (hasTaskBrowseScopeParams(new URL(request.url).searchParams)) {
+    return NextResponse.json(
+      { detail: "Browse scope is read-only" },
+      { status: 400 },
+    );
+  }
   const access = await getWritableProject(id, user);
   if (!access) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });

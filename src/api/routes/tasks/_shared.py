@@ -21,7 +21,7 @@ from ....services.task_management._shared import (
     MAX_RECURRENCE_HORIZON_DAYS,
     MAX_RECURRENCE_RRULE_LENGTH,
 )
-from ....task_time import DEFAULT_TASK_TIMEZONE
+from ....task_time import DEFAULT_TASK_TIMEZONE, timer_db_datetime
 from ...uuid_http import parse_uuid_or_400
 
 
@@ -106,10 +106,24 @@ class TaskReferencePayload(BaseModel):
 
 
 class OccurrenceUpdatePayload(BaseModel):
+    """Patch payload for a materialized task occurrence.
+
+    ``mode`` is intentionally optional so existing mobile clients that only
+    send ``start_at``/``end_at`` (or a status patch) keep the legacy single
+    occurrence semantics.  Future-series callers can provide the canonical
+    boundary and the desired next occurrence timestamps without changing the
+    existing fields used by those clients.
+    """
+
     status: Optional[str] = None
     start_at: Optional[str] = None
     end_at: Optional[str] = None
     reminder_offsets: Optional[list[int]] = None
+    mode: Optional[Literal["single", "future"]] = None
+    original_start_at: Optional[str] = None
+    next_start_at: Optional[str] = None
+    next_end_at: Optional[str] = None
+    all_day: Optional[bool] = None
 
 
 class TaskRecurrencePayload(BaseModel):
@@ -241,6 +255,68 @@ def _parse_wall_clock_datetime(
         return parsed
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
+
+
+def _parse_timer_datetime(
+    value: Optional[str], field_name: str
+) -> Optional[datetime]:
+    """Parse a timer timestamp at the API/naive-DB boundary.
+
+    Explicit offsets (including ``Z``) identify an instant and are converted
+    to the configured deployment-zone wall clock before storage/querying.
+    Naive values intentionally retain their legacy/manual wall-clock meaning.
+    Generic task, deadline, and recurrence fields continue to use
+    ``_parse_wall_clock_datetime`` instead.
+    """
+
+    if value in (None, ""):
+        return None
+    try:
+        normalized = value.strip()
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        return timer_db_datetime(datetime.fromisoformat(normalized))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid {field_name}") from exc
+
+
+def _parse_browse_scope(request) -> tuple[Optional[Any], Optional[Any]]:
+    """Parse an explicit read-only browse target for aggregate/detail GETs.
+
+    Missing browse keys preserve the legacy participating scope.  A present key
+    must contain exactly one valid UUID, and the two target kinds (as well as
+    legacy project/space filters) may not be mixed.  A generic ``browse=true``
+    flag is rejected rather than ever widening an unscoped request.
+    """
+
+    params = request.query_params
+    for legacy_name in ("browse", "browse_scope"):
+        if params.get(legacy_name) is not None:
+            raise HTTPException(status_code=400, detail=f"Invalid {legacy_name}")
+
+    def parse_one(name: str):
+        values = params.getlist(name)
+        if not values:
+            return None
+        if len(values) != 1 or not isinstance(values[0], str) or not values[0].strip():
+            raise HTTPException(status_code=400, detail=f"Invalid {name}")
+        return parse_uuid_or_400(values[0].strip(), name)
+
+    browse_project_id = parse_one("browse_project_id")
+    browse_space_id = parse_one("browse_space_id")
+    if browse_project_id is not None and browse_space_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="browse_project_id and browse_space_id are mutually exclusive",
+        )
+    if (browse_project_id is not None or browse_space_id is not None) and (
+        params.get("project_id") is not None or params.get("space_id") is not None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="browse scope cannot be combined with project_id or space_id",
+        )
+    return browse_project_id, browse_space_id
 
 
 def _build_update_task_updates(payload: UpdateTaskPayload) -> dict[str, Any]:

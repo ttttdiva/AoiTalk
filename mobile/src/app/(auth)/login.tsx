@@ -2,7 +2,7 @@
  * 接続画面 — 匿名開始を優先し、必要なら後からサーバーログイン
  */
 
-import React, { useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import {
   View,
   StyleSheet,
@@ -19,7 +19,7 @@ import {
 } from "react-native-paper";
 import { useRouter } from "expo-router";
 import { useAuth } from "../../contexts/AuthContext";
-import { DEFAULT_API_URL, EXTERNAL_API_URL } from "../../constants/config";
+import { DEFAULT_API_URL } from "../../constants/config";
 import { getApiUrl } from "../../lib/auth";
 import {
   getCurrentNetworkInfo,
@@ -27,6 +27,8 @@ import {
   saveNetworkEndpointRoutingConfig,
 } from "../../lib/connection-routing";
 import { clearApiUrlCache } from "../../lib/api-client";
+import { normalizeApiUrl, requireConfiguredApiUrl } from "../../lib/api-url";
+import { saveEndpointSettings } from "../../lib/endpoint-settings";
 
 export default function LoginScreen() {
   const router = useRouter();
@@ -43,76 +45,197 @@ export default function LoginScreen() {
   const [showLoginForm, setShowLoginForm] = useState(isAuthenticated);
   const [routeEnabled, setRouteEnabled] = useState(false);
   const [wifiSsid, setWifiSsid] = useState("");
-  const [wifiApiUrl, setWifiApiUrl] = useState(DEFAULT_API_URL);
-  const [cellularApiUrl, setCellularApiUrl] = useState(EXTERNAL_API_URL);
+  const [wifiApiUrl, setWifiApiUrl] = useState("");
+  const [cellularApiUrl, setCellularApiUrl] = useState("");
   const [currentNetwork, setCurrentNetwork] = useState("Checking...");
   const [routingSaved, setRoutingSaved] = useState(false);
+  const [hydrating, setHydrating] = useState(true);
+  const [hydrationFailed, setHydrationFailed] = useState(false);
+  const [routingSaving, setRoutingSaving] = useState(false);
+  const mountedRef = useRef(true);
+  const loadInFlightRef = useRef(false);
+  const operationInFlightRef = useRef(false);
 
-  React.useEffect(() => {
-    (async () => {
+  const loadSettings = useCallback(async () => {
+    if (loadInFlightRef.current) return;
+    loadInFlightRef.current = true;
+    setHydrating(true);
+    setHydrationFailed(false);
+    setError("");
+    try {
       const stored = await getApiUrl();
-      if (stored) setApiUrl(stored);
       const routing = await getNetworkEndpointRoutingConfig();
+      if (!mountedRef.current) return;
+      if (stored) setApiUrl(stored);
       setRouteEnabled(routing.enabled);
       setWifiSsid(routing.wifiSsid);
-      setWifiApiUrl(routing.wifiApiUrl || stored || DEFAULT_API_URL);
-      setCellularApiUrl(routing.cellularApiUrl || EXTERNAL_API_URL);
-      const network = await getCurrentNetworkInfo();
-      setCurrentNetwork(
-        network.type === "wifi"
-          ? `Wi-Fi${network.ssid ? `: ${network.ssid}` : ""}`
-          : network.type,
-      );
-    })();
+      setWifiApiUrl(routing.wifiApiUrl);
+      setCellularApiUrl(routing.cellularApiUrl);
+      try {
+        const network = await getCurrentNetworkInfo();
+        if (!mountedRef.current) return;
+        setCurrentNetwork(
+          network.type === "wifi"
+            ? `Wi-Fi${network.ssid ? `: ${network.ssid}` : ""}`
+            : network.type,
+        );
+      } catch {
+        if (mountedRef.current) setCurrentNetwork("unknown");
+      }
+    } catch (loadError: unknown) {
+      if (mountedRef.current) {
+        setHydrationFailed(true);
+        setError(
+          loadError instanceof Error
+            ? loadError.message
+            : "接続設定を読み込めませんでした",
+        );
+      }
+    } finally {
+      if (mountedRef.current) setHydrating(false);
+      loadInFlightRef.current = false;
+    }
   }, []);
 
+  React.useEffect(() => {
+    mountedRef.current = true;
+    void loadSettings();
+    return () => {
+      mountedRef.current = false;
+    };
+  }, [loadSettings]);
+
   const saveRouting = async () => {
-    await saveNetworkEndpointRoutingConfig({
-      enabled: routeEnabled,
-      wifiSsid: wifiSsid.trim(),
-      wifiApiUrl: wifiApiUrl.trim(),
-      cellularApiUrl: cellularApiUrl.trim(),
-    });
-    clearApiUrlCache();
+    let normalizedWifiApiUrl = wifiApiUrl;
+    let normalizedCellularApiUrl = cellularApiUrl;
+    if (routeEnabled) {
+      normalizedWifiApiUrl = normalizeApiUrl(wifiApiUrl);
+      normalizedCellularApiUrl = normalizeApiUrl(cellularApiUrl);
+      if (normalizedWifiApiUrl) {
+        normalizedWifiApiUrl = requireConfiguredApiUrl(normalizedWifiApiUrl);
+      }
+      if (normalizedCellularApiUrl) {
+        normalizedCellularApiUrl = requireConfiguredApiUrl(
+          normalizedCellularApiUrl,
+        );
+      }
+    }
+
+    try {
+      await saveNetworkEndpointRoutingConfig({
+        enabled: routeEnabled,
+        wifiSsid: wifiSsid.trim(),
+        wifiApiUrl: normalizedWifiApiUrl,
+        cellularApiUrl: normalizedCellularApiUrl,
+      });
+    } finally {
+      clearApiUrlCache();
+    }
   };
 
   const handleSaveRouting = async () => {
-    await saveRouting();
-    setRoutingSaved(true);
-    setTimeout(() => setRoutingSaved(false), 2000);
+    if (
+      hydrating ||
+      hydrationFailed ||
+      loading ||
+      guestLoading ||
+      routingSaving ||
+      operationInFlightRef.current
+    ) {
+      return;
+    }
+    operationInFlightRef.current = true;
+    setRoutingSaving(true);
+    setError("");
+    try {
+      await saveRouting();
+      setRoutingSaved(true);
+      setTimeout(() => setRoutingSaved(false), 2000);
+    } catch (saveError: unknown) {
+      setError(
+        saveError instanceof Error
+          ? saveError.message
+          : "接続設定を保存できませんでした",
+      );
+    } finally {
+      operationInFlightRef.current = false;
+      setRoutingSaving(false);
+    }
   };
 
   const handleLogin = async () => {
+    if (
+      hydrating ||
+      hydrationFailed ||
+      loading ||
+      guestLoading ||
+      routingSaving ||
+      operationInFlightRef.current
+    ) {
+      return;
+    }
     if (!username.trim() || !password.trim()) {
       setError("ユーザー名とパスワードを入力してください");
       return;
     }
 
+    let normalizedApiUrl: string;
+    try {
+      normalizedApiUrl = requireConfiguredApiUrl(apiUrl);
+    } catch (validationError: unknown) {
+      setError(
+        validationError instanceof Error
+          ? validationError.message
+          : "API URLが未設定または無効です",
+      );
+      return;
+    }
+
+    operationInFlightRef.current = true;
     setLoading(true);
     setError("");
 
     try {
-      await saveRouting();
-      await login(apiUrl.trim(), username.trim(), password);
+      await saveEndpointSettings({
+        apiUrl: normalizedApiUrl,
+        routing: {
+          enabled: routeEnabled,
+          wifiSsid,
+          wifiApiUrl,
+          cellularApiUrl,
+        },
+      });
+      await login(normalizedApiUrl, username.trim(), password);
       router.replace("/(tabs)/chat");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "ログインに失敗しました";
       setError(msg);
     } finally {
+      operationInFlightRef.current = false;
       setLoading(false);
     }
   };
 
   const handleContinueAsGuest = async () => {
+    if (guestLoading || loading || operationInFlightRef.current) return;
+    operationInFlightRef.current = true;
     setGuestLoading(true);
     setError("");
     try {
       await continueAsGuest();
       router.replace("/(tabs)/chat");
     } finally {
+      operationInFlightRef.current = false;
       setGuestLoading(false);
     }
   };
+
+  const canEditRouting =
+    !hydrating &&
+    !hydrationFailed &&
+    !loading &&
+    !guestLoading &&
+    !routingSaving;
 
   return (
     <View style={styles.container}>
@@ -156,7 +279,9 @@ export default function LoginScreen() {
             <Button
               mode="outlined"
               onPress={() => setShowLoginForm((value) => !value)}
-              disabled={guestLoading || loading}
+              disabled={
+                guestLoading || loading || routingSaving || hydrationFailed
+              }
               style={styles.secondaryButton}
               contentStyle={styles.buttonContent}
             >
@@ -168,7 +293,7 @@ export default function LoginScreen() {
               <Button
                 mode="text"
                 onPress={() => router.replace("/(tabs)/chat")}
-                disabled={guestLoading || loading}
+                disabled={guestLoading || loading || routingSaving}
               >
                 アプリを開く
               </Button>
@@ -183,44 +308,108 @@ export default function LoginScreen() {
                   Current network: {currentNetwork}
                 </Text>
               </View>
-              <Switch value={routeEnabled} onValueChange={setRouteEnabled} />
+              <Switch
+                value={routeEnabled}
+                onValueChange={(value) => {
+                  if (canEditRouting) setRouteEnabled(value);
+                }}
+                disabled={
+                  hydrating ||
+                  hydrationFailed ||
+                  loading ||
+                  guestLoading ||
+                  routingSaving
+                }
+              />
             </View>
             <TextInput
               label="Wi-Fi SSID"
               value={wifiSsid}
-              onChangeText={setWifiSsid}
+              onChangeText={(value) => {
+                if (canEditRouting) setWifiSsid(value);
+              }}
               mode="outlined"
               style={styles.input}
               autoCapitalize="none"
-              disabled={!routeEnabled}
+              disabled={
+                !routeEnabled ||
+                hydrating ||
+                hydrationFailed ||
+                loading ||
+                guestLoading ||
+                routingSaving
+              }
             />
             <TextInput
               label="API URL on that Wi-Fi"
               value={wifiApiUrl}
-              onChangeText={setWifiApiUrl}
+              onChangeText={(value) => {
+                if (canEditRouting) setWifiApiUrl(value);
+              }}
               mode="outlined"
               style={styles.input}
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="url"
-              disabled={!routeEnabled}
+              disabled={
+                !routeEnabled ||
+                hydrating ||
+                hydrationFailed ||
+                loading ||
+                guestLoading ||
+                routingSaving
+              }
             />
             <TextInput
               label="API URL on cellular / other networks"
               value={cellularApiUrl}
-              onChangeText={setCellularApiUrl}
+              onChangeText={(value) => {
+                if (canEditRouting) setCellularApiUrl(value);
+              }}
               mode="outlined"
               style={styles.input}
               autoCapitalize="none"
               autoCorrect={false}
               keyboardType="url"
-              disabled={!routeEnabled}
+              disabled={
+                !routeEnabled ||
+                hydrating ||
+                hydrationFailed ||
+                loading ||
+                guestLoading ||
+                routingSaving
+              }
             />
             <View style={styles.buttonRow}>
-              <Button mode="outlined" onPress={handleSaveRouting}>
+              <Button
+                mode="outlined"
+                onPress={handleSaveRouting}
+                loading={routingSaving}
+                disabled={
+                  hydrating ||
+                  hydrationFailed ||
+                  loading ||
+                  guestLoading ||
+                  routingSaving
+                }
+              >
                 {routingSaved ? "Saved" : "Save Routing"}
               </Button>
             </View>
+            {error ? (
+              <HelperText type="error" visible>
+                {error}
+              </HelperText>
+            ) : null}
+            {hydrationFailed ? (
+              <Button
+                mode="outlined"
+                onPress={() => void loadSettings()}
+                disabled={hydrating || loading || guestLoading || routingSaving}
+              >
+                再読み込み
+              </Button>
+            ) : null}
           </Surface>
 
           {showLoginForm ? (
@@ -229,17 +418,26 @@ export default function LoginScreen() {
               <Text style={styles.formTitle}>サーバーログイン</Text>
 
               {!routeEnabled ? (
-              <TextInput
-                label="サーバー URL"
-                value={apiUrl}
-                onChangeText={setApiUrl}
-                mode="outlined"
-                style={styles.input}
-                autoCapitalize="none"
-                autoCorrect={false}
-                keyboardType="url"
-                left={<TextInput.Icon icon="server" />}
-              />
+                <TextInput
+                  label="サーバー URL"
+                  value={apiUrl}
+                  onChangeText={(value) => {
+                    if (canEditRouting) setApiUrl(value);
+                  }}
+                  mode="outlined"
+                  style={styles.input}
+                  autoCapitalize="none"
+                  autoCorrect={false}
+                  keyboardType="url"
+                  left={<TextInput.Icon icon="server" />}
+                  disabled={
+                    hydrating ||
+                    hydrationFailed ||
+                    loading ||
+                    guestLoading ||
+                    routingSaving
+                  }
+                />
               ) : (
                 <Text style={styles.helperText}>
                   Login uses the URL selected by Network Routing.
@@ -275,17 +473,17 @@ export default function LoginScreen() {
                 onSubmitEditing={handleLogin}
               />
 
-              {error ? (
-                <HelperText type="error" visible>
-                  {error}
-                </HelperText>
-              ) : null}
-
               <Button
                 mode="contained"
                 onPress={handleLogin}
                 loading={loading}
-                disabled={loading || guestLoading}
+                disabled={
+                  hydrating ||
+                  hydrationFailed ||
+                  loading ||
+                  guestLoading ||
+                  routingSaving
+                }
                 style={styles.button}
                 contentStyle={styles.buttonContent}
               >

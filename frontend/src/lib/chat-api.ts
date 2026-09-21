@@ -94,6 +94,8 @@ export type ConversationMessageMetadata = Record<string, unknown> & {
   generation_status?: "cancelled" | "completed" | "failed" | string;
   partial?: boolean;
   finish_reason?: string;
+  context_manifest?: ContextManifest | null;
+  work_intelligence_evidence?: WorkIntelligenceEvidencePayload | null;
 };
 
 export type ChatGenerationMetrics = {
@@ -122,7 +124,7 @@ export type ContextSnapshotCategory = {
   label: string;
   tokens?: number | null;
   percentage?: number | null;
-  status?: "active" | "deferred";
+  status?: "active" | "deferred" | "failed";
   measurement?: ContextMeasurement;
   source?: string | null;
   preview?: string | null;
@@ -161,12 +163,243 @@ export type ContextSnapshot = ContextRequestSnapshot & {
   /** Optional explicit Main request supplied by newer backends. */
   main?: ContextRequestSnapshot | null;
   requests?: ContextRequestSnapshot[];
+  agent_run_id?: string | null;
+  context_manifest?: ContextManifest | null;
+  inspector?: ContextManifestInspector | null;
+  capabilities?: ContextCapabilities | null;
+  authorized_references?: ContextAuthorizedReference[];
+};
+
+export type ContextAuthorizedReference = {
+  kind: string;
+  ref_hash: string;
+  label: string;
+  href?: string | null;
+  relation?: string | null;
+  source?: string | null;
+  version?: string | number | null;
+  freshness?: string | null;
+  selection_reason?: string | null;
+};
+
+/** Canonical validated ContextManifest returned by the FastAPI inspector route. */
+export type ContextManifestResource = {
+  kind: string;
+  ref_hash: string;
+  relation?: string | null;
+  source?: string | null;
+  version?: string | number | null;
+  freshness?: string | null;
+  supersedes_ref_hash?: string | null;
+};
+
+export type ContextManifestEvidence = {
+  kind: string;
+  locator_hash: string;
+  source_type?: string | null;
+  version?: string | number | null;
+};
+
+export type ContextManifestPolicyDecision = {
+  authority: string;
+  scope: string;
+  decision: "allow" | "deny";
+  resource_ref_hash?: string | null;
+  decision_ref_hash: string;
+};
+
+export type ContextManifestLayer = {
+  category: string;
+  source: string;
+  status: "active" | "deferred" | "failed";
+  inclusion_reason?: string | null;
+  retrieved_chars?: number | null;
+  selected_chars?: number | null;
+  truncated?: boolean;
+  transform?: string | null;
+};
+
+export type ContextManifestRequest = {
+  request_index?: number | null;
+  request_kind?: string | null;
+  observed_provider?: string | null;
+  observed_model?: string | null;
+  context_window_tokens?: number | null;
+  response_tokens_reserved?: number | null;
+  input_tokens?: number | null;
+  remaining_tokens?: number | null;
+  measurement?: string | null;
+  component_categories: string[];
+  request_hash: string;
+};
+
+export type WorkIntelligenceManifestItem = {
+  kind: string;
+  ref_hash: string;
+  status?: string | null;
+  priority?: string | number | null;
+  score?: number;
+  version?: string | number | null;
+  freshness?: string | null;
+  uncertain?: boolean;
+  advisory_conflict?: boolean;
+  evidence_ref_hashes?: string[];
+};
+
+export type WorkIntelligenceManifestEvidence = {
+  kind: string;
+  locator_hash: string;
+  source_type?: string | null;
+  version?: string | number | null;
+  freshness?: string | null;
+  uncertain?: boolean;
+};
+
+export type WorkIntelligenceManifestRelation = {
+  relation_type: string;
+  subject_ref_hash: string;
+  target_kind: string;
+  target_ref_hash: string;
+  evidence_ref_hashes: string[];
+  confidence?: number;
+  uncertain?: boolean;
+};
+
+export type WorkIntelligenceManifest = {
+  schema_version: string;
+  producer_version: string;
+  items: WorkIntelligenceManifestItem[];
+  people: Array<{
+    person_ref_hash: string;
+    evidence_count: number;
+    score: number;
+    uncertain: boolean;
+  }>;
+  evidence: WorkIntelligenceManifestEvidence[];
+  relations: WorkIntelligenceManifestRelation[];
+  freshness: Record<string, string | number>;
+  omissions: Record<string, number>;
+  layers: Array<{
+    category: string;
+    source: string;
+    status: string;
+    selected_chars: number;
+    item_count: number;
+    evidence_count: number;
+  }>;
+};
+
+export type ContextManifest = {
+  schema_version: string;
+  producer_version: string;
+  sanitizer_version: string;
+  mode: string;
+  subject: {
+    actor?: ContextManifestResource | null;
+    turn_ref?: ContextManifestResource | null;
+    scopes: ContextManifestResource[];
+    include_project_context?: boolean | null;
+    strict_project_scope: boolean;
+    automatic_context_suppressed: boolean;
+    verified_project_attachment: boolean;
+  };
+  resources: ContextManifestResource[];
+  evidence: ContextManifestEvidence[];
+  policy_decisions: ContextManifestPolicyDecision[];
+  layers: ContextManifestLayer[];
+  requests: ContextManifestRequest[];
+  bundle_char_budget?: number | null;
+  omission_reason_counts: Record<string, number>;
+  reproducibility_hashes: {
+    turn: string;
+    context: string;
+    requests: string;
+  };
+  manifest_hash: string;
+  work_intelligence?: WorkIntelligenceManifest;
+};
+
+/** API-facing structured projection; it intentionally contains no raw prompt bodies. */
+export type ContextManifestInspector = {
+  schema_version?: string | null;
+  producer_version?: string | null;
+  sanitizer_version?: string | null;
+  mode?: string | null;
+  subject?: {
+    include_project_context?: boolean | null;
+    strict_project_scope?: boolean;
+    automatic_context_suppressed?: boolean;
+    verified_project_attachment?: boolean;
+    scopes?: ContextManifestResource[];
+  };
+  categories?: Array<{
+    category: string;
+    status: "active" | "deferred" | "failed";
+    measurement?: string;
+    source?: string;
+    selection_reason?: string;
+    tokens?: number;
+    percentage?: number;
+    retrieved_chars?: number;
+    selected_chars?: number;
+    size_chars?: number;
+  }>;
+  resources: ContextManifestResource[];
+  evidence: ContextManifestEvidence[];
+  policy_decisions: ContextManifestPolicyDecision[];
+  layers: ContextManifestLayer[];
+  requests: ContextManifestRequest[];
+  omission_reason_counts: Record<string, number>;
+  reproducibility_hashes: Record<string, string>;
+  bundle_char_budget?: number;
+  manifest_hash?: string | null;
+  work_intelligence?: WorkIntelligenceManifest;
+};
+
+export type ContextCapabilities = {
+  executed: Array<{ name: string; reason: "completed" | "failed" | "cancelled" | "timed_out" }>;
+  executed_names?: string[];
+};
+
+export type ContextSnapshotBinding = {
+  session_id: string;
+  message_id?: string | null;
+  agent_run_id?: string | null;
+  active_branch: boolean;
+};
+
+export type WorkIntelligenceEvidencePayload = {
+  kind?: string;
+  version?: number | string;
+  evidence_refs?: Array<{
+    kind?: string;
+    timestamp?: string | null;
+    hash?: string | null;
+    ref_hash?: string | null;
+    id?: string | null;
+  }>;
+  evidence?: Array<{
+    kind?: string;
+    timestamp?: string | null;
+    hash?: string | null;
+    ref_hash?: string | null;
+    id?: string | null;
+  }>;
 };
 
 export type ContextSnapshotResponse = {
   success: boolean;
   status: "available" | "unavailable" | "missing" | string;
   snapshot?: ContextSnapshot | null;
+  context_manifest?: ContextManifest | null;
+  inspector?: ContextManifestInspector | null;
+  capabilities?: ContextCapabilities | null;
+  binding?: ContextSnapshotBinding | null;
+  turn_binding?: ContextSnapshotBinding | null;
+  session_id?: string | null;
+  message_id?: string | null;
+  agent_run_id?: string | null;
+  authorized_references?: ContextAuthorizedReference[];
 };
 
 /**
@@ -197,6 +430,7 @@ export type ConversationMessage = {
   role: "user" | "assistant" | "system";
   content: string;
   metadata: ConversationMessageMetadata;
+  client_message_id?: string | null;
   sender_type?: string | null;
   sender_id?: string | null;
   sender_display_name?: string | null;
@@ -248,6 +482,14 @@ export type LlmCatalogProvider = {
   availability_reason?: string | null;
   configured_model?: string;
   models: LlmCatalogModelOption[];
+  /** Runtime-served models for chat; never populated from static catalog fallback. */
+  chat_models?: LlmCatalogModelOption[];
+  /** Compatibility alias for consumers that call this projection available_models. */
+  available_models?: LlmCatalogModelOption[];
+  availability?: {
+    state?: "available" | "empty" | "error" | "blocked" | "catalog" | string;
+    error?: string | null;
+  };
   settings?: {
     api_key_configured?: boolean;
     reasoning_effort?: string | null;
@@ -262,6 +504,9 @@ export type LlmCatalogProvider = {
 export type LlmModelCatalogResponse = {
   current: ChatResponseModelSelection;
   providers: LlmCatalogProvider[];
+  provider_visibility?: {
+    hidden_provider_ids?: unknown;
+  };
   deployment?: LlmDeploymentMetadata | null;
 };
 
@@ -381,6 +626,8 @@ export type AgentResourceMutation = {
   operation: "created" | "updated" | "moved" | "archived" | "deleted";
   success: boolean;
   project_name?: string | null;
+  parent_id?: string | null;
+  created_in_outline?: boolean | null;
   start_at?: string | null;
   due_date?: string | null;
   end_at?: string | null;
@@ -433,17 +680,115 @@ type ChatRequestInit = RequestInit & {
   timeoutMs?: number;
 };
 
-class ChatApiError extends Error {
-  status?: number;
+/** Sanitized error envelope returned by the BFF and FastAPI proxy routes. */
+export type StructuredApiError = {
+  code: string;
+  message: string;
+  retryable: boolean;
+  request_id?: string | null;
+};
 
-  constructor(message: string, status?: number) {
+export class ChatApiError extends Error {
+  status?: number;
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly requestId: string | null;
+  readonly request_id: string | null;
+  readonly error: StructuredApiError;
+
+  constructor(
+    message: string,
+    status?: number,
+    details?: Partial<StructuredApiError>,
+  ) {
     super(message);
     this.name = "ChatApiError";
     this.status = status;
+    this.code = details?.code || "chat_api_error";
+    this.retryable =
+      details?.retryable ??
+      (status != null && RETRYABLE_STATUSES.has(status));
+    this.requestId = details?.request_id ?? null;
+    this.request_id = this.requestId;
+    this.error = {
+      code: this.code,
+      message,
+      retryable: this.retryable,
+      request_id: this.requestId,
+    };
   }
 }
 
 const RETRYABLE_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+function fallbackApiErrorMessage(status: number, statusText: string): string {
+  if (status === 401) return "認証が必要です";
+  if (status === 403) return "この操作を実行する権限がありません";
+  if (status === 404) return "要求されたリソースが見つかりません";
+  if (status === 409) return "要求が競合したため完了できませんでした";
+  if (status >= 500) return "サーバーで要求を処理できませんでした";
+  return statusText || "要求を処理できませんでした";
+}
+
+function parseStructuredApiError(
+  raw: string,
+  status: number,
+  statusText: string,
+  responseRequestId: string | null = null,
+): StructuredApiError {
+  let payload: unknown;
+  try {
+    payload = raw ? JSON.parse(raw) : null;
+  } catch {
+    payload = null;
+  }
+
+  const candidate =
+    payload && typeof payload === "object"
+      ? (payload as { error?: unknown }).error
+      : null;
+  if (candidate && typeof candidate === "object") {
+    const value = candidate as Record<string, unknown>;
+    const code =
+      typeof value.code === "string" && value.code.trim()
+        ? value.code.trim()
+        : "chat_api_error";
+    const message =
+      typeof value.message === "string" && value.message.trim()
+        ? value.message.trim()
+        : fallbackApiErrorMessage(status, statusText);
+    const requestId =
+      typeof value.request_id === "string" && value.request_id.trim()
+        ? value.request_id.trim()
+        : responseRequestId;
+    return {
+      code,
+      message,
+      retryable:
+        typeof value.retryable === "boolean"
+          ? value.retryable
+          : RETRYABLE_STATUSES.has(status),
+      request_id: requestId,
+    };
+  }
+
+  // Older proxy routes returned {detail: ...}. Keep the message for
+  // compatibility, but cap it and avoid exposing a raw HTML/stack response.
+  const detail =
+    payload && typeof payload === "object"
+      ? (payload as { detail?: unknown }).detail
+      : null;
+  const message =
+    typeof detail === "string" && detail.trim() && detail.length <= 512
+      ? detail.trim()
+      : fallbackApiErrorMessage(status, statusText);
+  return {
+    code: "chat_api_error",
+    message,
+    retryable: RETRYABLE_STATUSES.has(status),
+    request_id: responseRequestId,
+  };
+}
 
 function sleep(ms: number) {
   return new Promise<void>((resolve) => setTimeout(resolve, ms));
@@ -451,7 +796,7 @@ function sleep(ms: number) {
 
 function isRetryableError(error: unknown) {
   if (error instanceof ChatApiError) {
-    return error.status != null && RETRYABLE_STATUSES.has(error.status);
+    return error.retryable;
   }
   if (error instanceof DOMException) {
     return error.name === "AbortError" || error.name === "TimeoutError";
@@ -474,19 +819,21 @@ async function requestOnce<T>(
     signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
   });
 
-  if (res.status === 401) {
-    const shouldRedirectToLogin = !path.startsWith("/api/python-proxy/");
-    if (shouldRedirectToLogin && typeof window !== "undefined") {
-      window.location.href = "/login";
-    }
-    throw new Error("認証が必要です");
-  }
   if (!res.ok) {
-    const text = await res.text().catch(() => "");
-    throw new ChatApiError(
-      `Chat API error: ${res.status} ${res.statusText} - ${text}`,
+    const raw = await res.text().catch(() => "");
+    const details = parseStructuredApiError(
+      raw,
       res.status,
+      res.statusText,
+      res.headers.get("x-request-id"),
     );
+    if (res.status === 401) {
+      const shouldRedirectToLogin = !path.startsWith("/api/python-proxy/");
+      if (shouldRedirectToLogin && typeof window !== "undefined") {
+        window.location.href = "/login";
+      }
+    }
+    throw new ChatApiError(details.message, res.status, details);
   }
 
   // DELETE等で空レスポンスの場合
@@ -741,16 +1088,31 @@ export const chatApi = {
     data: {
       role: "user" | "assistant";
       content: string;
+      /** Stable caller identity used for idempotent retries. */
+      client_message_id?: string | null;
+      /** Camel-case alias kept for callers outside the HTTP boundary. */
+      clientMessageId?: string | null;
     },
-  ) =>
-    request<{ success: boolean; message: ConversationMessage }>(
+  ) => {
+    const clientMessageId =
+      data.client_message_id ?? data.clientMessageId ?? null;
+    return request<{
+      success: boolean;
+      replayed?: boolean;
+      message: ConversationMessage;
+    }>(
       `/api/conversations/${sessionId}/messages`,
       {
         method: "POST",
-        body: JSON.stringify(data),
+        body: JSON.stringify({
+          role: data.role,
+          content: data.content,
+          ...(clientMessageId ? { client_message_id: clientMessageId } : {}),
+        }),
         signal: AbortSignal.timeout(15000),
       },
-    ),
+    );
+  },
 
   /** セッション再開。キャッシュ再訪時は includeMessages=false で全履歴転送を省く。 */
   resumeSession: (sessionId: string, includeMessages = true) =>
@@ -768,10 +1130,13 @@ export const chatApi = {
   dispatchMessage: (
     sessionId: string,
     // 生成型 ConversationDispatchRequest を正とする。default 値を持つ
-    // include_project_context / skip_user_persistence はクライアントでは任意化。
+    // include_project_context / skip_user_persistence /
+    // cloud_advisor_explicit はクライアントでは任意化。
     data: OptionalizeDefaults<
       Schemas["ConversationDispatchRequest"],
-      "include_project_context" | "skip_user_persistence"
+      | "include_project_context"
+      | "skip_user_persistence"
+      | "cloud_advisor_explicit"
     >,
   ) =>
     request<{
@@ -784,6 +1149,7 @@ export const chatApi = {
       method: "POST",
       keepalive: true,
       body: JSON.stringify(data),
+      timeoutMs: 15_000,
     }),
 
   getAgentRun: (runId: string, options?: AgentRunFetchOptions) => {

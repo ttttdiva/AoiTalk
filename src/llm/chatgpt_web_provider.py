@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from dataclasses import replace
 import logging
 import os
 from pathlib import Path
@@ -17,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, AsyncIterator, Iterable
+from typing import Any, AsyncIterator, Callable, Iterable, Mapping
 
 from .chatgpt_web_selectors import (
     ASSISTANT_MESSAGE_SELECTOR,
@@ -42,6 +43,11 @@ from ..security.browser_scope import (
     _agent_team_role_bound,
     create_director_browser_scope,
 )
+from ..services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyReviewDenied,
+)
 from ..utils.subprocess_env import build_aoitalk_subprocess_env
 
 logger = logging.getLogger(__name__)
@@ -55,6 +61,12 @@ LOGIN_STATE_POLL_SECONDS = 0.25
 LOGIN_STATE_STABLE_SECONDS = 1.0
 PROFILE_LOCK_POLL_SECONDS = 0.05
 BROWSER_CLOSE_TIMEOUT_SECONDS = 10.0
+
+# This is deliberately a stable adapter label rather than a provider-factory
+# candidate.  Web ChatGPT uses the parent-owned browser lane below and must
+# never be selected by ``create_llm_client_for_target`` or by a leaf worker.
+CHATGPT_WEB_ADVISOR_PROVIDER = "chatgpt-web"
+CHATGPT_WEB_ADVISOR_SOURCE_KIND = "cloud_advisor"
 
 
 class ChatGPTWebError(RuntimeError):
@@ -969,6 +981,249 @@ class ChatGPTWebProvider:
             raise ChatGPTWebNeedsHumanError(
                 "ChatGPTにログインしていません。"
             )
+
+
+class ChatGPTWebCloudAdvisorAdapter:
+    """Parent-only, privacy-gated Cloud Advisor façade for ChatGPT Web.
+
+    Web ChatGPT intentionally does not implement the normal native-provider
+    contract: it owns a persistent browser profile and has no API model
+    selector.  This adapter is the narrow seam the parent Cloud Advisor
+    coordinator can call when a deployment explicitly chooses the Web
+    transport.  It performs exactly one ``ChatGPTWebProvider.send`` inside a
+    single :class:`OutboundPrivacyGateway` transaction; the revalidation
+    gateway used for an edited protected payload has no sender and therefore
+    cannot create a second external request.
+
+    Attachments are rejected for this surface.  The existing Director path
+    continues to support authorised attachments, but an advisory request is
+    text-only by contract.
+    """
+
+    provider_id = CHATGPT_WEB_ADVISOR_PROVIDER
+
+    def __init__(
+        self,
+        config: Any,
+        *,
+        provider_factory: Callable[[Any], Any] = ChatGPTWebProvider,
+        gateway_factory: Callable[..., OutboundPrivacyGateway] = (
+            OutboundPrivacyGateway
+        ),
+    ) -> None:
+        self.config = config
+        self.provider_factory = provider_factory
+        self.gateway_factory = gateway_factory
+
+    @staticmethod
+    def _validate_final_text(value: Any) -> str:
+        # Never coerce arbitrary provider/review objects through ``str`` at
+        # the transport boundary.  A review editor is text-only and a
+        # malformed value must be denied before the browser opens.
+        if not isinstance(value, str):
+            raise PrivacyReviewDenied(
+                "ChatGPT Web Cloud Advisor final payload must be text"
+            )
+        if not value.strip():
+            raise PrivacyReviewDenied(
+                "ChatGPT Web Cloud Advisor final payload is empty"
+            )
+        return value
+
+    @staticmethod
+    async def _revalidate_protected_final(
+        value: str,
+        *,
+        gateway: OutboundPrivacyGateway,
+        descriptor: EgressDescriptor,
+        model: str,
+        semantic_exempt_values: Iterable[str] = (),
+    ) -> str:
+        """Reject an edited protected value that reintroduces raw content.
+
+        The primary gateway may have obtained a user-edited final string from
+        the review UI.  Re-running protection with review/caching disabled
+        proves that the edited value is already a safe fixed point.  No sender
+        is supplied to this validator, so it cannot emit another request.
+        """
+
+        if gateway.mode != "protected":
+            return value
+
+        validator = OutboundPrivacyGateway(
+            gateway.config,
+            session_id=gateway.session_id,
+            user_id=gateway.user_id,
+            semantic_redactor=gateway.semantic_redactor,
+            session_context=gateway.session_context,
+            project_metadata=gateway.project_metadata,
+        )
+        validator.settings = replace(
+            validator.settings,
+            review_policy="never",
+            notify=False,
+            cache_enabled=False,
+        )
+        checked = await validator.protect(
+            value,
+            provider=CHATGPT_WEB_ADVISOR_PROVIDER,
+            base_url=CHATGPT_HOME_URL,
+            source_kind=f"{CHATGPT_WEB_ADVISOR_SOURCE_KIND}.final_revalidation",
+            model=model,
+            descriptor=descriptor,
+            semantic_exempt_values=semantic_exempt_values,
+        )
+        checked_value = (
+            checked.final_payload
+            if checked.final_payload is not None
+            else checked.payload
+        )
+        if checked_value != value:
+            raise PrivacyReviewDenied(
+                "ChatGPT Web Cloud Advisor edited final failed privacy revalidation"
+            )
+        return value
+
+    async def consult(
+        self,
+        query: str,
+        *,
+        session_id: str | None = None,
+        user_id: str | None = None,
+        session_context: Mapping[str, Any] | None = None,
+        project_metadata: Mapping[str, Any] | None = None,
+        conversation_url: str | None = None,
+        attachments: Any = None,
+        gateway: OutboundPrivacyGateway | None = None,
+        review_callback: Callable[..., Any] | None = None,
+        model: str | None = None,
+        semantic_exempt_values: Iterable[str] = (),
+    ) -> str:
+        """Send one text-only advisory request through the parent browser.
+
+        ``gateway`` may be supplied by a parent coordinator that already owns
+        a session-scoped alias map.  If omitted, this method creates a gateway
+        using the supplied identity/context.  The local-only provider check is
+        deliberately performed before provider construction or browser
+        operation, so a blocked request cannot touch the ChatGPT profile.
+        """
+
+        if _agent_team_role_bound():
+            # Keep the same error family as the profile coordinator.  This
+            # defence-in-depth check runs before any privacy callback or
+            # provider factory supplied by an untrusted child can execute.
+            raise ChatGPTWebBusyError(
+                "Agent Team workers cannot access the Cloud Advisor browser."
+            )
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Cloud Advisor query must be non-empty text")
+        if attachments:
+            raise ChatGPTWebError(
+                "Cloud Advisor の ChatGPT Web 経路では添付ファイルを使用できません。"
+            )
+
+        active_gateway = gateway
+        if active_gateway is None:
+            active_gateway = self.gateway_factory(
+                self.config,
+                session_id=session_id,
+                user_id=user_id,
+                review_callback=review_callback,
+                session_context=session_context,
+                project_metadata=project_metadata,
+            )
+
+        # ``chatgpt-web`` is always an external destination.  This is the
+        # fail-closed preflight for local_only and intentionally precedes
+        # provider construction/browser profile acquisition.
+        active_gateway.ensure_provider_allowed(
+            self.provider_id,
+            base_url=CHATGPT_HOME_URL,
+        )
+
+        provider = self.provider_factory(self.config)
+        active_model = str(model or "").strip()
+        descriptor = EgressDescriptor(
+            action="cloud_advisor.consult",
+            transport="chatgpt-web.ui",
+            destination=CHATGPT_HOME_URL,
+            provider=self.provider_id,
+            tool="consult_cloud_advisor",
+            model=active_model,
+        )
+
+        async def send(final_payload: Any) -> Any:
+            outbound = self._validate_final_text(final_payload)
+            if query.strip() in tuple(semantic_exempt_values):
+                if outbound != query.strip():
+                    raise PrivacyReviewDenied(
+                        "workflow Cloud Web payload changed after review"
+                    )
+            outbound = await self._revalidate_protected_final(
+                outbound,
+                gateway=active_gateway,
+                descriptor=descriptor,
+                model=active_model,
+                semantic_exempt_values=semantic_exempt_values,
+            )
+            # Optional QA instrumentation is hash-only and inert unless the
+            # workflow evidence environment variables are configured.  Keep
+            # it immediately before the sole browser transport just like the
+            # native Cloud API adapters.
+            try:
+                from ..services.cloud_advisor_service import _record_workflow_egress_evidence
+
+                _record_workflow_egress_evidence(outbound)
+            except Exception:
+                pass
+            # The browser operation is entered only after the privacy gateway
+            # has approved and finalized the payload.  ``operation('director')``
+            # enforces the opaque parent capability and process-global profile
+            # lock; no worker can forge this lane.
+            async with provider.operation("director"):
+                await provider.open_conversation(conversation_url)
+                return await provider.send(outbound, files=None)
+
+        response = await active_gateway.execute(
+            query.strip(),
+            provider=self.provider_id,
+            descriptor=descriptor,
+            sender=send,
+            base_url=CHATGPT_HOME_URL,
+            source_kind=CHATGPT_WEB_ADVISOR_SOURCE_KIND,
+            model=active_model,
+            semantic_exempt_values=semantic_exempt_values,
+        )
+        if not isinstance(response, str) or not response.strip():
+            raise ChatGPTWebUIInteractionError(
+                "ChatGPT Web Cloud Advisor returned no text response"
+            )
+        # Aliases are permitted to cross the browser boundary only in the
+        # protected direction.  Restore them after the provider has returned,
+        # locally, so the parent receives useful advisory text while no raw
+        # value was present in the browser request/audit projection.
+        restored = active_gateway.restore_aliases(response).strip()
+        return restored
+
+
+async def consult_cloud_advisor_text(
+    config: Any,
+    query: str,
+    **kwargs: Any,
+) -> str:
+    """Canonical callable seam for a parent Cloud Advisor coordinator.
+
+    This wrapper keeps provider selection out of the generic LLM factory while
+    allowing the backend coordinator to use the same privacy/parent/browser
+    contract as :class:`ChatGPTWebCloudAdvisorAdapter`.
+    """
+
+    return await ChatGPTWebCloudAdvisorAdapter(config).consult(query, **kwargs)
+
+
+# A descriptive alias for integrations that prefer a verb-shaped adapter
+# name.  Both names intentionally point at the same one-send implementation.
+consult_cloud_advisor_web = consult_cloud_advisor_text
 
 
 async def open_chatgpt_settings_browser(config: Any) -> dict[str, Any]:

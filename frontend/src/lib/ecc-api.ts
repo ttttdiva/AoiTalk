@@ -565,6 +565,49 @@ export interface ScopedMemoryJob {
   updated_at?: string | null;
 }
 
+/** A durable Dreaming consolidation run shown alongside extraction jobs. */
+export interface DreamingMemoryRun {
+  id: string;
+  user_id?: string | null;
+  trigger: string;
+  status: string;
+  source_message_ids?: string[];
+  source_count?: number;
+  source_digest?: string | null;
+  backfill?: boolean;
+  candidate_count?: number;
+  mutation_count?: number;
+  started_at?: string | null;
+  completed_at?: string | null;
+  error?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface ScopedMemoryOverviewSection {
+  key: string;
+  label: string;
+  memories: ScopedMemory[];
+}
+
+export interface ScopedMemoryOverview {
+  active_count: number;
+  candidate_count: number;
+  last_dreamed_at?: string | null;
+  backfill_complete: boolean;
+  backfill_pending: boolean;
+  last_error?: string | null;
+  sections: ScopedMemoryOverviewSection[];
+}
+
+export interface ScopedMemoryJobsResponse {
+  success: boolean;
+  jobs: ScopedMemoryJob[];
+  dreaming_runs?: DreamingMemoryRun[];
+  /** Compatibility alias used by early overview API responses. */
+  runs?: DreamingMemoryRun[];
+}
+
 export interface ScopedMemoryMutation {
   success: boolean;
   memory_id: string;
@@ -688,7 +731,12 @@ export const memoryApi = {
     ),
 
   listJobs: (limit = 50) =>
-    get<{ success: boolean; jobs: ScopedMemoryJob[] }>(
+    get<ScopedMemoryJobsResponse>(
       `/memories/jobs?limit=${limit}`,
+    ),
+
+  getOverview: () =>
+    get<{ success: boolean; overview: ScopedMemoryOverview }>(
+      "/memories/overview",
     ),
 };

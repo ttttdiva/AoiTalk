@@ -16,10 +16,13 @@ services:
       AOITALK_EXTERNAL_PROVIDER: ${AOITALK_EXTERNAL_PROVIDER:-openai_compatible_local}
       AOITALK_EXTERNAL_MODEL: ${AOITALK_EXTERNAL_MODEL:-qwen3.8-27b}
       AOITALK_EXTERNAL_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-http://host.docker.internal:18080/v1}
-      AOITALK_EXTERNAL_REQUIRED_MODELS: ${AOITALK_EXTERNAL_REQUIRED_MODELS:-qwen3.8-27b,gemma-4-26b-a4b-it-qat-q4-0}
+      AOITALK_EXTERNAL_REQUIRED_MODELS: ${AOITALK_EXTERNAL_REQUIRED_MODELS:-qwen3.8-27b,qwen3.8-flash-next}
       OPENAI_COMPATIBLE_LOCAL_MODEL: ${AOITALK_EXTERNAL_MODEL:-qwen3.8-27b}
       OPENAI_COMPATIBLE_LOCAL_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-http://host.docker.internal:18080/v1}
       # Never let a known llama.cpp profile imply ownership of the router.
       LLAMA_CPP_AUTO_START: "false"
       OPENROUTER_BASE_URL: ${AOITALK_EXTERNAL_BASE_URL:-https://openrouter.ai/api/v1}
-      OPENROUTER_MODEL: ${AOITALK_EXTERNAL_MODEL:-openai/gpt-4o-mini}
+      # Kept as a compatibility pass-through for older images.  An unset
+      # value is intentional: model selection belongs to the provider-specific
+      # AoiTalk config/catalog and must never fall back to a retired model.
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}

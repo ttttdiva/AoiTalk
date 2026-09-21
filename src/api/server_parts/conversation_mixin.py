@@ -6,6 +6,7 @@ server.py から移設。ロジックは一切変更していない。
 
 from ..server_shared import *  # noqa: F401,F403
 from concurrent.futures import Future as ConcurrentFuture
+from contextlib import asynccontextmanager, nullcontext
 from typing import Iterable
 from uuid import NAMESPACE_URL, uuid5
 
@@ -36,9 +37,128 @@ from ...services.turn_context import (
 # path by passing this marker explicitly.
 TRUSTED_LEGACY_MARKER = object()
 
+_CONVERSATION_DISPATCH_RECOVERY_INTERVAL_SECONDS = 5.0
+_CONVERSATION_DISPATCH_RECOVERY_MAX_RETRY_INTERVAL_SECONDS = 60.0
+
+
+def _exception_chain(error: BaseException):
+    """Yield an exception and its causal chain without looping forever."""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        cause = current.__cause__ or current.__context__
+        current = cause if isinstance(cause, BaseException) else None
+
+
+def _is_transient_conversation_dispatch_error(error: BaseException) -> bool:
+    """Return whether a recovery poll may safely be retried later.
+
+    Recovery only reads durable outbox state.  Connection establishment and
+    database availability failures are expected to be temporary for the
+    optional Personal runtime, while programming/schema errors still need the
+    existing traceback logging.
+    """
+    try:
+        from sqlalchemy.exc import InterfaceError, OperationalError
+    except ImportError:  # pragma: no cover - SQLAlchemy is a runtime dependency
+        transient_sqlalchemy_errors: tuple[type[BaseException], ...] = ()
+    else:
+        transient_sqlalchemy_errors = (InterfaceError, OperationalError)
+
+    for current in _exception_chain(error):
+        if isinstance(current, (TimeoutError, ConnectionError, OSError)):
+            return True
+        if isinstance(current, transient_sqlalchemy_errors):
+            return True
+
+        error_type = type(current)
+        type_name = error_type.__name__.casefold()
+        module_name = error_type.__module__.casefold()
+        if module_name.startswith("asyncpg.") and (
+            "connect" in type_name or "connection" in type_name
+        ):
+            return True
+
+        if isinstance(current, RuntimeError) and (
+            "database is not initialized" in str(current).casefold()
+        ):
+            return True
+    return False
+
 
 class ConversationMixin:
     """WebChatServer の会話制御メソッド群。"""
+
+    def _dispatch_native_employee_execution_context(
+        self,
+        data: Dict[str, Any],
+    ):
+        """Return the server-issued native employee execution context.
+
+        Native Windows execution is an *identity-bound* capability, not a
+        consequence of the Enterprise profile or of any model/request field.
+        The capability service resolves the current authenticated principal
+        and configured endpoint mapping.  Keep the import lazy so Personal,
+        Linux, and older deployments retain the no-op path while the service
+        is optional during rolling upgrades.
+
+        ``agent_run_id`` and ``session_id`` are durable server-side dispatch
+        identifiers.  The audit id is derived locally rather than accepting a
+        value from JSON/model output.  The returned object is normally a
+        synchronous context manager; a small compatibility adapter also
+        accepts an async context manager from a future service implementation.
+        """
+
+        try:
+            from ...services.native_employee_execution_service import (
+                current_dispatch_native_employee_execution_context,
+            )
+        except (ImportError, AttributeError):
+            # The capability service is optional while an installation is
+            # rolling forward.  In its absence the existing command boundary
+            # remains fail-closed for Enterprise and Personal keeps legacy
+            # behaviour; do not invent a host identity here.
+            return nullcontext()
+
+        run_id = str(data.get("agent_run_id") or "").strip() or None
+        session_id = str(data.get("session_id") or "").strip() or None
+        audit_parts = [part for part in (session_id, run_id) if part]
+        audit_id = "conversation-dispatch:" + ":".join(audit_parts or ("turn",))
+
+        return current_dispatch_native_employee_execution_context(
+            config=getattr(self, "config", None),
+            run_id=run_id,
+            session_id=session_id,
+            audit_id=audit_id,
+        )
+
+    @asynccontextmanager
+    async def _bound_dispatch_native_employee_execution_context(
+        self,
+        data: Dict[str, Any],
+    ):
+        """Bind one dispatch's native capability for its generation task.
+
+        The context is intentionally task-local and is always reset before
+        the worker task exits.  Supporting both sync and async context
+        managers keeps the dispatch boundary independent from the capability
+        service's implementation details.
+        """
+
+        context = self._dispatch_native_employee_execution_context(data)
+        if hasattr(context, "__aenter__"):
+            async with context as capability:
+                yield capability
+            return
+        if hasattr(context, "__enter__"):
+            with context as capability:
+                yield capability
+            return
+        # A service may deliberately return None for disabled/mismatched
+        # mappings.  Treat that as an explicit no-op, never as authorization.
+        yield context
 
     async def _set_dispatch_user_context(self, data: Dict[str, Any]) -> None:
         """Install the durable dispatch principal for agent tool execution.
@@ -208,6 +328,26 @@ class ConversationMixin:
                     settlement["settled"] = True
                 return bool(marked)
 
+        async def succeed_terminal_delivery(message: str) -> bool:
+            """Complete a handled dispatch before closing its outbox lease."""
+            async with settlement_lock:
+                if settlement["settled"]:
+                    return True
+                completed = await agent_run_service.complete_run(
+                    agent_run_id,
+                    message=message,
+                    result={"group_dispatch_completed": True},
+                )
+                if completed is None:
+                    raise RuntimeError("agent run disappeared before dispatch completion")
+                marked = await agent_run_service.mark_dispatch_delivered(
+                    run_id=agent_run_id,
+                    lease_token=lease_token,
+                )
+                if marked:
+                    settlement["settled"] = True
+                return bool(marked)
+
         async def cancel_terminal_delivery() -> bool:
             async with settlement_lock:
                 if settlement["settled"]:
@@ -297,6 +437,7 @@ class ConversationMixin:
         lifecycle = {
             "agent_run_id": agent_run_id,
             "terminal": mark_terminal_delivery,
+            "terminal_success": succeed_terminal_delivery,
             "terminal_failure": fail_terminal_delivery,
             "cancelled": cancel_terminal_delivery,
             "failure": release_failed_handoff,
@@ -331,7 +472,12 @@ class ConversationMixin:
                 "_conversation_dispatch_service_factory",
                 AgentRunService,
             )
-            agent_run_service = service_factory()
+            if service_factory is AgentRunService:
+                agent_run_service = service_factory(
+                    getattr(self, "_db_manager", None),
+                )
+            else:
+                agent_run_service = service_factory()
         recovered = 0
         purge_delivered = getattr(
             agent_run_service,
@@ -370,19 +516,60 @@ class ConversationMixin:
                     recovered += 1
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as exc:
+                if _is_transient_conversation_dispatch_error(exc):
+                    raise
                 logger.exception("Failed to recover conversation dispatch %s", run_id)
         return recovered
 
     async def _conversation_dispatch_recovery_loop(self) -> None:
+        poll_interval = max(
+            0.001,
+            float(
+                getattr(
+                    self,
+                    "_conversation_dispatch_recovery_interval",
+                    _CONVERSATION_DISPATCH_RECOVERY_INTERVAL_SECONDS,
+                )
+            ),
+        )
+        retry_interval = poll_interval
+        database_unavailable = False
         while True:
             try:
                 await self._recover_conversation_dispatches_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("Conversation dispatch recovery poll failed")
-            await asyncio.sleep(5.0)
+            except Exception as exc:
+                # asyncpg's connection timeout uses asyncio.timeout(), which
+                # may translate a cancellation at its deadline into a plain
+                # TimeoutError.  Once shutdown has started, never turn that
+                # translated cancellation back into another retry cycle.
+                if getattr(self, "_conversation_dispatch_shutting_down", False):
+                    raise asyncio.CancelledError() from exc
+                if _is_transient_conversation_dispatch_error(exc):
+                    if not database_unavailable:
+                        logger.warning(
+                            "Conversation dispatch recovery is waiting for the database; retrying (%s)",
+                            type(exc).__name__,
+                        )
+                    database_unavailable = True
+                    retry_interval = min(
+                        _CONVERSATION_DISPATCH_RECOVERY_MAX_RETRY_INTERVAL_SECONDS,
+                        max(poll_interval, retry_interval * 2.0),
+                    )
+                else:
+                    database_unavailable = False
+                    retry_interval = poll_interval
+                    logger.exception("Conversation dispatch recovery poll failed")
+            else:
+                if database_unavailable:
+                    logger.info("Conversation dispatch recovery database connection restored")
+                database_unavailable = False
+                retry_interval = poll_interval
+            if getattr(self, "_conversation_dispatch_shutting_down", False):
+                return
+            await asyncio.sleep(retry_interval)
 
     async def _start_conversation_dispatch_recovery(self) -> None:
         current = getattr(self, "_conversation_dispatch_recovery_task", None)
@@ -782,7 +969,15 @@ class ConversationMixin:
         lifecycle = lifecycle if isinstance(lifecycle, dict) else None
         try:
             await self._set_dispatch_user_context(data)
-            await self._handle_user_message(data)
+            # Re-establish the native capability only after the durable
+            # authenticated principal above has been resolved.  The helper
+            # no-ops for Personal/non-Windows/disabled/unmapped dispatches;
+            # coding/Harness scopes remain independent and are nested by the
+            # generation/runtime layers when explicitly requested.
+            async with self._bound_dispatch_native_employee_execution_context(
+                data
+            ):
+                await self._handle_user_message(data)
         except BaseException as exc:
             if lifecycle and not lifecycle.get("handed_off"):
                 failure_name = (
@@ -1198,8 +1393,17 @@ class ConversationMixin:
         docs_reference_ids: Optional[Iterable[str]] = None,
         task_id: Optional[str] = None,
         explicit_references: Optional[Iterable[Any]] = None,
+        cloud_advisor_origin: Any | None = None,
+        cloud_advisor_assessment: Any | None = None,
         verified_project_attachment: bool = False,
+        suppress_automatic_context: bool = False,
+        strict_project_scope: bool = False,
     ) -> None:
+        # Materialize once before creating the async callback.  The dispatch
+        # path normally supplies an immutable tuple, but accepting any
+        # iterable here must not consume a generator for kwargs and then lose
+        # it when binding the callback TurnContext.
+        normalized_explicit_references = tuple(explicit_references or ())
         if session_id:
             self._set_conversation_generation_status(
                 session_id,
@@ -1238,6 +1442,12 @@ class ConversationMixin:
                 "command_capabilities": command_capabilities,
                 "tools_required": tools_required,
             }
+            if cloud_advisor_origin is not None:
+                callback_kwargs["cloud_advisor_origin"] = cloud_advisor_origin
+            if cloud_advisor_assessment is not None:
+                callback_kwargs["cloud_advisor_assessment"] = (
+                    cloud_advisor_assessment
+                )
             normalized_docs_reference_ids = tuple(
                 str(value).strip().lower()
                 for value in docs_reference_ids or ()
@@ -1245,8 +1455,23 @@ class ConversationMixin:
             )
             if normalized_docs_reference_ids:
                 callback_kwargs["docs_reference_ids"] = normalized_docs_reference_ids
+            # These values are resolved and authorized by the server-side
+            # mention/Task boundary before scheduling.  Carry them explicitly
+            # to the mode callback so a queued callback does not need to infer
+            # scope from prompt text (or from the client message id).
+            normalized_task_id = str(task_id or "").strip()
+            if normalized_task_id:
+                callback_kwargs["task_id"] = normalized_task_id
+            if normalized_explicit_references:
+                callback_kwargs["explicit_references"] = (
+                    normalized_explicit_references
+                )
             if verified_project_attachment:
                 callback_kwargs["verified_project_attachment"] = True
+            if suppress_automatic_context:
+                callback_kwargs["suppress_automatic_context"] = True
+            if strict_project_scope:
+                callback_kwargs["strict_project_scope"] = True
             return self.on_user_input(message, **callback_kwargs)
 
         cancellation_handle = register_generation_cancellation(agent_run_id)
@@ -1256,12 +1481,21 @@ class ConversationMixin:
                 f"{sender_user_id or 'default_user'}|{session_id or 'default'}"
             )
             callback_turn_context_token = None
-            if task_id or explicit_references:
+            if (
+                task_id
+                or normalized_explicit_references
+                or cloud_advisor_origin is not None
+                or cloud_advisor_assessment is not None
+            ):
                 current_turn = get_turn_context()
                 callback_turn_context_token = set_turn_context(
                     user_id=current_turn.user_id or sender_user_id,
                     project_id=current_turn.project_id or project_id,
-                    include_project_context=current_turn.include_project_context,
+                    # The scheduler's explicit flag is the authoritative
+                    # request value.  Do not let a copied parent ContextVar
+                    # (for example, a prior Project-enabled turn) override an
+                    # intentional OFF dispatch.
+                    include_project_context=bool(include_project_context),
                     session_id=current_turn.session_id or session_id,
                     task_id=task_id or current_turn.task_id,
                     message_id=current_turn.message_id,
@@ -1269,11 +1503,28 @@ class ConversationMixin:
                     tool_call_id=current_turn.tool_call_id,
                     docs_reference_ids=current_turn.docs_reference_ids,
                     explicit_references=(
-                        tuple(explicit_references)
-                        if explicit_references
+                        normalized_explicit_references
+                        if normalized_explicit_references
                         else current_turn.explicit_references
                     ),
+                    cloud_advisor_origin=(
+                        cloud_advisor_origin
+                        if cloud_advisor_origin is not None
+                        else current_turn.cloud_advisor_origin
+                    ),
+                    cloud_advisor_assessment=(
+                        cloud_advisor_assessment
+                        if cloud_advisor_assessment is not None
+                        else current_turn.cloud_advisor_assessment
+                    ),
                     verified_project_attachment=current_turn.verified_project_attachment,
+                    # Preserve trusted controller/scope gates across the
+                    # scheduler rebind as well.  Help turns that carry an
+                    # explicit Cloud Advisor assessment otherwise enter this
+                    # branch and could lose their Guide-only suppression
+                    # before TerminalMode binds its own context.
+                    suppress_automatic_context=bool(suppress_automatic_context),
+                    strict_project_scope=bool(strict_project_scope),
                 )
             # Give an immediately-following stop request a chance to cancel the
             # dispatch before user input enters the generation pipeline.  This
@@ -1283,7 +1534,19 @@ class ConversationMixin:
                 await asyncio.sleep(0)
                 token = set_current_generation_cancellation(cancellation_handle)
                 try:
-                    return await create_user_input_coro()
+                    # WebSocket turns reach ``_handle_user_message`` directly
+                    # (without the durable-dispatch worker above).  Bind the
+                    # capability for the actual generation callback as well,
+                    # after the server has materialized the run id.  The
+                    # context manager is task-local and resets before the
+                    # callback task is released.
+                    async with self._bound_dispatch_native_employee_execution_context(
+                        {
+                            "agent_run_id": agent_run_id,
+                            "session_id": session_id,
+                        }
+                    ):
+                        return await create_user_input_coro()
                 finally:
                     reset_current_generation_cancellation(token)
                     if cancellation_handle is not None:

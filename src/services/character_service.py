@@ -537,7 +537,7 @@ def _make_dynamic_agent_class(
             # SpecialistDelegationRunner supplies the resolved route model for
             # normal execution.  Keep this defensive fallback aligned with the
             # current fresh OpenAI default rather than reviving the retired
-            # gpt-4o-mini value if a caller instantiates the dynamic class
+            # retired model value if a caller instantiates the dynamic class
             # directly.
             effective_model = model or "gpt-5.6-luna"
             self.agent = AgentDefinition(

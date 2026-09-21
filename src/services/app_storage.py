@@ -94,6 +94,9 @@ APP_IGNORED_PATHS = {
     "dist",
     "build",
     "cache",
+    ".local",
+    ".runtime",
+    "log",
     "logs",
     "runtime data",
     "secrets",
@@ -127,6 +130,9 @@ REQUIRED_APP_IGNORE_RULES: tuple[str, ...] = (
     "dist/",
     "build/",
     "cache/",
+    ".local/",
+    ".runtime/",
+    "log/",
     "logs/",
     "runtime data/",
     "secrets/",
@@ -573,7 +579,8 @@ def list_app_files(
         return []
     result: list[dict[str, object]] = []
     for path in sorted(workspace.rglob("*")):
-        lower_parts = {part.lower() for part in path.parts}
+        relative_path = path.relative_to(workspace)
+        lower_parts = {part.lower() for part in relative_path.parts}
         if ".git" in lower_parts or lower_parts.intersection(APP_IGNORED_PATHS):
             continue
         if _is_storage_link_or_reparse(path):
@@ -584,15 +591,26 @@ def list_app_files(
             path.resolve(strict=True).relative_to(workspace.resolve())
         except (OSError, ValueError):
             continue
-        relative = path.relative_to(workspace).as_posix()
+        relative = relative_path.as_posix()
         if is_private_app_path(relative):
+            continue
+        try:
+            stat_result = path.stat()
+            digest = sha256_file(path)
+        except OSError as exc:
+            # A live editor/Office lock (or another transient filesystem
+            # failure) must not make the whole file-list request fail.  The
+            # archive endpoint already treats unreadable workspace files as
+            # best-effort supplements, so keep the same per-file boundary for
+            # the metadata used by the download settings tree.
+            logger.warning("App file listing skipped %s: %s", relative, exc)
             continue
         result.append(
             {
                 "path": relative,
                 "filename": path.name,
-                "size_bytes": path.stat().st_size,
-                "sha256": sha256_file(path),
+                "size_bytes": stat_result.st_size,
+                "sha256": digest,
             }
         )
     return result

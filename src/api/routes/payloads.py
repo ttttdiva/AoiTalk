@@ -31,6 +31,17 @@ class MobileCommandRequest(BaseModel):
 class ResponseModelSelection(BaseModel):
     provider: str
     model: str
+    reasoning_effort: Optional[str] = Field(default=None, max_length=32)
+
+    @model_validator(mode="after")
+    def validate_model_effort(self):
+        if self.reasoning_effort is not None:
+            from ...llm.response_model_effort import validate_response_model_effort
+
+            self.reasoning_effort = validate_response_model_effort(
+                self.provider, self.model, self.reasoning_effort
+            )
+        return self
 
 
 class ConversationDispatchRequest(BaseModel):
@@ -50,6 +61,10 @@ class ConversationDispatchRequest(BaseModel):
     client_message_id: Optional[str] = Field(default=None, max_length=512)
     command_capabilities: Optional[List[str]] = None
     tools_required: Optional[bool] = None
+    # Authenticated users may mark a turn as an explicit Cloud Advisor
+    # consultation.  This is a request-boundary intent flag, never a model
+    # tool argument or automatic-escalation signal.
+    cloud_advisor_explicit: bool = False
     skip_user_persistence: bool = False
     persisted_user_message_id: Optional[str] = None
     attachments: Optional[List[Dict[str, Any]]] = Field(
@@ -112,9 +127,11 @@ def sanitize_response_model_selection(value: Any) -> Optional[Dict[str, str]]:
     if isinstance(value, ResponseModelSelection):
         raw_provider = value.provider
         raw_model = value.model
+        raw_effort = value.reasoning_effort
     elif isinstance(value, dict):
         raw_provider = value.get("provider")
         raw_model = value.get("model")
+        raw_effort = value.get("reasoning_effort")
     else:
         return None
 
@@ -122,7 +139,14 @@ def sanitize_response_model_selection(value: Any) -> Optional[Dict[str, str]]:
     model = str(raw_model or "").strip()
     if not provider or not model:
         return None
-    return {"provider": provider, "model": model}
+    selection = {"provider": provider, "model": model}
+    if raw_effort is not None:
+        from ...llm.response_model_effort import validate_response_model_effort
+
+        selection["reasoning_effort"] = validate_response_model_effort(
+            provider, model, raw_effort
+        )
+    return selection
 
 
 class RuntimeFeaturePatchPayload(BaseModel):
@@ -152,6 +176,11 @@ class RuntimeFeaturePatchPayload(BaseModel):
 class LoginPayload(BaseModel):
     username: str = Field(max_length=255)
     password: str = Field(max_length=1024)
+    # Credential source is intentionally explicit when an external identity
+    # provider is enabled.  ``None`` keeps existing local installations
+    # compatible; the canonical authentication service rejects an omitted
+    # selector when AD is enabled rather than silently falling back.
+    credential_source: Optional[str] = Field(default=None, max_length=32)
 
 
 class CreateUserPayload(BaseModel):

@@ -288,7 +288,7 @@ class DueCompletionMixin:
             task.status = "closed"
             task.completed_at = completion_time
             task.updated_at = completion_time
-            await self._record_activity(
+            activity = await self._record_activity(
                 session,
                 task_id=task_id,
                 activity_type="task_auto_closed_on_due",
@@ -298,6 +298,20 @@ class DueCompletionMixin:
                     "auto_close_on_due": True,
                 },
             )
+            # Keep automatic due closure on the same transaction-friendly
+            # enqueue path as explicit Task completion.  The helper performs
+            # no LLM/research work and never commits this transaction.
+            from ..knowledge_capture_candidate_service import (
+                enqueue_for_completed_task,
+            )
+
+            activity_id = getattr(activity, "id", None)
+            if not isinstance(activity_id, UUID):
+                activity_id = None
+            enqueue_kwargs = {"trigger_user_id": None}
+            if activity_id is not None:
+                enqueue_kwargs["task_activity_id"] = activity_id
+            await enqueue_for_completed_task(session, task, **enqueue_kwargs)
             changed_tasks.append(task)
             stats["auto_closed"] += 1
             stats["tasks_closed"] += 1

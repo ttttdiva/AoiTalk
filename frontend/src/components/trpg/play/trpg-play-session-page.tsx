@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { Loader2 } from "lucide-react";
 import { useCurrentUserId } from "@/components/providers/swr-global-provider";
 import { Button } from "@/components/ui/button";
+import { AppSelect } from "@/components/ui/app-select";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
@@ -467,7 +468,7 @@ export function TrpgPlaySessionPage({ sessionId }: { sessionId: string }) {
           {!isSpectator ? (
           <section className="rounded-lg border border-border bg-card p-4 space-y-2">
             <h2 className="text-sm font-semibold">Whisper</h2>
-            <select
+              <AppSelect
               className="w-full rounded border border-border bg-background px-2 py-1 text-sm"
               value={whisperTargetId}
               onChange={(e) => setWhisperTargetId(e.target.value)}
@@ -478,7 +479,7 @@ export function TrpgPlaySessionPage({ sessionId }: { sessionId: string }) {
                 .map((item) => (
                   <option key={item.id} value={item.id}>{item.display_name}</option>
                 ))}
-            </select>
+              </AppSelect>
             <Textarea value={whisperText} onChange={(e) => setWhisperText(e.target.value)} rows={2} />
             <Button size="sm" onClick={() => void handleWhisper()}>送る</Button>
             <ul className="space-y-1 text-xs text-muted-foreground">

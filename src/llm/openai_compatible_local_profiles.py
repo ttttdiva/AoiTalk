@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -11,6 +12,12 @@ from typing import Any, Dict, List, Optional
 DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL = "http://127.0.0.1:8080/v1"
 EXO_BASE_URL = "http://127.0.0.1:52415/v1"
 MLX_LM_BASE_URL = DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL
+FREETOKEN_MINIMUM_VERSION = "0.1.2"
+FREETOKEN_DEFAULT_HOST = "127.0.0.1"
+FREETOKEN_DEFAULT_PORT = 1919
+FREETOKEN_DEFAULT_READINESS_TIMEOUT = 180.0
+FREETOKEN_BASE_URL = "http://127.0.0.1:1919/v1"
+FREETOKEN_QWEN3_06B_MODEL_ID = "Qwen/Qwen3-0.6B"
 
 # llama.cpp/llama-server is deliberately modelled as one runtime of the
 # existing OpenAI-compatible local provider.  Model-specific launch and UI
@@ -22,6 +29,59 @@ LLAMA_CPP_QWEN38_MODEL_ALIAS = "qwen3.8-27b-heretic-uncensored"
 LLAMA_CPP_QWEN38_MODEL_FILENAME = "Qwen3.8-27B-Heretic-Q4_K_M.gguf"
 LLAMA_CPP_QWEN38_OFFICIAL_MODEL_ALIAS = "qwen3.8-27b"
 LLAMA_CPP_QWEN38_OFFICIAL_MODEL_FILENAME = "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_FILENAME = "mmproj-F16.gguf"
+LLAMA_CPP_QWEN38_OFFICIAL_SOURCE_REVISION = "4ca720788d1e01f1bff70c033e0d0028fd02e502"
+LLAMA_CPP_QWEN38_OFFICIAL_MODEL_SIZE_BYTES = 17_559_178_144
+LLAMA_CPP_QWEN38_OFFICIAL_MODEL_SHA256 = (
+    "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+)
+LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_SIZE_BYTES = 927_607_488
+LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_SHA256 = (
+    "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e"
+)
+LLAMA_CPP_QWEN38_OFFICIAL_MTP_REPOSITORY = "ggml-org/Qwen3.8-27B-GGUF"
+LLAMA_CPP_QWEN38_OFFICIAL_MTP_REVISION = "efbb3b1f70a21d97fd4495240648405f7228554f"
+LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS = "qwen3.8-flash-next"
+LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAME = "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
+LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAMES = [
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf",
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00003.gguf",
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00003.gguf",
+]
+# The qwen4exp NextN/MTP implementation is currently available only from
+# llama.cpp PR #27836.  Keep this pin inside the nested MTP contract: the
+# ordinary Flash-Next profile remains compatible with official b10660+.
+LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_REQUIRED_COMMIT = (
+    "1d8de7c1b0c7d2febf8f983174d8e6a711e2b1af"
+)
+LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_MODEL_FILENAME = (
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-MTP-00001-of-00004.gguf"
+)
+LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_MODEL_FILENAMES = [
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-MTP-00001-of-00004.gguf",
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-MTP-00002-of-00004.gguf",
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-MTP-00003-of-00004.gguf",
+    "Qwen3.8-Flash-Next-UD-IQ4_XS-MTP-00004-of-00004.gguf",
+]
+LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_ALIAS = (
+    "qwen3.8-flash-next-uncensored"
+)
+LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_FILENAME = (
+    "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf"
+)
+LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_FILENAMES = [
+    "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00001-of-00003.gguf",
+    "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00002-of-00003.gguf",
+    "Qwen3.8-Flash-Next-Uncensored-IQ4_XS-00003-of-00003.gguf",
+]
+# Published Hugging Face file sizes are kept as constants for documentation
+# and download-plan tests.  They are not used as a runtime trust decision:
+# Hugging Face's signed metadata remains the source of truth for bytes.
+LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_FILE_SIZES = [
+    44_766_155_936,
+    44_735_995_008,
+    7_971_004_256,
+]
 # Spelling aliases for callers that use the dotted model family notation.
 LLAMA_CPP_QWEN3_8_MODEL_ALIAS = LLAMA_CPP_QWEN38_MODEL_ALIAS
 LLAMA_CPP_QWEN3_8_MODEL_FILENAME = LLAMA_CPP_QWEN38_MODEL_FILENAME
@@ -29,11 +89,58 @@ LLAMA_CPP_GEMMA4_MODEL_ALIAS = "gemma-4-26b-a4b-it-qat-q4-0"
 LLAMA_CPP_GEMMA4_MODEL_FILENAME = "gemma-4-26B_q4_0-it.gguf"
 LLAMA_CPP_MELODY1437_MODEL_ALIAS = "melody1437-26b-a4b-v2.0"
 LLAMA_CPP_MELODY1437_MODEL_FILENAME = "Melody1437-26B-A4B-v2.0-Q8_0.gguf"
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS = "dark-scarlett-27b-v2.0"
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_FILENAME = (
+    "Dark-Scarlett-27B-v2.0-Q4_K_M.gguf"
+)
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_FILENAME = (
+    "MMPROJ-Dark-Scarlett-27B-v2.0-Q8_0.gguf"
+)
+LLAMA_CPP_DARK_SCARLETT_27B_V2_SOURCE_REVISION = (
+    "5aa0350de88b22bfbb717de29e02f9666718c8ad"
+)
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_SIZE_BYTES = 16_810_714_336
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_SHA256 = (
+    "464c09dd5fb42bd8b8e61b8d3c6e368c75d1089a3cf5ed01bd47ac0c9b46739b"
+)
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_SIZE_BYTES = 629_247_040
+LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_SHA256 = (
+    "08af092b6bf0e29ef907170e2e0ef8c284333779962fcf7dac4a05a759056637"
+)
+LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_ALIAS = "dark-scarlett-26b-a4b-v1.0"
+LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_FILENAME = (
+    "Dark-Scarlett-v1.0-26B-A4B-Q4_K_M.gguf"
+)
+LLAMA_CPP_BONSAI2_MODEL_ALIAS = "bonsai-2-27b-ternary"
+LLAMA_CPP_BONSAI2_MODEL_FILENAME = "Ternary-Bonsai-2-27B-PQ2_0.gguf"
+LLAMA_CPP_BONSAI2_MMPROJ_FILENAME = "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf"
+LLAMA_CPP_BONSAI2_SOURCE_REVISION = "6ed5e12bf84b7a63069882c91dd9e9218647d17b"
+LLAMA_CPP_BONSAI2_MODEL_SIZE_BYTES = 7_206_168_928
+LLAMA_CPP_BONSAI2_MODEL_SHA256 = (
+    "3907dc1658db1f78a9826bf8d5bcb8dc65db0d466388937af57f2294fae62ec1"
+)
+LLAMA_CPP_BONSAI2_MMPROJ_SIZE_BYTES = 629_246_976
+LLAMA_CPP_BONSAI2_MMPROJ_SHA256 = (
+    "6807ede61d570bb86ba34b756a0fa109edc33668604de867c6ea6d8f1d631903"
+)
+# Short spelling aliases keep imports consistent with other model-family
+# constants while the versioned names above remain canonical.
+LLAMA_CPP_DARK_SCARLETT_27B_MODEL_ALIAS = LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS
+LLAMA_CPP_DARK_SCARLETT_27B_MODEL_FILENAME = LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_FILENAME
+LLAMA_CPP_DARK_SCARLETT_26B_A4B_MODEL_ALIAS = LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_ALIAS
+LLAMA_CPP_DARK_SCARLETT_26B_A4B_MODEL_FILENAME = LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_FILENAME
 LLAMA_CPP_DEFAULT_HOST = "127.0.0.1"
 LLAMA_CPP_DEFAULT_PORT = 8080
 LLAMA_CPP_DEFAULT_CONTEXT_SIZE = 131072
 LLAMA_CPP_DEFAULT_GPU_LAYERS = 999
 LLAMA_CPP_DEFAULT_READINESS_TIMEOUT = 180.0
+
+# Runtime distributions are trusted selectors, not user-supplied repository
+# settings.  The runtime manager resolves these identifiers through its own
+# allowlist so existing llama.cpp profiles remain on stock llama.cpp while a
+# future profile can opt into a compatible fork without model-ID branches.
+LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK = "stock"
+LLAMA_CPP_RUNTIME_DISTRIBUTION_PRISMML = "prismml"
 
 # Qwen3.8 llama.cpp profiles expose reasoning effort through the Jinja
 # chat-template contract.  Keep this metadata on the profile itself so the
@@ -144,7 +251,10 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "served_alias": LLAMA_CPP_QWEN38_OFFICIAL_MODEL_ALIAS,
         "alias_locked": True,
         "source_repository": "unsloth/Qwen3.8-27B-GGUF",
+        "source_revision": LLAMA_CPP_QWEN38_OFFICIAL_SOURCE_REVISION,
         "gguf_filename": LLAMA_CPP_QWEN38_OFFICIAL_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_QWEN38_OFFICIAL_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_QWEN38_OFFICIAL_MODEL_SHA256,
         "source_url": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF",
         "quantization": "UD-Q4_K_XL",
         "default_context_size": 32768,
@@ -154,10 +264,20 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
         "required_args": ["--jinja"],
         "default_args": ["--jinja"],
         "jinja_required": True,
+        "auxiliary_artifacts": [
+            {
+                "id": "mmproj",
+                "kind": "mmproj",
+                "filename": LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_FILENAME,
+                "required": True,
+                "size_bytes": LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_SIZE_BYTES,
+                "sha256": LLAMA_CPP_QWEN38_OFFICIAL_MMPROJ_SHA256,
+            }
+        ],
         "capabilities": {
             "reasoning": True,
             "tools": True,
-            "media": {"image": False, "audio": False},
+            "media": {"image": True, "audio": False},
         },
         "reasoning_effort_options": list(QWEN38_REASONING_EFFORT_OPTIONS),
         "reasoning_effort_default": QWEN38_REASONING_EFFORT_DEFAULT,
@@ -170,11 +290,101 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             "default_enabled": True,
             "mode": LLAMA_CPP_MTP_MODE_COMPANION,
             "companion_filenames": ["mtp-Qwen3.8-27B-Q4_0.gguf"],
+            "artifact_required": True,
+            "artifact_repository": LLAMA_CPP_QWEN38_OFFICIAL_MTP_REPOSITORY,
+            "artifact_revision": LLAMA_CPP_QWEN38_OFFICIAL_MTP_REVISION,
             "reason": (
                 "ggml-org/Qwen3.8-27B-GGUFの公式MTP sidecar。"
                 "UD-Q4_K_XL本体との互換性をllama-server b10437で実測確認済み。"
             ),
         },
+    },
+    LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS: {
+        "id": LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS,
+        "label": "Qwen3.8-Flash-Next UD-IQ4_XS",
+        "description": (
+            "unsloth/Qwen3.8-Flash-Next-GGUF の UD-IQ4_XS 3-shard GGUFを"
+            " llama-serverで提供します。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "source_url": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF",
+        "gguf_filename": LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAME,
+        "gguf_filenames": list(LLAMA_CPP_QWEN38_FLASH_NEXT_MODEL_FILENAMES),
+        "gguf_shard_count": 3,
+        "gguf_repository_subdir": "UD-IQ4_XS",
+        # Keep the local base weights separate from the derived embedded-MTP
+        # variant.  The repository subdirectory above remains the upstream
+        # download path; this field is only the deterministic local storage
+        # layout used by ManagedLocalRuntimeManager.
+        "model_storage_subdir": "main",
+        "quantization": "UD-IQ4_XS",
+        "default_context_size": 16384,
+        "native_context_size": 262144,
+        "default_gpu_layers": "auto",
+        # Official llama.cpp release b10660 is the first release with
+        # Qwen3.8-Flash-Next (qwen4exp) support.  Keep this as a minimum build
+        # rather than pinning the merge commit so later official builds work.
+        "minimum_llama_cpp_build": 10660,
+        # Flash-Next is exposed as an ordinary chat profile.  AoiTalk's
+        # agentic completion verifier remains disabled for plain chat until
+        # release-build compatibility is separately revalidated.  This is
+        # independent of the upstream qwen4exp minimum-build gate.
+        "chat_agentic_completion_review_enabled": False,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
+        "mtp": {
+            "supported": True,
+            # PR #27836 is still draft; do not opt new users into a
+            # source-built runtime and derived 4-shard artifact by default.
+            "default_enabled": False,
+            "mode": LLAMA_CPP_MTP_MODE_EMBEDDED,
+            "required_llama_cpp_commit": LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_REQUIRED_COMMIT,
+            "embedded_variant": {
+                "primary_filename": LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_MODEL_FILENAME,
+                "filenames": list(LLAMA_CPP_QWEN38_FLASH_NEXT_MTP_MODEL_FILENAMES),
+            },
+            "reason": (
+                "Qwen3.8-Flash-Next MTPはllama.cpp PR #27836のexact headと、"
+                "検証済み4-shard embedded variantが揃った場合だけ利用します。"
+                "通常の3-shard baseは公式b10660以上でMTPなしのまま利用できます。"
+            ),
+        },
+    },
+    LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_ALIAS: {
+        "id": LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_ALIAS,
+        "label": "Qwen3.8-Flash-Next Uncensored IQ4_XS",
+        "description": (
+            "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF の "
+            "IQ4_XS GGUFを llama-serverで提供します。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "orcarouter/Qwen3.8-Flash-Next-Uncensored-GGUF",
+        "source_url": (
+            "https://huggingface.co/orcarouter/"
+            "Qwen3.8-Flash-Next-Uncensored-GGUF"
+        ),
+        # These artifacts live at repository root; do not add a synthetic
+        # ``gguf_repository_subdir`` for this profile.
+        "gguf_filename": LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_FILENAME,
+        "gguf_filenames": list(
+            LLAMA_CPP_QWEN38_FLASH_NEXT_UNCENSORED_MODEL_FILENAMES
+        ),
+        "gguf_shard_count": 3,
+        "quantization": "IQ4_XS",
+        "default_context_size": 16384,
+        "native_context_size": 262144,
+        "default_gpu_layers": "auto",
+        "minimum_llama_cpp_build": 10660,
+        "chat_agentic_completion_review_enabled": False,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
     },
     LLAMA_CPP_GEMMA4_MODEL_ALIAS: {
         "id": LLAMA_CPP_GEMMA4_MODEL_ALIAS,
@@ -237,7 +447,172 @@ LLAMA_CPP_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
             "media": {"image": False, "audio": False},
         },
     },
+    LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS: {
+        "id": LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS,
+        "label": "Dark Scarlett 27B v2.0 Q4_K_M",
+        "description": (
+            "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF の Q4_K_M GGUFと"
+            " 専用Q8_0 mmprojを llama-serverで提供する画像対応profileです。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "ReadyArt/Dark-Scarlett-27B-v2.0-GGUF",
+        "source_revision": LLAMA_CPP_DARK_SCARLETT_27B_V2_SOURCE_REVISION,
+        "source_url": (
+            "https://huggingface.co/ReadyArt/Dark-Scarlett-27B-v2.0-GGUF"
+        ),
+        "gguf_filename": LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_DARK_SCARLETT_27B_V2_MODEL_SHA256,
+        "quantization": "Q4_K_M",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        # Qwen3.5 vision was already exercised in upstream llama.cpp b8155.
+        # Use the later specialized-parser build as a conservative managed
+        # floor so image-capable Dark Scarlett never launches on text-only-era
+        # or early multimodal runtimes.
+        "minimum_llama_cpp_build": 10227,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
+        "auxiliary_artifacts": [
+            {
+                "id": "mmproj",
+                "kind": "mmproj",
+                "filename": LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_FILENAME,
+                "required": True,
+                "size_bytes": LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_SIZE_BYTES,
+                "sha256": LLAMA_CPP_DARK_SCARLETT_27B_V2_MMPROJ_SHA256,
+            }
+        ],
+        "capabilities": {
+            "reasoning": False,
+            "tools": False,
+            "media": {"image": True, "audio": False},
+        },
+    },
+    LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_ALIAS: {
+        "id": LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_ALIAS,
+        "label": "Dark Scarlett 26B-A4B v1.0 Q4_K_M",
+        "description": (
+            "ReadyArt/Dark-Scarlett-v1.0-26B-A4B-GGUF の Q4_K_M GGUFを"
+            " llama-serverで提供します。restricted optional の text-only profileです。"
+        ),
+        "runtime": "llama_cpp",
+        "served_alias": LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "ReadyArt/Dark-Scarlett-v1.0-26B-A4B-GGUF",
+        "source_url": (
+            "https://huggingface.co/ReadyArt/Dark-Scarlett-v1.0-26B-A4B-GGUF"
+        ),
+        "gguf_filename": LLAMA_CPP_DARK_SCARLETT_26B_A4B_V1_MODEL_FILENAME,
+        "quantization": "Q4_K_M",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
+        "capabilities": {
+            "reasoning": False,
+            "tools": False,
+            "media": {"image": False, "audio": False},
+        },
+    },
+    LLAMA_CPP_BONSAI2_MODEL_ALIAS: {
+        "id": LLAMA_CPP_BONSAI2_MODEL_ALIAS,
+        "label": "Bonsai 2 27B Ternary PQ2_0",
+        "description": (
+            "PrismML Ternary-Bonsai-2-27BのPQ2_0 GGUFを"
+            " PrismML llama.cpp runtimeで提供します。"
+        ),
+        "runtime": "llama_cpp",
+        "runtime_distribution": LLAMA_CPP_RUNTIME_DISTRIBUTION_PRISMML,
+        "served_alias": LLAMA_CPP_BONSAI2_MODEL_ALIAS,
+        "alias_locked": True,
+        "source_repository": "prism-ml/Ternary-Bonsai-2-27B-gguf",
+        "source_url": (
+            "https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf"
+        ),
+        "source_revision": LLAMA_CPP_BONSAI2_SOURCE_REVISION,
+        "gguf_filename": LLAMA_CPP_BONSAI2_MODEL_FILENAME,
+        "gguf_size_bytes": LLAMA_CPP_BONSAI2_MODEL_SIZE_BYTES,
+        "gguf_sha256": LLAMA_CPP_BONSAI2_MODEL_SHA256,
+        "quantization": "PQ2_0",
+        "default_context_size": 32768,
+        "native_context_size": 262144,
+        "default_gpu_layers": "auto",
+        "minimum_llama_cpp_build": 10683,
+        "required_args": ["--jinja"],
+        "default_args": ["--jinja"],
+        "jinja_required": True,
+        "auxiliary_artifacts": [
+            {
+                "id": "mmproj",
+                "kind": "mmproj",
+                "filename": LLAMA_CPP_BONSAI2_MMPROJ_FILENAME,
+                "required": True,
+                "size_bytes": LLAMA_CPP_BONSAI2_MMPROJ_SIZE_BYTES,
+                "sha256": LLAMA_CPP_BONSAI2_MMPROJ_SHA256,
+            }
+        ],
+        "sampling_defaults": {
+            "temperature": 1.0,
+            "top_p": 0.95,
+            "top_k": 20,
+        },
+        "capabilities": {
+            "reasoning": True,
+            "tools": True,
+            "media": {"image": True, "audio": False},
+        },
+    },
 }
+
+# Keep this registry deliberately small. Entries belong here only when the
+# FreeToken serve contract and the exact upstream model repository have both
+# been confirmed. FreeToken serves a local model directory, so no individual
+# safetensors filename is inferred.
+FREETOKEN_MODEL_PROFILES: Dict[str, Dict[str, Any]] = {
+    FREETOKEN_QWEN3_06B_MODEL_ID: {
+        "id": FREETOKEN_QWEN3_06B_MODEL_ID,
+        "label": "Qwen3 0.6B / FreeToken",
+        "description": "FreeToken公式確認用の最小managed profile。",
+        "runtime": "freetoken",
+        "source_repository": "Qwen/Qwen3-0.6B",
+        "source_url": "https://huggingface.co/Qwen/Qwen3-0.6B",
+        "model_format": "safetensors",
+        "minimum_freetoken_version": FREETOKEN_MINIMUM_VERSION,
+        "capabilities": {
+            "reasoning": True,
+            "tools": False,
+            "media": {"image": False, "audio": False},
+        },
+    },
+}
+
+
+def freetoken_model_profile(
+    model: str | None = None,
+) -> Optional[Dict[str, Any]]:
+    """Return a copy of one trusted FreeToken model profile."""
+
+    candidate = str(model or "").strip().casefold()
+    if not candidate:
+        return None
+    for key, profile in FREETOKEN_MODEL_PROFILES.items():
+        identities = {
+            str(key).casefold(),
+            str(profile.get("id") or "").casefold(),
+            str(profile.get("source_repository") or "").casefold(),
+        }
+        if candidate in identities:
+            return copy.deepcopy(profile)
+    return None
+
+
+def freetoken_model_profiles() -> List[Dict[str, Any]]:
+    return [copy.deepcopy(profile) for profile in FREETOKEN_MODEL_PROFILES.values()]
 
 
 def llama_cpp_model_profile(
@@ -278,6 +653,13 @@ def llama_cpp_model_profile(
                 str(profile.get("model_filename") or "").casefold(),
                 str(profile.get("official_filename") or "").casefold(),
             }
+            shard_filenames = profile.get("gguf_filenames")
+            if isinstance(shard_filenames, (list, tuple)):
+                aliases.update(
+                    Path(str(filename)).name.strip().casefold()
+                    for filename in shard_filenames
+                    if str(filename).strip()
+                )
             if candidate in aliases:
                 return copy.deepcopy(profile)
     return None
@@ -287,6 +669,227 @@ def llama_cpp_model_profiles() -> List[Dict[str, Any]]:
     """Return all registered model profiles as independent dictionaries."""
 
     return [copy.deepcopy(profile) for profile in LLAMA_CPP_MODEL_PROFILES.values()]
+
+
+def llama_cpp_runtime_distribution(
+    model: str | None = None,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Return the trusted runtime-distribution selector for a profile.
+
+    Existing profiles intentionally default to the stock distribution.  The
+    returned value is only a logical identifier; repository, release and
+    asset trust decisions stay in the runtime manager's allowlist.
+    """
+
+    selected = profile
+    if selected is None and model:
+        selected = llama_cpp_model_profile(model)
+    if not isinstance(selected, dict):
+        return LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK
+    value = str(
+        selected.get("runtime_distribution")
+        or LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK
+    ).strip().lower()
+    return value or LLAMA_CPP_RUNTIME_DISTRIBUTION_STOCK
+
+
+def _llama_cpp_safe_metadata_filename(value: Any, *, field: str) -> str:
+    """Normalize one trusted profile filename without permitting path input."""
+
+    if not isinstance(value, str):
+        raise ValueError(f"{field} must be a filename string")
+    filename = value.strip()
+    path = Path(filename)
+    if (
+        not filename
+        or filename in {".", ".."}
+        or "/" in filename
+        or "\\" in filename
+        or "\x00" in filename
+        or ":" in filename
+        or any(char in filename for char in "*?[]")
+        or path.is_absolute()
+        or path.name != filename
+        # ``Path`` on POSIX does not consider ``C:\\foo`` absolute; reject
+        # a drive-qualified spelling explicitly for cross-platform safety.
+        or bool(re.match(r"^[A-Za-z]:", filename))
+    ):
+        raise ValueError(f"{field} must be a safe basename")
+    return filename
+
+
+def _llama_cpp_safe_metadata_filenames(
+    value: Any,
+    *,
+    field: str,
+) -> list[str]:
+    """Normalize an exact filename list and reject duplicates/traversal."""
+
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{field} must be a non-empty filename list")
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        filename = _llama_cpp_safe_metadata_filename(
+            item,
+            field=f"{field}[{index}]",
+        )
+        duplicate_key = filename.casefold()
+        if duplicate_key in seen:
+            raise ValueError(f"{field} contains duplicate filenames")
+        seen.add(duplicate_key)
+        result.append(filename)
+    return result
+
+
+_LLAMA_CPP_AUXILIARY_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+
+def llama_cpp_auxiliary_artifacts(
+    model: str | None = None,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+) -> list[Dict[str, Any]]:
+    """Return a validated generic sidecar-artifact contract.
+
+    This contract is intentionally separate from the MTP metadata: mmproj and
+    future launch-time sidecars are ordinary required/optional files, while
+    MTP remains a speculative-decoding-specific contract.
+    """
+
+    selected = profile
+    if selected is None and model:
+        selected = llama_cpp_model_profile(model)
+    if not isinstance(selected, dict):
+        return []
+    raw_items = selected.get("auxiliary_artifacts")
+    if raw_items is None:
+        return []
+    if not isinstance(raw_items, (list, tuple)):
+        raise ValueError("auxiliary_artifacts must be a list")
+
+    result: list[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    mmproj_count = 0
+    for index, raw in enumerate(raw_items):
+        if not isinstance(raw, dict):
+            raise ValueError(f"auxiliary_artifacts[{index}] must be an object")
+        artifact_id = str(raw.get("id") or "").strip().lower()
+        kind = str(raw.get("kind") or "").strip().lower()
+        if not _LLAMA_CPP_AUXILIARY_ID_PATTERN.fullmatch(artifact_id):
+            raise ValueError(f"auxiliary_artifacts[{index}].id is invalid")
+        if not _LLAMA_CPP_AUXILIARY_ID_PATTERN.fullmatch(kind):
+            raise ValueError(f"auxiliary_artifacts[{index}].kind is invalid")
+        if artifact_id in seen_ids:
+            raise ValueError("auxiliary_artifacts contains duplicate ids")
+        seen_ids.add(artifact_id)
+        filename = _llama_cpp_safe_metadata_filename(
+            raw.get("filename"),
+            field=f"auxiliary_artifacts[{index}].filename",
+        )
+        required = _llama_cpp_metadata_bool(raw.get("required"), default=False)
+        normalized: Dict[str, Any] = {
+            "id": artifact_id,
+            "kind": kind,
+            "filename": filename,
+            "required": required,
+        }
+        if raw.get("size_bytes") not in (None, ""):
+            size = raw.get("size_bytes")
+            if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+                raise ValueError(
+                    f"auxiliary_artifacts[{index}].size_bytes is invalid"
+                )
+            normalized["size_bytes"] = size
+        if raw.get("sha256") not in (None, ""):
+            digest = str(raw.get("sha256") or "").strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", digest):
+                raise ValueError(
+                    f"auxiliary_artifacts[{index}].sha256 is invalid"
+                )
+            normalized["sha256"] = digest
+        repository_subdir = raw.get("repository_subdir")
+        if repository_subdir not in (None, ""):
+            if not isinstance(repository_subdir, str):
+                raise ValueError(
+                    f"auxiliary_artifacts[{index}].repository_subdir is invalid"
+                )
+            subdir = repository_subdir.strip()
+            parts = subdir.split("/")
+            if (
+                not subdir
+                or "\\" in subdir
+                or subdir.startswith("/")
+                or any(part in {"", ".", ".."} for part in parts)
+                or (len(parts[0]) >= 2 and parts[0][1] == ":")
+            ):
+                raise ValueError(
+                    f"auxiliary_artifacts[{index}].repository_subdir is invalid"
+                )
+            normalized["repository_subdir"] = subdir
+        if kind == "mmproj":
+            mmproj_count += 1
+        result.append(normalized)
+    if mmproj_count > 1:
+        raise ValueError("auxiliary_artifacts may contain at most one mmproj")
+    return copy.deepcopy(result)
+
+
+def llama_cpp_mmproj_metadata(
+    model: str | None = None,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return the one validated mmproj sidecar, if declared."""
+
+    artifacts = llama_cpp_auxiliary_artifacts(model, profile=profile)
+    for artifact in artifacts:
+        if artifact.get("kind") == "mmproj":
+            return artifact
+    return None
+
+
+def _llama_cpp_mtp_embedded_variant(raw: Any) -> Optional[Dict[str, Any]]:
+    """Return a safe copy of the optional embedded variant declaration."""
+
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError("mtp.embedded_variant must be an object")
+    primary = _llama_cpp_safe_metadata_filename(
+        raw.get("primary_filename"),
+        field="mtp.embedded_variant.primary_filename",
+    )
+    filenames = _llama_cpp_safe_metadata_filenames(
+        raw.get("filenames"),
+        field="mtp.embedded_variant.filenames",
+    )
+    if filenames[0] != primary:
+        raise ValueError(
+            "mtp.embedded_variant.primary_filename must be the first filename"
+        )
+    return {
+        "primary_filename": primary,
+        "filenames": filenames,
+    }
+
+
+def _llama_cpp_metadata_bool(value: Any, *, default: bool = False) -> bool:
+    """Parse metadata booleans without treating ``"false"`` as truthy."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value) if value in (0, 1) else default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
 
 
 def llama_cpp_mtp_metadata(
@@ -325,11 +928,13 @@ def llama_cpp_mtp_metadata(
         filenames = [filenames]
     elif not isinstance(filenames, (list, tuple)):
         filenames = []
-    normalized_filenames = [
-        str(filename).strip()
-        for filename in filenames
-        if str(filename).strip()
-    ]
+    if filenames:
+        normalized_filenames = _llama_cpp_safe_metadata_filenames(
+            filenames,
+            field="mtp.companion_filenames",
+        )
+    else:
+        normalized_filenames = []
     mode = str(raw.get("mode") or "").strip().lower()
     if mode not in {
         LLAMA_CPP_MTP_MODE_EMBEDDED,
@@ -342,13 +947,56 @@ def llama_cpp_mtp_metadata(
         reason = (
             "選択したllama.cpp profileに互換性のあるMTP artifactが宣言されていません。"
         )
-    return {
-        "supported": bool(raw.get("supported")),
-        "default_enabled": bool(raw.get("default_enabled")),
+    result = {
+        "supported": _llama_cpp_metadata_bool(raw.get("supported")),
+        "default_enabled": _llama_cpp_metadata_bool(raw.get("default_enabled")),
         "mode": mode,
         "companion_filenames": normalized_filenames,
+        "artifact_required": _llama_cpp_metadata_bool(
+            raw.get("artifact_required")
+            if raw.get("artifact_required") is not None
+            else raw.get("required")
+        ),
         "reason": reason,
     }
+    minimum_value = raw.get("minimum_llama_cpp_build")
+    if minimum_value not in (None, ""):
+        if isinstance(minimum_value, bool):
+            raise ValueError(
+                "mtp.minimum_llama_cpp_build must be a positive integer"
+            )
+        if isinstance(minimum_value, float) and not minimum_value.is_integer():
+            raise ValueError(
+                "mtp.minimum_llama_cpp_build must be a positive integer"
+            )
+        try:
+            minimum = int(minimum_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "mtp.minimum_llama_cpp_build must be a positive integer"
+            ) from exc
+        if minimum <= 0:
+            raise ValueError(
+                "mtp.minimum_llama_cpp_build must be a positive integer"
+            )
+        result["minimum_llama_cpp_build"] = minimum
+
+    required_commit = str(raw.get("required_llama_cpp_commit") or "").strip().lower()
+    if required_commit:
+        if not re.fullmatch(r"[0-9a-f]{7,40}", required_commit):
+            raise ValueError("mtp.required_llama_cpp_commit must be a git SHA")
+        result["required_llama_cpp_commit"] = required_commit
+
+    embedded_variant = _llama_cpp_mtp_embedded_variant(
+        raw.get("embedded_variant")
+    )
+    if embedded_variant is not None:
+        if mode != LLAMA_CPP_MTP_MODE_EMBEDDED:
+            raise ValueError("mtp.embedded_variant requires mode=embedded")
+        result["embedded_variant"] = embedded_variant
+    if "required" in raw:
+        result["required"] = _llama_cpp_metadata_bool(raw.get("required"))
+    return copy.deepcopy(result)
 
 
 def llama_cpp_profile_capabilities(
@@ -538,6 +1186,7 @@ SUPPORTED_SERVER_PROFILES = (
     "sglang",
     "vllm",
     "llama.cpp",
+    "freetoken",
     "ollama",
     "lm-studio",
     "custom",
@@ -578,6 +1227,47 @@ def _config_get(config: Any, key: str, default: Any = None) -> Any:
     return default
 
 
+def managed_local_runtime_for_model(
+    config: Any = None,
+    model: str | None = None,
+) -> Optional[str]:
+    """Return llama_cpp/freetoken for a managed nested runtime, else None.
+
+    The selected model identity is authoritative. Stale nested runtime state
+    from a previous selection is never allowed to override a trusted profile.
+    ``local-model`` remains the explicit operator-owned external sentinel.
+    """
+
+    selected_model = str(
+        model
+        or _config_get(config, "openai_compatible_local.model", "")
+        or _config_get(config, "llm_model", "")
+        or ""
+    ).strip()
+    if not selected_model or selected_model.casefold() == "local-model":
+        return None
+
+    if freetoken_model_profile(selected_model) is not None:
+        return "freetoken"
+    if llama_cpp_model_profile(selected_model) is not None:
+        return "llama_cpp"
+
+    # Preserve the existing generic llama.cpp/custom-GGUF compatibility, but
+    # only when the persisted served alias explicitly identifies this model.
+    # A stale model_path alone is insufficient to claim a new selection.
+    raw_llama = _config_get(config, "openai_compatible_local.llama_cpp", {})
+    if isinstance(raw_llama, dict) and llama_cpp_runtime_declared(raw_llama):
+        alias = str(
+            os.getenv("LLAMA_CPP_MODEL_ALIAS")
+            or raw_llama.get("model_alias")
+            or ""
+        ).strip()
+        if alias and alias.casefold() == selected_model.casefold():
+            return "llama_cpp"
+
+    return None
+
+
 def _configured_base_url(config: Any) -> str:
     return str(
         os.getenv("OPENAI_COMPATIBLE_LOCAL_BASE_URL")
@@ -593,6 +1283,49 @@ def _is_default_base_url(base_url: str) -> bool:
     return (
         normalize_openai_compatible_base_url(base_url)
         == DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL
+    )
+
+
+def _freetoken_runtime_base_url(
+    config: Any,
+    *,
+    model: str = "",
+) -> Optional[str]:
+    """Resolve the managed FreeToken loopback endpoint for a trusted profile."""
+
+    if managed_local_runtime_for_model(config, model) != "freetoken":
+        return None
+
+    raw = _config_get(config, "openai_compatible_local.freetoken", {})
+    raw = raw if isinstance(raw, dict) else {}
+    configured = _configured_base_url(config)
+    auto_start = raw.get("auto_start", True)
+    manual_endpoint = (
+        isinstance(auto_start, str)
+        and auto_start.strip().lower() in {"0", "false", "no", "off"}
+    ) or auto_start is False
+
+    # A known profile can still be connected to an operator-owned endpoint.
+    # In that case preserve the explicitly configured non-default URL.
+    if manual_endpoint and configured and not _is_default_base_url(configured):
+        return None
+
+    host = str(raw.get("host") or FREETOKEN_DEFAULT_HOST).strip()
+    if not host:
+        host = FREETOKEN_DEFAULT_HOST
+    try:
+        port = int(raw.get("port", FREETOKEN_DEFAULT_PORT))
+    except (TypeError, ValueError):
+        port = FREETOKEN_DEFAULT_PORT
+    if not (1 <= port <= 65535):
+        port = FREETOKEN_DEFAULT_PORT
+    if host in {"0.0.0.0", "::", "[::]", "::0"}:
+        host = "127.0.0.1"
+    host_for_url = (
+        host if ":" not in host or host.startswith("[") else f"[{host}]"
+    )
+    return normalize_openai_compatible_base_url(
+        f"http://{host_for_url}:{port}"
     )
 
 
@@ -695,6 +1428,27 @@ def openai_compatible_local_base_url(
     model: Optional[str] = None,
     platform_name: Optional[str] = None,
 ) -> str:
+    # An Enterprise external deployment owns this endpoint outside AoiTalk.
+    # Check it before the model-profile runtime resolver, otherwise a stale
+    # llama.cpp profile can redirect host.docker.internal to 127.0.0.1:8080.
+    try:
+        from src.llm.deployment_resolver import resolve_llm_deployment
+
+        deployment = resolve_llm_deployment(config)
+        if (
+            deployment is not None
+            and deployment.backend == "external"
+            and deployment.effective_provider == "openai_compatible_local"
+            and deployment.effective_base_url
+        ):
+            return normalize_openai_compatible_base_url(
+                deployment.effective_base_url
+            )
+    except Exception:
+        # Preserve the historical local resolver when deployment metadata is
+        # unavailable during lightweight import/test paths.
+        pass
+
     configured = _configured_base_url(config)
     selected_model = str(
         model
@@ -702,6 +1456,13 @@ def openai_compatible_local_base_url(
         or _config_get(config, "llm_model")
         or ""
     ).strip()
+
+    freetoken_runtime_url = _freetoken_runtime_base_url(
+        config,
+        model=selected_model,
+    )
+    if freetoken_runtime_url:
+        return freetoken_runtime_url
 
     llama_runtime_url = _llama_cpp_runtime_base_url(
         config,
@@ -731,6 +1492,18 @@ def openai_compatible_local_discovery_base_urls(
     model: Optional[str] = None,
     platform_name: Optional[str] = None,
 ) -> List[str]:
+    operator_owned_external = False
+    try:
+        from src.llm.deployment_resolver import resolve_llm_deployment
+
+        deployment = resolve_llm_deployment(config)
+        operator_owned_external = bool(
+            deployment is not None
+            and deployment.backend == "external"
+            and deployment.effective_provider == "openai_compatible_local"
+        )
+    except Exception:
+        pass
     urls = [
         openai_compatible_local_base_url(
             config,
@@ -738,7 +1511,7 @@ def openai_compatible_local_discovery_base_urls(
             platform_name=platform_name,
         )
     ]
-    if is_macos(platform_name):
+    if is_macos(platform_name) and not operator_owned_external:
         urls.extend([EXO_BASE_URL, MLX_LM_BASE_URL])
 
     result: List[str] = []
@@ -812,8 +1585,21 @@ def openai_compatible_server_profile(
         configured = "auto"
 
     url = (base_url or "").casefold()
+    selected_model = str(
+        _config_get(config, "openai_compatible_local.model", "")
+        or _config_get(config, "llm_model", "")
+        or ""
+    ).strip()
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        selected_model,
+    )
     if configured == "auto":
-        if provider == "sglang" or ":30000" in url or "sglang" in url:
+        if managed_runtime == "freetoken":
+            name = "freetoken"
+        elif managed_runtime == "llama_cpp":
+            name = "llama.cpp"
+        elif provider == "sglang" or ":30000" in url or "sglang" in url:
             name = "sglang"
         elif provider == "ollama" or ":11434" in url or "ollama" in url:
             name = "ollama"
@@ -832,6 +1618,7 @@ def openai_compatible_server_profile(
         "sglang": "radix",
         "vllm": "automatic_prefix_caching",
         "llama.cpp": "slot_kv_cache",
+        "freetoken": "server-managed",
         "ollama": "cache_prompt",
         "lm-studio": "server-managed",
         "custom": "custom",
@@ -860,6 +1647,7 @@ def openai_compatible_server_profile(
             "sglang": "server_metrics_if_available",
             "vllm": "server_metrics_if_available",
             "llama.cpp": "response_timings",
+            "freetoken": "response_usage",
             "ollama": "ollama_native_or_openai_compatible_response",
         }.get(name, "response_usage"),
         "supports_keep_alive": name == "ollama",

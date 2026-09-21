@@ -34,10 +34,6 @@ class LogLayout:
         return self.logs_root / "startup"
 
     @property
-    def desktop_dir(self) -> Path:
-        return self.logs_root / "desktop"
-
-    @property
     def ops_dir(self) -> Path:
         return self.logs_root / "ops"
 
@@ -52,7 +48,6 @@ class LogLayout:
             self.web_dir,
             self.models_dir,
             self.startup_dir,
-            self.desktop_dir,
             self.ops_dir,
             self.discord_dir,
         ):
@@ -89,9 +84,6 @@ class LogLayout:
 
     def sglang_server_error_log(self) -> Path:
         return self.models_dir / "sglang_server_error.log"
-
-    def desktop_backend_log(self) -> Path:
-        return self.desktop_dir / "desktop-tauri-backend.log"
 
     def ddns_update_log(self) -> Path:
         return self.ops_dir / "ddns_update.log"
@@ -166,18 +158,6 @@ class LogLayout:
                     legacy_sglang,
                     self.models_dir / legacy_sglang.name,
                 )
-
-        _move_file_fail_open(
-            self.logs_root / "desktop-tauri-backend.log",
-            self.desktop_backend_log(),
-        )
-        for legacy_desktop in self.logs_root.glob("desktop-tauri-backend*.log"):
-            if legacy_desktop.name == "desktop-tauri-backend.log":
-                continue
-            _move_file_fail_open(
-                legacy_desktop,
-                self.desktop_dir / legacy_desktop.name,
-            )
 
         _move_file_fail_open(
             self.logs_root / "ddns_update.log",

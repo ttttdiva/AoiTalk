@@ -7,15 +7,19 @@ inside AoiTalk.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from contextlib import contextmanager
 from typing import Any, Awaitable, Callable, Iterable, Optional
+from urllib.parse import urlsplit
+from urllib.request import getproxies, proxy_bypass
 
-from openai import AsyncOpenAI
+from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from ..tools.core import ToolDefinition, ensure_tool_definition
 from ..tools.registry import ToolRegistry
@@ -27,6 +31,15 @@ from .conversation_context import (
     prompt_text,
     stable_cache_key,
     stable_tool_schemas,
+)
+from .agentic_completion import (
+    DETERMINISTIC_TASK_MUTATION_TOOLS,
+    _simple_task_has_unexpected_successful_mutation,
+    _simple_task_request_is_explicit,
+    requested_deterministic_task_mutation_tools,
+    simple_task_mutation_completion_state,
+    SimpleTaskMutationCompletionState,
+    successful_empty_task_search,
 )
 from .context_budget import resolve_context_budget
 from .context_snapshot import (
@@ -40,16 +53,195 @@ from .context_snapshot import (
 )
 from .openrouter_provider_routing import merge_provider_options_into_extra_body
 from .turn_stream_events import thinking_text_from_message
-from .unified_turn_runtime import RegistryToolRouter, UnifiedToolCall
-from .generation_error import GenerationFailure, empty_response_failure
+from .unified_turn_runtime import (
+    RegistryToolRouter,
+    UnifiedToolCall,
+    observable_tool_name,
+)
+from .generation_error import (
+    GenerationFailure,
+    classify_generation_error,
+    empty_response_failure,
+)
+from .generation_cancellation import PlanningInteractionTerminated
+from ..services.agent_team_service import ToolFailureCircuitBreaker
+from ..services.agent_team_v3 import agent_team_v3_delegation_enabled
 from ..services.outbound_privacy_service import (
+    EgressDescriptor,
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
+)
+from .planning_policy import (
+    PlanningRunPhase,
+    get_current_planning_run_state,
 )
 
 logger = logging.getLogger(__name__)
 
 StreamCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
+
+
+def _help_turn_is_isolated() -> bool:
+    """Return whether the current low-level native turn is Guide-only."""
+
+    try:
+        from ..services.turn_context import get_turn_context
+
+        return bool(getattr(get_turn_context(), "suppress_automatic_context", False))
+    except Exception:
+        # A missing/legacy turn context is an ordinary native call, not an
+        # authorization signal for the restricted Help mode.
+        return False
+
+
+def _simple_task_create_execution_allowed(
+    user_input: str | None,
+    records: list["ToolExecutionRecord"],
+) -> bool:
+    """Require a proven empty duplicate search before simple task creation."""
+
+    if not _simple_task_request_is_explicit(str(user_input or "")):
+        return True
+    if requested_deterministic_task_mutation_tools(user_input) != {"create_task"}:
+        return True
+    if _simple_task_has_unexpected_successful_mutation(records):
+        return False
+    return successful_empty_task_search(records) is True
+
+
+def _simple_task_unexpected_mutation_execution_blocked(
+    user_input: str | None,
+    tool_name: str,
+    records: list["ToolExecutionRecord"],
+) -> bool:
+    """Keep the simple-create native tool surface to search -> create.
+
+    A model batch can contain several function calls.  Waiting until the
+    later ``create_task`` call to reject an unexpected update/delete would
+    still commit that first side effect.  Block the call before dispatch and
+    stop the rest of the batch; failed/synthetic audit records remain visible.
+    """
+
+    if not _simple_task_request_is_explicit(str(user_input or "")):
+        return False
+    if requested_deterministic_task_mutation_tools(user_input) != {"create_task"}:
+        return False
+    unexpected = DETERMINISTIC_TASK_MUTATION_TOOLS - {"create_task"}
+    if str(tool_name or "").strip().casefold() not in unexpected:
+        return False
+    return not any(
+        record.tool.casefold() == "create_task" and record.successful
+        for record in records
+    )
+
+
+# ``planning_runtime`` imports the provider-neutral LLM package during normal
+# application startup.  Keep this bridge lazy so importing that service first
+# cannot cycle through manager -> Gemini -> native_runtime -> planning_runtime.
+def get_approved_action_directive():
+    from ..services.planning_runtime import get_approved_action_directive as resolve
+
+    return resolve()
+
+
+def bind_approved_action_call(*args, **kwargs):
+    from ..services.planning_runtime import bind_approved_action_call as bind
+
+    return bind(*args, **kwargs)
+
+
+@contextmanager
+def cloud_advisor_parent_scope(
+    *,
+    origin: Any | None = None,
+    assessment: Any | None = None,
+):
+    """Bind trusted Cloud Advisor invocation metadata for a parent turn.
+
+    This is a deliberately small bridge between request/controller code and
+    the canonical ``consult_cloud_advisor`` tool.  Trigger origin and
+    automatic-escalation assessment live in a task-local ContextVar owned by
+    ``cloud_advisor_service``; they are never accepted as model tool
+    arguments.  Invalid/missing values fail closed to Main-agent + an empty
+    semantic assessment.  Agent Team child denial remains enforced by the
+    service/tool-policy boundary.
+
+    Callers that already bind the metadata through ``set_turn_context`` may
+    omit both arguments.  The context is inherited by asynchronous work in
+    the parent turn and restored on exit, so concurrent sessions cannot leak
+    origin or assessment state.
+    """
+
+    from ..services.cloud_advisor_service import (
+        CloudAdvisorEscalationAssessment,
+        CloudAdvisorTriggerOrigin,
+        cloud_advisor_invocation_scope,
+        get_cloud_advisor_invocation_context,
+    )
+    from ..services.turn_context import get_turn_context
+
+    turn = get_turn_context()
+    current = get_cloud_advisor_invocation_context()
+
+    effective_origin = origin
+    if effective_origin is None:
+        effective_origin = getattr(turn, "cloud_advisor_origin", None)
+    if effective_origin is None:
+        effective_origin = current.origin
+    try:
+        if not isinstance(effective_origin, CloudAdvisorTriggerOrigin):
+            effective_origin = CloudAdvisorTriggerOrigin(
+                str(effective_origin).strip().casefold()
+            )
+    except (TypeError, ValueError):
+        effective_origin = CloudAdvisorTriggerOrigin.MAIN_AGENT
+
+    effective_assessment = assessment
+    if effective_assessment is None:
+        effective_assessment = getattr(
+            turn,
+            "cloud_advisor_assessment",
+            None,
+        )
+    if not isinstance(effective_assessment, CloudAdvisorEscalationAssessment):
+        # Never coerce arbitrary mappings/booleans into escalation authority.
+        effective_assessment = (
+            current.assessment
+            if isinstance(current.assessment, CloudAdvisorEscalationAssessment)
+            else CloudAdvisorEscalationAssessment()
+        )
+
+    with cloud_advisor_invocation_scope(
+        origin=effective_origin,
+        assessment=effective_assessment,
+    ):
+        yield
+
+
+async def get_approved_action_receipt(*args, **kwargs):
+    from ..services.planning_runtime import get_approved_action_receipt as read
+
+    return await read(*args, **kwargs)
+
+
+async def accept_approved_action_receipt(*args, **kwargs):
+    from ..services.planning_runtime import accept_approved_action_receipt as accept
+
+    return await accept(*args, **kwargs)
+
+
+async def persist_and_accept_approved_action_result(*args, **kwargs):
+    from ..services.planning_runtime import (
+        persist_and_accept_approved_action_result as persist,
+    )
+
+    return await persist(*args, **kwargs)
+
+
+async def fail_approved_action(*args, **kwargs):
+    from ..services.planning_runtime import fail_approved_action as fail
+
+    return await fail(*args, **kwargs)
 
 
 def _normalized_usage(
@@ -138,6 +330,24 @@ class ToolExecutionRecord:
     @property
     def successful(self) -> bool:
         lowered = self.result.strip().lower()
+        if lowered.startswith(("{", "[")):
+            try:
+                payload = json.loads(self.result)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = None
+            if isinstance(payload, dict):
+                marker = payload.get("success")
+                if marker is not None and str(marker).strip().casefold() not in {
+                    "1",
+                    "true",
+                    "yes",
+                    "ok",
+                    "success",
+                    "succeeded",
+                }:
+                    return False
+                if str(payload.get("error") or "").strip():
+                    return False
         return not (
             lowered.startswith("tool not found:")
             or lowered.startswith("error:")
@@ -269,6 +479,70 @@ def _resolve_max_tool_rounds(explicit: int | None, config: Any | None) -> int:
         return DEFAULT_MAX_TOOL_ROUNDS
 
 
+def _new_native_turn_failure_breaker(
+    config: Any | None,
+) -> ToolFailureCircuitBreaker | None:
+    """Create the one breaker shared by all routers in one native turn.
+
+    Preserve RegistryToolRouter's existing opt-in semantics: ordinary chat
+    remains unchanged, while Agent Team v3 delegation gets one breaker for
+    the entire turn instead of one fresh breaker per provider round.
+    """
+
+    if config is None or not agent_team_v3_delegation_enabled(config):
+        return None
+    return ToolFailureCircuitBreaker(max_same_failure=2, failed_tool_budget=8)
+
+
+def _observable_tool_arguments(
+    registry: ToolRegistry,
+    tool_name: str,
+    arguments: Any,
+) -> dict[str, Any]:
+    """Return only arguments accepted by the canonical tool contract.
+
+    Provider/model arguments are untrusted. Tool events and audit records must
+    not publish unknown keys which RegistryToolRouter will reject, and
+    compatibility aliases such as Docs ``project_id`` must be represented by
+    their canonical key.
+    """
+
+    try:
+        definition = registry.get(str(tool_name or ""))
+    except Exception:
+        definition = None
+    if definition is None:
+        return {}
+    return _observable_arguments_for_definition(definition, arguments)
+
+
+def _observable_arguments_for_definition(
+    definition: ToolDefinition | None,
+    arguments: Any,
+) -> dict[str, Any]:
+    """Normalize one trusted definition for provider/audit observations."""
+
+    if definition is None:
+        return {}
+    normalizer = getattr(definition, "normalize_arguments", None)
+    if not callable(normalizer):
+        return {}
+    try:
+        normalized = normalizer(
+            arguments if isinstance(arguments, dict) else {}
+        )
+    except Exception:
+        # Observation must never leak the rejected raw arguments or interfere
+        # with the router's authoritative failure result.
+        return {}
+    normalized = dict(normalized or {})
+    # Hidden arguments are trusted wrapper inputs (for example a bound Story
+    # conversation id), not provider-visible or audit-visible fields.
+    for name in getattr(definition, "hidden_argument_names", ()) or ():
+        normalized.pop(str(name), None)
+    return normalized
+
+
 class AgentTurnRunner:
     """Run a single AoiTalk agent turn with OpenAI-compatible chat completions."""
 
@@ -379,6 +653,56 @@ class AgentTurnRunner:
         except Exception:
             self.context_budget = None
 
+    def _model_egress_descriptor(
+        self,
+        *,
+        transport: str,
+        model: str | None = None,
+    ) -> EgressDescriptor:
+        """Describe a native provider request for the privacy transaction.
+
+        ``OutboundPrivacyGateway.execute`` owns the protect/review/send
+        transaction.  Keeping descriptor construction here means every
+        native round (including tool-loop continuations and retries) carries
+        the same auditable provider identity and destination.
+        """
+
+        base_url = str(getattr(self.client, "base_url", "") or "")
+        return EgressDescriptor(
+            action="model.generate",
+            transport=transport,
+            destination=base_url,
+            provider=str(self.provider_label or ""),
+            model=str(model or ""),
+        )
+
+    async def _execute_model_request(self, payload: dict[str, Any], **options: Any) -> Any:
+        """Retry a broken connection once at the reviewed request boundary.
+
+        Tool execution is outside this retry, so a failed follow-up cannot
+        replay a committed tool. Keep SDK retries disabled and re-enter the
+        privacy gateway for each attempt. Timeouts and HTTP/API rejections
+        retain their existing failure semantics.
+        """
+        for attempt in range(2):
+            try:
+                return await self.privacy_gateway.execute(payload, **options)
+            except APIConnectionError as error:
+                cause = error.__cause__
+                retry = attempt == 0 and not isinstance(error, APITimeoutError)
+                logger.warning(
+                    "Native model transport failed: provider=%s model=%s "
+                    "exception_type=%s cause_type=%s retry=%s",
+                    self.provider_label,
+                    options.get("model", ""),
+                    type(error).__name__,
+                    type(cause).__name__ if cause is not None else "none",
+                    retry,
+                )
+                if not retry:
+                    raise
+                await asyncio.sleep(0.5)
+
     async def run(
         self,
         agent: AgentDefinition,
@@ -386,6 +710,8 @@ class AgentTurnRunner:
         *,
         stream_callback: Optional[StreamCallback] = None,
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
+        cloud_advisor_origin: Any | None = None,
+        cloud_advisor_assessment: Any | None = None,
     ) -> NativeRunResult:
         """Run one turn, optionally resolving tools before each model round.
 
@@ -395,16 +721,101 @@ class AgentTurnRunner:
         loaded function schemas.  Direct callers retain the historical static
         ``agent.tools`` behavior when no resolver is supplied.
         """
-        # AgentTurnRunner is created before the per-turn AgentDefinition is
-        # assembled.  Resolve again here so the official model registry sees
-        # the model that will actually be sent over the wire.
-        self._refresh_context_budget(agent.model)
-        return await self._run_core(
-            agent,
-            user_input,
-            stream_callback=stream_callback,
-            tools_provider=tools_provider,
+        # Help is a trusted, Guide-only controller turn.  Enforce the
+        # stateless boundary here as a final guard for direct native callers
+        # as well as the normal AgentLLMClient path, then restore the ordinary
+        # provider state even when transport or tool execution fails.
+        isolated_state: tuple[Any, Any, Any, Any, Any] | None = None
+        isolated_privacy_gateway: OutboundPrivacyGateway | None = None
+        isolated_privacy_gateway_previous: OutboundPrivacyGateway | None = None
+        from ..services.turn_context import (
+            AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+            get_turn_context,
         )
+
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        effective_agent = (
+            replace(
+                agent,
+                instructions=AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+            )
+            if suppress_automatic_context
+            else agent
+        )
+        if suppress_automatic_context:
+            isolated_state = (
+                self.conversation_state_mode,
+                self.provider_state,
+                self.prompt_cache_key,
+                self.prompt_cache_retention,
+                self.reasoning_summary_enabled,
+            )
+            self.conversation_state_mode = "stateless"
+            self.provider_state = ProviderState(mode="stateless")
+            self.prompt_cache_key = None
+            self.prompt_cache_retention = None
+            # Direct AgentTurnRunner callers do not pass through TerminalMode's
+            # provider snapshot.  Give the controller turn a fresh alias scope
+            # so a prior ordinary request can never restore an old secret-shaped
+            # marker in the Guide answer.  Restore the exact gateway object on
+            # every exit, including transport/tool failures.
+            isolated_privacy_gateway_previous = self.privacy_gateway
+            try:
+                turn = get_turn_context()
+                isolated_privacy_gateway = OutboundPrivacyGateway(
+                    self.config,
+                    session_id=(
+                        str(getattr(turn, "session_id", None) or "")
+                        or str(getattr(isolated_privacy_gateway_previous, "session_id", "") or "")
+                    ),
+                    user_id=(
+                        str(getattr(turn, "user_id", None) or "")
+                        or str(getattr(isolated_privacy_gateway_previous, "user_id", "") or "")
+                    ),
+                    session_context={},
+                    project_metadata={},
+                )
+                self.privacy_gateway = isolated_privacy_gateway
+            except Exception as exc:
+                # A Help turn must never fall back to the ordinary gateway.  A
+                # construction failure would otherwise re-enable aliases or
+                # outbound policy inherited from the preceding user turn.
+                raise RuntimeError(
+                    "AoiTalk Help isolated privacy gateway is unavailable"
+                ) from exc
+
+        try:
+            # AgentTurnRunner is created before the per-turn AgentDefinition is
+            # assembled.  Resolve again here so the official model registry sees
+            # the model that will actually be sent over the wire.
+            self._refresh_context_budget(effective_agent.model)
+            # Bind the parent-owned Cloud Advisor metadata only for the duration of
+            # this native turn.  The default scope is Main-agent + empty semantic
+            # assessment, so existing callers remain unchanged and automatic mode
+            # cannot escalate from input length/regexes/model-controlled flags.
+            with cloud_advisor_parent_scope(
+                origin=cloud_advisor_origin,
+                assessment=cloud_advisor_assessment,
+            ):
+                return await self._run_core(
+                    effective_agent,
+                    user_input,
+                    stream_callback=stream_callback,
+                    tools_provider=tools_provider,
+                )
+        finally:
+            if isolated_privacy_gateway is not None:
+                self.privacy_gateway = isolated_privacy_gateway_previous
+            if isolated_state is not None:
+                (
+                    self.conversation_state_mode,
+                    self.provider_state,
+                    self.prompt_cache_key,
+                    self.prompt_cache_retention,
+                    self.reasoning_summary_enabled,
+                ) = isolated_state
 
     async def _run_core(
         self,
@@ -456,13 +867,20 @@ class AgentTurnRunner:
         tools_provider: Callable[[AgentDefinition], Iterable[ToolDefinition]] | None = None,
     ) -> NativeRunResult:
         await _emit(stream_callback, "stream_start", {"message": "応答を生成しています"})
+        suppress_automatic_context = _help_turn_is_isolated()
 
-        seed_messages = _prompt_messages_or_user(user_input)
+        seed_messages = (
+            _prompt_messages_for_isolated_help(user_input)
+            if suppress_automatic_context
+            else _prompt_messages_or_user(user_input)
+        )
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": agent.instructions or ""},
             *seed_messages,
         ]
-        plain_user_input = prompt_text(user_input)
+        plain_user_input = prompt_text(
+            seed_messages[-1].get("content") if seed_messages else ""
+        ) if suppress_automatic_context else prompt_text(user_input)
         tool_records: list[ToolExecutionRecord] = []
         usage_records: list[dict[str, int]] = []
         context_snapshots: list[dict[str, Any]] = []
@@ -474,6 +892,9 @@ class AgentTurnRunner:
         )
         current_tool_choice = requested_tool_choice
         final_output = ""
+        failure_breaker = _new_native_turn_failure_breaker(self.config)
+        hard_stop = False
+        authoritative_task_complete = False
 
         for round_index in range(self.max_tool_rounds + 1):
             # A tool call can load a deferred pack.  Resolve the effective
@@ -482,6 +903,99 @@ class AgentTurnRunner:
             if round_index:
                 active_tools = _resolve_runtime_tools(agent, tools_provider)
                 tools_payload = _tool_specs(active_tools)
+                if authoritative_task_complete:
+                    active_tools = []
+                    tools_payload = []
+                    current_tool_choice = None
+            approved_directive = (
+                None if suppress_automatic_context else get_approved_action_directive()
+            )
+            while approved_directive is not None:
+                existing_receipt = await get_approved_action_receipt(
+                    approved_directive
+                )
+                if existing_receipt is None:
+                    break
+                receipt_output = str(existing_receipt.get("result") or "")
+                receipt_arguments = dict(existing_receipt.get("arguments") or {})
+                receipt_definition = next(
+                    (
+                        tool
+                        for tool in active_tools
+                        if tool.name == approved_directive.tool
+                    ),
+                    None,
+                )
+                observed_receipt_arguments = _observable_arguments_for_definition(
+                    receipt_definition,
+                    receipt_arguments,
+                )
+                provider_call_id = approved_directive.call_id
+                messages.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": provider_call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": approved_directive.tool,
+                                        "arguments": json.dumps(
+                                            observed_receipt_arguments,
+                                            ensure_ascii=False,
+                                            sort_keys=True,
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": provider_call_id,
+                            "content": receipt_output,
+                        },
+                    ]
+                )
+                tool_records.append(
+                    ToolExecutionRecord(
+                        tool=approved_directive.tool,
+                        arguments=observed_receipt_arguments,
+                        result=receipt_output,
+                    )
+                )
+                await accept_approved_action_receipt(
+                    approved_directive,
+                    existing_receipt,
+                )
+                approved_directive = (
+                    None
+                    if suppress_automatic_context
+                    else get_approved_action_directive()
+                )
+
+            planning_state = (
+                None
+                if suppress_automatic_context
+                else get_current_planning_run_state()
+            )
+            if planning_state is not None and planning_state.phase == PlanningRunPhase.COMPLETED:
+                active_tools = []
+                tools_payload = []
+                current_tool_choice = None
+            elif approved_directive is not None:
+                approved_tools = [
+                    tool for tool in active_tools if tool.name == approved_directive.tool
+                ]
+                if len(approved_tools) != 1:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_tool_unavailable",
+                    )
+                active_tools = approved_tools
+                tools_payload = _tool_specs(active_tools)
+                current_tool_choice = "required"
             tool_registry = ToolRegistry()
             for tool in active_tools:
                 tool_registry.register(tool)
@@ -495,6 +1009,7 @@ class AgentTurnRunner:
                 # ``Docs操作エージェント``) do not leak into the child and
                 # block the specialist's direct Docs tools.
                 user_input=plain_user_input,
+                failure_breaker=failure_breaker,
             )
             kwargs = self._build_completion_kwargs(
                 agent=agent,
@@ -539,14 +1054,42 @@ class AgentTurnRunner:
                     "chat.completions context observation failed; continuing",
                     exc_info=True,
                 )
-            protected = await self.privacy_gateway.protect(
-                kwargs,
-                provider=self.provider_label,
-                base_url=str(getattr(self.client, "base_url", "") or ""),
-                source_kind="model_request",
+            base_url = str(getattr(self.client, "base_url", "") or "")
+            descriptor = self._model_egress_descriptor(
+                transport="openai.chat.completions",
+                model=agent.model,
             )
-            kwargs = protected.payload
-            response = await self.client.chat.completions.create(**kwargs)
+
+            async def send_chat_request(outbound_kwargs: dict[str, Any]) -> Any:
+                # The sender is intentionally nested inside the gateway
+                # transaction.  It can therefore receive only the final
+                # reviewed payload and cannot accidentally send ``kwargs``
+                # captured before redaction.
+                return await self.client.chat.completions.create(**outbound_kwargs)
+
+            try:
+                response = await self._execute_model_request(
+                    kwargs,
+                    provider=self.provider_label,
+                    descriptor=descriptor,
+                    sender=send_chat_request,
+                    base_url=base_url,
+                    source_kind="model_request",
+                    model=agent.model,
+                )
+            except Exception as error:
+                if not tool_records and not usage_records:
+                    raise
+                failure = classify_generation_error(error)
+                await _emit(stream_callback, "stream_end", {"content": ""})
+                return NativeRunResult(
+                    final_output="",
+                    messages=list(messages),
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                )
             usage = _normalized_usage(
                 getattr(response, "usage", None),
                 provider=self.provider_label,
@@ -571,7 +1114,22 @@ class AgentTurnRunner:
             content = str(getattr(message, "content", "") or "")
             final_output = content
             tool_calls = list(getattr(message, "tool_calls", None) or [])
-            assistant_payload = _assistant_message_payload(message)
+            assistant_payload = _assistant_message_payload(
+                message,
+                registry=tool_registry,
+            )
+
+            if approved_directive is not None:
+                if not tool_calls:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_plain_final_rejected",
+                    )
+                if len(tool_calls) != 1:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_multiple_calls_rejected",
+                    )
 
             if not tool_calls:
                 if not content.strip():
@@ -616,27 +1174,107 @@ class AgentTurnRunner:
                     "assistant_text",
                     {"text": content, "round": round_index},
                 )
-            for tool_call in tool_calls:
+            for tool_call_index, tool_call in enumerate(tool_calls):
                 tool_name = _tool_call_name(tool_call)
-                call_id = _tool_call_id(tool_call)
-                args, parse_error = _tool_call_arguments(tool_call)
-                await _emit(
-                    stream_callback,
-                    "tool_start",
-                    {
-                        "tool": tool_name,
-                        "tool_args": args,
-                        "message": f"{tool_name} を実行しています",
-                    },
+                observable_name = observable_tool_name(tool_registry, tool_name)
+                provider_call_id = _tool_call_id(tool_call)
+                call_id = (
+                    approved_directive.call_id
+                    if approved_directive is not None
+                    else provider_call_id
                 )
-
-                if parse_error:
-                    result_text = f"Error: invalid JSON arguments: {parse_error}"
-                else:
+                args, parse_error = _tool_call_arguments(tool_call)
+                if not parse_error and approved_directive is not None:
                     args = self.privacy_gateway.restore_tool_arguments(
                         args,
                         tool_name=tool_name,
                     )
+                if approved_directive is not None:
+                    if parse_error:
+                        await fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_arguments_invalid",
+                            detail=parse_error,
+                        )
+                    try:
+                        args = bind_approved_action_call(
+                            approved_directive,
+                            tool_name=tool_name,
+                            proposed_arguments=args,
+                        )
+                    except PlanningInteractionTerminated as exc:
+                        await fail_approved_action(
+                            approved_directive,
+                            reason=exc.reason,
+                        )
+                event_args = (
+                    {}
+                    if parse_error
+                    else _observable_tool_arguments(
+                        tool_registry, tool_name, args
+                    )
+                )
+                await _emit(
+                    stream_callback,
+                    "tool_start",
+                    {
+                        "tool": observable_name,
+                        "tool_args": event_args,
+                        "operation_id": call_id,
+                        "tool_call_id": call_id,
+                        "message": f"{observable_name} を実行しています",
+                    },
+                )
+
+                execution_success = False
+                execution_error = parse_error or ""
+                audit_args = dict(event_args)
+                if parse_error:
+                    result_text = f"Error: invalid JSON arguments: {parse_error}"
+                elif _simple_task_unexpected_mutation_execution_blocked(
+                    plain_user_input,
+                    tool_name,
+                    tool_records,
+                ):
+                    hard_stop = True
+                    result_text = json.dumps(
+                        {
+                            "success": False,
+                            "error_code": "unexpected_task_mutation",
+                            "error": (
+                                "simple task creation permits only duplicate search "
+                                "followed by create_task"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    execution_error = "unexpected_task_mutation"
+                elif (
+                    tool_name == "create_task"
+                    and not _simple_task_create_execution_allowed(
+                        plain_user_input,
+                        tool_records,
+                    )
+                ):
+                    hard_stop = True
+                    result_text = json.dumps(
+                        {
+                            "success": False,
+                            "error_code": "duplicate_search_required",
+                            "error": (
+                                "create_task requires a successful, unambiguous "
+                                "empty search_task_candidates result first"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    execution_error = "duplicate_search_required"
+                else:
+                    if approved_directive is None:
+                        args = self.privacy_gateway.restore_tool_arguments(
+                            args,
+                            tool_name=tool_name,
+                        )
                     tool_result = await tool_router.execute_async(
                         UnifiedToolCall(
                             tool=tool_name,
@@ -645,9 +1283,16 @@ class AgentTurnRunner:
                         )
                     )
                     result_text = tool_result.model_output
+                    execution_success = tool_result.success
+                    execution_error = tool_result.error or ""
+                    audit_args = _observable_tool_arguments(
+                        tool_registry,
+                        tool_name,
+                        tool_result.call.arguments,
+                    )
 
                 model_payload = model_tool_result_payload(
-                    tool_name=tool_name,
+                    tool_name=observable_name,
                     output=result_text,
                     user_input=plain_user_input,
                     max_chars=self.max_tool_result_chars,
@@ -656,15 +1301,33 @@ class AgentTurnRunner:
                 )
                 tool_records.append(
                     ToolExecutionRecord(
-                        tool=tool_name,
-                        arguments=dict(args),
+                        tool=observable_name,
+                        arguments=dict(audit_args),
                         result=result_text,
                     )
                 )
+                if tool_name == "create_task" and _simple_task_request_is_explicit(
+                    plain_user_input
+                ):
+                    if (
+                        simple_task_mutation_completion_state(
+                            plain_user_input,
+                            tool_records,
+                        )
+                        is SimpleTaskMutationCompletionState.COMPLETE
+                    ):
+                        authoritative_task_complete = True
+                    else:
+                        # A create that did not produce an authoritative
+                        # receipt is terminal for this native attempt.  Do
+                        # not retry a potentially committed mutation and risk
+                        # a duplicate row; the outer controller will surface
+                        # the fail-closed result.
+                        hard_stop = True
                 messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": call_id,
+                        "tool_call_id": provider_call_id,
                         "content": model_payload.text,
                     }
                 )
@@ -672,14 +1335,71 @@ class AgentTurnRunner:
                     stream_callback,
                     "tool_end",
                     {
-                        "tool": tool_name,
-                        "tool_args": args,
+                        "tool": observable_name,
+                        "tool_args": audit_args,
+                        "operation_id": call_id,
+                        "tool_call_id": call_id,
+                        "tool_result": {
+                            "tool": observable_name,
+                            "arguments": audit_args,
+                            "output": result_text,
+                            "error": None if execution_success else (execution_error or result_text),
+                            "mutation_confirmed": bool(
+                                approved_directive is not None and execution_success
+                            ),
+                            "tool_call_id": call_id,
+                        },
                         "message": "ツール実行が完了しました",
                     },
                 )
 
+                if approved_directive is not None:
+                    await persist_and_accept_approved_action_result(
+                        approved_directive,
+                        arguments=audit_args,
+                        result=result_text,
+                        success=execution_success,
+                    )
+                elif (
+                    tool_name == "submit_plan_for_approval"
+                    and (state := get_current_planning_run_state()) is not None
+                    and state.phase == PlanningRunPhase.EXECUTING
+                ):
+                    # Provider batches are proposals, not authority.  Once an
+                    # approval response activates execution, every remaining
+                    # call in that same batch is acknowledged as not executed;
+                    # the next provider round receives only action[0].
+                    for skipped in tool_calls[tool_call_index + 1 :]:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": _tool_call_id(skipped),
+                                "content": (
+                                    "Not executed: approved actions start on the next "
+                                    "server-controlled round."
+                                ),
+                            }
+                        )
+                    break
+
+                if hard_stop or authoritative_task_complete:
+                    for skipped in tool_calls[tool_call_index + 1 :]:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": _tool_call_id(skipped),
+                                "content": (
+                                    "Not executed: the deterministic task mutation "
+                                    "was already terminal (or duplicate search failed)."
+                                ),
+                            }
+                        )
+                    break
+
             if round_index == 0 and current_tool_choice == "required":
                 current_tool_choice = "auto"
+            if hard_stop:
+                break
 
         fallback = str(
             self.privacy_gateway.restore_aliases(
@@ -790,12 +1510,20 @@ class AgentTurnRunner:
         併用できないため、function tools を使う経路はすべて Responses API に寄せる。
         会話状態はサーバー保存に依存せず、毎ラウンド input を全量送信する（store=False）。
         """
+        suppress_automatic_context = _help_turn_is_isolated()
         await _emit(stream_callback, "stream_start", {"message": "応答を生成しています"})
 
-        plain_user_input = prompt_text(user_input)
-
         # Responses API へ渡す input items（毎ラウンド全量送信する状態）。
-        seed_messages = _prompt_messages_or_user(user_input)
+        seed_messages = (
+            _prompt_messages_for_isolated_help(user_input)
+            if suppress_automatic_context
+            else _prompt_messages_or_user(user_input)
+        )
+        plain_user_input = (
+            prompt_text(seed_messages[-1].get("content") if seed_messages else "")
+            if suppress_automatic_context
+            else prompt_text(user_input)
+        )
         request_seed_messages = seed_messages
         if (
             self.conversation_state_mode == "provider-managed"
@@ -829,6 +1557,9 @@ class AgentTurnRunner:
         current_tool_choice = requested_tool_choice
         effort = getattr(agent.model_settings.reasoning, "effort", None)
         final_output = ""
+        failure_breaker = _new_native_turn_failure_breaker(self.config)
+        hard_stop = False
+        authoritative_task_complete = False
 
         def build_request_snapshot(
             request_kwargs: dict[str, Any],
@@ -990,15 +1721,27 @@ class AgentTurnRunner:
 
         async def create_response(request_kwargs: dict[str, Any]) -> Any:
             """Responses API を呼ぶ。summary 非対応モデルだけ 1 回だけ外して再試行する。"""
-            protected = await self.privacy_gateway.protect(
-                request_kwargs,
-                provider=self.provider_label,
-                base_url=str(getattr(self.client, "base_url", "") or ""),
-                source_kind="model_request",
+            base_url = str(getattr(self.client, "base_url", "") or "")
+            descriptor = self._model_egress_descriptor(
+                transport="openai.responses",
+                model=agent.model,
             )
-            request_kwargs = protected.payload
+
+            async def send_response_request(outbound_kwargs: dict[str, Any]) -> Any:
+                # Keep the provider sender inside the privacy transaction so
+                # approval/redaction is applied to the exact request sent.
+                return await self.client.responses.create(**outbound_kwargs)
+
             try:
-                return await self.client.responses.create(**request_kwargs)
+                return await self._execute_model_request(
+                    request_kwargs,
+                    provider=self.provider_label,
+                    descriptor=descriptor,
+                    sender=send_response_request,
+                    base_url=base_url,
+                    source_kind="model_request",
+                    model=agent.model,
+                )
             except Exception as exc:  # noqa: BLE001
                 if not (
                     self.reasoning_summary_enabled
@@ -1013,13 +1756,15 @@ class AgentTurnRunner:
                     agent.model,
                 )
                 retry_kwargs = _without_reasoning_summary(request_kwargs)
-                protected_retry = await self.privacy_gateway.protect(
+                return await self._execute_model_request(
                     retry_kwargs,
                     provider=self.provider_label,
+                    descriptor=descriptor,
+                    sender=send_response_request,
                     base_url=str(getattr(self.client, "base_url", "") or ""),
                     source_kind="model_request",
+                    model=agent.model,
                 )
-                return await self.client.responses.create(**protected_retry.payload)
 
         for round_index in range(self.max_tool_rounds + 1):
             # See the chat-completions path above.  Keep the provider payload
@@ -1028,6 +1773,112 @@ class AgentTurnRunner:
             if round_index:
                 active_tools = _resolve_runtime_tools(agent, tools_provider)
                 tools_payload = _responses_tool_specs(active_tools)
+                if authoritative_task_complete:
+                    active_tools = []
+                    tools_payload = []
+                    current_tool_choice = None
+            approved_directive = (
+                None if suppress_automatic_context else get_approved_action_directive()
+            )
+            while approved_directive is not None:
+                existing_receipt = await get_approved_action_receipt(
+                    approved_directive
+                )
+                if existing_receipt is None:
+                    break
+                receipt_output = str(existing_receipt.get("result") or "")
+                receipt_arguments = dict(existing_receipt.get("arguments") or {})
+                receipt_definition = next(
+                    (
+                        tool
+                        for tool in active_tools
+                        if tool.name == approved_directive.tool
+                    ),
+                    None,
+                )
+                observed_receipt_arguments = _observable_arguments_for_definition(
+                    receipt_definition,
+                    receipt_arguments,
+                )
+                synthetic_call = {
+                    "type": "function_call",
+                    "id": f"fc_{approved_directive.call_id}",
+                    "call_id": approved_directive.call_id,
+                    "name": approved_directive.tool,
+                    "arguments": json.dumps(
+                        observed_receipt_arguments,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                }
+                synthetic_output = {
+                    "type": "function_call_output",
+                    "call_id": approved_directive.call_id,
+                    "output": receipt_output,
+                }
+                input_items.extend([synthetic_call, synthetic_output])
+                stateless_input_items.extend([synthetic_call, synthetic_output])
+                chat_messages.extend(
+                    [
+                        {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": approved_directive.call_id,
+                                    "type": "function",
+                                    "function": {
+                                        "name": approved_directive.tool,
+                                        "arguments": synthetic_call["arguments"],
+                                    },
+                                }
+                            ],
+                        },
+                        {
+                            "role": "tool",
+                            "tool_call_id": approved_directive.call_id,
+                            "content": receipt_output,
+                        },
+                    ]
+                )
+                tool_records.append(
+                    ToolExecutionRecord(
+                        tool=approved_directive.tool,
+                        arguments=observed_receipt_arguments,
+                        result=receipt_output,
+                    )
+                )
+                await accept_approved_action_receipt(
+                    approved_directive,
+                    existing_receipt,
+                )
+                approved_directive = (
+                    None
+                    if suppress_automatic_context
+                    else get_approved_action_directive()
+                )
+
+            planning_state = (
+                None
+                if suppress_automatic_context
+                else get_current_planning_run_state()
+            )
+            if planning_state is not None and planning_state.phase == PlanningRunPhase.COMPLETED:
+                active_tools = []
+                tools_payload = []
+                current_tool_choice = None
+            elif approved_directive is not None:
+                approved_tools = [
+                    tool for tool in active_tools if tool.name == approved_directive.tool
+                ]
+                if len(approved_tools) != 1:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_tool_unavailable",
+                    )
+                active_tools = approved_tools
+                tools_payload = _responses_tool_specs(active_tools)
+                current_tool_choice = "required"
             tool_registry = ToolRegistry()
             for tool in active_tools:
                 tool_registry.register(tool)
@@ -1036,6 +1887,7 @@ class AgentTurnRunner:
                 log_prefix=f"NativeAgentTurnRunner:{agent.name}",
                 config=self.config,
                 user_input=plain_user_input,
+                failure_breaker=failure_breaker,
             )
             kwargs: dict[str, Any] = {
                 "model": agent.model,
@@ -1081,11 +1933,46 @@ class AgentTurnRunner:
             if request_snapshot is not None:
                 context_snapshots.append(request_snapshot)
 
+            async def _partial_result_after_provider_failure(
+                error: Exception,
+            ) -> NativeRunResult:
+                """Preserve tool evidence and usage when a follow-up fails.
+
+                Reads and arbitrary mutations are evidence too. Dropping them
+                hides partial work and can cause a subsequent retry to repeat
+                an already committed operation. The failure marker prevents
+                this partial result from being reported as a completed turn.
+                Turns with no evidence retain the historical exception path.
+                """
+
+                if not tool_records and not usage_records:
+                    raise error
+                failure = classify_generation_error(error)
+                await _emit(stream_callback, "stream_end", {"content": ""})
+                return NativeRunResult(
+                    final_output="",
+                    messages=list(chat_messages),
+                    tool_calls=list(tool_records),
+                    usage_records=list(usage_records),
+                    context_snapshots=list(context_snapshots),
+                    generation_failure=failure,
+                )
+
             try:
                 response = await create_response(kwargs)
-            except Exception:
+            except Exception as first_error:
+                if authoritative_task_complete and tool_records:
+                    # Once a durable deterministic create is proven, a
+                    # provider-managed finalization failure is not a reason
+                    # to spend another request rebuilding context.  Invalidate
+                    # the managed response id for the next turn, then let the
+                    # controller finalize from the receipt.
+                    if self.conversation_state_mode == "provider-managed":
+                        self.conversation_state_mode = "stateless"
+                        self.provider_state.reset()
+                    return await _partial_result_after_provider_failure(first_error)
                 if self.conversation_state_mode != "provider-managed":
-                    raise
+                    return await _partial_result_after_provider_failure(first_error)
                 # Provider state may expire or be unavailable after a server
                 # restart.  Rebuild from AoiTalk's canonical transcript.
                 logger.warning("provider-managed stateを破棄してstatelessへフォールバック", exc_info=True)
@@ -1102,7 +1989,10 @@ class AgentTurnRunner:
                 )
                 if request_snapshot is not None:
                     context_snapshots.append(request_snapshot)
-                response = await create_response(retry_kwargs)
+                try:
+                    response = await create_response(retry_kwargs)
+                except Exception as retry_error:
+                    return await _partial_result_after_provider_failure(retry_error)
             usage = _normalized_usage(
                 getattr(response, "usage", None),
                 provider=self.provider_label,
@@ -1119,6 +2009,17 @@ class AgentTurnRunner:
             function_calls = _responses_function_calls(output_items)
             content = responses_output_text(response, output_items)
             final_output = content
+            if approved_directive is not None:
+                if not function_calls:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_plain_final_rejected",
+                    )
+                if len(function_calls) != 1:
+                    await fail_approved_action(
+                        approved_directive,
+                        reason="approved_action_multiple_calls_rejected",
+                    )
             for summary_text in _responses_reasoning_summaries(output_items):
                 # 推論サマリーは中間・最終どちらのラウンドでもそのまま配信する。
                 await _emit(
@@ -1175,7 +2076,10 @@ class AgentTurnRunner:
 
             # reasoning item を含む前ラウンドの output をそのまま次の input に引き継ぐ。
             # reasoning を落とすと terra 系でエラーや品質劣化の恐れがあるため全量保持する。
-            serialized_output_items = _serialize_responses_output_items(output_items)
+            serialized_output_items = _serialize_responses_output_items(
+                output_items,
+                registry=tool_registry,
+            )
             stateless_input_items.extend(serialized_output_items)
             if self.conversation_state_mode == "provider-managed":
                 # The provider already owns the previous response.  Only the
@@ -1188,7 +2092,11 @@ class AgentTurnRunner:
                     "role": "assistant",
                     "content": content or "",
                     "tool_calls": [
-                        _responses_call_to_chat_tool_call(fc) for fc in function_calls
+                        _responses_call_to_chat_tool_call(
+                            fc,
+                            registry=tool_registry,
+                        )
+                        for fc in function_calls
                     ],
                 }
             )
@@ -1201,27 +2109,107 @@ class AgentTurnRunner:
                     {"text": content, "round": round_index},
                 )
 
-            for function_call in function_calls:
+            for function_call_index, function_call in enumerate(function_calls):
                 tool_name = _responses_call_name(function_call)
-                call_id = _responses_call_id(function_call)
-                args, parse_error = _responses_call_arguments(function_call)
-                await _emit(
-                    stream_callback,
-                    "tool_start",
-                    {
-                        "tool": tool_name,
-                        "tool_args": args,
-                        "message": f"{tool_name} を実行しています",
-                    },
+                observable_name = observable_tool_name(tool_registry, tool_name)
+                provider_call_id = _responses_call_id(function_call)
+                call_id = (
+                    approved_directive.call_id
+                    if approved_directive is not None
+                    else provider_call_id
                 )
-
-                if parse_error:
-                    result_text = f"Error: invalid JSON arguments: {parse_error}"
-                else:
+                args, parse_error = _responses_call_arguments(function_call)
+                if not parse_error and approved_directive is not None:
                     args = self.privacy_gateway.restore_tool_arguments(
                         args,
                         tool_name=tool_name,
                     )
+                if approved_directive is not None:
+                    if parse_error:
+                        await fail_approved_action(
+                            approved_directive,
+                            reason="approved_action_arguments_invalid",
+                            detail=parse_error,
+                        )
+                    try:
+                        args = bind_approved_action_call(
+                            approved_directive,
+                            tool_name=tool_name,
+                            proposed_arguments=args,
+                        )
+                    except PlanningInteractionTerminated as exc:
+                        await fail_approved_action(
+                            approved_directive,
+                            reason=exc.reason,
+                        )
+                event_args = (
+                    {}
+                    if parse_error
+                    else _observable_tool_arguments(
+                        tool_registry, tool_name, args
+                    )
+                )
+                await _emit(
+                    stream_callback,
+                    "tool_start",
+                    {
+                        "tool": observable_name,
+                        "tool_args": event_args,
+                        "operation_id": call_id,
+                        "tool_call_id": call_id,
+                        "message": f"{observable_name} を実行しています",
+                    },
+                )
+
+                execution_success = False
+                execution_error = parse_error or ""
+                audit_args = dict(event_args)
+                if parse_error:
+                    result_text = f"Error: invalid JSON arguments: {parse_error}"
+                elif _simple_task_unexpected_mutation_execution_blocked(
+                    plain_user_input,
+                    tool_name,
+                    tool_records,
+                ):
+                    hard_stop = True
+                    result_text = json.dumps(
+                        {
+                            "success": False,
+                            "error_code": "unexpected_task_mutation",
+                            "error": (
+                                "simple task creation permits only duplicate search "
+                                "followed by create_task"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    execution_error = "unexpected_task_mutation"
+                elif (
+                    tool_name == "create_task"
+                    and not _simple_task_create_execution_allowed(
+                        plain_user_input,
+                        tool_records,
+                    )
+                ):
+                    hard_stop = True
+                    result_text = json.dumps(
+                        {
+                            "success": False,
+                            "error_code": "duplicate_search_required",
+                            "error": (
+                                "create_task requires a successful, unambiguous "
+                                "empty search_task_candidates result first"
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                    execution_error = "duplicate_search_required"
+                else:
+                    if approved_directive is None:
+                        args = self.privacy_gateway.restore_tool_arguments(
+                            args,
+                            tool_name=tool_name,
+                        )
                     tool_result = await tool_router.execute_async(
                         UnifiedToolCall(
                             tool=tool_name,
@@ -1230,9 +2218,16 @@ class AgentTurnRunner:
                         )
                     )
                     result_text = tool_result.model_output
+                    execution_success = tool_result.success
+                    execution_error = tool_result.error or ""
+                    audit_args = _observable_tool_arguments(
+                        tool_registry,
+                        tool_name,
+                        tool_result.call.arguments,
+                    )
 
                 model_payload = model_tool_result_payload(
-                    tool_name=tool_name,
+                    tool_name=observable_name,
                     output=result_text,
                     user_input=plain_user_input,
                     max_chars=self.max_tool_result_chars,
@@ -1241,29 +2236,44 @@ class AgentTurnRunner:
                 )
                 tool_records.append(
                     ToolExecutionRecord(
-                        tool=tool_name,
-                        arguments=dict(args),
+                        tool=observable_name,
+                        arguments=dict(audit_args),
                         result=result_text,
                     )
                 )
+                if tool_name == "create_task" and _simple_task_request_is_explicit(
+                    plain_user_input
+                ):
+                    if (
+                        simple_task_mutation_completion_state(
+                            plain_user_input,
+                            tool_records,
+                        )
+                        is SimpleTaskMutationCompletionState.COMPLETE
+                    ):
+                        authoritative_task_complete = True
+                    else:
+                        # See the chat-completions path: never retry a create
+                        # whose durable receipt is not proven.
+                        hard_stop = True
                 input_items.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id,
+                        "call_id": provider_call_id,
                         "output": model_payload.text,
                     }
                 )
                 stateless_input_items.append(
                     {
                         "type": "function_call_output",
-                        "call_id": call_id,
+                        "call_id": provider_call_id,
                         "output": model_payload.text,
                     }
                 )
                 chat_messages.append(
                     {
                         "role": "tool",
-                        "tool_call_id": call_id,
+                        "tool_call_id": provider_call_id,
                         "content": model_payload.text,
                     }
                 )
@@ -1271,14 +2281,81 @@ class AgentTurnRunner:
                     stream_callback,
                     "tool_end",
                     {
-                        "tool": tool_name,
-                        "tool_args": args,
+                        "tool": observable_name,
+                        "tool_args": audit_args,
+                        "operation_id": call_id,
+                        "tool_call_id": call_id,
+                        "tool_result": {
+                            "tool": observable_name,
+                            "arguments": audit_args,
+                            "output": result_text,
+                            "error": None if execution_success else (execution_error or result_text),
+                            "mutation_confirmed": bool(
+                                approved_directive is not None and execution_success
+                            ),
+                            "tool_call_id": call_id,
+                        },
                         "message": "ツール実行が完了しました",
                     },
                 )
 
+                if approved_directive is not None:
+                    await persist_and_accept_approved_action_result(
+                        approved_directive,
+                        arguments=audit_args,
+                        result=result_text,
+                        success=execution_success,
+                    )
+                elif (
+                    tool_name == "submit_plan_for_approval"
+                    and (state := get_current_planning_run_state()) is not None
+                    and state.phase == PlanningRunPhase.EXECUTING
+                ):
+                    for skipped in function_calls[function_call_index + 1 :]:
+                        skipped_output = {
+                            "type": "function_call_output",
+                            "call_id": _responses_call_id(skipped),
+                            "output": (
+                                "Not executed: approved actions start on the next "
+                                "server-controlled round."
+                            ),
+                        }
+                        input_items.append(skipped_output)
+                        stateless_input_items.append(dict(skipped_output))
+                        chat_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": _responses_call_id(skipped),
+                                "content": skipped_output["output"],
+                            }
+                        )
+                    break
+
+                if hard_stop or authoritative_task_complete:
+                    for skipped in function_calls[function_call_index + 1 :]:
+                        skipped_output = {
+                            "type": "function_call_output",
+                            "call_id": _responses_call_id(skipped),
+                            "output": (
+                                "Not executed: the deterministic task mutation "
+                                "was already terminal (or duplicate search failed)."
+                            ),
+                        }
+                        input_items.append(skipped_output)
+                        stateless_input_items.append(dict(skipped_output))
+                        chat_messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": _responses_call_id(skipped),
+                                "content": skipped_output["output"],
+                            }
+                        )
+                    break
+
             if round_index == 0 and current_tool_choice == "required":
                 current_tool_choice = "auto"
+            if hard_stop:
+                break
 
         fallback = str(
             self.privacy_gateway.restore_aliases(
@@ -1495,18 +2572,171 @@ class AgentTurnRunner:
                 kwargs.pop(key, None)
         return kwargs
 
+
+def _safe_transport_origin(value: Any) -> str | None:
+    """Return scheme://host[:port] only; discard path/query/userinfo."""
+
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = urlsplit(text)
+        scheme = str(parsed.scheme or "").strip().casefold()
+        hostname = str(parsed.hostname or "").strip()
+        if scheme not in {"http", "https"} or not hostname:
+            return None
+        port = parsed.port
+    except (TypeError, ValueError):
+        return None
+    host = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
+    return (
+        f"{scheme}://{host}"
+        f"{f':{port}' if port is not None else ''}"
+    )
+
+
+def _environment_proxy_diagnostic(base_url: Any) -> dict[str, Any]:
+    """Observe the environment proxy inputs used by the default SDK client.
+
+    This is diagnostic-only. It does not inject an HTTP client, change the
+    endpoint, bypass a proxy, or retry a refused provider request.
+    """
+
+    origin = _safe_transport_origin(base_url)
+    result: dict[str, Any] = {
+        "base_url_origin": origin,
+        "proxy_mode": "sdk_environment",
+        "proxy_configured": False,
+        "proxy_bypassed": False,
+    }
+    if not origin:
+        return result
+
+    try:
+        target = urlsplit(origin)
+        proxies = {
+            str(key or "").strip().casefold(): str(value or "").strip()
+            for key, value in getproxies().items()
+            if str(key or "").strip() and str(value or "").strip()
+        }
+    except Exception:
+        return result
+
+    scheme = str(target.scheme or "").casefold()
+    proxy_value = proxies.get(scheme)
+    proxy_source = f"{scheme}_proxy" if proxy_value else ""
+    if not proxy_value:
+        proxy_value = proxies.get("all")
+        proxy_source = "all_proxy" if proxy_value else ""
+    if not proxy_value:
+        return result
+
+    result["proxy_configured"] = True
+    result["proxy_source"] = proxy_source
+    # ``proxy_bypass`` expects the hostname (not an authority with a port);
+    # NO_PROXY entries are conventionally host/domain patterns.
+    target_host = str(target.hostname or "")
+    try:
+        bypassed = bool(proxy_bypass(target_host))
+    except Exception:
+        bypassed = False
+    result["proxy_bypassed"] = bypassed
+    if not bypassed:
+        proxy_origin = _safe_transport_origin(proxy_value)
+        if proxy_origin:
+            result["proxy_origin"] = proxy_origin
+    return result
+
+
+def _sanitize_transport_diagnostic(
+    value: Any,
+    *,
+    fallback_base_url: Any = None,
+) -> dict[str, Any]:
+    """Reduce stored/custom transport diagnostics to safe bounded fields."""
+
+    raw = dict(value) if isinstance(value, dict) else {}
+    result: dict[str, Any] = {
+        "proxy_configured": bool(raw.get("proxy_configured", False)),
+        "proxy_bypassed": bool(raw.get("proxy_bypassed", False)),
+    }
+
+    base_origin = (
+        _safe_transport_origin(raw.get("base_url_origin"))
+        or _safe_transport_origin(fallback_base_url)
+    )
+    if base_origin:
+        result["base_url_origin"] = base_origin
+
+    proxy_mode = str(raw.get("proxy_mode") or "").strip().casefold()
+    if proxy_mode == "sdk_environment":
+        result["proxy_mode"] = proxy_mode
+
+    proxy_source = str(raw.get("proxy_source") or "").strip().casefold()
+    if proxy_source in {"http_proxy", "https_proxy", "all_proxy"}:
+        result["proxy_source"] = proxy_source
+
+    proxy_origin = _safe_transport_origin(raw.get("proxy_origin"))
+    if proxy_origin and not result["proxy_bypassed"]:
+        result["proxy_origin"] = proxy_origin
+        result["proxy_configured"] = True
+
+    return result
+
+
+def openai_transport_diagnostic(client: Any) -> dict[str, Any]:
+    """Return the secret-free transport observation for a constructed client."""
+
+    stored = getattr(client, "_aoitalk_transport_diagnostic", None)
+    if isinstance(stored, dict):
+        raw = stored
+    else:
+        raw = _environment_proxy_diagnostic(
+            getattr(client, "base_url", None)
+        )
+    return _sanitize_transport_diagnostic(
+        raw,
+        fallback_base_url=getattr(client, "base_url", None),
+    )
+
+
 def create_async_openai_client(
     *,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     default_headers: Optional[dict[str, str]] = None,
 ) -> AsyncOpenAI:
-    kwargs: dict[str, Any] = {"api_key": api_key or os.getenv("OPENAI_API_KEY")}
+    # The privacy gateway owns retry/review semantics for every model
+    # request.  Disable the SDK's implicit retries so a reviewed payload is
+    # never replayed behind the gateway's back.
+    kwargs: dict[str, Any] = {
+        "api_key": api_key or os.getenv("OPENAI_API_KEY"),
+        "max_retries": 0,
+    }
     if base_url:
         kwargs["base_url"] = base_url
     if default_headers:
         kwargs["default_headers"] = default_headers
-    return AsyncOpenAI(**kwargs)
+    client = AsyncOpenAI(**kwargs)
+    diagnostic = _sanitize_transport_diagnostic(
+        _environment_proxy_diagnostic(
+            getattr(client, "base_url", None)
+        ),
+        fallback_base_url=getattr(client, "base_url", None),
+    )
+    try:
+        setattr(
+            client,
+            "_aoitalk_transport_diagnostic",
+            diagnostic,
+        )
+    except Exception:
+        pass
+    return client
 
 
 async def run_native_agent_once(
@@ -1521,6 +2751,8 @@ async def run_native_agent_once(
     privacy_gateway: OutboundPrivacyGateway | None = None,
     session_id: str | None = None,
     user_id: str | None = None,
+    cloud_advisor_origin: Any | None = None,
+    cloud_advisor_assessment: Any | None = None,
 ) -> NativeRunResult:
     runner = AgentTurnRunner(
         client=create_async_openai_client(
@@ -1534,7 +2766,15 @@ async def run_native_agent_once(
         session_id=session_id,
         user_id=user_id,
     )
-    return await runner.run(agent, prompt)
+    run_kwargs: dict[str, Any] = {}
+    # Do not pass new keyword arguments for the historical/default call.  A
+    # few integrations replace ``AgentTurnRunner`` with a tiny two-argument
+    # test/compatibility runner; keeping the old call shape preserves them.
+    if cloud_advisor_origin is not None:
+        run_kwargs["cloud_advisor_origin"] = cloud_advisor_origin
+    if cloud_advisor_assessment is not None:
+        run_kwargs["cloud_advisor_assessment"] = cloud_advisor_assessment
+    return await runner.run(agent, prompt, **run_kwargs)
 
 
 def _tool_specs(tools: Iterable[ToolDefinition]) -> list[dict[str, Any]]:
@@ -1561,6 +2801,19 @@ def _resolve_runtime_tools(
     failure must not make the model turn disappear, and the static agent tool
     list remains the safe fallback for legacy/direct callers.
     """
+    # ``AgentTurnRunner`` is also a public low-level entrypoint.  Do not rely
+    # solely on TerminalMode/tool-exposure filtering: a direct Help caller can
+    # supply a static AgentDefinition containing arbitrary mutation tools.
+    # The trusted controller scope is always tool-free, including resolver
+    # failure paths where the normal compatibility fallback would reuse those
+    # static definitions.
+    try:
+        from ..services.turn_context import get_turn_context
+
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return []
+    except Exception:
+        pass
     if tools_provider is None:
         return list(agent.tools)
     try:
@@ -1617,6 +2870,26 @@ def _prompt_messages_or_user(
     ):
         return [dict(item) for item in value if isinstance(item, dict) and item.get("role")]
     return [{"role": "user", "content": _responses_user_content(value)}]
+
+
+def _prompt_messages_for_isolated_help(
+    value: str | list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Keep only the current user message for a direct Help invocation.
+
+    ``AgentTurnRunner`` is public and a few integrations call it directly
+    with a pre-built message list.  The normal terminal path passes a single
+    Guide-grounded string, but accepting that list verbatim here would let a
+    stale conversation/tool result bypass the controller's stateless
+    boundary.  Preserve the last user item (including an explicitly attached
+    image) and let ``agent.instructions`` remain the sole system prompt.
+    """
+
+    messages = _prompt_messages_or_user(value)
+    for message in reversed(messages):
+        if str(message.get("role") or "") == "user":
+            return [dict(message)]
+    return [{"role": "user", "content": ""}]
 
 
 def _responses_input_items(messages: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1769,21 +3042,46 @@ def _is_reasoning_summary_error(exc: Exception) -> bool:
     )
 
 
-def _serialize_responses_output_items(output_items: Iterable[Any]) -> list[Any]:
+def _serialize_responses_output_items(
+    output_items: Iterable[Any],
+    *,
+    registry: ToolRegistry | None = None,
+) -> list[Any]:
     """次ラウンドの input に引き継ぐため output item を素の dict へ変換する。"""
     serialized: list[Any] = []
     for item in output_items:
         if isinstance(item, dict):
-            serialized.append(item)
-            continue
-        dump = getattr(item, "model_dump", None)
-        if callable(dump):
-            try:
-                serialized.append(dump(exclude_none=True))
-                continue
-            except Exception:  # noqa: BLE001
-                pass
-        serialized.append(item)
+            payload = dict(item)
+        else:
+            dump = getattr(item, "model_dump", None)
+            if callable(dump):
+                try:
+                    payload = dump(exclude_none=True)
+                except Exception:  # noqa: BLE001
+                    payload = item
+            else:
+                payload = item
+        if registry is not None and isinstance(payload, dict):
+            if str(payload.get("type") or "") == "function_call":
+                provider_name = str(payload.get("name") or "")
+                raw_arguments = payload.get("arguments", "{}")
+                if isinstance(raw_arguments, dict):
+                    parsed_arguments = raw_arguments
+                else:
+                    try:
+                        parsed_arguments = json.loads(raw_arguments or "{}")
+                    except Exception:
+                        parsed_arguments = {}
+                payload["name"] = observable_tool_name(registry, provider_name)
+                payload["arguments"] = json.dumps(
+                    _observable_tool_arguments(
+                        registry,
+                        provider_name,
+                        parsed_arguments if isinstance(parsed_arguments, dict) else {},
+                    ),
+                    ensure_ascii=False,
+                )
+        serialized.append(payload)
     return serialized
 
 
@@ -1840,14 +3138,37 @@ def _responses_call_arguments(function_call: Any) -> tuple[dict[str, Any], str |
     return parsed, None
 
 
-def _responses_call_to_chat_tool_call(function_call: Any) -> dict[str, Any]:
+def _responses_call_to_chat_tool_call(
+    function_call: Any,
+    *,
+    registry: ToolRegistry | None = None,
+) -> dict[str, Any]:
     """外部消費用の chat 形式 tool_call dict へ変換する。"""
+    provider_name = _responses_call_name(function_call)
+    raw_arguments = _responses_call_raw_arguments(function_call)
+    if registry is not None:
+        try:
+            parsed_arguments = json.loads(raw_arguments or "{}")
+        except Exception:
+            parsed_arguments = {}
+        tool_name = observable_tool_name(registry, provider_name)
+        arguments = json.dumps(
+            _observable_tool_arguments(
+                registry,
+                provider_name,
+                parsed_arguments if isinstance(parsed_arguments, dict) else {},
+            ),
+            ensure_ascii=False,
+        )
+    else:
+        tool_name = provider_name
+        arguments = raw_arguments
     return {
         "id": _responses_call_id(function_call),
         "type": "function",
         "function": {
-            "name": _responses_call_name(function_call),
-            "arguments": _responses_call_raw_arguments(function_call),
+            "name": tool_name,
+            "arguments": arguments,
         },
     }
 
@@ -1861,7 +3182,11 @@ def _normalize_tool_choice(value: Optional[str], *, has_tools: bool) -> Optional
     return "auto"
 
 
-def _assistant_message_payload(message: Any) -> dict[str, Any]:
+def _assistant_message_payload(
+    message: Any,
+    *,
+    registry: ToolRegistry | None = None,
+) -> dict[str, Any]:
     """Preserve provider fields needed to continue a Chat Completions turn."""
     if isinstance(message, dict):
         payload = dict(message)
@@ -1892,24 +3217,49 @@ def _assistant_message_payload(message: Any) -> dict[str, Any]:
     tool_calls = list(payload.get("tool_calls") or getattr(message, "tool_calls", None) or [])
     if tool_calls:
         payload["tool_calls"] = [
-            dict(call) if isinstance(call, dict) else _serialize_tool_call(call)
+            _serialize_tool_call(call, registry=registry)
             for call in tool_calls
         ]
     return payload
 
 
-def _serialize_tool_call(tool_call: Any) -> dict[str, Any]:
+def _serialize_tool_call(
+    tool_call: Any,
+    *,
+    registry: ToolRegistry | None = None,
+) -> dict[str, Any]:
+    provider_name = _tool_call_name(tool_call)
+    raw_arguments = _tool_call_raw_arguments(tool_call)
+    if registry is not None:
+        try:
+            parsed_arguments = json.loads(raw_arguments or "{}")
+        except Exception:
+            parsed_arguments = {}
+        tool_name = observable_tool_name(registry, provider_name)
+        arguments = json.dumps(
+            _observable_tool_arguments(
+                registry,
+                provider_name,
+                parsed_arguments if isinstance(parsed_arguments, dict) else {},
+            ),
+            ensure_ascii=False,
+        )
+    else:
+        tool_name = provider_name
+        arguments = raw_arguments
     return {
         "id": _tool_call_id(tool_call),
         "type": "function",
         "function": {
-            "name": _tool_call_name(tool_call),
-            "arguments": _tool_call_raw_arguments(tool_call),
+            "name": tool_name,
+            "arguments": arguments,
         },
     }
 
 
 def _tool_call_id(tool_call: Any) -> str:
+    if isinstance(tool_call, dict):
+        return str(tool_call.get("id") or f"call_{uuid.uuid4().hex}")
     return str(getattr(tool_call, "id", "") or f"call_{uuid.uuid4().hex}")
 
 

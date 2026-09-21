@@ -11,16 +11,30 @@ import inspect
 import json
 import re
 import time
+from datetime import datetime
 from typing import Any, Optional
 
-from ...llm.agentic_completion import response_looks_like_unfinished_work
+from ...llm.agentic_completion import (
+    _simple_task_has_unexpected_successful_mutation,
+    _simple_task_post_create_has_blocked_work,
+    _simple_task_request_is_explicit,
+    requested_deterministic_task_mutation_tools,
+    response_looks_like_unfinished_work,
+)
 from ...llm.context_snapshot import sanitize_context_snapshot
 from ...llm.tool_policy import (
     DOCS_MUTATION_TOOL_NAMES,
     FILESYSTEM_MUTATION_TOOL_NAMES,
     PROJECT_MANAGEMENT_MUTATION_TOOL_NAMES,
+    mutation_execution_forbidden,
 )
-from ...services.agent_run_service import AgentRunService
+from ...services.agent_run_service import (
+    AgentRunService,
+    sanitize_assistant_display_text,
+    sanitize_durable_error_text,
+    sanitize_stream_display_payload,
+    sanitize_tool_audit_payload,
+)
 from ...services.agent_team_service import config_get
 from ...services.agent_team_v3 import (
     AGENT_TEAM_SUBAGENT_CATALOG,
@@ -28,6 +42,7 @@ from ...services.agent_team_v3 import (
     agent_team_v3_subagents,
     resolve_agent_team_v3_route,
 )
+from ...services.turn_context import get_turn_context
 
 
 _SEARCH_TOOL_URL_RE = re.compile(r"https?://[^\s<>()\[\]{}\"'、。]+")
@@ -352,10 +367,21 @@ def _agent_run_tool_operation_signature(data: dict[str, Any]) -> str:
     return f"{tool_name}\0{json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)}"
 
 
+def _is_isolated_controller_turn() -> bool:
+    """Whether this AgentRun belongs to a Guide-only controller turn."""
+
+    try:
+        return bool(get_turn_context().suppress_automatic_context)
+    except Exception:
+        return False
+
+
 def _client_tool_calls(client) -> list[Any]:
     # chat completions 経路は `_last_tool_calls`、Responses API 経路（native runtime）は
     # `_last_turn_tool_records` に積む。前者しか見ていなかったため Responses 経路の
     # ツール実行が agent_run_tool_calls に1件も残らず、実行内容を後から追えなかった。
+    if _is_isolated_controller_turn():
+        return []
     for attribute in ("_last_tool_calls", "_last_turn_tool_records"):
         calls = getattr(client, attribute, None)
         if calls:
@@ -369,6 +395,10 @@ async def _peek_client_agent_run_state(
 ) -> tuple[list[Any], dict[str, int] | None, str] | None:
     """Peek at provider run state so DB failures remain retryable."""
 
+    if _is_isolated_controller_turn():
+        # Never let a coincidentally reused cancellation/run id expose an
+        # ordinary turn's completed tool ledger or usage to Help.
+        return None
     getter = getattr(client, "peek_completed_agent_run_state", None)
     if not callable(getter):
         return None
@@ -415,6 +445,8 @@ async def _ack_client_agent_run_state(client, run_id: str | None) -> None:
 
 
 async def _discard_client_generation_run(client, run_id: str | None) -> None:
+    if _is_isolated_controller_turn():
+        return
     discard = getattr(client, "discard_generation_run", None)
     if not callable(discard):
         return
@@ -428,6 +460,8 @@ async def _discard_client_generation_run(client, run_id: str | None) -> None:
 
 def _client_tool_rounds_exhausted(client) -> bool:
     """ツールループ上限で打ち切られたターンかどうか。"""
+    if _is_isolated_controller_turn():
+        return False
     return bool(getattr(client, "_last_turn_tool_rounds_exhausted", False))
 
 
@@ -438,6 +472,8 @@ def _client_tool_loop_failed(client) -> bool:
     covered the max-rounds case.  Keep max-rounds clients compatible while
     also honoring the broader failure flag exposed by CLI clients.
     """
+    if _is_isolated_controller_turn():
+        return False
     return bool(
         getattr(client, "_last_turn_tool_loop_failed", False)
         or _client_tool_rounds_exhausted(client)
@@ -446,6 +482,8 @@ def _client_tool_loop_failed(client) -> bool:
 
 def _client_context_snapshot(client) -> dict[str, Any] | None:
     """Read generation observation without letting metadata failures stop a run."""
+    if _is_isolated_controller_turn():
+        return None
     getter = getattr(client, "get_generation_metadata", None)
     if not callable(getter):
         return None
@@ -458,8 +496,48 @@ def _client_context_snapshot(client) -> dict[str, Any] | None:
         return None
 
 
+def _client_context_manifest_ref(client) -> dict[str, Any] | None:
+    """Return only the validated, hash-based ContextManifest projection."""
+
+    if _is_isolated_controller_turn():
+        return None
+
+    getter = getattr(client, "get_generation_metadata", None)
+    if not callable(getter):
+        return None
+    try:
+        metadata = getter() or {}
+        if not isinstance(metadata, dict):
+            return None
+        from ...llm.context_snapshot import validate_context_manifest_metadata
+
+        manifest = validate_context_manifest_metadata(metadata.get("context_manifest"))
+        if not isinstance(manifest, dict):
+            return None
+        evidence_hashes: list[str] = []
+        for item in manifest.get("evidence") or []:
+            if not isinstance(item, dict):
+                continue
+            value = item.get("locator_hash") or item.get("ref_hash")
+            if value:
+                evidence_hashes.append(str(value))
+        return {
+            "schema_version": str(manifest.get("schema_version") or ""),
+            "manifest_hash": str(manifest.get("manifest_hash") or ""),
+            "reproducibility_hashes": {
+                str(key): str(value)
+                for key, value in (manifest.get("reproducibility_hashes") or {}).items()
+                if str(key) and str(value)
+            },
+            "evidence_hashes": sorted(set(evidence_hashes))[:512],
+            "evidence_count": len(evidence_hashes),
+        }
+    except Exception:
+        return None
 def _client_agent_run_usage(client) -> dict[str, int] | None:
     """Return the client-side confirmed usage accumulated for this AgentRun."""
+    if _is_isolated_controller_turn():
+        return None
     getter = getattr(client, "get_generation_metadata", None)
     if not callable(getter):
         return None
@@ -546,13 +624,21 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         )
     else:
         result = str(raw_result or "")
+    if result_object is None and isinstance(result, str) and result.lstrip().startswith("{"):
+        try:
+            parsed_result = json.loads(result)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_result = None
+        if isinstance(parsed_result, dict):
+            result_object = parsed_result
     error = value("error", "failure", "error_message", default=None)
     if error is not None:
         error = str(error)
 
     explicit_success = value("successful", "success", default=None)
-    if explicit_success is None and isinstance(result_object, dict):
-        explicit_success = result_object.get("success")
+    if isinstance(result_object, dict):
+        if explicit_success is None:
+            explicit_success = result_object.get("success")
         if error is None and result_object.get("error"):
             error = str(result_object.get("error"))
     if isinstance(explicit_success, bool):
@@ -576,6 +662,21 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
             or lowered.startswith("tool not found:")
             or "delegation error" in lowered
         )
+    if error and str(error).strip():
+        # Never let a contradictory provider marker (successful=True plus an
+        # error/failure field) become authoritative completion evidence.
+        successful = False
+    if isinstance(result_object, dict):
+        result_success = result_object.get("success")
+        if result_success is not None and str(result_success).strip().casefold() not in {
+            "1",
+            "true",
+            "yes",
+            "ok",
+            "success",
+            "succeeded",
+        }:
+            successful = False
 
     tool_call_id = value(
         "tool_call_id",
@@ -593,14 +694,39 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
     if error:
         metadata.setdefault("error", error)
 
+    safe_payload = sanitize_tool_audit_payload(
+        {
+            "tool": str(value("tool", "name", default="") or ""),
+            "arguments": dict(arguments),
+            "result": result,
+            "successful": bool(successful),
+            "error": error,
+            "tool_call_id": normalized_tool_call_id,
+        }
+    )
+    safe_arguments = safe_payload.get("arguments")
+    if not isinstance(safe_arguments, dict):
+        safe_arguments = {"_redacted": "[REDACTED_UNAVAILABLE]"}
+    safe_result = safe_payload.get("result")
+    if isinstance(safe_result, (dict, list, tuple)):
+        safe_result = json.dumps(
+            safe_result,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        )
+    elif safe_result is None:
+        safe_result = ""
+    else:
+        safe_result = str(safe_result)
     payload: dict[str, Any] = {
-        "tool": str(value("tool", "name", default="") or ""),
-        "arguments": dict(arguments),
-        "result": result,
+        "tool": str(safe_payload.get("tool") or value("tool", "name", default="") or ""),
+        "arguments": safe_arguments,
+        "result": safe_result,
         "successful": bool(successful),
-        "error": error,
-        "metadata": metadata,
-        "tool_call_id": normalized_tool_call_id,
+        "error": safe_payload.get("error"),
+        "metadata": sanitize_tool_audit_payload(metadata),
+        "tool_call_id": str(safe_payload.get("tool_call_id") or normalized_tool_call_id or "") or None,
         "already_recorded": bool(
             value("tool_result_already_recorded", "already_recorded", default=False)
         ),
@@ -610,6 +736,422 @@ def _agent_run_tool_call_payload(call: Any) -> dict[str, Any]:
         if item is not None:
             payload[key] = item
     return payload
+
+
+# A deterministic mutation may be followed by a provider-side finalization
+# failure (for example, the final text request can hit a quota limit).  Keep
+# this allowlist deliberately small: only operations whose result is a durable
+# object with a machine-checkable postcondition may be used as authoritative
+# completion evidence.  Complex/project-review work continues through the
+# normal verifier path.
+_AUTHORITATIVE_MUTATION_TOOL_NAMES = frozenset({"create_task"})
+
+
+def _decode_tool_result_payload(value: Any) -> Any:
+    """Decode one provider tool result without trusting arbitrary wrappers."""
+
+    if isinstance(value, (dict, list)):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_result_object(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the bounded task projection emitted by ``create_task``."""
+
+    decoded = _decode_tool_result_payload(payload.get("result"))
+    if not isinstance(decoded, dict):
+        return None
+    # Approved-mutation replay adapters may wrap the original task under a
+    # ``task``/``data`` key.  Accept only a dictionary wrapper; never infer a
+    # successful task from prose or an arbitrary truthy value.
+    if not (decoded.get("id") or decoded.get("task_id")):
+        for key in ("task", "data"):
+            nested = decoded.get(key)
+            if isinstance(nested, dict) and (nested.get("id") or nested.get("task_id")):
+                decoded = nested
+                break
+    success_marker = decoded.get("success")
+    if success_marker is not None and str(success_marker).strip().casefold() not in {
+        "1",
+        "true",
+        "yes",
+        "ok",
+        "success",
+        "succeeded",
+    }:
+        return None
+    if str(decoded.get("error") or "").strip():
+        return None
+    task_id = decoded.get("id") or decoded.get("task_id")
+    title = decoded.get("title")
+    if not str(task_id or "").strip() or not str(title or "").strip():
+        return None
+    return decoded
+
+
+def _task_schedule_field_present(task: dict[str, Any], key: str) -> bool:
+    value = task.get(key)
+    if isinstance(value, bool):
+        return value
+    return bool(str(value or "").strip())
+
+
+def _canonical_task_datetime(value: Any) -> str:
+    """Normalize the wall-clock ISO shape used by ``Task.to_dict``."""
+
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(text[:-1] if text.endswith("Z") else text)
+    except (TypeError, ValueError):
+        return " ".join(text.split()).casefold()
+    # Task scheduling deliberately stores wall-clock values without a timezone
+    # offset.  Match the tool's normalization instead of comparing raw input
+    # spelling (``19:00`` vs ``19:00:00``).
+    if parsed.tzinfo is not None:
+        parsed = parsed.replace(tzinfo=None)
+    return parsed.isoformat()
+
+
+def _task_boolean(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _create_task_postcondition_holds(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Validate the fields required for an authoritative task-create result.
+
+    ``create_task`` returns ``Task.to_dict()``.  Validate every non-empty
+    structured argument that the caller supplied, rather than treating a
+    generic ``{"success": true}`` response as proof that the requested task
+    exists.  Date-only ``due_date`` is normalized by the tool into ``start_at``.
+    """
+
+    if (
+        payload.get("tool", "").casefold() != "create_task"
+        or payload.get("successful") is not True
+    ):
+        return None
+    task = _task_result_object(payload)
+    if task is None:
+        return None
+    arguments = payload.get("arguments")
+    if not isinstance(arguments, dict):
+        arguments = {}
+
+    requested_title = str(arguments.get("title") or "").strip()
+    if not requested_title:
+        return None
+    if str(task.get("title") or "").strip() != requested_title:
+        return None
+    # Keep the fallback limited to the flat Task.to_dict fields we can prove
+    # without another provider/database read.  Nested recurrence/assignee and
+    # opt-in auto-close requests stay on the normal verification path.
+    if (
+        bool(arguments.get("auto_close_on_due"))
+        or str(arguments.get("assignee_ids") or "").strip()
+        or str(arguments.get("recurrence_rrule") or "").strip()
+    ):
+        return None
+
+    # Required identity fields are always checked above.  Optional fields are
+    # checked only when the provider actually received a non-empty request for
+    # them, preserving fail-closed behavior for missing schedule/description
+    # data while allowing ordinary title-only tasks.
+    requested_description = str(arguments.get("description") or "")
+    if requested_description.strip():
+        if not _task_schedule_field_present(task, "description"):
+            return None
+        if str(task.get("description") or "") != requested_description:
+            return None
+    requested_priority = str(arguments.get("priority") or "").strip()
+    if requested_priority:
+        if not _task_schedule_field_present(task, "priority"):
+            return None
+        if str(task.get("priority") or "").strip().casefold() != requested_priority.casefold():
+            return None
+    task_start_present = (
+        _task_schedule_field_present(task, "start_at")
+        or _task_schedule_field_present(task, "due_date")
+    )
+    if (
+        str(arguments.get("start_at") or "").strip()
+        or str(arguments.get("due_date") or "").strip()
+    ) and not task_start_present:
+        return None
+    requested_start = str(arguments.get("start_at") or arguments.get("due_date") or "").strip()
+    if requested_start and _canonical_task_datetime(requested_start) != _canonical_task_datetime(
+        task.get("start_at") or task.get("due_date")
+    ):
+        return None
+    if str(arguments.get("end_at") or "").strip() and not _task_schedule_field_present(
+        task, "end_at"
+    ):
+        return None
+    requested_end = str(arguments.get("end_at") or "").strip()
+    if requested_end and _canonical_task_datetime(requested_end) != _canonical_task_datetime(
+        task.get("end_at")
+    ):
+        return None
+    requested_project_id = str(arguments.get("project_id") or "").strip()
+    requested_project = str(arguments.get("project") or "").strip()
+    if requested_project_id:
+        observed_project_id = str(task.get("project_id") or "").strip()
+        if not observed_project_id or observed_project_id.casefold() != requested_project_id.casefold():
+            return None
+    elif requested_project:
+        observed_project_id = str(task.get("project_id") or "").strip()
+        observed_project_name = str(
+            task.get("project_name") or task.get("project") or ""
+        ).strip()
+        if not observed_project_id and not observed_project_name:
+            return None
+        if requested_project.casefold() not in {
+            observed_project_id.casefold(),
+            observed_project_name.casefold(),
+        }:
+            return None
+    if str(arguments.get("parent_task_id") or "").strip() and not _task_schedule_field_present(
+        task, "parent_task_id"
+    ):
+        return None
+    if str(arguments.get("parent_task_id") or "").strip() and str(
+        task.get("parent_task_id") or ""
+    ).strip().casefold() != str(arguments.get("parent_task_id") or "").strip().casefold():
+        return None
+    requested_all_day = _task_boolean(arguments.get("all_day")) or bool(
+        str(arguments.get("due_date") or "").strip()
+    )
+    if requested_all_day and not _task_boolean(task.get("all_day")):
+        return None
+    return task
+
+
+def _search_result_is_empty(payload: dict[str, Any]) -> bool:
+    """Return True only for a successful, unambiguous empty task search."""
+
+    if payload.get("tool", "").casefold() not in {"search_task_candidates", "list_tasks"}:
+        return False
+    if payload.get("successful") is not True:
+        return False
+    decoded = _decode_tool_result_payload(payload.get("result"))
+    if isinstance(decoded, list):
+        return len(decoded) == 0
+    if not isinstance(decoded, dict):
+        return False
+    indicators: list[bool] = []
+    for key in ("items", "tasks", "candidates", "results"):
+        if key in decoded and not isinstance(decoded.get(key), list):
+            return False
+        value = decoded.get(key)
+        if isinstance(value, list):
+            indicators.append(len(value) == 0)
+    for key in ("count", "total"):
+        if key in decoded and (
+            isinstance(decoded.get(key), bool)
+            or not isinstance(decoded.get(key), int)
+        ):
+            return False
+        value = decoded.get(key)
+        if isinstance(value, int):
+            indicators.append(value == 0)
+    return bool(indicators) and all(item == indicators[0] for item in indicators)
+
+
+def _request_requires_task_create(user_input: str | None) -> bool:
+    """Keep a mutation result tied to an explicit task-create request."""
+
+    if user_input is None:
+        # Callers that do not carry request text (legacy integrations) already
+        # own the required-operation decision and may use the structured
+        # ledger directly.
+        return True
+    raw_text = str(user_input).strip()
+    text = raw_text.casefold()
+    if not text:
+        return False
+    if not _simple_task_request_is_explicit(raw_text):
+        return False
+    if mutation_execution_forbidden(raw_text):
+        return False
+    question_markers = (
+        "方法",
+        "使い方",
+        "教えて",
+        "できますか",
+        "できるか",
+        "確認して",
+        "確認したい",
+        "かどうか",
+        "?",
+        "？",
+    )
+    confirmation_markers = (
+        "してもいい",
+        "してもよい",
+        "しても大丈夫",
+        "作ってもいい",
+        "作ってもよい",
+        "作っていい",
+        "作って良い",
+        "作成していい",
+        "作成してよい",
+        "作成して良い",
+        "登録していい",
+        "登録してよい",
+        "登録して良い",
+        "追加していい",
+        "追加してよい",
+        "追加して良い",
+        "許可",
+        "承認",
+        "is it okay",
+        "may i",
+        "can i",
+        "should i",
+    )
+    imperative_markers = (
+        "作って",
+        "作ってください",
+        "作成して",
+        "作成してください",
+        "作成お願いします",
+        "作成をお願いします",
+        "登録して",
+        "登録してください",
+        "登録お願いします",
+        "追加して",
+        "追加してください",
+        "入れて",
+        "create ",
+        "create_task",
+        "register a task",
+        "make a task",
+        "add a task",
+    )
+    conditional_markers = (
+        "作成予定",
+        "作る予定",
+        "作成するつもり",
+        "作るつもり",
+        "作成を検討",
+        "作成を考えて",
+    )
+    if any(marker in text for marker in conditional_markers) and not any(
+        marker in text for marker in imperative_markers
+    ):
+        return False
+    if any(marker in text for marker in confirmation_markers):
+        return False
+    if any(marker in text for marker in question_markers) and not any(
+        marker in text for marker in imperative_markers
+    ):
+        return False
+    if any(marker in text for marker in ("?", "？")) and any(
+        marker in text
+        for marker in ("いい", "良い", "大丈夫", "可能", "できますか")
+    ):
+        return False
+    try:
+        required = requested_deterministic_task_mutation_tools(raw_text)
+    except Exception:
+        return False
+    required.discard("schedule_task")
+    return required == {"create_task"}
+
+
+def authoritative_mutation_completion_evidence(
+    tool_calls: list[Any] | None,
+    *,
+    user_input: str | None = None,
+) -> dict[str, Any] | None:
+    """Return safe completion evidence for a required deterministic mutation.
+
+    The evidence is intentionally independent from the final assistant text.
+    A successful ``create_task`` is authoritative only when the latest
+    duplicate-candidate search *before that create* succeeded and was empty,
+    and the returned task projection contains the requested fields.  Failures
+    after the create remain in the audit ledger but do not erase this evidence.
+    """
+
+    if not _request_requires_task_create(user_input):
+        return None
+    records = [
+        _agent_run_tool_call_payload(call)
+        for call in (tool_calls or [])
+    ]
+    if _simple_task_has_unexpected_successful_mutation(records):
+        return None
+    if _simple_task_post_create_has_blocked_work(records):
+        return None
+    create_indexes = [
+        index
+        for index, payload in enumerate(records)
+        if payload.get("tool", "").casefold() in _AUTHORITATIVE_MUTATION_TOOL_NAMES
+        and payload.get("successful")
+    ]
+    # Multiple successful creates are ambiguous and must never be collapsed
+    # into one user-facing success summary.
+    if len(create_indexes) != 1:
+        return None
+    create_index = create_indexes[0]
+    if any(
+        not payload.get("successful")
+        for index, payload in enumerate(records)
+        if payload.get("tool", "").casefold() == "create_task"
+        and index > create_index
+    ):
+        # A later failed create is a required-operation failure, not an
+        # optional diagnostic.  Do not let the earlier success hide it.
+        return None
+    task = _create_task_postcondition_holds(records[create_index])
+    if task is None:
+        return None
+
+    searches = [
+        payload
+        for index, payload in enumerate(records)
+        if index < create_index
+        and payload.get("tool", "").casefold()
+        in {"search_task_candidates", "list_tasks"}
+    ]
+    if not searches or not _search_result_is_empty(searches[-1]):
+        return None
+
+    task_id = str(task.get("id") or task.get("task_id") or "").strip()
+    title = " ".join(str(task.get("title") or "").split())
+    safe_title = sanitize_assistant_display_text(title).strip()
+    start_at = " ".join(
+        str(task.get("start_at") or task.get("due_date") or "").split()
+    )
+    end_at = " ".join(str(task.get("end_at") or "").split())
+    if start_at and end_at:
+        schedule = f"{start_at}〜{end_at}"
+    else:
+        schedule = start_at or end_at
+    safe_schedule = sanitize_assistant_display_text(schedule).strip()
+    summary = f"タスク「{safe_title}」を作成しました。"
+    if safe_schedule:
+        summary += f"日時: {safe_schedule}"
+    return {
+        "tool": "create_task",
+        "tool_call_id": records[create_index].get("tool_call_id"),
+        "task_id": task_id,
+        "title": safe_title,
+        "start_at": sanitize_assistant_display_text(start_at).strip() or None,
+        "end_at": sanitize_assistant_display_text(end_at).strip() or None,
+        "summary": sanitize_assistant_display_text(summary),
+    }
 
 
 def _agent_run_tool_call_id(
@@ -683,7 +1225,9 @@ def _agent_run_completion_result(
     tool_calls: list[Any],
 ) -> dict[str, Any]:
     result_payload: dict[str, Any] = {
-        "assistant_response": reply or "",
+        # Keep the raw reply local for completion classification only; the
+        # durable AgentRun projection must never carry provider credentials.
+        "assistant_response": sanitize_assistant_display_text(reply),
         "tool_result_count": len(search_tool_results) + len(tool_calls),
         "successful_mutation_tool_count": _successful_mutation_tool_call_count(
             tool_calls
@@ -968,6 +1512,7 @@ class AgentRunEventEmitter:
                         value[:20000].rstrip() + "\n... (truncated)"
                     )
             payload["tool_result"] = tool_result
+        payload = sanitize_stream_display_payload(event_type, payload)
         return payload
 
     async def record_event(
@@ -1001,12 +1546,17 @@ class AgentRunEventEmitter:
                         self._already_recorded_tool_ids.add(operation_id)
                     self._already_recorded_tool_signatures.add(signature)
         try:
+            safe_message_text = (
+                sanitize_assistant_display_text(message_text)
+                if message_text is not None
+                else None
+            )
             await self._agent_run_service.record_event(
                 self._agent_run_id,
                 event_type,
                 status=status,
                 message=self._resolve_message_text(
-                    event_type, payload, message_text
+                    event_type, payload, safe_message_text
                 ),
                 payload=payload,
             )
@@ -1083,12 +1633,50 @@ class AgentRunEventEmitter:
         except Exception as exc:
             print(f"[{self._log_prefix}] AgentRun start update failed: {exc}")
 
+    async def authoritative_mutation_completion(self, client=None) -> dict[str, Any] | None:
+        """Return this run's proven mutation result, if one exists.
+
+        The lookup is run-keyed whenever the provider exposes its completion
+        ledger.  That prevents a failed finalization from accidentally using a
+        different conversation's stale ``_last_*`` fields as success evidence.
+        """
+
+        profile = getattr(self._generation_profile, "value", self._generation_profile)
+        if str(profile or "").strip().casefold() == "review":
+            return None
+        # Only the task-update capability is allowed to share this narrow
+        # create receipt path.  Workspace/Docs/DB/WBS/media/help/review
+        # capabilities have independent verification contracts and must never
+        # be promoted by a task-shaped sentence in the same turn.
+        non_task_capabilities = set(self._command_capabilities or ()) - {
+            "task_update"
+        }
+        if non_task_capabilities:
+            return None
+
+        run_state = await _peek_client_agent_run_state(client, self._agent_run_id)
+        tool_calls = (
+            run_state[0]
+            if run_state is not None
+            else _client_tool_calls(client)
+        )
+        evidence = authoritative_mutation_completion_evidence(
+            tool_calls,
+            user_input=self._user_input,
+        )
+        if evidence is not None and run_state is not None and run_state[2]:
+            evidence["provider_finalization_failure"] = sanitize_durable_error_text(
+                run_state[2]
+            )
+        return evidence
+
     async def complete(
         self,
         reply: Optional[str],
         client=None,
         *,
         completion_confirmed: bool = False,
+        allow_authoritative_mutation: bool = False,
     ) -> None:
         if self.finished:
             return
@@ -1116,9 +1704,20 @@ class AgentRunEventEmitter:
             successful_mutation_tool_count = _successful_mutation_tool_call_count(
                 tool_calls
             )
+            mutation_evidence = (
+                authoritative_mutation_completion_evidence(
+                    tool_calls,
+                    user_input=self._user_input,
+                )
+                if allow_authoritative_mutation
+                else None
+            )
             context_snapshot = _client_context_snapshot(client)
             if context_snapshot:
                 result_payload["context_snapshot"] = context_snapshot
+            context_manifest_ref = _client_context_manifest_ref(client)
+            if context_manifest_ref:
+                result_payload["context_manifest"] = context_manifest_ref
             usage = (
                 run_state[1]
                 if run_state is not None
@@ -1127,6 +1726,16 @@ class AgentRunEventEmitter:
             completion_metadata = {"usage": usage} if usage else None
             if usage:
                 result_payload["usage"] = usage
+            if mutation_evidence is not None:
+                # Keep the provider-side finalization failure observable while
+                # allowing the already-proven mutation to complete the run.
+                # Tool-level failed records are persisted above and remain
+                # available to the audit/UI timeline.
+                result_payload["authoritative_mutation"] = mutation_evidence
+                if run_state is not None and run_state[2]:
+                    result_payload["provider_finalization_failure"] = (
+                        sanitize_durable_error_text(run_state[2])
+                    )
             failure_message = (
                 run_state[2]
                 if run_state is not None and run_state[2]
@@ -1140,6 +1749,8 @@ class AgentRunEventEmitter:
                     tool_loop_failed=_client_tool_loop_failed(client),
                 )
             )
+            if mutation_evidence is not None:
+                failure_message = None
             if failure_message:
                 failure_kwargs = {"result": result_payload}
                 if completion_metadata:
@@ -1152,7 +1763,11 @@ class AgentRunEventEmitter:
             else:
                 completion_kwargs = {
                     "result": result_payload,
-                    "message": "Assistant generation completed",
+                    "message": (
+                        "Assistant generation completed from authoritative mutation evidence"
+                        if mutation_evidence is not None
+                        else "Assistant generation completed"
+                    ),
                 }
                 if completion_metadata:
                     completion_kwargs["metadata"] = completion_metadata
@@ -1173,6 +1788,8 @@ class AgentRunEventEmitter:
         error_text: str,
         reply: Optional[str] = None,
         client=None,
+        *,
+        status: str = "failed",
     ) -> None:
         if self.finished:
             return
@@ -1197,6 +1814,9 @@ class AgentRunEventEmitter:
             context_snapshot = _client_context_snapshot(client)
             if context_snapshot:
                 result["context_snapshot"] = context_snapshot
+            context_manifest_ref = _client_context_manifest_ref(client)
+            if context_manifest_ref:
+                result["context_manifest"] = context_manifest_ref
             usage = (
                 run_state[1]
                 if run_state is not None
@@ -1208,9 +1828,11 @@ class AgentRunEventEmitter:
             failure_kwargs = {"result": result}
             if failure_metadata:
                 failure_kwargs["metadata"] = failure_metadata
+            safe_status = status if status in {"failed", "cancelled"} else "failed"
             terminal_result = await self._agent_run_service.fail_run(
                 self._agent_run_id,
                 (run_state[2] if run_state is not None and run_state[2] else error_text),
+                status=safe_status,
                 **failure_kwargs,
             )
             if terminal_result is None:

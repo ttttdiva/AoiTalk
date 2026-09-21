@@ -8,6 +8,7 @@ from ..server_shared import *  # noqa: F401,F403
 from ...tools.external_llm_permission import get_permission_request_scope
 from ...features import Features
 from ...services.agent_run_service import get_current_agent_run_id
+from collections.abc import Mapping
 from uuid import uuid4
 
 
@@ -106,7 +107,20 @@ class MessagingMixin:
                 set_human_interaction_manager,
             )
 
-            self._human_interaction_manager = HumanInteractionManager()
+            # Bind the interaction transport to the same durable AgentRun
+            # service used by the server.  Requests/resolutions are persisted
+            # before websocket delivery, so a restart can reconcile stale
+            # runs without attempting to recreate in-memory Futures.
+            interaction_service = None
+            try:
+                from ...services.agent_run_service import AgentRunService
+
+                interaction_service = AgentRunService(getattr(self, "_db_manager", None))
+            except Exception:
+                interaction_service = None
+            self._human_interaction_manager = HumanInteractionManager(
+                agent_run_service=interaction_service,
+            )
 
             async def broadcast_human_interaction(message: dict):
                 permission_user_id, permission_session_id = (
@@ -186,6 +200,9 @@ class MessagingMixin:
         requester_session_id: Optional[str] = None,
     ):
         """Handle user response to external LLM permission request"""
+        if not isinstance(data, dict):
+            logger.warning("Malformed external LLM permission response envelope")
+            return
         if not self._external_llm_permission_manager:
             logger.warning("External LLM permission manager not available")
             return
@@ -193,9 +210,13 @@ class MessagingMixin:
         request_id = data.get("request_id")
         approved = data.get("approved", False)
         # scope: "once"（今回だけ）/ "session"（このセッション中は許可）
-        scope = str(data.get("scope") or "once")
+        scope_value = data.get("scope", "once")
+        if not isinstance(approved, bool) or not isinstance(scope_value, str):
+            logger.warning("Malformed external LLM permission response")
+            return
+        scope = scope_value or "once"
 
-        if not request_id:
+        if not isinstance(request_id, str) or not request_id.strip():
             logger.warning("Permission response missing request_id")
             return
 
@@ -221,15 +242,33 @@ class MessagingMixin:
         requester_session_id: Optional[str] = None,
     ):
         """Handle approval or edited prompt for an external model call."""
+        if not isinstance(data, dict):
+            logger.warning("Malformed external model prompt response envelope")
+            return
         if not self._external_llm_permission_manager:
             logger.warning("External LLM permission manager not available")
             return
 
         request_id = data.get("request_id")
-        approved = bool(data.get("approved", False))
-        prompt = str(data.get("prompt") or "")
+        approved = data.get("approved", False)
+        if not isinstance(approved, bool):
+            logger.warning("Malformed external model prompt approval")
+            return
+        # v2 egress responses use an exact final_payload string and carry the
+        # nonce/binding envelope.  Legacy prompt responses continue to use
+        # ``prompt`` for source compatibility; do not coerce arbitrary JSON
+        # values to strings because ``'false'`` must never become approval.
+        prompt_value = data.get("prompt", "")
+        final_payload = data.get("final_payload")
+        if prompt_value is not None and not isinstance(prompt_value, str):
+            logger.warning("Malformed external model prompt payload")
+            return
+        if final_payload is not None and not isinstance(final_payload, str):
+            logger.warning("Malformed external egress final_payload")
+            return
+        prompt = prompt_value or ""
 
-        if not request_id:
+        if not isinstance(request_id, str) or not request_id.strip():
             logger.warning("External model prompt response missing request_id")
             return
 
@@ -237,6 +276,11 @@ class MessagingMixin:
             request_id,
             approved,
             prompt,
+            final_payload=final_payload,
+            contract_version=data.get("contract_version"),
+            review_nonce=data.get("review_nonce"),
+            binding_digest=data.get("binding_digest"),
+            scope=data.get("scope", "once"),
             requester_user_id=requester_user_id,
             requester_session_id=requester_session_id,
         )
@@ -395,7 +439,10 @@ class MessagingMixin:
         )
 
     async def add_assistant_message(
-        self, message: str, session_id: Optional[str] = None
+        self,
+        message: str,
+        session_id: Optional[str] = None,
+        attachments: Optional[list[dict[str, Any]]] = None,
     ):
         """Add assistant message"""
         if Features.is_enterprise() and not session_id:
@@ -420,6 +467,12 @@ class MessagingMixin:
             "session_id": effective_session_id,
             "agent_run_id": agent_run_id,
         }
+        if attachments:
+            entry["attachments"] = [
+                dict(item)
+                for item in attachments[:32]
+                if isinstance(item, dict)
+            ]
 
         self.manager.add_to_history(entry)
         await self._broadcast_new_message(entry)
@@ -475,6 +528,74 @@ class MessagingMixin:
         """Set callback called when the active LLM client changes."""
         self.on_llm_client_change = callback
 
+    def _configure_heartbeat_execution(self) -> None:
+        """Install the single durable Heartbeat callback and broadcasters."""
+
+        runner = getattr(self, "_heartbeat_runner", None)
+        if runner is None:
+            return
+
+        try:
+            from ...services.project_steward_service import (
+                HeartbeatExecutionDispatcher,
+            )
+
+            dispatcher = HeartbeatExecutionDispatcher(
+                config=self.config,
+                broadcaster=self.manager.broadcast,
+            )
+
+            async def _heartbeat_admin_notify(
+                message: Dict[str, Any],
+            ) -> None:
+                await self.manager.broadcast(
+                    message,
+                    admin_only=True,
+                )
+
+            async def _heartbeat_execute(
+                heartbeat_definition: Any,
+                scope: Dict[str, Any],
+            ) -> Mapping[str, Any]:
+                # Heartbeat is a wake/cursor mechanism.  It may materialize
+                # newly discovered durable work, but never claims or executes
+                # an AgentWorkItem inside the heartbeat transaction.
+                coordinator = getattr(self, "_agent_work_coordinator", None)
+                if coordinator is not None and Features.autonomous_agent_runtime():
+                    materialized = await coordinator.discover_and_materialize(
+                        project_id=scope.get("project_id"),
+                    )
+                    # In autonomous mode Heartbeat is a wake/cursor source,
+                    # not an LLM executor.  The coordinator owns claims and
+                    # long-running AgentRuns; returning a bounded success
+                    # lets Heartbeat advance its cursor after materialization.
+                    return {
+                        "status": "ok",
+                        "work_items_materialized": len(materialized),
+                        "cursor_json": {
+                            **(
+                                dict(scope.get("cursor_json"))
+                                if isinstance(scope.get("cursor_json"), Mapping)
+                                else {}
+                            ),
+                            "last_materialized_count": len(materialized),
+                        },
+                    }
+                return await dispatcher.execute(heartbeat_definition, scope)
+
+            runner.set_execute_callback(_heartbeat_execute)
+            runner.set_broadcast_fn(self.manager.broadcast)
+            runner.set_admin_notify_fn(_heartbeat_admin_notify)
+            self._heartbeat_execution_dispatcher = dispatcher
+        except Exception:
+            # Runner itself already treats a missing callback as
+            # executor_unavailable and retains its durable cursor.
+            logger.exception(
+                "Heartbeat execution dispatcher initialization failed"
+            )
+            runner.set_execute_callback(None)
+            self._heartbeat_execution_dispatcher = None
+
     def set_llm_client(self, llm_client):
         """Set LLM client reference for mode management
 
@@ -489,7 +610,9 @@ class MessagingMixin:
             except Exception as exc:
                 logger.exception("LLM client change callback failed: %s", exc)
 
-        # HeartbeatRunnerにもLLMクライアントとブロードキャスト関数を注入
+        # Compatibility/status only. Heartbeat execution itself always uses
+        # fresh Project Automation clients through the dispatcher installed
+        # by _configure_heartbeat_execution().
         if self._heartbeat_runner:
             self._heartbeat_runner.set_llm_client(llm_client)
 
@@ -501,10 +624,19 @@ class MessagingMixin:
     def _register_character_switch_callback(self):
         """キャラクター切り替え通知を登録"""
         try:
+            # Retain the exact manager/callback pair so the composition root
+            # can unregister this server on lifespan teardown.  Resolving a
+            # fresh manager in cleanup would make ownership ambiguous for
+            # test/runtime instances that replace the singleton.
             character_manager = CharacterSwitchManager()
-            character_manager.register_callback(self._on_character_switch)
+            callback = self._on_character_switch
+            character_manager.register_callback(callback)
+            self._character_switch_manager = character_manager
+            self._character_switch_callback = callback
+            self._character_switch_callback_registered = True
             logger.info("WebChatServer: キャラクター切り替えコールバックを登録しました")
         except Exception as e:
+            self._character_switch_callback_registered = False
             logger.error(
                 f"WebChatServer: キャラクター切り替えコールバック登録エラー: {e}"
             )

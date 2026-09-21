@@ -19,6 +19,7 @@ import {
   integer,
   real,
   index,
+  uniqueIndex,
   primaryKey,
 } from 'drizzle-orm/sqlite-core';
 
@@ -62,6 +63,7 @@ export const projects = sqliteTable(
     storageQuotaMb: integer('storage_quota_mb'),
     storageUsedMb: real('storage_used_mb'),
     projectMetadata: text('project_metadata', { mode: 'json' }),
+    isParticipating: integer('is_participating', { mode: 'boolean' }),
     createdAt: text('created_at'),
     updatedAt: text('updated_at'),
     deletedAt: text('deleted_at'),
@@ -119,6 +121,9 @@ export const taskOccurrences = sqliteTable(
     taskId: text('task_id').notNull(),
     startAt: text('start_at').notNull(),
     endAt: text('end_at'),
+    // Canonical RRULE start.  Nullable for legacy materialized rows and
+    // servers that predate recurrence schedule segments.
+    originalStartAt: text('original_start_at'),
     status: text('status').notNull().default('todo'),
     allDay: integer('all_day', { mode: 'boolean' }),
     reminderOffsets: text('reminder_offsets', { mode: 'json' }),
@@ -1404,28 +1409,48 @@ export const taskDetailCache = sqliteTable(
   }),
 );
 
-// ---------- pending_clip_ingests（サーバー未到達時のクリップ取り込み保留キュー） ----------
-// AoiTalk サーバーへ到達できず、モバイルLLMでもローカル完結できなかった入力を保持する。
-// 同期時に `POST /api/docs/ingest` へ再送し、成功したら行を削除する。
-// 恒久エラー（4xx）は status='failed' として残し、ユーザーに見える形で保持する。
-// authScope は enqueue 時点の認証スコープ（`auth:<user_id>` / 'anonymous'）で、
-// 別ユーザーの保留を再送しないための絞り込みに使う。
+// ---------- pending_clip_ingests（durable ClipIngest operation journal） ----------
+// Legacy rows keep operation_key=NULL forever until the user explicitly
+// claims them. New rows use this table as a durable operation journal rather
+// than a best-effort resend queue.
 export const pendingClipIngests = sqliteTable(
   'pending_clip_ingests',
   {
     id: text('id').primaryKey(),
     source: text('source').notNull(),
-    status: text('status').notNull().default('queued'), // queued | failed
+    operationKey: text('operation_key'),
+    requestJson: text('request_json'),
+    contextJson: text('context_json'),
+    delivery: text('delivery'), // remote | local
+    status: text('status').notNull().default('queued'),
     authScope: text('auth_scope'),
+    // Stable configured API identity. NULL is preserved for legacy rows and
+    // means recovery-only/server-unknown; never infer it during migration.
+    serverFingerprint: text('server_fingerprint'),
+    remoteJobId: text('remote_job_id'),
+    ackJson: text('ack_json'),
+    resultJson: text('result_json'),
+    errorJson: text('error_json'),
     retryCount: integer('retry_count').notNull().default(0),
     lastError: text('last_error'),
     createdAt: text('created_at'),
     updatedAt: text('updated_at'),
+    terminalAt: text('terminal_at'),
   },
   (t) => ({
     byStatus: index('idx_pending_clip_ingests_status').on(t.status),
     byAuthScope: index('idx_pending_clip_ingests_auth_scope').on(t.authScope),
     byCreatedAt: index('idx_pending_clip_ingests_created_at').on(t.createdAt),
+    byScopeStatus: index('idx_pending_clip_ingests_scope_status').on(
+      t.authScope,
+      t.status,
+    ),
+    byScopeServerStatus: index(
+      'idx_pending_clip_ingests_scope_server_status',
+    ).on(t.authScope, t.serverFingerprint, t.status),
+    byOperationKey: uniqueIndex(
+      'idx_pending_clip_ingests_operation_key',
+    ).on(t.operationKey),
   }),
 );
 

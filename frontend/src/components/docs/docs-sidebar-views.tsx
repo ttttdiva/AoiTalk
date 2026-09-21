@@ -12,6 +12,7 @@ import {
   Link2,
   Copy,
   ListFilter,
+  LockKeyhole,
   Plus,
   Type,
   type LucideIcon,
@@ -23,7 +24,13 @@ import {
 } from "@/components/ui/menu-mnemonic";
 import { useContextMenuPosition } from "@/hooks/use-context-menu-position";
 import { cn } from "@/lib/utils";
-import type { DocsNode, DocsSupertag } from "./types";
+import { toast } from "sonner";
+import {
+  docsNodeProtectionMessage,
+  isDocsProjectCanonicalNode,
+  type DocsNode,
+  type DocsSupertag,
+} from "./types";
 import {
   hoistedVisibleChildren,
   isDocsNodeTitleVisible,
@@ -34,7 +41,10 @@ import {
 export function isDocsSidebarNodeVisible(node: DocsNode): boolean {
   return (
     !node.archived_at
-    && isDocsNodeTitleVisible(node)
+    // Keep malformed/stale Project-information identities addressable for the
+    // dedicated cleanup action even when their title is empty.  Ordinary
+    // markerless empty rows remain suppressed by the shared predicate.
+    && (isDocsNodeTitleVisible(node) || isDocsProjectCanonicalNode(node))
     && node.display_props?.hidden_from_sidebar !== true
     && !node.system_key?.startsWith("project_mail_management:")
   );
@@ -61,10 +71,12 @@ export function TrashMainView({
   archivedNodes,
   onRestoreNode,
   onPermanentDeleteNode,
+  onCleanupNode,
 }: {
   archivedNodes: DocsNode[];
   onRestoreNode: (nodeId: string) => void;
   onPermanentDeleteNode: (nodeId: string) => void;
+  onCleanupNode?: (node: DocsNode) => void;
 }) {
   return (
     <section className="flex min-w-0 flex-1 flex-col overflow-hidden bg-background">
@@ -82,10 +94,23 @@ export function TrashMainView({
               <div key={node.id} className="rounded-md border border-border bg-card p-3">
                 <div className="truncate text-sm font-medium">{nodeText(node)}</div>
                 <div className="mt-1 text-[11px] text-muted-foreground">{node.archived_at ? `Archived: ${node.archived_at}` : ""}</div>
-                <div className="mt-2 flex gap-1">
-                  <Button type="button" size="sm" variant="secondary" className="h-7 px-2 text-xs" onClick={() => onRestoreNode(node.id)}>復元</Button>
-                  <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs text-destructive" onClick={() => onPermanentDeleteNode(node.id)}>完全削除</Button>
-                </div>
+                {isDocsProjectCanonicalNode(node) ? (
+                  <>
+                    <div role="status" className="mt-2 text-[11px] leading-relaxed text-muted-foreground">
+                      {docsNodeProtectionMessage(node)}
+                    </div>
+                    {onCleanupNode ? (
+                      <Button type="button" size="sm" variant="secondary" className="mt-2 h-7 px-2 text-xs" onClick={() => onCleanupNode(node)}>
+                        staleをクリーンアップ
+                      </Button>
+                    ) : null}
+                  </>
+                ) : (
+                  <div className="mt-2 flex gap-1">
+                    <Button type="button" size="sm" variant="secondary" className="h-7 px-2 text-xs" onClick={() => onRestoreNode(node.id)}>復元</Button>
+                    <Button type="button" size="sm" variant="ghost" className="h-7 px-2 text-xs text-destructive" onClick={() => onPermanentDeleteNode(node.id)}>完全削除</Button>
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -310,6 +335,14 @@ export function DocsSidebarContextMenu({
   onCopyId,
   onPin,
   onArchive,
+  onCleanup,
+  canRename = true,
+  canDuplicate = true,
+  canCleanup = false,
+  canPin = true,
+  canArchive = true,
+  canMove = true,
+  protectedMessage = null,
 }: {
   menu: SidebarContextMenuState | null;
   node: DocsNode | null;
@@ -324,6 +357,14 @@ export function DocsSidebarContextMenu({
   onCopyId: (node: DocsNode) => void;
   onPin: (node: DocsNode) => void;
   onArchive: (node: DocsNode) => void;
+  onCleanup?: (node: DocsNode) => void;
+  canRename?: boolean;
+  canDuplicate?: boolean;
+  canCleanup?: boolean;
+  canPin?: boolean;
+  canArchive?: boolean;
+  canMove?: boolean;
+  protectedMessage?: string | null;
 }) {
   const { ref, style } = useContextMenuPosition(
     menu ? { x: menu.x, y: menu.y } : null,
@@ -348,6 +389,16 @@ export function DocsSidebarContextMenu({
 
   if (!menu || !node || typeof document === "undefined") return null;
 
+  const run = (action: () => void | Promise<unknown>) => {
+    try {
+      void Promise.resolve(action()).catch((error: unknown) => {
+        toast.error(error instanceof Error ? error.message : "Docs操作に失敗しました");
+      });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Docs操作に失敗しました");
+    }
+  };
+
   return createPortal(
     <MenuMnemonicSurface
       ref={ref}
@@ -359,7 +410,7 @@ export function DocsSidebarContextMenu({
         type="button"
         mnemonic="O"
         className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onOpen(node)}
+        onClick={() => run(() => onOpen(node))}
       >
         <ExternalLink className="size-4" />
         開く
@@ -368,7 +419,7 @@ export function DocsSidebarContextMenu({
         type="button"
         mnemonic="S"
         className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onOpenSplit(node)}
+        onClick={() => run(() => onOpenSplit(node))}
       >
         <Columns2 className="size-4" />
         右パネルで開く
@@ -378,7 +429,7 @@ export function DocsSidebarContextMenu({
         type="button"
         mnemonic="L"
         className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onCopyReference(node)}
+        onClick={() => run(() => onCopyReference(node))}
       >
         <Copy className="size-4" />
         チャット用参照をコピー
@@ -387,67 +438,94 @@ export function DocsSidebarContextMenu({
         type="button"
         mnemonic="C"
         className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onCopyId(node)}
+        onClick={() => run(() => onCopyId(node))}
       >
         <Hash className="size-4" />
         ノードIDをコピー
       </MenuMnemonicButton>
       <div className="my-1 h-px bg-border" />
-      <MenuMnemonicButton
-        type="button"
-        mnemonic="R"
-        className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onRename(node)}
-      >
-        <Type className="size-4" />
-        名前の変更
-      </MenuMnemonicButton>
-      <MenuMnemonicButton
-        type="button"
-        mnemonic="U"
-        className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onDuplicate(node)}
-      >
-        <Plus className="size-4" />
-        複製
-      </MenuMnemonicButton>
-      <MenuMnemonicButton
-        type="button"
-        mnemonic="M"
-        className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onMoveWithReference(node)}
-      >
-        <Link2 className="size-4" />
-        参照を残して移動
-      </MenuMnemonicButton>
+      {protectedMessage ? (
+        <div role="status" data-docs-protected-node className="my-1 flex items-start gap-2 rounded px-2 py-1.5 text-[11px] leading-relaxed text-muted-foreground">
+          <LockKeyhole className="mt-0.5 size-3.5 shrink-0 text-amber-600" />
+          <span>{protectedMessage}</span>
+        </div>
+      ) : null}
+      {canRename ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="R"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
+          onClick={() => run(() => onRename(node))}
+        >
+          <Type className="size-4" />
+          名前の変更
+        </MenuMnemonicButton>
+      ) : null}
+      {canDuplicate ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="U"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
+          onClick={() => run(() => onDuplicate(node))}
+        >
+          <Plus className="size-4" />
+          複製
+        </MenuMnemonicButton>
+      ) : null}
+      {canMove ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="M"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
+          onClick={() => run(() => onMoveWithReference(node))}
+        >
+          <Link2 className="size-4" />
+          参照を残して移動
+        </MenuMnemonicButton>
+      ) : null}
       <MenuMnemonicButton
         type="button"
         mnemonic="E"
         className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onExport(node)}
+        onClick={() => run(() => onExport(node))}
       >
         <ExternalLink className="size-4" />
         エクスポート
       </MenuMnemonicButton>
-      <MenuMnemonicButton
-        type="button"
-        mnemonic="P"
-        className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
-        onClick={() => onPin(node)}
-      >
-        <Hash className="size-4" />
-        {node.display_props?.pinned_sidebar === true ? "ピン留め解除" : "ピン留め"}
-      </MenuMnemonicButton>
+      {canPin ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="P"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground"
+          onClick={() => run(() => onPin(node))}
+        >
+          <Hash className="size-4" />
+          {node.display_props?.pinned_sidebar === true ? "ピン留め解除" : "ピン留め"}
+        </MenuMnemonicButton>
+      ) : null}
       <div className="my-1 h-px bg-border" />
-      <MenuMnemonicButton
-        type="button"
-        mnemonic="A"
-        className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10"
-        onClick={() => onArchive(node)}
-      >
-        <Archive className="size-4" />
-        アーカイブ
-      </MenuMnemonicButton>
+      {canArchive ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="A"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+          onClick={() => run(() => onArchive(node))}
+        >
+          <Archive className="size-4" />
+          アーカイブ
+        </MenuMnemonicButton>
+      ) : null}
+      {canCleanup && onCleanup ? (
+        <MenuMnemonicButton
+          type="button"
+          mnemonic="K"
+          className="flex w-full cursor-default items-center gap-2 rounded-sm px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+          onClick={() => run(() => onCleanup(node))}
+        >
+          <Archive className="size-4" />
+          staleをクリーンアップ
+        </MenuMnemonicButton>
+      ) : null}
     </MenuMnemonicSurface>,
     document.body,
   );

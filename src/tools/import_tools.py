@@ -4,6 +4,7 @@
 AoiTalkのシナリオデータベースに取り込むためのツールを提供する。
 """
 
+import inspect
 import json
 import logging
 import os
@@ -30,6 +31,7 @@ from ..memory.models.story import (
 from ..services.story_studio import StoryEpisodeService
 from ..llm.conversation_context import normalize_usage, persist_usage_sync
 from ..services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     PrivacyError,
     get_privacy_policy_context,
@@ -154,7 +156,21 @@ async def _llm_extract(prompt: str, text: str, usage_context=None) -> str:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY が設定されていません")
 
-    client = AsyncOpenAI(api_key=api_key)
+    # The gateway owns review/retry semantics.  Disable implicit SDK retries
+    # so a reviewed payload cannot be replayed behind this transaction.
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    try:
+        parameters = inspect.signature(AsyncOpenAI).parameters.values()
+        supports_max_retries = any(
+            parameter.name == "max_retries"
+            or parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters
+        )
+    except (TypeError, ValueError):
+        supports_max_retries = True
+    if supports_max_retries:
+        client_kwargs["max_retries"] = 0
+    client = AsyncOpenAI(**client_kwargs)
     started = time.monotonic()
     inherited = get_privacy_policy_context()
 
@@ -250,14 +266,27 @@ async def _llm_extract(prompt: str, text: str, usage_context=None) -> str:
             request_kwargs["reasoning"] = {"effort": effort, "summary": "auto"}
         else:
             request_kwargs["temperature"] = 0.1
-        protected = await gateway.protect(
+        base_url = str(getattr(client, "base_url", "") or "")
+        descriptor = EgressDescriptor(
+            action="model.generate",
+            transport="openai.responses",
+            destination=base_url,
+            provider="openai",
+            tool="import_tools",
+            model=model,
+        )
+
+        async def send_request(outbound: dict[str, Any]):
+            return await client.responses.create(**outbound)
+
+        response = await gateway.execute(
             request_kwargs,
             provider="openai",
-            base_url=str(getattr(client, "base_url", "") or ""),
+            descriptor=descriptor,
+            sender=send_request,
+            base_url=base_url,
             source_kind="import_model_request",
-        )
-        response = await client.responses.create(
-            **protected.payload
+            model=model,
         )
         _record_import_usage(
             response,

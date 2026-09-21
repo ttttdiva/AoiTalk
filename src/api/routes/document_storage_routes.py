@@ -445,6 +445,9 @@ async def _convert_office_with_limits(content: bytes, filename: str):
 def register_document_storage_routes(app: FastAPI, server: "WebChatServer") -> None:
     """documents/upload / storage contexts / storage usage ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+    from .storage_root_routes import register_storage_root_routes
+
+    register_storage_root_routes(app, server)
 
     # ── Document Upload API Endpoints ─────────────────────────────────────
     # Convert Office files (docx, xlsx, pptx, pdf) to Markdown

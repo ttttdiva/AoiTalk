@@ -25,12 +25,17 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from src.llm.openai_compatible_local_profiles import (
     EXO_BASE_URL,
+    FREETOKEN_DEFAULT_HOST,
+    FREETOKEN_DEFAULT_PORT,
+    FREETOKEN_DEFAULT_READINESS_TIMEOUT,
+    freetoken_model_profile,
     LLAMA_CPP_DEFAULT_CONTEXT_SIZE,
     LLAMA_CPP_DEFAULT_GPU_LAYERS,
     LLAMA_CPP_DEFAULT_HOST,
@@ -38,14 +43,28 @@ from src.llm.openai_compatible_local_profiles import (
     LLAMA_CPP_DEFAULT_READINESS_TIMEOUT,
     llama_cpp_model_profile,
     llama_cpp_mtp_metadata,
+    llama_cpp_mmproj_metadata,
     llama_cpp_reasoning_effort_metadata,
     llama_cpp_profile_legacy_kind,
     MLX_LM_BASE_URL,
+    managed_local_runtime_for_model,
     is_macos,
     local_server_profile_for_model,
     normalize_openai_compatible_base_url,
     openai_compatible_local_base_url,
 )
+from src.llm.deployment_resolver import resolve_llm_deployment
+from src.services.local_llm_runtime_manager import ManagedLocalRuntimeManager
+from src.services.local_llm_paths import (
+    canonicalize_llama_cpp_model_root_override,
+    default_llama_cpp_model_root,
+    llama_cpp_model_discovery_roots,
+    local_llm_storage_root,
+    repository_root,
+    resolve_llama_cpp_model_root,
+    validate_managed_child,
+)
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 from ._process_utils import (
     _IS_WINDOWS,
@@ -56,9 +75,11 @@ from ._process_utils import (
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_AI_ROOT = Path(Path(__file__).resolve().anchor or ".") / "AI"
-_DEFAULT_DEV_ROOT = Path(Path(__file__).resolve().anchor or ".") / "Dev"
-_DEFAULT_HOT_LLM_ROOT = _DEFAULT_AI_ROOT / "models" / "Hot" / "llm"
+# Compatibility exports retained for the service-manager facade.  They are no
+# longer used as ambient discovery fallbacks.
+_DEFAULT_AI_ROOT = local_llm_storage_root()
+_DEFAULT_DEV_ROOT = repository_root().parent
+_DEFAULT_HOT_LLM_ROOT = default_llama_cpp_model_root()
 _DEFAULT_MUSE_GLIMMER_MODEL_PATH = ""
 _LLAMA_CPP_MIN_MUSE_BUILD = int(
     (llama_cpp_model_profile("muse-glimmer-30b") or {}).get(
@@ -86,6 +107,8 @@ _LLAMA_CPP_MANAGED_EXTRA_FLAGS = frozenset(
         "--gpu-layers",
         "-ngl",
         "-n-gpu-layers",
+        "--mmproj",
+        "--mmproj-url",
         # MTP/speculative decoding is runtime-owned.  Users configure the
         # formal profile/runtime metadata instead of injecting
         # these flags through extra_args.
@@ -98,6 +121,15 @@ _LLAMA_CPP_MANAGED_EXTRA_FLAGS = frozenset(
     }
 )
 
+_FREETOKEN_MANAGED_EXTRA_FLAGS = frozenset(
+    {
+        "--model",
+        "--host",
+        "--port",
+    }
+)
+
+
 # ``resolve_llama_cpp_runtime`` is used from the session/generation hot path.
 # Keep the optional MTP CLI probe out of that path and reuse the result for the
 # lifetime of this process.  The executable identity includes both its
@@ -109,6 +141,22 @@ _LLAMA_CPP_MTP_CAPABILITY_CACHE_LOCK = threading.Lock()
 # executable identity so an unrelated executable can be probed concurrently.
 _LLAMA_CPP_MTP_CAPABILITY_PROBE_LOCKS: dict[tuple[object, ...], threading.Lock] = {}
 _LLAMA_CPP_MTP_CAPABILITY_CACHE_MISSING = object()
+# MTP's nested build/commit requirement is cached separately from the CLI
+# feature probe.  This keeps runtime resolution side-effect free while making
+# launch/preflight perform the expensive version check at most once per binary
+# and contract.
+_LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE: dict[
+    tuple[object, ...], tuple[bool, str]
+] = {}
+_LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE_LOCK = threading.Lock()
+_LLAMA_CPP_MTP_VARIANT_CACHE: dict[tuple[object, ...], str] = {}
+_LLAMA_CPP_MTP_VARIANT_CACHE_LOCK = threading.Lock()
+_LLAMA_CPP_MTP_VARIANT_NEGATIVE_CACHE: dict[
+    tuple[object, ...], tuple[float, tuple[tuple[object, ...], ...], tuple[str, ...]]
+] = {}
+_LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_PROBE_LOCKS: dict[
+    tuple[object, ...], threading.Lock
+] = {}
 
 
 def _llama_cpp_executable_identity(
@@ -286,53 +334,29 @@ def _llama_cpp_profile_runtime_model_paths(raw: dict[str, object]) -> list[str]:
 
 
 def _llama_cpp_discovery_roots(raw: dict[str, object]) -> list[Path]:
-    """Return ordered roots used for profile-owned GGUF discovery.
+    """Return the single canonical root used for GGUF discovery.
 
-    The checkout-drive ``C:\\AI`` default is retained for compatibility, but
-    installations commonly keep large GGUF files on another drive.  An
-    explicit root (config or environment) wins, followed by roots inferred
-    from already persisted profile paths and the documented per-user model
-    directory.  Inference only supplies directories; the selected profile's
-    exact filename is still required by the discovery function.
+    ``raw`` is retained as the historical helper signature; the shared path
+    resolver supplies environment/config precedence and rejects unsafe roots.
+    A monkeypatched ``_DEFAULT_HOT_LLM_ROOT`` remains a test-only explicit
+    root, preserving the existing focused runtime tests without reintroducing
+    ambient drive/home fallbacks in production.
     """
 
-    configured: list[object] = []
-    for value in (
-        os.getenv("LLAMA_CPP_MODEL_ROOT"),
-        os.getenv("AOITALK_LLAMA_CPP_MODEL_ROOT"),
-        raw.get("model_root"),
-        raw.get("model_dir"),
-    ):
-        if value is None or (isinstance(value, str) and not value.strip()):
-            continue
-        if isinstance(value, (list, tuple, set)):
-            configured.extend(value)
-        else:
-            configured.append(value)
-
-    configured.extend(_llama_cpp_profile_runtime_model_paths(raw))
-    configured.append(_DEFAULT_HOT_LLM_ROOT)
-    try:
-        configured.append(Path.home() / "AoiTalk-models")
-    except (OSError, RuntimeError):
-        pass
-
-    roots: list[Path] = []
-    seen: set[str] = set()
-    for value in configured:
-        text = str(value or "").strip()
-        if not text:
-            continue
-        # Permit a small PATH-like list without splitting Windows drive
-        # letters: os.pathsep is `;` on Windows and `:` on POSIX.
-        values = text.split(os.pathsep) if os.pathsep in text else [text]
-        for item in values:
-            candidate = Path(item.strip()).expanduser()
-            key = os.path.normcase(os.path.normpath(str(candidate)))
-            if key in seen:
-                continue
-            seen.add(key)
-            roots.append(candidate)
+    settings = raw if isinstance(raw, dict) else {}
+    config = {"openai_compatible_local": {"llama_cpp": settings}}
+    roots = llama_cpp_model_discovery_roots(config, settings=settings)
+    canonical_default = default_llama_cpp_model_root()
+    explicit_configured = bool(
+        str(settings.get("model_root") or "").strip()
+        or str(settings.get("model_dir") or "").strip()
+        or os.getenv("LLAMA_CPP_MODEL_ROOT")
+        or os.getenv("AOITALK_LLAMA_CPP_MODEL_ROOT")
+    )
+    if _DEFAULT_HOT_LLM_ROOT != canonical_default and not explicit_configured:
+        override = Path(_DEFAULT_HOT_LLM_ROOT)
+        if override not in roots:
+            roots.insert(0, override)
     return roots
 
 _PROFILE_RUNTIME_CANONICAL_KEY_PREFIX = "encoded_"
@@ -750,6 +774,17 @@ def _llama_cpp_settings(
         "LLAMA_SERVER_EXE",
         default="",
     )
+    if (
+        not executable
+        and model_profile
+        and _bool("auto_start", "LLAMA_CPP_AUTO_START", default=True)
+    ):
+        # Match the runtime manager's installed-binary selection. Falling
+        # straight through to PATH could launch a different (e.g. Vulkan)
+        # distribution despite an already prepared AoiTalk CUDA runtime.
+        executable = ManagedLocalRuntimeManager(
+            config,
+        ).installed_managed_llama_cpp_executable(model_profile)
     model_path_env_names = ["LLAMA_CPP_MODEL_PATH"]
     if llama_cpp_profile_legacy_kind(model_profile) == "muse":
         model_path_env_names.append("MUSE_GLIMMER_MODEL_PATH")
@@ -758,7 +793,46 @@ def _llama_cpp_settings(
         *model_path_env_names,
         default=_DEFAULT_MUSE_GLIMMER_MODEL_PATH,
     )
-    discovery_roots = _llama_cpp_discovery_roots(raw)
+    try:
+        model_root_resolution = resolve_llama_cpp_model_root(
+            config,
+            settings=raw,
+        )
+    except ValueError:
+        # A malformed legacy/persisted path must not make the catalog or
+        # engine route unreachable.  Surface the safe repository-local
+        # default; the dedicated model-root endpoint still rejects the stale
+        # value and provides the admin reset action.
+        model_root_resolution = resolve_llama_cpp_model_root(
+            config,
+            explicit="",
+        )
+    discovery_roots = [model_root_resolution.path]
+    # Keep the historical module constant as a test/embedding seam only.
+    # Production defaults point at the shared resolver root; a monkeypatched
+    # value can still isolate legacy unit fixtures without becoming an
+    # ambient workstation fallback.
+    if (
+        _DEFAULT_HOT_LLM_ROOT != default_llama_cpp_model_root()
+        and not (
+            str(raw.get("model_root") or "").strip()
+            or str(raw.get("model_dir") or "").strip()
+            or os.getenv("LLAMA_CPP_MODEL_ROOT")
+            or os.getenv("AOITALK_LLAMA_CPP_MODEL_ROOT")
+        )
+    ):
+        model_root_resolution = resolve_llama_cpp_model_root(
+            config,
+            explicit=_DEFAULT_HOT_LLM_ROOT,
+        )
+        discovery_roots = [model_root_resolution.path]
+    try:
+        persisted_model_root = canonicalize_llama_cpp_model_root_override(
+            raw.get("model_root"),
+            create=False,
+        )
+    except ValueError:
+        persisted_model_root = None
     if not str(model_path or "").strip() and model_profile:
         try:
             discovered = _discover_llama_cpp_model_path(
@@ -800,12 +874,30 @@ def _llama_cpp_settings(
             else LLAMA_CPP_DEFAULT_CONTEXT_SIZE
         ),
     )
-    gpu_layers = _int(
+    gpu_layers_default = (
+        model_profile.get("default_gpu_layers")
+        if model_profile and model_profile.get("default_gpu_layers") is not None
+        else LLAMA_CPP_DEFAULT_GPU_LAYERS
+    )
+    gpu_layers_text = _text(
         "gpu_layers",
         "LLAMA_CPP_GPU_LAYERS",
-        default=LLAMA_CPP_DEFAULT_GPU_LAYERS,
-        allow_negative=True,
+        default=str(gpu_layers_default),
     )
+    if gpu_layers_text.casefold() == "auto":
+        gpu_layers: int | str = "auto"
+    else:
+        try:
+            gpu_layers = int(gpu_layers_text)
+        except (TypeError, ValueError):
+            default_text = str(gpu_layers_default).strip()
+            if default_text.casefold() == "auto":
+                gpu_layers = "auto"
+            else:
+                try:
+                    gpu_layers = int(default_text)
+                except (TypeError, ValueError):
+                    gpu_layers = LLAMA_CPP_DEFAULT_GPU_LAYERS
     timeout = _float(
         "readiness_timeout",
         "readiness_timeout_seconds",
@@ -855,6 +947,7 @@ def _llama_cpp_settings(
             model_profile,
             enabled=mtp_enabled,
             base_model_path=model_path,
+            discovery_roots=discovery_roots,
         )
     else:
         mtp_enabled = False
@@ -868,12 +961,16 @@ def _llama_cpp_settings(
                 else "選択したllama.cpp profileに互換性のあるMTP artifactがありません。"
             ),
             "artifact_path": "",
+            "variant_model_path": "",
             "mode": "unavailable",
         }
     return {
         "executable": executable,
         "model_path": model_path,
-        "model_root": str(discovery_roots[0]) if discovery_roots else "",
+        "model_root": str(model_root_resolution.path),
+        "model_root_default": str(model_root_resolution.default),
+        "model_root_override": str(persisted_model_root or ""),
+        "model_root_source": model_root_resolution.source,
         "model_alias": model_alias,
         "host": host,
         "port": port,
@@ -895,6 +992,9 @@ def _llama_cpp_settings(
         "mtp_reason": str(mtp_resolution.get("reason") or ""),
         "mtp_artifact_path": str(mtp_resolution.get("artifact_path") or ""),
         "mtp_resolved_model_path": str(mtp_resolution.get("artifact_path") or ""),
+        "mtp_variant_model_path": str(
+            mtp_resolution.get("variant_model_path") or ""
+        ),
         "mtp_mode": str(mtp_resolution.get("mode") or "unavailable"),
         # Read-only metadata consumed by catalog/UI and version validation.
         "profile_id": str(model_profile.get("id") or "") if model_profile else "",
@@ -941,6 +1041,9 @@ def _llama_cpp_mtp_runtime_fields(settings: dict[str, object]) -> dict[str, obje
             or settings.get("mtp_artifact_path")
             or ""
         ),
+        "mtp_variant_model_path": str(
+            settings.get("mtp_variant_model_path") or ""
+        ),
         "mtp_mode": str(settings.get("mtp_mode") or "unavailable"),
     }
 
@@ -969,13 +1072,15 @@ def _llama_cpp_mtp_cli_supported(executable: str) -> bool | None:
                 timeout=5,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, UnicodeError):
             return None
         output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
         return (
             None
             if not output.strip()
-            else "--spec-type" in output and "draft-mtp" in output
+            else bool(getattr(result, "returncode", 0) == 0)
+            and "--spec-type" in output
+            and "draft-mtp" in output
         )
 
     # Only the short cache/lock-map operations use the global lock.  The
@@ -1011,18 +1116,137 @@ def _llama_cpp_mtp_cli_supported(executable: str) -> bool | None:
                 timeout=5,
                 check=False,
             )
-        except (OSError, subprocess.SubprocessError):
+        except (OSError, subprocess.SubprocessError, UnicodeError):
             capability: bool | None = None
         else:
             output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
             capability = (
                 None
                 if not output.strip()
-                else "--spec-type" in output and "draft-mtp" in output
+                else bool(getattr(result, "returncode", 0) == 0)
+                and "--spec-type" in output
+                and "draft-mtp" in output
             )
         with _LLAMA_CPP_MTP_CAPABILITY_CACHE_LOCK:
             _LLAMA_CPP_MTP_CAPABILITY_CACHE[identity] = capability
         return capability
+
+
+def _llama_cpp_mtp_runtime_compatibility(
+    settings: dict[str, object],
+    executable: str,
+    *,
+    model_profile: dict[str, object] | None = None,
+    probe: bool = True,
+) -> tuple[bool | None, str]:
+    """Validate only the nested MTP runtime requirement.
+
+    The profile's top-level minimum build is deliberately not consulted here;
+    it is validated by the ordinary base launch path.  ``probe=False`` is
+    used by hot-path runtime resolution and only reports a previously cached
+    result, preserving that resolver's no-subprocess contract.
+    """
+
+    profile = model_profile
+    if profile is None:
+        profile_id = str(settings.get("profile_id") or "").strip()
+        profile = llama_cpp_model_profile(profile_id) if profile_id else None
+    metadata = llama_cpp_mtp_metadata(profile=profile)
+    if not metadata:
+        return True, ""
+    minimum_raw = metadata.get("minimum_llama_cpp_build")
+    try:
+        minimum = int(minimum_raw) if minimum_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        minimum = None
+    required_commit = str(metadata.get("required_llama_cpp_commit") or "").strip()
+    if minimum is None and not required_commit:
+        return True, ""
+
+    identity = _llama_cpp_executable_identity(executable)
+    cache_key: tuple[object, ...] | None = None
+    probe_lock: threading.Lock | None = None
+    if identity is not None:
+        cache_key = (identity, minimum, required_commit.casefold())
+        with _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE_LOCK:
+            cached = _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE.get(cache_key)
+            probe_lock = _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_PROBE_LOCKS.setdefault(
+                cache_key,
+                threading.Lock(),
+            )
+        if cached is not None:
+            return cached
+    if not probe:
+        return None, ""
+
+    if probe_lock is not None:
+        probe_lock.acquire()
+        try:
+            with _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE_LOCK:
+                cached = _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            result = _llama_cpp_mtp_runtime_compatibility_probe(
+                settings,
+                executable,
+                profile=profile,
+                minimum=minimum,
+                required_commit=required_commit,
+                identity=identity,
+            )
+            if _llama_cpp_executable_identity(executable) == identity:
+                with _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE_LOCK:
+                    _LLAMA_CPP_MTP_RUNTIME_COMPATIBILITY_CACHE[cache_key] = result
+            return result
+        finally:
+            probe_lock.release()
+
+    return _llama_cpp_mtp_runtime_compatibility_probe(
+        settings,
+        executable,
+        profile=profile,
+        minimum=minimum,
+        required_commit=required_commit,
+        identity=None,
+    )
+
+
+def _llama_cpp_mtp_runtime_compatibility_probe(
+    settings: dict[str, object],
+    executable: str,
+    *,
+    profile: dict[str, object] | None,
+    minimum: int | None,
+    required_commit: str,
+    identity: tuple[object, ...] | None,
+) -> tuple[bool, str]:
+    """Run one nested requirement check after its per-binary lock is held."""
+
+    label = str(profile.get("label") or settings.get("profile_id") or "llama.cpp")
+    try:
+        _validate_llama_cpp_version(
+            executable,
+            minimum_build=minimum,
+            model_label=f"{label} MTP",
+            required_commit=required_commit or None,
+        )
+    except Exception as exc:
+        reason = (
+            f"MTP向けllama.cpp runtime要件を満たしません。"
+            f"期待値: {('b' + str(minimum) + '以上') if minimum is not None else ''}"
+            f"{(' commit ' + required_commit) if required_commit else ''}。"
+            f"実行結果: {exc}"
+        )
+        result = (False, reason)
+    else:
+        result = (True, "")
+    if identity is not None and _llama_cpp_executable_identity(executable) != identity:
+        return (
+            False,
+            "MTP runtime検証中にllama-server executableが置換されたため、"
+            "MTPを無効化して本体を通常モードで起動します。",
+        )
+    return result
 
 
 def _llama_cpp_settings_with_mtp_cli_capability(
@@ -1030,6 +1254,7 @@ def _llama_cpp_settings_with_mtp_cli_capability(
     executable: str,
     *,
     probe: bool = True,
+    model_profile: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Project explicit CLI incompatibility without blocking base startup.
 
@@ -1056,15 +1281,119 @@ def _llama_cpp_settings_with_mtp_cli_capability(
             capability,
             identity=probe_identity,
         )
+        if (
+            probe_identity is not None
+            and _llama_cpp_executable_identity(executable) != probe_identity
+        ):
+            adjusted = dict(settings)
+            adjusted["mtp_available"] = False
+            adjusted["mtp_status"] = "unsupported_build"
+            adjusted["mtp_reason"] = (
+                "MTP capability確認中にllama-server executableが置換されたため、"
+                "MTPを無効化して本体を通常モードで起動します。"
+            )
+            adjusted["mtp_variant_model_path"] = ""
+            adjusted["mtp_artifact_path"] = ""
+            adjusted["mtp_resolved_model_path"] = ""
+            adjusted["mtp_model_path"] = ""
+            return adjusted
+    metadata = llama_cpp_mtp_metadata(
+        profile=model_profile
+        or llama_cpp_model_profile(str(settings.get("profile_id") or ""))
+    )
+    has_nested_requirement = bool(
+        metadata
+        and (
+            metadata.get("minimum_llama_cpp_build") not in (None, "")
+            or str(metadata.get("required_llama_cpp_commit") or "").strip()
+        )
+    )
     if capability is not False:
-        return settings
+        # Legacy companion profiles retain the historical behaviour for
+        # lightweight/test executables when a help probe is inconclusive.
+        # Flash-Next's nested PR/build contract is stricter: an unknown CLI
+        # capability or uncached runtime check must never select a derived
+        # four-shard variant on an arbitrary binary.
+        if capability is None:
+            if not has_nested_requirement:
+                return settings
+            compatible, reason = _llama_cpp_mtp_runtime_compatibility(
+                settings,
+                executable,
+                model_profile=model_profile,
+                probe=probe,
+            )
+            if compatible is True:
+                reason = (
+                    "llama-serverの--spec-type draft-mtp capabilityを確認できないため、"
+                    "MTPを無効化して本体を通常モードで起動します。"
+                )
+            elif compatible is None:
+                reason = (
+                    "MTP向けllama-serverのruntime要件を未確認のため、"
+                    "MTPを無効化して本体を通常モードで起動します。"
+                )
+            adjusted = dict(settings)
+            adjusted["mtp_available"] = False
+            adjusted["mtp_status"] = "unsupported_build"
+            adjusted["mtp_reason"] = reason
+            adjusted["mtp_variant_model_path"] = ""
+            adjusted["mtp_artifact_path"] = ""
+            adjusted["mtp_resolved_model_path"] = ""
+            adjusted["mtp_model_path"] = ""
+            return adjusted
+        compatible, reason = _llama_cpp_mtp_runtime_compatibility(
+            settings,
+            executable,
+            model_profile=model_profile,
+            probe=probe,
+        )
+        if compatible is True or (compatible is None and not has_nested_requirement):
+            return settings
+        adjusted = dict(settings)
+        adjusted["mtp_available"] = False
+        adjusted["mtp_status"] = "unsupported_build"
+        adjusted["mtp_reason"] = reason or (
+            "MTP向けllama.cpp runtime要件を未確認のため、"
+            "MTPを無効化して本体を通常モードで起動します。"
+        )
+        adjusted["mtp_variant_model_path"] = ""
+        adjusted["mtp_artifact_path"] = ""
+        adjusted["mtp_resolved_model_path"] = ""
+        adjusted["mtp_model_path"] = ""
+        logger.warning("MTP runtime compatibility check failed: %s", reason)
+        return adjusted
     adjusted = dict(settings)
     adjusted["mtp_available"] = False
     adjusted["mtp_status"] = "unsupported_build"
-    adjusted["mtp_reason"] = (
+    cli_reason = (
         "llama-serverが--spec-type draft-mtpを提供しないため、"
         "MTPを無効化して本体を通常モードで起動します。"
     )
+    if has_nested_requirement:
+        compatible, runtime_reason = _llama_cpp_mtp_runtime_compatibility(
+            settings,
+            executable,
+            model_profile=model_profile,
+            probe=probe,
+        )
+        if runtime_reason:
+            cli_reason = f"{cli_reason} {runtime_reason}"
+        elif compatible is not True:
+            expected = []
+            if metadata and metadata.get("minimum_llama_cpp_build") not in (None, ""):
+                expected.append(f"b{metadata['minimum_llama_cpp_build']}以上")
+            if metadata and metadata.get("required_llama_cpp_commit"):
+                expected.append(
+                    f"commit {metadata['required_llama_cpp_commit']}"
+                )
+            if expected:
+                cli_reason = f"{cli_reason} MTP runtime期待値: {' / '.join(expected)}。"
+    adjusted["mtp_reason"] = cli_reason
+    adjusted["mtp_variant_model_path"] = ""
+    adjusted["mtp_artifact_path"] = ""
+    adjusted["mtp_resolved_model_path"] = ""
+    adjusted["mtp_model_path"] = ""
     logger.warning(
         "llama-server does not advertise draft-mtp; starting the base model without MTP"
     )
@@ -1093,6 +1422,12 @@ def resolve_llama_cpp_runtime(
     """
 
     selected_model = _llama_cpp_selected_model(config, model)
+    deployment = resolve_llm_deployment(config)
+    external_operator_router = bool(
+        deployment is not None
+        and deployment.backend == "external"
+        and deployment.effective_provider == "openai_compatible_local"
+    )
     external = selected_model.casefold() == "local-model"
     active_provider = str(_config_get(config, "llm_provider", "") or "").strip().lower()
     explicit_target_model = bool(str(model or "").strip())
@@ -1118,6 +1453,7 @@ def resolve_llama_cpp_runtime(
     )
     applies = bool(
         not external
+        and not external_operator_router
         # Lightweight provider clients in unit/schema paths may carry only a
         # model name and no provider/runtime config.  They use the generic
         # OpenAI-compatible transport and must not be forced through a
@@ -1178,8 +1514,60 @@ def resolve_llama_cpp_runtime(
         if model_path and raw_path
         else "missing"
     )
+
+    declared_shards = (
+        selected_profile.get("gguf_filenames")
+        if isinstance(selected_profile, dict)
+        else None
+    )
+    if (
+        managed
+        and auto_start
+        and model_path
+        and isinstance(declared_shards, (list, tuple))
+        and declared_shards
+    ):
+        shard_paths = _llama_cpp_model_path_shards(selected_profile, model_path)
+        missing_shards = [
+            path.name
+            for path in shard_paths
+            if not path.is_file()
+        ]
+        if not shard_paths or missing_shards:
+            label = str(
+                (selected_profile or {}).get("label")
+                or selected_model
+                or "llama.cpp"
+            )
+            expected_primary = _llama_cpp_profile_expected_filename(selected_profile)
+            error = (
+                f"{label} のmodel_pathはprimary shard "
+                f"{expected_primary!r} を指定してください。"
+                if not shard_paths
+                else (
+                    f"{label} のGGUF shardが不足しています: "
+                    f"{', '.join(missing_shards)}。"
+                    "primary shardと同じdirectoryに配置してください。"
+                )
+            )
+            return {
+                "model": selected_model,
+                "profile": profile,
+                "settings": settings,
+                "managed": True,
+                "auto_start": True,
+                "state": "model_path_not_found",
+                "model_path": model_path,
+                "model_path_source": path_source,
+                "model_path_status": "not_found",
+                "executable_status": "not_checked",
+                "minimum_build": _llama_cpp_effective_minimum_build(profile),
+                "error": error,
+                **_llama_cpp_mtp_runtime_fields(settings),
+            }
+
     if not managed:
-        state = "external" if external else "unmanaged"
+        state = "external" if external or external_operator_router else "unmanaged"
         return {
             "model": selected_model,
             "profile": profile,
@@ -1197,13 +1585,40 @@ def resolve_llama_cpp_runtime(
         }
 
     if not auto_start:
-        # A managed profile may intentionally attach to a manually started
-        # endpoint.  Do not call this an executable/path failure; the manual
-        # connection validator owns reachability checks for this mode.
+        # FLASH_MTP_REVIEW_FIX_V3_MANUAL_FAIL_CLOSED
+        # Artifact discovery proves only local files. For an
+        # operator-owned/manual endpoint it does not prove that the
+        # running server is the MTP-capable binary/commit.
+        manual_settings = settings
+        if bool(settings.get("mtp_enabled")) and bool(settings.get("mtp_available")):
+            executable_text = str(settings.get("executable") or "").strip()
+            cached_capability = (
+                _llama_cpp_mtp_cli_cached(executable_text)
+                if executable_text
+                else None
+            )
+            manual_settings = dict(settings)
+            manual_settings["mtp_available"] = False
+            if cached_capability is False:
+                manual_settings["mtp_status"] = "unsupported_build"
+                manual_settings["mtp_reason"] = (
+                    "手動起動llama-serverが--spec-type draft-mtpを提供しないことが"
+                    "既知のため、MTPをready扱いしません。"
+                )
+            else:
+                manual_settings["mtp_status"] = "runtime_unverified"
+                manual_settings["mtp_reason"] = (
+                    "auto_start=Falseの手動serverではartifact metadataだけでは"
+                    "稼働中llama-serverのMTP/commit互換性を確認できないため、"
+                    "MTPをready扱いしません。"
+                )
+
+        # Endpoint reachability remains owned by the existing manual
+        # connection validator. This branch only fixes MTP truthfulness.
         return {
             "model": selected_model,
             "profile": profile,
-            "settings": settings,
+            "settings": manual_settings,
             "managed": True,
             "auto_start": False,
             "state": "manual",
@@ -1213,7 +1628,7 @@ def resolve_llama_cpp_runtime(
             "executable_status": "not_required",
             "minimum_build": _llama_cpp_effective_minimum_build(profile),
             "error": None,
-            **_llama_cpp_mtp_runtime_fields(settings),
+            **_llama_cpp_mtp_runtime_fields(manual_settings),
         }
 
     path_profile_error = _llama_cpp_model_path_profile_mismatch_error(
@@ -1429,6 +1844,45 @@ def _llama_cpp_is_muse_selection(
     return llama_cpp_profile_legacy_kind(profile) == "muse"
 
 
+def _llama_cpp_declared_model_filenames(
+    model_profile: dict[str, object] | None,
+) -> list[str]:
+    if not isinstance(model_profile, dict):
+        return []
+    primary = str(
+        model_profile.get("gguf_filename")
+        or model_profile.get("filename")
+        or model_profile.get("model_filename")
+        or ""
+    ).strip()
+    declared = model_profile.get("gguf_filenames")
+    values = [primary, *(declared if isinstance(declared, (list, tuple)) else [])]
+    filenames: list[str] = []
+    for value in values:
+        name = str(value or "").strip()
+        if not name or name in {".", ".."} or name != Path(name).name or "\\" in name:
+            return []
+        if name not in filenames:
+            filenames.append(name)
+    return filenames
+
+
+def _llama_cpp_model_path_shards(
+    model_profile: dict[str, object] | None,
+    primary_path: str | Path,
+) -> list[Path]:
+    filenames = _llama_cpp_declared_model_filenames(model_profile)
+    if not filenames:
+        return []
+    primary = Path(primary_path).expanduser()
+    declared = (model_profile or {}).get("gguf_filenames")
+    if not isinstance(declared, (list, tuple)) or not declared:
+        return [primary]
+    if primary.name != filenames[0]:
+        return []
+    return [primary.parent / filename for filename in filenames]
+
+
 def _discover_llama_cpp_model_path(
     model_profile: dict[str, object] | None,
     *,
@@ -1438,20 +1892,53 @@ def _discover_llama_cpp_model_path(
 
     if not model_profile:
         return ""
-    discovery_roots = list(roots or [_DEFAULT_HOT_LLM_ROOT])
-    official = str(
-        model_profile.get("gguf_filename")
-        or model_profile.get("filename")
-        or model_profile.get("model_filename")
-        or ""
-    ).strip()
+    discovery_roots = list(roots or [])
+    if (
+        _DEFAULT_HOT_LLM_ROOT != default_llama_cpp_model_root()
+        and _DEFAULT_HOT_LLM_ROOT not in discovery_roots
+    ):
+        discovery_roots.insert(0, _DEFAULT_HOT_LLM_ROOT)
+    if not discovery_roots:
+        discovery_roots = [default_llama_cpp_model_root()]
+    filenames = _llama_cpp_declared_model_filenames(model_profile)
+    official = filenames[0] if filenames else ""
+    if not official and any(
+        model_profile.get(key)
+        for key in ("gguf_filename", "filename", "model_filename", "gguf_filenames")
+    ):
+        return ""
     for root in discovery_roots:
         if not root.is_dir():
             continue
         if official:
             for candidate in root.rglob(official):
-                if candidate.is_file():
-                    return str(candidate.resolve())
+                # ``rglob`` can encounter a symlink/junction below an
+                # otherwise trusted model root.  Resolve every discovered
+                # shard through the shared containment check before using it
+                # for status or launch; never follow an escape outside the
+                # configured root.
+                try:
+                    safe_candidate = validate_managed_child(
+                        root,
+                        candidate,
+                        kind="model",
+                    )
+                    shards = _llama_cpp_model_path_shards(
+                        model_profile,
+                        safe_candidate,
+                    )
+                    safe_shards = [
+                        validate_managed_child(root, path, kind="model")
+                        for path in shards
+                    ]
+                except ValueError:
+                    continue
+                if (
+                    safe_candidate.is_file()
+                    and safe_shards
+                    and all(path.is_file() for path in safe_shards)
+                ):
+                    return str(safe_candidate)
 
     # Registered non-Muse profiles declare an exact GGUF filename.  Never
     # silently pick an arbitrary newest file from their profile directory:
@@ -1481,8 +1968,17 @@ def _discover_llama_cpp_model_path(
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
-        if ggufs:
-            return str(ggufs[0].resolve())
+        for candidate in ggufs:
+            try:
+                safe_candidate = validate_managed_child(
+                    directory,
+                    candidate,
+                    kind="model",
+                )
+            except ValueError:
+                continue
+            if safe_candidate.is_file():
+                return str(safe_candidate)
     return ""
 
 
@@ -1490,6 +1986,7 @@ def _discover_llama_cpp_mtp_artifact_path(
     model_profile: dict[str, object] | None,
     *,
     base_model_path: str = "",
+    discovery_roots: list[Path] | None = None,
 ) -> str:
     """Discover only companion filenames declared by profile metadata.
 
@@ -1512,16 +2009,22 @@ def _discover_llama_cpp_mtp_artifact_path(
         return ""
 
     search_dirs: list[Path] = []
-    if _DEFAULT_HOT_LLM_ROOT.is_dir():
-        search_dirs.append(_DEFAULT_HOT_LLM_ROOT)
+    roots = list(discovery_roots or [])
+    if _DEFAULT_HOT_LLM_ROOT != default_llama_cpp_model_root() and _DEFAULT_HOT_LLM_ROOT not in roots:
+        roots.insert(0, _DEFAULT_HOT_LLM_ROOT)
+    if not roots:
+        roots = [default_llama_cpp_model_root()]
     base_path = Path(str(base_model_path or "")).expanduser()
     if base_path.is_file() and base_path.parent not in search_dirs:
         search_dirs.append(base_path.parent)
     profile_id = str((model_profile or {}).get("id") or "").strip()
-    if profile_id:
-        profile_dir = _DEFAULT_HOT_LLM_ROOT / profile_id
-        if profile_dir not in search_dirs:
-            search_dirs.append(profile_dir)
+    for root in roots:
+        if root.is_dir() and root not in search_dirs:
+            search_dirs.append(root)
+        if profile_id:
+            profile_dir = root / profile_id
+            if profile_dir not in search_dirs:
+                search_dirs.append(profile_dir)
 
     for filename in filenames:
         for directory in search_dirs:
@@ -1534,9 +2037,322 @@ def _discover_llama_cpp_mtp_artifact_path(
             except OSError:
                 continue
             for candidate in matches:
-                if candidate.is_file() and candidate.name == filename:
-                    return str(candidate.resolve())
+                if candidate.name != filename:
+                    continue
+                safe_candidate: Path | None = None
+                # A search directory may originate from an explicit model
+                # path outside the configured root, so only apply root
+                # containment when this candidate is under one of the
+                # resolver-provided discovery roots.  Explicit paths still
+                # require a regular, non-symlink file below.
+                for root in roots:
+                    try:
+                        safe_candidate = validate_managed_child(
+                            root,
+                            candidate,
+                            kind="model",
+                        )
+                        break
+                    except ValueError:
+                        continue
+                candidate_to_use = safe_candidate or candidate
+                if (
+                    candidate_to_use.parent.is_symlink()
+                    or not _llama_cpp_regular_non_symlink_file(candidate_to_use)
+                ):
+                    continue
+                try:
+                    return str(candidate_to_use.resolve(strict=True))
+                except (OSError, RuntimeError):
+                    return str(candidate_to_use.absolute())
     return ""
+
+
+def _llama_cpp_mtp_search_directories(
+    model_profile: dict[str, object] | None,
+    *,
+    base_model_path: str = "",
+    discovery_roots: list[Path] | None = None,
+) -> list[Path]:
+    """Return ordered directories for exact embedded-variant discovery.
+
+    The selected base directory wins, followed by the canonical hot root, the
+    same configured roots used for ordinary profile discovery, and each
+    profile-specific directory.  No caller-provided MTP path is accepted and
+    no arbitrary GGUF filename is ever selected by this helper.
+    """
+
+    directories: list[Path] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        try:
+            directory = Path(text).expanduser()
+        except (OSError, RuntimeError, ValueError):
+            return
+        key = os.path.normcase(os.path.normpath(str(directory)))
+        if key in seen:
+            return
+        seen.add(key)
+        directories.append(directory)
+
+    base = Path(str(base_model_path or "")).expanduser()
+    if base.is_file():
+        add(base.parent)
+
+    # Keep the documented precedence stable: the canonical hot root is
+    # checked before configurable/profile-inferred roots.  ``discovery_roots``
+    # may already contain the hot root (and the per-user fallback below), so
+    # the normal de-duplication in ``add`` preserves a single deterministic
+    # entry while still allowing explicit roots to follow it.
+    roots = list(discovery_roots or [])
+    if _DEFAULT_HOT_LLM_ROOT != default_llama_cpp_model_root() and _DEFAULT_HOT_LLM_ROOT not in roots:
+        roots.insert(0, _DEFAULT_HOT_LLM_ROOT)
+    if not roots:
+        roots = [default_llama_cpp_model_root()]
+    profile_id = str((model_profile or {}).get("id") or "").strip()
+    for root in roots:
+        add(root)
+    if profile_id:
+        for root in roots:
+            add(Path(root) / profile_id)
+    return directories
+
+
+def _llama_cpp_regular_non_symlink_file(path: Path) -> bool:
+    """Return True only for a regular file owned by the model directory."""
+
+    try:
+        return path.is_file() and not path.is_symlink()
+    except OSError:
+        return False
+
+
+def _llama_cpp_mtp_directory_signatures(
+    directories: list[Path],
+) -> tuple[tuple[object, ...], ...]:
+    """Return cheap directory signatures for short-lived negative caching."""
+
+    signatures: list[tuple[object, ...]] = []
+    for directory in directories:
+        try:
+            stat_result = directory.stat()
+            signatures.append(
+                (
+                    os.path.normcase(os.path.normpath(str(directory))),
+                    int(getattr(stat_result, "st_mtime_ns", 0)),
+                    int(getattr(stat_result, "st_size", 0)),
+                )
+            )
+        except OSError:
+            signatures.append(
+                (os.path.normcase(os.path.normpath(str(directory))), None, None)
+            )
+    return tuple(signatures)
+
+
+def _resolve_llama_cpp_mtp_embedded_variant(
+    model_profile: dict[str, object] | None,
+    *,
+    base_model_path: str = "",
+    discovery_roots: list[Path] | None = None,
+) -> tuple[str, list[str]]:
+    """Resolve a complete exact embedded variant, returning missing names too."""
+
+    metadata = llama_cpp_mtp_metadata(profile=model_profile)
+    if (
+        not metadata
+        or not bool(metadata.get("supported"))
+        or str(metadata.get("mode") or "") != "embedded"
+    ):
+        return "", []
+    variant = metadata.get("embedded_variant")
+    if not isinstance(variant, dict):
+        return "", []
+    primary = str(variant.get("primary_filename") or "").strip()
+    raw_filenames = variant.get("filenames")
+    if (
+        not primary
+        or not isinstance(raw_filenames, (list, tuple))
+        or not raw_filenames
+        or str(raw_filenames[0]) != primary
+    ):
+        return "", []
+    filenames = [str(item).strip() for item in raw_filenames if str(item).strip()]
+    if len(filenames) != len(raw_filenames) or len(set(filenames)) != len(filenames):
+        return "", filenames
+
+    search_directories = _llama_cpp_mtp_search_directories(
+        model_profile,
+        base_model_path=base_model_path,
+        discovery_roots=discovery_roots,
+    )
+    cache_key = (
+        str((model_profile or {}).get("id") or "").strip().casefold(),
+        os.path.normcase(os.path.normpath(str(base_model_path or ""))),
+        tuple(
+            os.path.normcase(os.path.normpath(str(directory)))
+            for directory in search_directories
+        ),
+        tuple(filenames),
+    )
+    directory_signatures = _llama_cpp_mtp_directory_signatures(search_directories)
+    with _LLAMA_CPP_MTP_VARIANT_CACHE_LOCK:
+        cached_path = _LLAMA_CPP_MTP_VARIANT_CACHE.get(cache_key, "")
+    if cached_path:
+        cached = Path(cached_path)
+        try:
+            cached_parent = cached.resolve(strict=True).parent
+        except (OSError, RuntimeError):
+            cached_parent = None
+        cached_under_search_root = False
+        if cached_parent is not None:
+            for directory in search_directories:
+                try:
+                    cached_parent.relative_to(directory.resolve(strict=False))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                cached_under_search_root = True
+                break
+        if (
+            cached.name == primary
+            and cached_under_search_root
+            and all(
+                _llama_cpp_regular_non_symlink_file(cached.parent / filename)
+                for filename in filenames
+            )
+        ):
+            # FLASH_MTP_REVIEW_FIX_V3_POSITIVE_CACHE_NONAUTHORITATIVE
+            # Positive cache entries are hints only: a complete variant
+            # can appear later in a higher-priority root. Fall through
+            # to the existing deterministic root scan. The existing
+            # signature-guarded negative cache remains unchanged.
+            pass
+        with _LLAMA_CPP_MTP_VARIANT_CACHE_LOCK:
+            _LLAMA_CPP_MTP_VARIANT_CACHE.pop(cache_key, None)
+
+    with _LLAMA_CPP_MTP_VARIANT_CACHE_LOCK:
+        negative = _LLAMA_CPP_MTP_VARIANT_NEGATIVE_CACHE.get(cache_key)
+    if (
+        negative is not None
+        and time.monotonic() - negative[0] < 2.0
+        and negative[1] == directory_signatures
+    ):
+        return "", list(negative[2])
+
+    missing: set[str] = set(filenames)
+    root_candidates = [Path(root) for root in (discovery_roots or [])]
+
+    def _strict_regular(path: Path) -> bool:
+        """Reject symlink/reparse files when scanning an explicit directory."""
+
+        if not _llama_cpp_regular_non_symlink_file(path):
+            return False
+        try:
+            resolved = path.resolve(strict=True)
+            absolute = path.absolute()
+        except (OSError, RuntimeError):
+            return False
+        return os.path.normcase(os.path.normpath(str(resolved))) == os.path.normcase(
+            os.path.normpath(str(absolute))
+        )
+
+    for directory in search_directories:
+        if not directory.is_dir():
+            continue
+        candidates: list[Path] = [directory / primary]
+        try:
+            candidates.extend(
+                sorted(
+                    directory.rglob(primary),
+                    key=lambda path: os.path.normcase(
+                        os.path.normpath(str(path))
+                    ),
+                )
+            )
+        except OSError:
+            continue
+        seen_candidates: set[str] = set()
+        for candidate in candidates:
+            key = os.path.normcase(os.path.normpath(str(candidate)))
+            if key in seen_candidates:
+                continue
+            seen_candidates.add(key)
+            if candidate.name != primary:
+                continue
+            matched_root: Path | None = None
+            safe_candidate: Path | None = None
+            for root in root_candidates:
+                try:
+                    safe_candidate = validate_managed_child(
+                        root,
+                        candidate,
+                        kind="model",
+                    )
+                    matched_root = root
+                    break
+                except ValueError:
+                    continue
+            candidate_to_use = safe_candidate or candidate
+            if not _strict_regular(candidate_to_use):
+                continue
+            parent = candidate_to_use.parent
+            if matched_root is not None:
+                try:
+                    shard_paths = [
+                        validate_managed_child(
+                            matched_root,
+                            parent / filename,
+                            kind="model",
+                        )
+                        for filename in filenames
+                    ]
+                except ValueError:
+                    continue
+            else:
+                shard_paths = [parent / filename for filename in filenames]
+            absent = [
+                filename
+                for filename, shard_path in zip(filenames, shard_paths)
+                if not _strict_regular(shard_path)
+            ]
+            if not absent:
+                try:
+                    resolved = str(candidate_to_use.resolve(strict=True))
+                except (OSError, RuntimeError):
+                    resolved = str(candidate_to_use.absolute())
+                with _LLAMA_CPP_MTP_VARIANT_CACHE_LOCK:
+                    _LLAMA_CPP_MTP_VARIANT_CACHE[cache_key] = resolved
+                    _LLAMA_CPP_MTP_VARIANT_NEGATIVE_CACHE.pop(cache_key, None)
+                return resolved, []
+            missing.update(absent)
+    missing_result = tuple(filename for filename in filenames if filename in missing)
+    with _LLAMA_CPP_MTP_VARIANT_CACHE_LOCK:
+        _LLAMA_CPP_MTP_VARIANT_NEGATIVE_CACHE[cache_key] = (
+            time.monotonic(),
+            directory_signatures,
+            missing_result,
+        )
+    return "", list(missing_result)
+
+
+def _discover_llama_cpp_mtp_embedded_variant(
+    model_profile: dict[str, object] | None,
+    *,
+    base_model_path: str = "",
+    discovery_roots: list[Path] | None = None,
+) -> str:
+    """Discover the primary shard of a complete embedded MTP variant."""
+
+    primary, _missing = _resolve_llama_cpp_mtp_embedded_variant(
+        model_profile,
+        base_model_path=base_model_path,
+        discovery_roots=discovery_roots,
+    )
+    return primary
 
 
 def _resolve_llama_cpp_mtp(
@@ -1544,6 +2360,7 @@ def _resolve_llama_cpp_mtp(
     *,
     enabled: bool,
     base_model_path: str = "",
+    discovery_roots: list[Path] | None = None,
 ) -> dict[str, object]:
     """Resolve the read-only MTP availability projection for one profile."""
 
@@ -1574,12 +2391,42 @@ def _resolve_llama_cpp_mtp(
                 else base_reason or "選択したGGUFではMTPを利用できません。"
             ),
             "artifact_path": "",
+            "variant_model_path": "",
             "mode": mode,
         }
 
     if mode == "embedded":
-        # Embedded NextN/MTP has no separate draft artifact. (Current AoiTalk
-        # profiles remain conservative and use unavailable until verified.)
+        # The Flash profile defaults to MTP OFF.  Do not recursively scan
+        # configured model roots (which may contain terabytes of GGUFs) just
+        # to populate a read-only path that cannot be used by this launch.
+        if not enabled:
+            return {
+                "supported": True,
+                "available": False,
+                "status": "disabled",
+                "reason": "MTPはOFFです。",
+                "artifact_path": "",
+                "variant_model_path": "",
+                "mode": mode,
+            }
+        variant_path, missing = _resolve_llama_cpp_mtp_embedded_variant(
+            model_profile,
+            base_model_path=base_model_path,
+            discovery_roots=discovery_roots,
+        )
+        if not variant_path:
+            missing_text = ", ".join(missing) if missing else "宣言済み4-shard variant"
+            reason = base_reason or "互換性のあるembedded MTP variantを解決できません。"
+            reason = f"{reason} 不足または不正なartifact: {missing_text}"
+            return {
+                "supported": True,
+                "available": False,
+                "status": "disabled" if not enabled else "unavailable",
+                "reason": "MTPはOFFです。" if not enabled else reason,
+                "artifact_path": "",
+                "variant_model_path": "",
+                "mode": mode,
+            }
         return {
             "supported": True,
             "available": True,
@@ -1590,6 +2437,7 @@ def _resolve_llama_cpp_mtp(
                 else base_reason or "埋め込みMTP/NextNを利用できます。"
             ),
             "artifact_path": "",
+            "variant_model_path": variant_path,
             "mode": mode,
         }
 
@@ -1612,11 +2460,13 @@ def _resolve_llama_cpp_mtp(
                 else "互換性を確認したMTP artifact filenameが未宣言です。"
             ),
             "artifact_path": "",
+            "variant_model_path": "",
             "mode": mode,
         }
     artifact_path = _discover_llama_cpp_mtp_artifact_path(
         model_profile,
         base_model_path=base_model_path,
+        discovery_roots=discovery_roots,
     )
     if not artifact_path:
         filenames = ", ".join(
@@ -1633,6 +2483,7 @@ def _resolve_llama_cpp_mtp(
             "status": "disabled" if not enabled else "unavailable",
             "reason": "MTPはOFFです。" if not enabled else reason,
             "artifact_path": "",
+            "variant_model_path": "",
             "mode": mode,
         }
     return {
@@ -1641,6 +2492,7 @@ def _resolve_llama_cpp_mtp(
         "status": "disabled" if not enabled else "ready",
         "reason": "MTPはOFFです。" if not enabled else "互換性のあるMTP artifactを利用できます。",
         "artifact_path": artifact_path,
+        "variant_model_path": "",
         "mode": mode,
     }
 
@@ -1717,13 +2569,29 @@ def _llama_cpp_model_path_profile_mismatch_error(
     ).strip().casefold()
     path_profile = llama_cpp_model_profile(model_path=actual_filename)
     path_profile_id = str((path_profile or {}).get("id") or "").strip().casefold()
+
     mismatch_reason = ""
-    if path_profile_id and selected_profile_id and path_profile_id != selected_profile_id:
+    declared_shards = (model_profile or {}).get("gguf_filenames")
+    if isinstance(declared_shards, (list, tuple)) and declared_shards:
+        filenames = _llama_cpp_declared_model_filenames(model_profile)
+        if not filenames:
+            mismatch_reason = "profileのGGUF shard filename metadataが不正です"
+        elif actual_filename != filenames[0]:
+            mismatch_reason = (
+                f"primary shard={filenames[0]!r} が必要です"
+                f" (actual {actual_filename!r})"
+            )
+    if (
+        not mismatch_reason
+        and path_profile_id
+        and selected_profile_id
+        and path_profile_id != selected_profile_id
+    ):
         mismatch_reason = (
             f"path profile={path_profile_id!r}"
             f" ({str((path_profile or {}).get('label') or path_profile_id)})"
         )
-    else:
+    elif not mismatch_reason:
         expected_marker = _llama_cpp_filename_family_marker(expected_filename)
         actual_marker = _llama_cpp_filename_family_marker(actual_filename)
         if expected_marker and actual_marker and expected_marker != actual_marker:
@@ -1819,6 +2687,13 @@ def _llama_cpp_runtime_applies_to_selection(
     """Avoid inheriting a prior Muse runtime for an unrelated custom model."""
 
     model_id = str(selected_model or "").strip()
+    deployment = resolve_llm_deployment(config)
+    if (
+        deployment is not None
+        and deployment.backend == "external"
+        and deployment.effective_provider == "openai_compatible_local"
+    ):
+        return False
     # ``local-model`` is the operator-managed external OpenAI-compatible
     # endpoint.  Never let stale nested llama.cpp settings make it managed.
     if model_id.casefold() == "local-model":
@@ -1950,6 +2825,13 @@ def _should_start_llama_cpp(
 
     provider = str(_config_get(config, "llm_provider", "") or "").strip().lower()
     if provider != "openai_compatible_local":
+        return False
+    deployment = resolve_llm_deployment(config)
+    if (
+        deployment is not None
+        and deployment.backend == "external"
+        and deployment.effective_provider == "openai_compatible_local"
+    ):
         return False
     selected_model = _llama_cpp_selected_model(config, model)
     explicit_profile = llama_cpp_model_profile(selected_model)
@@ -2170,6 +3052,432 @@ def _base_url_host_port(base_url: str) -> tuple[str, int]:
     return host, port
 
 
+def _freetoken_selected_model(
+    config: object | None,
+    model: str | None = None,
+) -> str:
+    return str(
+        model
+        or _config_get(config, "openai_compatible_local.model", "")
+        or _config_get(config, "llm_model", "")
+        or ""
+    ).strip()
+
+
+def _freetoken_raw_settings(
+    config: object | None,
+) -> dict[str, object]:
+    raw = _config_get(config, "openai_compatible_local.freetoken", {})
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _freetoken_extra_args(
+    raw: dict[str, object],
+    *,
+    is_windows: bool | None = None,
+) -> list[str]:
+    value: object = os.getenv("FREETOKEN_EXTRA_ARGS")
+    if value is None:
+        value = raw.get("extra_args", [])
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            value = shlex.split(
+                value,
+                posix=not bool(
+                    is_windows if is_windows is not None else _IS_WINDOWS
+                ),
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"FreeToken extra_args が不正です: {exc}") from exc
+    if not isinstance(value, (list, tuple)):
+        raise RuntimeError(
+            "FreeToken extra_args は配列または文字列で指定してください"
+        )
+    return [str(item) for item in value if str(item).strip()]
+
+
+def _freetoken_managed_extra_flag(token: object) -> str | None:
+    text = str(token or "").strip()
+    if not text.startswith("-"):
+        return None
+    name = text.split("=", 1)[0].casefold()
+    return name if name in _FREETOKEN_MANAGED_EXTRA_FLAGS else None
+
+
+def _validate_freetoken_extra_args(extra_args: object) -> None:
+    if isinstance(extra_args, str):
+        try:
+            tokens = shlex.split(extra_args, posix=not _IS_WINDOWS)
+        except ValueError as exc:
+            raise RuntimeError(f"FreeToken extra_args が不正です: {exc}") from exc
+    elif isinstance(extra_args, (list, tuple)):
+        tokens = [str(item) for item in extra_args]
+    else:
+        tokens = []
+    for token in tokens:
+        managed = _freetoken_managed_extra_flag(token)
+        if managed:
+            raise RuntimeError(
+                "FreeToken extra_args では管理対象引数を指定できません: "
+                f"{token!r}（{managed} は runtime 設定で指定してください）"
+            )
+
+
+def _freetoken_settings(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> dict[str, object]:
+    selected_model = _freetoken_selected_model(config, model)
+    if managed_local_runtime_for_model(config, selected_model) != "freetoken":
+        return {
+            "model": selected_model,
+            "model_alias": selected_model,
+            "model_path": "",
+            "executable": "",
+            "host": FREETOKEN_DEFAULT_HOST,
+            "port": FREETOKEN_DEFAULT_PORT,
+            "auto_start": False,
+            "readiness_timeout": FREETOKEN_DEFAULT_READINESS_TIMEOUT,
+            "extra_args": [],
+            "manager_status": "external",
+            "manager_error": None,
+        }
+
+    profile = freetoken_model_profile(selected_model)
+    if not profile:
+        raise RuntimeError(
+            f"FreeToken trusted profile が見つかりません: {selected_model!r}"
+        )
+
+    raw = _freetoken_raw_settings(config)
+    manager = ManagedLocalRuntimeManager(
+        config,
+        platform_name=(
+            "windows"
+            if bool(is_windows if is_windows is not None else _IS_WINDOWS)
+            else None
+        ),
+    )
+    status = manager.status(selected_model, "freetoken")
+
+    host = str(
+        os.getenv("FREETOKEN_HOST")
+        or raw.get("host")
+        or FREETOKEN_DEFAULT_HOST
+    ).strip()
+    if not host:
+        host = FREETOKEN_DEFAULT_HOST
+
+    port_value: object = (
+        os.getenv("FREETOKEN_PORT")
+        if os.getenv("FREETOKEN_PORT") is not None
+        else raw.get("port", FREETOKEN_DEFAULT_PORT)
+    )
+    try:
+        port = int(str(port_value).strip())
+    except (TypeError, ValueError):
+        port = FREETOKEN_DEFAULT_PORT
+    if not (1 <= port <= 65535):
+        port = FREETOKEN_DEFAULT_PORT
+
+    auto_start_value: object = (
+        os.getenv("FREETOKEN_AUTO_START")
+        if os.getenv("FREETOKEN_AUTO_START") is not None
+        else raw.get("auto_start", True)
+    )
+    if isinstance(auto_start_value, bool):
+        auto_start = auto_start_value
+    else:
+        auto_start = str(auto_start_value).strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+
+    timeout_value: object = (
+        os.getenv("FREETOKEN_READINESS_TIMEOUT")
+        if os.getenv("FREETOKEN_READINESS_TIMEOUT") is not None
+        else raw.get(
+            "readiness_timeout",
+            raw.get(
+                "readiness_timeout_seconds",
+                FREETOKEN_DEFAULT_READINESS_TIMEOUT,
+            ),
+        )
+    )
+    try:
+        readiness_timeout = float(str(timeout_value).strip())
+    except (TypeError, ValueError):
+        readiness_timeout = FREETOKEN_DEFAULT_READINESS_TIMEOUT
+    if readiness_timeout <= 0:
+        readiness_timeout = FREETOKEN_DEFAULT_READINESS_TIMEOUT
+
+    extra_args = _freetoken_extra_args(raw, is_windows=is_windows)
+    model_alias = str(profile.get("id") or selected_model).strip()
+
+    # model_path/runtime_path are accepted only from the trusted preparation
+    # manager.  No config/env/free-form model path is consumed here.
+    return {
+        "model": selected_model,
+        "model_alias": model_alias,
+        "model_path": str(status.get("model_path") or "").strip(),
+        "executable": str(status.get("runtime_path") or "").strip(),
+        "host": host,
+        "port": port,
+        "auto_start": auto_start,
+        "readiness_timeout": readiness_timeout,
+        "extra_args": extra_args,
+        "manager_status": str(status.get("status") or ""),
+        "manager_error": status.get("error"),
+    }
+
+
+def _freetoken_base_url(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> str:
+    settings = _freetoken_settings(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    host = str(settings["host"] or FREETOKEN_DEFAULT_HOST).strip()
+    if host in {"0.0.0.0", "::", "[::]", "::0"}:
+        host = "127.0.0.1"
+    host_for_url = (
+        host if ":" not in host or host.startswith("[") else f"[{host}]"
+    )
+    return normalize_openai_compatible_base_url(
+        f"http://{host_for_url}:{int(settings['port'])}/v1"
+    )
+
+
+def resolve_freetoken_runtime(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> dict[str, object]:
+    selected_model = _freetoken_selected_model(config, model)
+    if managed_local_runtime_for_model(config, selected_model) != "freetoken":
+        return {
+            "model": selected_model,
+            "managed": False,
+            "auto_start": False,
+            "state": "external",
+            "settings": {},
+            "error": None,
+        }
+
+    settings = _freetoken_settings(
+        config,
+        model=selected_model,
+        is_windows=is_windows,
+    )
+    manager_status = str(settings.get("manager_status") or "")
+    error = str(settings.get("manager_error") or "").strip() or None
+
+    if manager_status in {"installer_required", "unsupported"}:
+        state = manager_status
+    elif not settings.get("executable"):
+        state = "runtime_missing"
+    elif not settings.get("model_path"):
+        state = "model_missing"
+    else:
+        state = "ready"
+
+    return {
+        "model": selected_model,
+        "profile": freetoken_model_profile(selected_model),
+        "managed": True,
+        "auto_start": bool(settings["auto_start"]),
+        "state": state,
+        "settings": settings,
+        "error": error,
+    }
+
+
+def freetoken_managed_launch_configured(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> bool:
+    resolved = resolve_freetoken_runtime(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    return (
+        bool(resolved.get("managed"))
+        and bool(resolved.get("auto_start"))
+        and resolved.get("state") == "ready"
+    )
+
+
+def freetoken_managed_launch_configuration_error(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> str | None:
+    resolved = resolve_freetoken_runtime(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    if not resolved.get("managed") or not resolved.get("auto_start"):
+        return None
+    if resolved.get("state") == "ready":
+        return None
+    error = str(resolved.get("error") or "").strip()
+    if error:
+        return error
+    return (
+        "FreeToken managed runtime is not ready: "
+        f"{resolved.get('state') or 'unknown'}"
+    )
+
+
+def _should_start_freetoken(
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> bool:
+    provider = str(
+        _config_get(config, "llm_provider", "") or ""
+    ).strip().lower()
+    if provider != "openai_compatible_local":
+        return False
+    return freetoken_managed_launch_configured(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+
+
+def _freetoken_launch_plan(
+    config: object | None,
+    *,
+    project_root: Path | None = None,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> tuple[list[str], Path]:
+    settings = _freetoken_settings(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    _validate_freetoken_extra_args(settings["extra_args"])
+
+    executable = str(settings["executable"] or "").strip()
+    if not executable:
+        raise RuntimeError(
+            str(settings.get("manager_error") or "")
+            or "FreeToken executable が解決できません"
+        )
+
+    model_path = str(settings["model_path"] or "").strip()
+    model_dir = Path(model_path).expanduser()
+    if not model_path or not model_dir.is_dir() or model_dir.is_symlink():
+        raise RuntimeError(
+            "FreeToken managed model directory が準備されていません。"
+            "ManagedLocalRuntimeManagerでモデルをprepareしてください。"
+        )
+
+    args = [
+        executable,
+        "serve",
+        "--model",
+        str(model_dir),
+        "--host",
+        str(settings["host"]),
+        "--port",
+        str(settings["port"]),
+    ]
+    args.extend(str(item) for item in settings["extra_args"])
+    return args, project_root or Path(__file__).resolve().parents[2]
+
+
+def _freetoken_health_ready(base_url: str) -> bool:
+    normalized = normalize_openai_compatible_base_url(base_url)
+    health_url = f"{normalized[:-3]}/health"
+    try:
+        with urlopen(health_url, timeout=2.0) as response:
+            status = int(getattr(response, "status", 200) or 200)
+            return 200 <= status < 300
+    except Exception:
+        return False
+
+
+def _freetoken_readiness_ready(
+    base_url: str,
+    expected_alias: str,
+) -> bool:
+    if not _freetoken_health_ready(base_url):
+        return False
+    served_ids = _local_openai_model_ids_exact(base_url)
+    return bool(expected_alias and expected_alias in served_ids)
+
+
+def _wait_for_freetoken_readiness(
+    proc: object,
+    config: object | None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> None:
+    settings = _freetoken_settings(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    base_url = _freetoken_base_url(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    expected_alias = str(settings["model_alias"] or "").strip()
+    timeout_seconds = float(settings["readiness_timeout"])
+    deadline = time.monotonic() + timeout_seconds
+
+    while time.monotonic() < deadline:
+        try:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    "FreeTokenがreadiness完了前に終了しました。"
+                    " logs/models/freetoken.logを確認してください。"
+                )
+        except AttributeError:
+            pass
+
+        health_ready = _freetoken_health_ready(base_url)
+        if health_ready:
+            served_ids = _local_openai_model_ids_exact(base_url)
+            if expected_alias in served_ids:
+                return
+            if served_ids:
+                raise RuntimeError(
+                    "FreeTokenは起動しましたが、/v1/modelsのmodelが一致しません。"
+                    f"期待={expected_alias!r}, 実際={sorted(served_ids)!r}。"
+                )
+        time.sleep(0.25)
+
+    raise RuntimeError(
+        "FreeToken readiness timeoutです。"
+        f"{timeout_seconds:g}秒以内に/healthと/v1/modelsで"
+        f"model {expected_alias!r}を確認できませんでした。"
+    )
+
+
 def _is_openai_compatible_local_server_running(base_url: str) -> bool:
     normalized_url = normalize_openai_compatible_base_url(base_url)
     if _local_openai_model_ids(normalized_url):
@@ -2357,6 +3665,7 @@ def _validate_llama_cpp_version(
     muse: bool = False,
     minimum_build: int | None = None,
     model_label: str = "llama.cpp",
+    required_commit: str | None = None,
 ) -> str | None:
     """Reject a profile's known-old llama.cpp build while remaining portable.
 
@@ -2368,7 +3677,15 @@ def _validate_llama_cpp_version(
 
     if minimum_build is None and muse:
         minimum_build = _LLAMA_CPP_MIN_MUSE_BUILD
-    if minimum_build is None:
+    required_commit_text = str(required_commit or "").strip().lower()
+    if required_commit_text and not re.fullmatch(
+        r"[0-9a-f]{7,40}",
+        required_commit_text,
+    ):
+        raise RuntimeError(
+            f"{model_label} のrequired_llama_cpp_commitが不正です: {required_commit!r}"
+        )
+    if minimum_build is None and not required_commit_text:
         return None
     try:
         result = subprocess.run(
@@ -2380,13 +3697,41 @@ def _validate_llama_cpp_version(
         )
         output = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
     except Exception as exc:  # pragma: no cover - platform executable failure
+        if required_commit_text:
+            raise RuntimeError(
+                f"{model_label}向けllama.cppのcommitを確認できませんでした。"
+                f"required commit={required_commit_text} のllama-serverを使用してください。"
+            ) from exc
         requirement = f"b{minimum_build}以上"
         raise RuntimeError(
             f"{model_label}向けllama.cppのバージョンを確認できませんでした。"
             f"{requirement}のllama-serverを用意してください。"
         ) from exc
 
-    import re
+    if required_commit_text:
+        commit_match = re.search(
+            r"\bcommit\s*[:=]?\s*([0-9a-f]{7,40})\b",
+            output,
+            re.IGNORECASE,
+        )
+        if not commit_match:
+            raise RuntimeError(
+                f"{model_label}向けllama.cppのcommitをversion outputから確認できないため"
+                "起動を拒否しました。"
+                f"required commit={required_commit_text}。"
+            )
+        actual_commit = commit_match.group(1).lower()
+        if not (
+            actual_commit.startswith(required_commit_text)
+            or required_commit_text.startswith(actual_commit)
+        ):
+            raise RuntimeError(
+                f"{model_label}にはllama.cpp commit {required_commit_text} が必要です。"
+                f"検出されたcommitは{actual_commit}です。"
+            )
+
+    if minimum_build is None:
+        return output
 
     match = re.search(r"\bb(\d{4,6})\b", output, re.IGNORECASE)
     if not match:
@@ -2419,6 +3764,140 @@ def _validate_llama_cpp_version(
     return output
 
 
+def _resolve_llama_cpp_profile_launch_executable(
+    config: object | None,
+    *,
+    selected_model: str,
+    settings: dict[str, object],
+    model_profile: dict[str, object] | None,
+    is_windows: bool | None = None,
+) -> str:
+    """Resolve and validate llama-server, recovering stale persisted paths.
+
+    A persisted executable may outlive a managed runtime update and fail the
+    selected profile's minimum build/commit contract.  In that narrow case,
+    use the manager-owned current runtime when it validates for the same
+    profile.  Explicit environment overrides and unregistered/custom models
+    remain fail-closed so operators do not silently switch binaries.
+    """
+
+    configured = str(settings.get("executable") or "").strip()
+    minimum_build = _llama_cpp_effective_minimum_build(model_profile)
+    managed_runtime_manager = None
+    if model_profile and not (
+        os.getenv("LLAMA_CPP_EXECUTABLE") or os.getenv("LLAMA_SERVER_EXE")
+    ):
+        managed_runtime_manager = ManagedLocalRuntimeManager(config)
+    required_commit = ""
+    if model_profile:
+        if managed_runtime_manager is not None:
+            required_commit_resolver = getattr(
+                managed_runtime_manager,
+                "_llama_cpp_required_commit",
+                None,
+            )
+            if callable(required_commit_resolver):
+                required_commit = str(
+                    required_commit_resolver(dict(model_profile)) or ""
+                ).strip()
+            else:
+                # Compatibility for narrow test doubles and older embedders.
+                required_commit = str(
+                    model_profile.get("required_llama_cpp_commit") or ""
+                ).strip()
+    model_label = (
+        str(model_profile.get("label") or selected_model)
+        if model_profile
+        else selected_model
+    )
+
+    def validate(executable: str) -> None:
+        _validate_llama_cpp_version(
+            executable,
+            muse=False,
+            minimum_build=(
+                int(minimum_build) if minimum_build is not None else None
+            ),
+            model_label=model_label,
+            required_commit=required_commit or None,
+        )
+
+    executable = ""
+    try:
+        executable = _resolve_llama_cpp_executable(
+            configured,
+            is_windows=is_windows,
+        )
+        validate(executable)
+        return executable
+    except RuntimeError:
+        # Environment variables are explicit operator choices and must never
+        # be shadowed by an automatically selected managed binary.
+        if (
+            os.getenv("LLAMA_CPP_EXECUTABLE")
+            or os.getenv("LLAMA_SERVER_EXE")
+            or not configured
+            or model_profile is None
+        ):
+            raise
+
+        if managed_runtime_manager is None:
+            managed_runtime_manager = ManagedLocalRuntimeManager(config)
+        managed = managed_runtime_manager
+        legacy_resolver = None
+        used_marker_backed_fallback = False
+        fallback = str(
+            managed.compatible_managed_llama_cpp_executable(model_profile)
+            or ""
+        ).strip()
+        if not fallback:
+            # A pre-existing Windows install may live under an older
+            # ``<drive>:/AI/runtimes/aoitalk-managed-*`` root rather than this
+            # process's configured runtime root.  Recover it only through the
+            # marker-backed, exact-profile helper; the persisted executable
+            # setting itself is intentionally left unchanged.
+            legacy_resolver = getattr(
+                managed,
+                "compatible_marker_backed_legacy_llama_cpp_executable",
+                None,
+            )
+            if callable(legacy_resolver):
+                fallback = str(
+                    legacy_resolver(configured, model_profile) or ""
+                ).strip()
+                used_marker_backed_fallback = bool(fallback)
+        if not fallback:
+            raise
+        same_path = False
+        if executable:
+            try:
+                same_path = Path(fallback).expanduser().resolve(strict=False) == Path(
+                    executable
+                ).expanduser().resolve(strict=False)
+            except (OSError, RuntimeError, ValueError):
+                same_path = os.path.normcase(os.path.normpath(fallback)) == os.path.normcase(
+                    os.path.normpath(executable)
+                )
+        if same_path:
+            raise
+        if used_marker_backed_fallback:
+            logger.warning(
+                "Persisted llama.cpp executable is incompatible with profile %s; "
+                "using marker-backed legacy managed runtime %s; "
+                "persisted config unchanged",
+                selected_model,
+                fallback,
+            )
+        else:
+            logger.warning(
+                "Persisted llama.cpp executable is incompatible with profile %s; "
+                "using compatible managed runtime %s",
+                selected_model,
+                fallback,
+            )
+        return fallback
+
+
 def _llama_cpp_launch_plan(
     config: object | None,
     *,
@@ -2446,19 +3925,37 @@ def _llama_cpp_launch_plan(
         "llama.cpp GGUF",
         "openai_compatible_local.llama_cpp.model_path",
     )
+    model_file_path = Path(model_file)
+    selected_profile = llama_cpp_model_profile(selected_model)
     _validate_llama_cpp_model_path_profile(
         selected_model,
-        llama_cpp_model_profile(selected_model),
+        selected_profile,
         model_file,
     )
+    declared_shards = (
+        selected_profile.get("gguf_filenames")
+        if isinstance(selected_profile, dict)
+        else None
+    )
+    if isinstance(declared_shards, (list, tuple)) and declared_shards:
+        shard_files = _llama_cpp_model_path_shards(selected_profile, model_file)
+        if not shard_files:
+            expected_primary = _llama_cpp_profile_expected_filename(selected_profile)
+            raise RuntimeError(
+                f"{str(selected_profile.get('label') or selected_model)} のmodel_pathは"
+                f"primary shard {expected_primary!r} を指定してください。"
+            )
+        missing_shards = [path.name for path in shard_files if not path.is_file()]
+        if missing_shards:
+            raise RuntimeError(
+                f"{str(selected_profile.get('label') or selected_model)} のGGUF shardが"
+                f"不足しています: {', '.join(missing_shards)}。"
+                "primary shardと同じdirectoryに配置してください。"
+            )
     _validate_llama_cpp_model_alias(
         config,
         model=selected_model,
         overrides=overrides,
-        is_windows=is_windows,
-    )
-    executable = _resolve_llama_cpp_executable(
-        str(settings["executable"] or ""),
         is_windows=is_windows,
     )
     model_profile = _llama_cpp_profile_for_selection(
@@ -2466,16 +3963,23 @@ def _llama_cpp_launch_plan(
         model_alias=str(settings["model_alias"] or ""),
         model_path=model_file,
     )
-    # Keep launch validation on the exact same profile metadata contract used
-    # by the resolver/UI diagnostics.
-    minimum_build = _llama_cpp_effective_minimum_build(model_profile)
-    _validate_llama_cpp_version(
-        executable,
-        muse=False,
-        minimum_build=int(minimum_build) if minimum_build is not None else None,
-        model_label=str(model_profile.get("label") or selected_model)
-        if model_profile
-        else selected_model,
+    mmproj_metadata = llama_cpp_mmproj_metadata(profile=model_profile)
+    mmproj_path = ""
+    if mmproj_metadata:
+        candidate_mmproj = model_file_path.parent / str(mmproj_metadata["filename"])
+        if _llama_cpp_regular_non_symlink_file(candidate_mmproj):
+            mmproj_path = str(candidate_mmproj)
+        elif mmproj_metadata.get("required"):
+            raise RuntimeError(
+                f"{str(model_profile.get('label') or selected_model)} のrequired mmprojが"
+                f"見つかりません: {mmproj_metadata['filename']}"
+            )
+    executable = _resolve_llama_cpp_profile_launch_executable(
+        config,
+        selected_model=selected_model,
+        settings=settings,
+        model_profile=model_profile,
+        is_windows=is_windows,
     )
 
     args = [
@@ -2493,17 +3997,73 @@ def _llama_cpp_launch_plan(
         "--n-gpu-layers",
         str(settings["gpu_layers"]),
     ]
+    if mmproj_path:
+        args.extend(["--mmproj", mmproj_path])
     args.extend(str(item) for item in settings["extra_args"])
     # MTP flags are generated only from the resolved profile capability and
     # artifact state.  Never add spec-draft-n-max here; llama.cpp owns its
     # current default (3) and AoiTalk does not persist a tuning knob for it.
-    settings = _llama_cpp_settings_with_mtp_cli_capability(settings, executable)
+    settings = _llama_cpp_settings_with_mtp_cli_capability(
+        settings,
+        executable,
+        model_profile=model_profile,
+    )
     mtp_ready = bool(settings.get("mtp_enabled")) and bool(settings.get("mtp_available"))
+    effective_model_file = model_file
     if mtp_ready:
-        args.extend(["--spec-type", "draft-mtp"])
-        artifact_path = str(settings.get("mtp_artifact_path") or "").strip()
-        if artifact_path:
-            args.extend(["--spec-draft-model", artifact_path])
+        mtp_mode = str(settings.get("mtp_mode") or "").strip().lower()
+        if mtp_mode == "embedded":
+            variant_model_path = str(
+                settings.get("mtp_variant_model_path") or ""
+            ).strip()
+            variant_metadata = llama_cpp_mtp_metadata(profile=model_profile) or {}
+            variant_decl = variant_metadata.get("embedded_variant")
+            variant_files = (
+                [str(item).strip() for item in variant_decl.get("filenames", [])]
+                if isinstance(variant_decl, dict)
+                and isinstance(variant_decl.get("filenames"), (list, tuple))
+                else []
+            )
+            variant_primary = (
+                str(variant_decl.get("primary_filename") or "").strip()
+                if isinstance(variant_decl, dict)
+                else ""
+            )
+            variant_path_obj = Path(variant_model_path).expanduser()
+            variant_complete = bool(
+                variant_model_path
+                and variant_primary
+                and variant_path_obj.name == variant_primary
+                and variant_files
+                and all(
+                    _llama_cpp_regular_non_symlink_file(
+                        variant_path_obj.parent / filename
+                    )
+                    for filename in variant_files
+                )
+            )
+            if variant_complete:
+                # The variant has already been checked as a complete exact
+                # shard set by the profile resolver.  It is intentionally
+                # not passed through base-profile filename validation: the
+                # selected profile identity remains the original 3-shard
+                # Flash model while the effective GGUF is the derived bundle.
+                effective_model_file = variant_model_path
+            else:
+                # A stale/incomplete computed projection must never turn into
+                # a speculative launch.  Keep the base model and omit all MTP
+                # flags if the embedded primary disappeared between resolve
+                # and launch.
+                mtp_ready = False
+        if mtp_ready:
+            # Replace the model value assembled above only after every MTP
+            # compatibility gate has passed.  Companion mode intentionally
+            # keeps the original base model and adds its sidecar below.
+            args[args.index("--model") + 1] = effective_model_file
+            args.extend(["--spec-type", "draft-mtp"])
+            artifact_path = str(settings.get("mtp_artifact_path") or "").strip()
+            if artifact_path:
+                args.extend(["--spec-draft-model", artifact_path])
     for required_arg in (
         list(model_profile.get("required_args") or []) if model_profile else []
     ):
@@ -2681,6 +4241,7 @@ def _start_logged_openai_compatible_process(
     cwd: Path,
     log_path: Path,
     mirror_to_parent_console: bool = False,
+    create_new_console_on_windows: bool = True,
 ) -> subprocess.Popen:
     from src.utils.log_housekeeping import rotate_log_if_over_size
 
@@ -2696,7 +4257,11 @@ def _start_logged_openai_compatible_process(
         # Keep the parent-side pipe unbuffered so partial llama.cpp output is
         # forwarded without waiting for a BufferedReader fill threshold.
         popen_kwargs["bufsize"] = 0
-    if _IS_WINDOWS and not mirror_to_parent_console:
+    if (
+        _IS_WINDOWS
+        and not mirror_to_parent_console
+        and create_new_console_on_windows
+    ):
         popen_kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE
     elif not _IS_WINDOWS:
         popen_kwargs["start_new_session"] = True
@@ -2758,11 +4323,75 @@ def _start_llama_cpp_server(
         overrides=overrides,
         is_windows=is_windows,
     )
+    # Capture the executable identity and exact embedded shard set at the end
+    # of preflight.  The final checks immediately before Popen avoid a second
+    # full launch-plan pass on every request while still closing the common
+    # installer/race window.  If an embedded shard disappears, recompute once
+    # so the fallback is the original base model with no speculative flags.
+    planned_executable_identity = _llama_cpp_executable_identity(
+        str(args[0]) if args else ""
+    )
+    selected_model = _llama_cpp_selected_model(config, model)
+    planned_model_path = ""
+    try:
+        planned_model_path = str(args[args.index("--model") + 1])
+    except (ValueError, IndexError):
+        pass
+    if "--spec-type" in args and planned_model_path:
+        profile = llama_cpp_model_profile(selected_model)
+        metadata = llama_cpp_mtp_metadata(profile=profile)
+        variant = metadata.get("embedded_variant") if metadata else None
+        variant_files = (
+            [str(item).strip() for item in variant.get("filenames", [])]
+            if isinstance(variant, dict)
+            and isinstance(variant.get("filenames"), (list, tuple))
+            else []
+        )
+        if (
+            metadata
+            and str(metadata.get("mode") or "").strip().lower() == "embedded"
+            and variant_files
+        ):
+            model_path_obj = Path(planned_model_path).expanduser()
+            if not all(
+                _llama_cpp_regular_non_symlink_file(
+                    model_path_obj.parent / filename
+                )
+                for filename in variant_files
+            ):
+                args, cwd = _llama_cpp_launch_plan(
+                    config,
+                    project_root=project_root,
+                    model=model,
+                    overrides=overrides,
+                    is_windows=is_windows,
+                )
+                planned_executable_identity = _llama_cpp_executable_identity(
+                    str(args[0]) if args else ""
+                )
+    current_executable_identity = _llama_cpp_executable_identity(
+        str(args[0]) if args else ""
+    )
+    if (
+        planned_executable_identity is not None
+        and current_executable_identity != planned_executable_identity
+    ):
+        args, cwd = _llama_cpp_launch_plan(
+            config,
+            project_root=project_root,
+            model=model,
+            overrides=overrides,
+            is_windows=is_windows,
+        )
     proc = _start_logged_openai_compatible_process(
         args,
         cwd=cwd,
         log_path=_models_log_dir(project_root) / "llama_cpp.log",
-        mirror_to_parent_console=True,
+        # Managed llama.cpp requires file-only logging (no PIPE) and no
+        # CREATE_NEW_CONSOLE: observed Windows launches can stall CUDA loading.
+        # Generic exo/MLX/FreeToken behavior remains unchanged.
+        mirror_to_parent_console=False,
+        create_new_console_on_windows=False,
     )
     # Keep endpoint ownership attached to the tracked process itself.  The
     # persisted config can change before a hot-switch validation runs, so
@@ -2779,9 +4408,84 @@ def _start_llama_cpp_server(
                 is_windows=is_windows,
             ),
         )
+        setattr(proc, "_aoi_local_runtime", "llama_cpp")
+        setattr(
+            proc,
+            "_aoi_local_base_url",
+            _llama_cpp_base_url(
+                config,
+                model=model,
+                overrides=overrides,
+                is_windows=is_windows,
+            ),
+        )
+        settings = _llama_cpp_settings(
+            config,
+            model=model,
+            overrides=overrides,
+            is_windows=is_windows,
+        )
+        setattr(
+            proc,
+            "_aoi_local_model_alias",
+            str(settings.get("model_alias") or "").strip(),
+        )
     except Exception:
         logger.debug("llama.cpp process endpoint metadataを設定できません", exc_info=True)
-    print(f"llama-serverを起動しました (PID {proc.pid})")
+    logger.info(
+        "llama-server started (PID %s)",
+        proc.pid,
+        extra=FILE_ONLY_LOG_EXTRA,
+    )
+    return proc
+
+
+def _start_freetoken_server(
+    project_root: Path,
+    config: object | None = None,
+    *,
+    model: str | None = None,
+    is_windows: bool | None = None,
+) -> subprocess.Popen:
+    args, cwd = _freetoken_launch_plan(
+        config,
+        project_root=project_root,
+        model=model,
+        is_windows=is_windows,
+    )
+    proc = _start_logged_openai_compatible_process(
+        args,
+        cwd=cwd,
+        log_path=_models_log_dir(project_root) / "freetoken.log",
+    )
+    settings = _freetoken_settings(
+        config,
+        model=model,
+        is_windows=is_windows,
+    )
+    try:
+        setattr(proc, "_aoi_local_runtime", "freetoken")
+        setattr(
+            proc,
+            "_aoi_local_base_url",
+            _freetoken_base_url(
+                config,
+                model=model,
+                is_windows=is_windows,
+            ),
+        )
+        setattr(
+            proc,
+            "_aoi_local_model_alias",
+            str(settings.get("model_alias") or "").strip(),
+        )
+    except Exception:
+        logger.debug("FreeToken process metadataを設定できません", exc_info=True)
+    logger.info(
+        "FreeToken server started (PID %s)",
+        proc.pid,
+        extra=FILE_ONLY_LOG_EXTRA,
+    )
     return proc
 
 
@@ -2795,7 +4499,11 @@ def _start_exo_server(
         cwd=cwd,
         log_path=_models_log_dir(project_root) / "exo.log",
     )
-    print(f"Started exo OpenAI-compatible server (PID {proc.pid})")
+    logger.info(
+        "Started exo OpenAI-compatible server (PID %s)",
+        proc.pid,
+        extra=FILE_ONLY_LOG_EXTRA,
+    )
 
 
 def _start_mlx_lm_server(
@@ -2808,4 +4516,8 @@ def _start_mlx_lm_server(
         cwd=cwd,
         log_path=_models_log_dir(project_root) / "mlx_lm.log",
     )
-    print(f"Started MLX LM OpenAI-compatible server (PID {proc.pid})")
+    logger.info(
+        "Started MLX LM OpenAI-compatible server (PID %s)",
+        proc.pid,
+        extra=FILE_ONLY_LOG_EXTRA,
+    )

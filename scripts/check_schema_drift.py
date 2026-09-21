@@ -35,6 +35,11 @@ import psycopg2
 from dotenv import load_dotenv
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.memory.config import postgres_search_path
+
 SCHEMA_TS = REPO_ROOT / "frontend" / "src" / "db" / "schema.ts"
 
 
@@ -134,17 +139,23 @@ def parse_columns(block: str) -> dict[str, dict]:
     return columns
 
 
+def _schema_connect_args() -> dict[str, str]:
+    search_path = postgres_search_path(os.getenv("POSTGRES_SCHEMA"))
+    return {"options": f"-c search_path={search_path}"} if search_path else {}
+
+
 def get_conn():
     load_dotenv(REPO_ROOT / ".env")
     dsn = os.getenv("DATABASE_URL")
     if dsn:
-        return psycopg2.connect(dsn)
+        return psycopg2.connect(dsn, **_schema_connect_args())
     return psycopg2.connect(
         host=os.getenv("POSTGRES_HOST", "127.0.0.1"),
         port=int(os.getenv("POSTGRES_PORT", "5432")),
         user=os.getenv("POSTGRES_USER", "aoitalk"),
         password=os.getenv("POSTGRES_PASSWORD"),
         dbname=os.getenv("POSTGRES_DB", "aoitalk_memory"),
+        **_schema_connect_args(),
     )
 
 
@@ -156,7 +167,12 @@ def fetch_db_columns(conn, table_names: list[str]) -> dict[str, dict[str, dict]]
             """
             SELECT table_name, column_name, data_type, is_nullable, column_default
             FROM information_schema.columns
-            WHERE table_schema = 'public' AND table_name = ANY(%s)
+            -- ``current_schema()`` is ``public`` in the normal deployment,
+            -- while an isolated worktree may set a validated search_path via
+            -- POSTGRES_SCHEMA / DATABASE_URL.  Never fall back to another
+            -- schema for a drift gate: the schema being migrated is the one
+            -- that must match Drizzle.
+            WHERE table_schema = current_schema() AND table_name = ANY(%s)
             ORDER BY table_name, ordinal_position
             """,
             (table_names,),

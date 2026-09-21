@@ -11,7 +11,7 @@ import socket
 import ssl
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import Any, TYPE_CHECKING, Mapping
 from urllib.parse import SplitResult, urlencode, urljoin, urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query
@@ -21,6 +21,11 @@ import certifi
 import httpx
 
 from ..router_helpers import cookie_auth_dependency
+from ...services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    get_privacy_policy_context,
+)
 
 if TYPE_CHECKING:
     from ..server import WebChatServer
@@ -149,7 +154,7 @@ def _set_response_socket_timeout(raw_response, timeout: float) -> None:
         setter(timeout)
 
 
-def _read_bounded_ogp_body(raw_response, deadline: float) -> bytes:
+def _read_bounded_ogp_body(raw_response, deadline: float, *, max_response_bytes: int = OGP_MAX_RESPONSE_BYTES) -> bytes:
     """Read a response body in bounded chunks under one absolute deadline.
 
     ``HTTPResponse.read(n)`` only guarantees an inactivity timeout.  A peer
@@ -163,7 +168,7 @@ def _read_bounded_ogp_body(raw_response, deadline: float) -> bytes:
     while True:
         remaining = _deadline_remaining(deadline)
         _set_response_socket_timeout(raw_response, remaining)
-        read_size = min(_OGP_READ_CHUNK_BYTES, OGP_MAX_RESPONSE_BYTES + 1 - len(body))
+        read_size = min(_OGP_READ_CHUNK_BYTES, max_response_bytes + 1 - len(body))
         # ``read(n)`` may internally issue many recv calls until n bytes or
         # EOF.  ``read1`` returns after at most one underlying read, allowing
         # us to re-check the absolute deadline for every network operation.
@@ -177,7 +182,7 @@ def _read_bounded_ogp_body(raw_response, deadline: float) -> bytes:
         if not chunk:
             return bytes(body)
         body.extend(chunk)
-        if len(body) > OGP_MAX_RESPONSE_BYTES:
+        if len(body) > max_response_bytes:
             raise OGPFetchError("取得本文がサイズ上限を超えました")
 
 
@@ -394,6 +399,10 @@ async def _resolve_public_ogp_endpoint(url: str) -> tuple[SplitResult, str]:
 def _pinned_ogp_request(
     parts: SplitResult,
     address: str,
+    *,
+    max_response_bytes: int = OGP_MAX_RESPONSE_BYTES,
+    user_agent: str = "AoiTalk/1.0 OGP Fetcher",
+    accept: str = "text/html,application/xhtml+xml",
 ) -> httpx.Response:
     """Perform a bounded GET while connecting to the already-resolved IP."""
 
@@ -481,14 +490,14 @@ def _pinned_ogp_request(
         if parts.port is not None:
             host_header = f"{host_header}:{parts.port}"
         connection.putheader("Host", host_header)
-        connection.putheader("User-Agent", "AoiTalk/1.0 OGP Fetcher")
-        connection.putheader("Accept", "text/html,application/xhtml+xml")
+        connection.putheader("User-Agent", user_agent)
+        connection.putheader("Accept", accept)
         connection.putheader("Accept-Encoding", "identity")
         connection.putheader("Connection", "close")
         connection.endheaders()
         _set_response_socket_timeout(connection, _deadline_remaining(deadline))
         raw = connection.getresponse()
-        content = _read_bounded_ogp_body(raw, deadline)
+        content = _read_bounded_ogp_body(raw, deadline, max_response_bytes=max_response_bytes)
         _deadline_remaining(deadline)
         request_url = parts.geturl()
         return httpx.Response(
@@ -511,19 +520,71 @@ def _pinned_ogp_request(
         connection.close()
 
 
-async def _safe_ogp_get(url: str) -> httpx.Response:
+async def _safe_ogp_get(
+    url: str,
+    *,
+    config: Any | None = None,
+    privacy_gateway: OutboundPrivacyGateway | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
+) -> httpx.Response:
     """GET a URL with DNS pinning and validation on every redirect."""
 
+    if privacy_gateway is None:
+        context = get_privacy_policy_context()
+        inherited_session = context.session_context or {}
+        privacy_gateway = OutboundPrivacyGateway(
+            config,
+            user_id=str(user_id or ""),
+            session_id=str(
+                session_id
+                or inherited_session.get("session_id")
+                or inherited_session.get("id")
+                or ""
+            ),
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
     current = str(url)
+    active_payload: Any = {"url": current}
     for redirect_count in range(OGP_MAX_REDIRECTS + 1):
         parts, address = await _resolve_public_ogp_endpoint(current)
-        try:
-            response = await asyncio.wait_for(
-                asyncio.to_thread(_pinned_ogp_request, parts, address),
-                timeout=OGP_TIMEOUT_SECONDS + 0.25,
-            )
-        except asyncio.TimeoutError as exc:
-            raise OGPTimeoutError("取得がタイムアウトしました") from exc
+
+        approved_payload: dict[str, Any] = {}
+
+        async def _send(final_payload: Any) -> httpx.Response:
+            # The URL is part of the reviewed transaction.  A reviewer may
+            # edit body-less metadata only by returning the same canonical
+            # destination; allowing a retarget here would bypass the DNS
+            # pinning and redirect validation performed above.
+            if not isinstance(final_payload, Mapping):
+                raise OGPFetchError("OGP送信 payload が不正です")
+            approved_url = str(final_payload.get("url") or "")
+            if approved_url != current:
+                raise OGPFetchError("OGP送信先の変更は許可されません")
+            approved_payload["value"] = final_payload
+            try:
+                return await asyncio.wait_for(
+                    asyncio.to_thread(_pinned_ogp_request, parts, address),
+                    timeout=OGP_TIMEOUT_SECONDS + 0.25,
+                )
+            except asyncio.TimeoutError as exc:
+                raise OGPTimeoutError("取得がタイムアウトしました") from exc
+
+        response = await privacy_gateway.execute(
+            active_payload,
+            provider="ogp_fetch",
+            descriptor=EgressDescriptor(
+                action="ogp.get",
+                transport="http.client",
+                destination=parts.geturl(),
+                provider="ogp_fetch",
+            ),
+            base_url=parts.geturl(),
+            source_kind="ogp_fetch",
+            sender=_send,
+        )
         if not response.is_redirect:
             return response
         location = response.headers.get("location")
@@ -531,6 +592,8 @@ async def _safe_ogp_get(url: str) -> httpx.Response:
             return response
         if redirect_count >= OGP_MAX_REDIRECTS:
             raise OGPFetchError("リダイレクト回数が上限を超えました")
+        if "value" in approved_payload:
+            active_payload = approved_payload["value"]
         current = urljoin(current, location)
     raise OGPFetchError("リダイレクト回数が上限を超えました")
 
@@ -539,12 +602,36 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
     """OGP メタデータ取得ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
 
+    async def _safe_fetch(target_url: str) -> httpx.Response:
+        """Route wrapper that binds the app privacy policy when available.
+
+        The small indirection keeps the helper source-compatible with tests
+        and embedders that monkeypatch ``_safe_ogp_get(url)`` while production
+        requests still receive the server's DB-backed privacy configuration.
+        Request-local user/session metadata is inherited from the privacy
+        context populated by the authenticated turn middleware.
+        """
+
+        kwargs: dict[str, Any] = {}
+        config = getattr(server, "config", None)
+        if config is not None:
+            kwargs["config"] = config
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        user_id = session_context.get("user_id") or session_context.get("id")
+        session_id = session_context.get("session_id")
+        if user_id:
+            kwargs["user_id"] = str(user_id)
+        if session_id:
+            kwargs["session_id"] = str(session_id)
+        return await _safe_ogp_get(target_url, **kwargs)
+
     @app.get("/api/ogp/media")
     async def ogp_media(url: str = Query(...), _: None = Depends(require_auth)):
         """Proxy a validated OGP image through the bounded server fetcher."""
 
         try:
-            response = await _safe_ogp_get(url)
+            response = await _safe_fetch(url)
             if not 200 <= response.status_code < 300:
                 return JSONResponse(
                     {"success": False, "error": "画像を取得できません"},
@@ -629,7 +716,7 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                     oembed_url = "https://publish.twitter.com/oembed?" + urlencode(
                         {"url": url, "omit_script": "true", "dnt": "true"}
                     )
-                    oembed_resp = await _safe_ogp_get(oembed_url)
+                    oembed_resp = await _safe_fetch(oembed_url)
                     oembed_resp.raise_for_status()
                     oembed = oembed_resp.json()
                     embed_html = oembed.get("html")
@@ -657,7 +744,7 @@ def register_ogp_routes(app: FastAPI, server: "WebChatServer") -> None:
                         type(exc).__name__,
                     )
 
-            resp = await _safe_ogp_get(url)
+            resp = await _safe_fetch(url)
             resp.raise_for_status()
 
             soup = BeautifulSoup(resp.text, "html.parser")

@@ -1,11 +1,21 @@
 import type { Metadata } from "next";
+import { headers } from "next/headers";
 import { ThemeProvider } from "@/contexts/theme-context";
+import {
+  AZURE_WIKI_ICON,
+  AZURE_WIKI_TITLE,
+  usesAzureWikiBranding,
+} from "@/lib/browser-branding";
 import "./globals.css";
 
-export const metadata: Metadata = {
-  title: "AoiTalk",
-  description: "タスク管理 + チャットUI + エージェント",
-};
+export async function generateMetadata(): Promise<Metadata> {
+  const wiki = usesAzureWikiBranding(await headers());
+  return {
+    title: wiki ? AZURE_WIKI_TITLE : "AoiTalk",
+    description: "タスク管理 + チャットUI + エージェント",
+    icons: { icon: wiki ? AZURE_WIKI_ICON : "/favicon.ico" },
+  };
+}
 
 // first paint 前にテーマを適用し、フルロード経路での白フラッシュを防ぐ。
 // theme-context.tsx の localStorage キー "aoitalk-theme" と値("light"/"dark"/"system")に一致させる。

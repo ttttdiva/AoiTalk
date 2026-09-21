@@ -23,7 +23,12 @@ export {
   buildTimeReportFromEntries,
   calculateTimeEntryDuration,
 } from "./timeEntries";
-export { enqueueOutbox, listOutboxConflicts } from "./outbox";
+export {
+  enqueueOutbox,
+  getOutboxConflict,
+  listOutboxConflicts,
+  rebaseOutboxConflict,
+} from "./outbox";
 export * from "./records";
 export * from "./docs";
 export type { SyncAction, OutboxEnqueue } from "./types";

@@ -118,6 +118,44 @@ export async function canWriteProject(
   );
 }
 
+/** Revalidate a Project write ACL on a caller-supplied transaction executor. */
+export async function canWriteProjectWithExecutor(
+  executor: typeof db,
+  projectId: string,
+  user: ConversationScopeUser,
+): Promise<boolean> {
+  let normalizedProjectId: string;
+  try {
+    normalizedProjectId = normalizeUuid(projectId, "project_id");
+  } catch (error) {
+    if (error instanceof ConversationScopeError) return false;
+    throw error;
+  }
+  const [project] = await executor
+    .select({ ownerId: projects.ownerId })
+    .from(projects)
+    .where(and(eq(projects.id, normalizedProjectId), isNull(projects.deletedAt)))
+    .limit(1)
+    .for("update");
+  if (!project) return false;
+  if (user.role === "admin" || project.ownerId === user.id) return true;
+
+  const [membership] = await executor
+    .select({ permissions: projectMembers.permissions })
+    .from(projectMembers)
+    .where(
+      and(
+        eq(projectMembers.projectId, normalizedProjectId),
+        eq(projectMembers.userId, user.id),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  return Boolean(
+    membership && hasProjectPermission(membership.permissions, "write"),
+  );
+}
+
 export async function validateAppConversationScope(options: {
   appId: string | null | undefined;
   appTargetId?: string | null;
@@ -280,6 +318,7 @@ export function messageToSnake(row: typeof conversationMessages.$inferSelect) {
     role: row.role,
     content,
     metadata: row.messageMetadata,
+    client_message_id: row.clientMessageId,
     sender_type: row.senderType,
     sender_id: row.senderId,
     sender_display_name: row.senderDisplayName,
@@ -425,6 +464,53 @@ export async function canWriteConversationSession(
 
   const participantRole = await getJoinedParticipantRole(id, user.id);
   return ["owner", "admin", "member"].includes(participantRole ?? "");
+}
+
+/**
+ * Revalidate write access using a transaction-bound query executor.
+ *
+ * The normal helper intentionally uses the process-wide `db` handle and is
+ * suitable for request preflight checks.  Message persistence must perform a
+ * second check after locking the session row, otherwise a participant/project
+ * permission revoked between the preflight and INSERT could still write a
+ * message.  `executor` uses the exported database shape because Drizzle's
+ * transaction type is not exported consistently across postgres-js versions;
+ * callers cast the transaction object at this narrow boundary.
+ */
+export async function canWriteLockedConversationSession(
+  executor: typeof db,
+  session: ConversationSessionRow,
+  user: ConversationScopeUser,
+): Promise<boolean> {
+  if (!session || session.deletedAt) return false;
+
+  if (session.projectId) {
+    if (
+      !(await canWriteProjectWithExecutor(
+        executor,
+        String(session.projectId),
+        user,
+      ))
+    ) {
+      return false;
+    }
+  }
+
+  if (session.userId === user.id) return true;
+  const [participant] = await executor
+    .select({ role: conversationParticipants.role })
+    .from(conversationParticipants)
+    .where(
+      and(
+        eq(conversationParticipants.sessionId, session.id),
+        eq(conversationParticipants.participantType, "user"),
+        eq(conversationParticipants.participantId, user.id),
+        eq(conversationParticipants.status, "joined"),
+      ),
+    )
+    .limit(1)
+    .for("update");
+  return ["owner", "admin", "member"].includes(participant?.role ?? "");
 }
 
 export async function canManageWritableConversationSession(

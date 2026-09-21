@@ -20,6 +20,11 @@ import { RichTitle } from "./rich-title";
 
 const MAX_DEPTH = 6;
 
+function isProtectedProjectNode(node: Pick<DocsNode, "system_key">) {
+  const key = String(node.system_key ?? "").trim();
+  return key === "project_information_root" || key.startsWith("project_information:");
+}
+
 export type OutlineTreeProps = {
   parentId: string;
   depth?: number;
@@ -52,6 +57,8 @@ function OutlineRow({
   const [collapsed, setCollapsed] = useState(false);
   const [menuVisible, setMenuVisible] = useState(false);
   const [busy, setBusy] = useState(false);
+  const protectedNode = isProtectedProjectNode(node);
+  const displayTitle = node.is_explicit_blank ? " " : node.title || "無題";
 
   const runAction = useCallback(
     async (fn: () => Promise<unknown>) => {
@@ -84,7 +91,7 @@ function OutlineRow({
         />
         <Pressable style={styles.titlePress} onPress={() => onOpen(node.id)}>
           <RichTitle
-            text={node.title || "無題"}
+            text={displayTitle}
             numberOfLines={2}
             style={[styles.title, node.archived_at ? styles.archived : null]}
           />
@@ -106,7 +113,7 @@ function OutlineRow({
           size={18}
           iconColor={index > 0 ? "#a6adc8" : "#45475a"}
           style={styles.icon}
-          disabled={busy || index === 0}
+          disabled={busy || index === 0 || protectedNode}
           onPress={() => void runAction(() => docsRepo.indentNode(node.id))}
         />
         <IconButton
@@ -114,7 +121,7 @@ function OutlineRow({
           size={18}
           iconColor={depth > 0 ? "#a6adc8" : "#45475a"}
           style={styles.icon}
-          disabled={busy || depth === 0}
+          disabled={busy || depth === 0 || protectedNode}
           onPress={() => void runAction(() => docsRepo.outdentNode(node.id))}
         />
         <Menu
@@ -134,6 +141,7 @@ function OutlineRow({
           <Menu.Item
             leadingIcon="folder-move-outline"
             title="移動"
+            disabled={protectedNode}
             onPress={() => {
               setMenuVisible(false);
               onMoveRequest(node.id);
@@ -142,6 +150,7 @@ function OutlineRow({
           <Menu.Item
             leadingIcon="archive-outline"
             title="アーカイブ"
+            disabled={protectedNode}
             onPress={() => {
               setMenuVisible(false);
               void runAction(() => docsRepo.archiveNode(node.id));

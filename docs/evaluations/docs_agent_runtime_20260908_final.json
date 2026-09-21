@@ -1,0 +1,15 @@
+{
+  "success": true,
+  "disposable": true,
+  "driver": "asyncpg",
+  "embedding": "BAAI/bge-m3",
+  "vector_store": "Qdrant in-memory",
+  "migration": "20260908_0005",
+  "atomic_mutation": true,
+  "receipt_replay": true,
+  "durable_index_delivery": true,
+  "authorized_semantic_search": true,
+  "coverage_complete": true,
+  "delivered_records": 2,
+  "elapsed_seconds": 7.95441159999973
+}

@@ -2,6 +2,11 @@ import { expect, test, type Page, type Response } from "@playwright/test";
 
 import { loadLiveUserA, loginAsRegularLiveUser } from "./support/live-auth";
 import {
+  assertVerificationStorageIsolated,
+  createVerificationRun,
+  installVerificationRun,
+} from "../e2e/support/auth";
+import {
   assertNoLiveObservabilityIssues,
   attachLiveObservability,
   type LiveObservability,
@@ -66,6 +71,19 @@ function installRpResponseCollector(page: Page) {
 test.describe("chat rp-settings 経路", () => {
   test.beforeEach(async ({ page }) => {
     test.skip(!liveUser, "live user A credentials are not available");
+    test.skip(
+      (process.env.AOITALK_VERIFICATION_HARNESS_KEY?.trim().length ?? 0) < 16,
+      "AOITALK_VERIFICATION_HARNESS_KEY is required for provenance-tagged live writes",
+    );
+    // Opening a new chat persists a session and RP settings.  Conversation
+    // fixtures are intentionally exercised only on a fresh ephemeral
+    // database: this flow predates the generic verification cleanup graph and
+    // must never write an ordinary runtime session.
+    assertVerificationStorageIsolated({ requireEphemeralDatabase: true });
+    await installVerificationRun(
+      page,
+      createVerificationRun("frontend/e2e-live/chat-rp-settings.spec.ts"),
+    );
     observabilityByPage.set(page, attachLiveObservability(page));
     await loginAsRegularLiveUser(page, liveUser!);
   });

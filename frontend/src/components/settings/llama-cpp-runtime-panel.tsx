@@ -48,9 +48,43 @@ export function LlamaCppRuntimePanel({
   const servedAlias = profile?.served_alias?.trim() || selectedModelId.trim();
   const aliasLocked = profile?.alias_locked === true && Boolean(profile?.served_alias?.trim());
   const requiredArgs = (profile?.required_args ?? []).map((item) => String(item).trim()).filter(Boolean);
+  const ggufFilenames = profile?.gguf_filenames ?? [];
+  const ggufShardCount = profile?.gguf_shard_count ?? (ggufFilenames.length > 0 ? ggufFilenames.length : undefined);
   const mtpProfile = profile?.mtp ?? null;
-  const runtimeMtpMode = String(settings?.mtp_mode ?? "").trim().toLowerCase();
-  const runtimeMtpStatus = String(settings?.mtp_status ?? "").trim().toLowerCase();
+  const selectedIdentity = String(
+    profile?.profile_id ?? profile?.served_alias ?? selectedModelId,
+  ).trim().toLowerCase();
+  const runtimeIdentity = String(
+    settings?.profile_id
+      ?? settings?.runtime_profile?.profile_id
+      ?? settings?.runtime_profile?.served_alias
+      ?? settings?.model_alias
+      ?? "",
+  ).trim().toLowerCase();
+  const runtimeHasComputedMtpProjection = Boolean(
+    settings
+    && [
+      settings.mtp_supported,
+      settings.mtp_available,
+      settings.mtp_status,
+      settings.mtp_reason,
+      settings.mtp_artifact_path,
+      settings.mtp_resolved_model_path,
+      settings.mtp_variant_model_path,
+      settings.mtp_mode,
+    ].some((value) => value !== undefined && value !== null),
+  );
+  // Provider-level settings can lag one render behind a model switch.  Do
+  // not let a previous profile's computed MTP state make the new model look
+  // supported; profile metadata remains the source of truth until the
+  // backend returns a matching runtime projection.
+  const mtpSettings = !runtimeIdentity && runtimeHasComputedMtpProjection
+    ? null
+    : runtimeIdentity && selectedIdentity && runtimeIdentity !== selectedIdentity
+      ? null
+      : settings;
+  const runtimeMtpMode = String(mtpSettings?.mtp_mode ?? "").trim().toLowerCase();
+  const runtimeMtpStatus = String(mtpSettings?.mtp_status ?? "").trim().toLowerCase();
   const boolValue = (value: unknown, fallback: boolean): boolean => {
     if (value === undefined || value === null || value === "") return fallback;
     if (typeof value === "boolean") return value;
@@ -58,37 +92,40 @@ export function LlamaCppRuntimePanel({
     return ["1", "true", "yes", "on"].includes(String(value).trim().toLowerCase());
   };
   const mtpDeclared = Boolean(mtpProfile)
-    || boolValue(settings?.mtp_supported, false)
-    || boolValue(settings?.mtp_enabled, false)
+    || boolValue(mtpSettings?.mtp_supported, false)
+    || boolValue(mtpSettings?.mtp_enabled, false)
     || Boolean(runtimeMtpMode && runtimeMtpMode !== "unavailable")
     || Boolean(runtimeMtpStatus && !["unavailable", "not_applicable", "unsupported"].includes(runtimeMtpStatus));
-  const mtpSupported = boolValue(settings?.mtp_supported, mtpProfile?.supported === true);
+  const mtpSupported = boolValue(mtpSettings?.mtp_supported, mtpProfile?.supported === true);
   const mtpEnabled = draft.mtp_enabled
     ?? mtpProfile?.default_enabled === true;
   const mtpStatusRaw = runtimeMtpStatus;
   const mtpArtifactPath = String(
-      settings?.mtp_artifact_path
-      ?? settings?.mtp_resolved_model_path
-      ?? settings?.mtp_model_path
+      mtpSettings?.mtp_artifact_path
+      ?? mtpSettings?.mtp_resolved_model_path
+      ?? mtpSettings?.mtp_model_path
       ?? "",
   ).trim();
-  const mtpAvailable = settings?.mtp_available !== undefined && settings?.mtp_available !== null
-    ? boolValue(settings.mtp_available, false)
+  const mtpVariantModelPath = String(
+    mtpSettings?.mtp_variant_model_path ?? "",
+  ).trim();
+  const mtpAvailable = mtpSettings?.mtp_available !== undefined && mtpSettings?.mtp_available !== null
+    ? boolValue(mtpSettings.mtp_available, false)
     : mtpStatusRaw === "unavailable" || mtpStatusRaw === "not_applicable"
       ? false
       : mtpStatusRaw === "ready"
         ? true
         : mtpSupported
-      && (String(mtpProfile?.mode ?? "").trim().toLowerCase() === "embedded"
-        || Boolean(mtpArtifactPath)
-        || String(mtpProfile?.mode ?? "").trim().toLowerCase() !== "companion");
+          && String(mtpProfile?.mode ?? "").trim().toLowerCase() !== "embedded"
+          && (Boolean(mtpArtifactPath)
+            || String(mtpProfile?.mode ?? "").trim().toLowerCase() !== "companion");
   const mtpStatus = !mtpEnabled
     ? "disabled"
     : mtpAvailable
       ? "enabled / available"
       : "enabled / unavailable (fallback to standard decoding)";
   const mtpReason = [
-    settings?.mtp_reason,
+    mtpSettings?.mtp_reason,
     mtpProfile?.reason,
     mtpProfile?.ui_notice,
     mtpProfile?.compatibility,
@@ -154,8 +191,19 @@ export function LlamaCppRuntimePanel({
           <p className="font-medium">選択モデルの llama.cpp プロファイル</p>
           {profile.ui_notice && <p>{profile.ui_notice}</p>}
           <div className="space-y-0.5">
-            {profile.gguf_filename && <p>GGUF: <code>{profile.gguf_filename}</code></p>}
+            {profile.gguf_filename && <p>GGUF primary: <code>{profile.gguf_filename}</code></p>}
+            {ggufShardCount !== undefined && <p>GGUF shard count: <code>{ggufShardCount}</code></p>}
+            {ggufFilenames.length > 0 && (
+              <p>GGUF shards: <code>{ggufFilenames.map((filename) => `${filename}${filename === profile.gguf_filename ? " (primary)" : ""}`).join(", ")}</code></p>
+            )}
+            {profile.gguf_repository_subdir && <p>repository subdir: <code>{profile.gguf_repository_subdir}</code></p>}
             {profile.quantization && <p>量子化: <code>{profile.quantization}</code></p>}
+            {profile.runtime_distribution && (
+              <p>runtime distribution: <code>{profile.runtime_distribution}</code></p>
+            )}
+            {profile.source_revision && (
+              <p>source revision: <code>{profile.source_revision}</code></p>
+            )}
             {profile.served_alias && <p>served alias: <code>{profile.served_alias}</code>{aliasLocked ? "（固定）" : ""}</p>}
             {(profile.source_repository || profile.source_url) && (
               <p>
@@ -167,6 +215,9 @@ export function LlamaCppRuntimePanel({
             {profile.minimum_llama_cpp_build !== undefined && (
               <p>minimum llama.cpp build: <code>{profile.minimum_llama_cpp_build}</code></p>
             )}
+            {profile.required_llama_cpp_commit && (
+              <p>required llama.cpp commit: <code>{profile.required_llama_cpp_commit}</code></p>
+            )}
             {profile.reasoning_tools_minimum_llama_cpp_build !== undefined && (
               <p>reasoning/tools minimum build: <code>{profile.reasoning_tools_minimum_llama_cpp_build}</code></p>
             )}
@@ -176,6 +227,30 @@ export function LlamaCppRuntimePanel({
             {profile.default_context_size !== undefined && (
               <p>default context: <code>{profile.default_context_size}</code></p>
             )}
+            {profile.default_gpu_layers !== undefined && (
+              <p>default GPU layers: <code>{profile.default_gpu_layers}</code></p>
+            )}
+            {profile.auxiliary_artifacts?.map((artifact) => (
+              <p key={`${artifact.id ?? artifact.filename}-auxiliary`}>
+                {artifact.kind ?? "auxiliary"}: <code>{artifact.filename}</code>
+                {artifact.required ? "（required）" : ""}
+                {artifact.installed !== undefined
+                  ? ` / ${artifact.installed ? "ready" : "missing"}`
+                  : ""}
+              </p>
+            ))}
+            {profile.sampling_defaults && (
+              <p>
+                sampling: <code>{[
+                  profile.sampling_defaults.temperature !== undefined
+                    ? `temp=${profile.sampling_defaults.temperature}` : null,
+                  profile.sampling_defaults.top_p !== undefined
+                    ? `top_p=${profile.sampling_defaults.top_p}` : null,
+                  profile.sampling_defaults.top_k !== undefined
+                    ? `top_k=${profile.sampling_defaults.top_k}` : null,
+                ].filter(Boolean).join(", ")}</code>
+              </p>
+            )}
             {profile.jinja_required && <p>chat template: <code>Jinja (--jinja)</code></p>}
             {profile.chat_template && <p>chat template: <code>{profile.chat_template}</code></p>}
             {profile.reasoning_format && <p>reasoning format: <code>{profile.reasoning_format}</code></p>}
@@ -183,14 +258,25 @@ export function LlamaCppRuntimePanel({
             {requiredArgs.length > 0 && <p>required args: <code>{requiredArgs.join(" ")}</code></p>}
             {capabilityLabels.length > 0 && <p>capabilities: <code>{capabilityLabels.join(", ")}</code></p>}
             {mtpProfile && (
-              <p>
-                MTP profile: <code>{mtpProfile.mode || "declared"}</code>
-                {mtpProfile.artifact_filename
-                  ? <> · artifact: <code>{mtpProfile.artifact_filename}</code></>
-                  : mtpProfile.companion_filenames?.length
-                    ? <> · artifacts: <code>{mtpProfile.companion_filenames.join(", ")}</code></>
-                    : null}
-              </p>
+              <>
+                <p>
+                  MTP profile: <code>{mtpProfile.mode || "declared"}</code>
+                  {mtpProfile.artifact_filename
+                    ? <> · artifact: <code>{mtpProfile.artifact_filename}</code></>
+                    : mtpProfile.companion_filenames?.length
+                      ? <> · artifacts: <code>{mtpProfile.companion_filenames.join(", ")}</code></>
+                      : null}
+                </p>
+                {mtpProfile.minimum_llama_cpp_build !== undefined && (
+                  <p>MTP minimum llama.cpp build: <code>{mtpProfile.minimum_llama_cpp_build}</code></p>
+                )}
+                {mtpProfile.required_llama_cpp_commit && (
+                  <p>MTP required llama.cpp commit: <code>{mtpProfile.required_llama_cpp_commit}</code></p>
+                )}
+                {mtpProfile.embedded_variant?.primary_filename && (
+                  <p>MTP embedded variant primary: <code>{mtpProfile.embedded_variant.primary_filename}</code></p>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -207,6 +293,9 @@ export function LlamaCppRuntimePanel({
           {mtpReason && <p>MTP reason: {mtpReason}</p>}
           {!mtpSupported && mtpEnabled && !mtpReason && (
             <p>MTP artifact is unavailable; the base model will use standard decoding.</p>
+          )}
+          {mtpVariantModelPath && runtimeMtpMode === "embedded" && (
+            <p>MTP variant path: <code>{mtpVariantModelPath}</code></p>
           )}
         </div>
       )}
@@ -320,8 +409,8 @@ export function LlamaCppRuntimePanel({
           <Input
             id="llama-cpp-gpu-layers"
             aria-label="llama.cpp GPU layers"
-            type="number"
-            step={1}
+            type="text"
+            placeholder={String(profile?.default_gpu_layers ?? "999")}
             value={draft.gpu_layers}
             onChange={(event) => update("gpu_layers", event.target.value)}
             disabled={saving}

@@ -93,6 +93,7 @@ type ManagedUser = {
   status: "active" | "inactive" | "deleted";
   is_deleted: boolean;
   password_reset_required: boolean | null;
+  auth_source?: "local" | "ad" | "active_directory" | null;
   created_at: string | null;
   last_login: string | null;
   deleted_at: string | null;
@@ -142,6 +143,14 @@ function formatDate(value: string | null) {
 
 function displayName(user: ManagedUser) {
   return user.display_name || user.username;
+}
+
+function isActiveDirectoryUser(user: ManagedUser) {
+  return user.auth_source === "ad" || user.auth_source === "active_directory";
+}
+
+function authSourceLabel(user: ManagedUser) {
+  return isActiveDirectoryUser(user) ? "Active Directory" : "ローカル";
 }
 
 function avatarFallback(user: ManagedUser) {
@@ -445,7 +454,12 @@ export function UserManagementConsole({
   };
 
   const generateResetLink = async () => {
-    if (!resetUser) return;
+    if (!resetUser || isActiveDirectoryUser(resetUser)) {
+      if (resetUser && isActiveDirectoryUser(resetUser)) {
+        toast.error("Active Directoryユーザーのパスワードは再設定できません");
+      }
+      return;
+    }
     setBusyUserId(resetUser.id);
     setResetUrl("");
     try {
@@ -503,8 +517,14 @@ export function UserManagementConsole({
           </DropdownMenuItem>
           <DropdownMenuItem
             mnemonic="P"
-            disabled={user.status !== "active"}
+            disabled={user.status !== "active" || isActiveDirectoryUser(user)}
+            title={
+              isActiveDirectoryUser(user)
+                ? "パスワードはActive Directoryで管理されています"
+                : undefined
+            }
             onClick={() => {
+              if (isActiveDirectoryUser(user)) return;
               setResetUser(user);
               setResetUrl("");
             }}
@@ -710,6 +730,9 @@ export function UserManagementConsole({
                               <p className="truncate text-sm font-medium">
                                 {displayName(user)}
                               </p>
+                              <Badge variant="secondary">
+                                {authSourceLabel(user)}
+                              </Badge>
                               {user.password_reset_required && (
                                 <Badge variant="outline">再設定要求</Badge>
                               )}
@@ -802,6 +825,7 @@ export function UserManagementConsole({
                         label="ロール"
                         value={ROLE_LABELS[selectedUser.role || "user"] || selectedUser.role || "-"}
                       />
+                      <Info label="認証方式" value={authSourceLabel(selectedUser)} />
                       <Info
                         label="状態"
                         value={STATUS_LABELS[selectedUser.status]}
@@ -817,32 +841,42 @@ export function UserManagementConsole({
                     </Button>
                   </TabsContent>
                   <TabsContent value="security" className="mt-4 space-y-4">
-                    <div className="rounded-lg border p-3">
-                      <div className="flex items-start gap-3">
-                        <KeyRound className="mt-0.5 size-4 text-muted-foreground" />
-                        <div className="space-y-2">
-                          <div>
-                            <p className="text-sm font-medium">
-                              パスワード再設定リンク
-                            </p>
-                            <p className="text-xs text-muted-foreground">
-                              管理者がパスワードを知る形にせず、ユーザー本人が新しいパスワードを設定します。
-                            </p>
+                    {isActiveDirectoryUser(selectedUser) ? (
+                      <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
+                        <p className="font-medium">Active Directory (AD自動生成)</p>
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          このユーザーの資格情報はActive Directoryで管理されています。
+                          AoiTalkのパスワード変更・再設定リンクは利用できません。
+                        </p>
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border p-3">
+                        <div className="flex items-start gap-3">
+                          <KeyRound className="mt-0.5 size-4 text-muted-foreground" />
+                          <div className="space-y-2">
+                            <div>
+                              <p className="text-sm font-medium">
+                                パスワード再設定リンク
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                管理者がパスワードを知る形にせず、ユーザー本人が新しいパスワードを設定します。
+                              </p>
+                            </div>
+                            <Button
+                              size="sm"
+                              disabled={selectedUser.status !== "active"}
+                              onClick={() => {
+                                setResetUser(selectedUser);
+                                setResetUrl("");
+                              }}
+                            >
+                              <KeyRound className="size-3.5" />
+                              再設定リンクを発行
+                            </Button>
                           </div>
-                          <Button
-                            size="sm"
-                            disabled={selectedUser.status !== "active"}
-                            onClick={() => {
-                              setResetUser(selectedUser);
-                              setResetUrl("");
-                            }}
-                          >
-                            <KeyRound className="size-3.5" />
-                            再設定リンクを発行
-                          </Button>
                         </div>
                       </div>
-                    </div>
+                    )}
                   </TabsContent>
                   <TabsContent value="danger" className="mt-4 space-y-4">
                     <div className="rounded-lg border border-destructive/30 p-3">

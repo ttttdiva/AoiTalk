@@ -838,9 +838,20 @@ class DirectorTurnController:
         if self.operator_runner is not None:
             if self.trusted_parent_context is None:
                 return str(await self.operator_runner(block, index, total))
+            from contextlib import ExitStack
             from ..security.agent_run_scope import run_scope_context
+            from ..security.harness_execution_scope import (
+                harness_execution_scope_context,
+            )
 
-            with run_scope_context(self.trusted_parent_context.scope):
+            with ExitStack() as stack:
+                if self.trusted_parent_context.execution_scope is not None:
+                    stack.enter_context(
+                        harness_execution_scope_context(
+                            self.trusted_parent_context.execution_scope
+                        )
+                    )
+                stack.enter_context(run_scope_context(self.trusted_parent_context.scope))
                 return str(await self.operator_runner(block, index, total))
         return await self._run_default_operator(block, index, total)
 
@@ -854,6 +865,28 @@ class DirectorTurnController:
             await self.publication_controller.start_async()
         service = self.agent_run_service
         child_run_id: str | None = None
+
+        async def _close_operator_edge(status: str) -> None:
+            """Close the durable Director→Operator edge exactly once."""
+
+            if service is None or not self.parent_run_id or not child_run_id:
+                return
+            closer = getattr(service, "close_edge", None)
+            if not callable(closer):
+                return
+            try:
+                outcome = closer(
+                    parent_run_id=self.parent_run_id,
+                    child_run_id=child_run_id,
+                    status=status,
+                )
+                if inspect.isawaitable(outcome):
+                    await outcome
+            except Exception as exc:
+                # Edge closure is audit housekeeping; never hide the child
+                # terminal result when a legacy/fake service lacks the method.
+                print(f"[DirectorController] Operator edge closure failed: {exc}")
+
         operator_trusted_context = self.trusted_parent_context
         operator_qa_coordinator = self.qa_browser_coordinator
         if (
@@ -1153,6 +1186,7 @@ class DirectorTurnController:
                     result={"output": _clip(report, OPERATOR_RESULT_LIMIT)},
                     message="Directorの作業依頼を完了",
                 )
+                await _close_operator_edge("succeeded")
             return report
         except asyncio.CancelledError:
             if service is not None and child_run_id:
@@ -1168,6 +1202,14 @@ class DirectorTurnController:
                         "[DirectorController] Operator子runの停止記録に失敗: "
                         f"{exc}"
                     )
+                finally:
+                    try:
+                        await asyncio.shield(_close_operator_edge("cancelled"))
+                    except Exception as exc:
+                        print(
+                            "[DirectorController] Operator edge closure failed: "
+                            f"{exc}"
+                        )
             raise
         except Exception as exc:
             if service is not None and child_run_id:
@@ -1176,6 +1218,7 @@ class DirectorTurnController:
                     str(exc),
                     result={"error": str(exc)},
                 )
+                await _close_operator_edge("failed")
             return f"Operator実行に失敗しました: {exc}"
         finally:
             if client is not None:

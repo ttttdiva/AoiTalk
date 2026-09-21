@@ -1,9 +1,11 @@
+import { ScopeSwitcher } from "./scope-switcher";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
   Animated,
   FlatList,
   PanResponder,
+  Platform,
   Pressable,
   StyleSheet,
   View,
@@ -13,12 +15,10 @@ import { usePathname, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import {
   ActivityIndicator,
-  Button,
   Divider,
   Icon,
   IconButton,
   List,
-  Menu,
   SegmentedButtons,
   Surface,
   Text,
@@ -41,6 +41,7 @@ import { useReducedMotion } from "../features/ui/use-reduced-motion";
 import { filesApi, type FilesEntry, type FilesSource } from "../lib/files-api";
 import { COMPLETED_TASK_STATUSES, isFutureTask } from "../lib/task-visibility";
 import type { ConversationSession, Task } from "../types/api";
+import { AppSidebarContext } from "./app-sidebar-context";
 
 type SidebarTab = "chat" | "tasks" | "files";
 
@@ -102,115 +103,17 @@ function NavigationRow({
 }
 
 function ContextSwitcher() {
-  const {
-    spaces,
-    projects,
-    selectedSpaceId,
-    selectedProjectId,
-    selectedSpace,
-    selectedProject,
-    setSelectedSpaceId,
-    setSelectedProjectId,
-  } = useProject();
-  const [spaceMenuVisible, setSpaceMenuVisible] = useState(false);
-  const [projectMenuVisible, setProjectMenuVisible] = useState(false);
-
-  if (spaces.length === 0 && projects.length === 0) return null;
-
-  return (
-    <View style={styles.contextBlock}>
-      {spaces.length > 0 && (
-        <Menu
-          visible={spaceMenuVisible}
-          onDismiss={() => setSpaceMenuVisible(false)}
-          anchor={
-            <Button
-              mode="outlined"
-              compact
-              icon="layers-outline"
-              textColor={TEXT}
-              style={styles.contextButton}
-              contentStyle={styles.contextButtonContent}
-              onPress={() => setSpaceMenuVisible(true)}
-            >
-              {selectedSpace?.name || "スペース"}
-            </Button>
-          }
-        >
-          <Menu.Item
-            leadingIcon={
-              !selectedSpaceId && !selectedProjectId ? "check" : undefined
-            }
-            onPress={() => {
-              setSelectedProjectId(null);
-              setSpaceMenuVisible(false);
-            }}
-            title="すべてのスペース"
-          />
-          {spaces.map((space) => (
-            <Menu.Item
-              key={space.id}
-              leadingIcon={space.id === selectedSpaceId ? "check" : undefined}
-              onPress={() => {
-                setSelectedSpaceId(space.id);
-                setSpaceMenuVisible(false);
-              }}
-              title={space.name}
-            />
-          ))}
-        </Menu>
-      )}
-      {projects.length > 0 && (
-        <Menu
-          visible={projectMenuVisible}
-          onDismiss={() => setProjectMenuVisible(false)}
-          anchor={
-            <Button
-              mode="outlined"
-              compact
-              icon="folder-outline"
-              textColor={TEXT}
-              style={styles.contextButton}
-              contentStyle={styles.contextButtonContent}
-              onPress={() => setProjectMenuVisible(true)}
-            >
-              {selectedProject?.name || "プロジェクト"}
-            </Button>
-          }
-        >
-          <Menu.Item
-            leadingIcon={
-              !selectedProjectId && !selectedSpaceId ? "check" : undefined
-            }
-            onPress={() => {
-              setSelectedProjectId(null);
-              setProjectMenuVisible(false);
-            }}
-            title="すべてのスペース"
-          />
-          {projects.map((project) => (
-            <Menu.Item
-              key={project.id}
-              leadingIcon={project.id === selectedProjectId ? "check" : undefined}
-              onPress={() => {
-                setSelectedProjectId(project.id);
-                setProjectMenuVisible(false);
-              }}
-              title={project.name}
-            />
-          ))}
-        </Menu>
-      )}
-    </View>
-  );
+  return <View style={styles.contextBlock}><ScopeSwitcher /></View>;
 }
 
 function ChatSidebar({
   close,
   replaceCurrentChat,
+  header,
 }: {
   close: () => void;
   replaceCurrentChat: boolean;
+  header: React.ReactElement;
 }) {
   const router = useRouter();
   const { selectedProjectId } = useProject();
@@ -280,82 +183,94 @@ function ChatSidebar({
   };
 
   return (
-    <View style={styles.panel}>
-      <View style={styles.groupHeader}>
-        <Text style={styles.groupLabel}>会話履歴</Text>
-        <IconButton
-          icon="plus"
-          size={18}
-          iconColor={TEXT}
-          style={styles.smallIconButton}
-          onPress={createSession}
-        />
-      </View>
-      {loading && sessions.length === 0 ? (
-        <ActivityIndicator color="#7c3aed" style={styles.loading} />
-      ) : (
-        <FlatList
-          data={sessions}
-          keyExtractor={(item) => item.id}
-          ItemSeparatorComponent={() => <Divider style={styles.divider} />}
-          ListEmptyComponent={
+    <View style={styles.sidebarContainer}>
+      <FlatList
+        style={styles.sidebarList}
+        data={sessions}
+        keyExtractor={(item) => item.id}
+        ItemSeparatorComponent={() => <Divider style={styles.divider} />}
+        ListHeaderComponent={
+          <View>
+            {header}
+            <View style={styles.groupHeader}>
+              <Text style={styles.groupLabel}>会話履歴</Text>
+              <IconButton
+                icon="plus"
+                size={18}
+                iconColor={TEXT}
+                style={styles.smallIconButton}
+                onPress={createSession}
+              />
+            </View>
+          </View>
+        }
+        ListEmptyComponent={
+          loading && sessions.length === 0 ? (
+            <ActivityIndicator color="#7c3aed" style={styles.loading} />
+          ) : (
             <Text style={styles.emptyText}>会話がありません</Text>
-          }
-          renderItem={({ item }) => (
-            <List.Item
-              title={item.title || "無題の会話"}
-              description={
-                item.last_activity
-                  ? `${item.character_name || "キャラクター未設定"} ・ ${formatRelativeTime(
-                      item.last_activity,
-                    )}`
-                  : item.character_name || "キャラクター未設定"
-              }
-              titleNumberOfLines={1}
-              descriptionNumberOfLines={1}
-              titleStyle={styles.listTitle}
-              descriptionStyle={styles.listDescription}
-              left={(props) => (
-                item.development_status === "working" && item.message_count > 0 ? (
-                  <View style={styles.sessionIconSlot}>
-                    <ActivityIndicator
-                      accessibilityLabel="エージェントが作業中"
-                      size={18}
-                      color="#89b4fa"
-                    />
-                  </View>
-                ) : (
-                  <List.Icon {...props} icon="message-outline" color="#7c3aed" />
-                )
-              )}
-              right={() => (
-                <View style={styles.sessionMeta}>
-                  {item.is_unread && item.development_status !== "working" ? (
-                    <View accessibilityLabel="未読" style={styles.unreadDot} />
-                  ) : null}
-                  <Text style={styles.itemCount}>{item.message_count}</Text>
+          )
+        }
+        renderItem={({ item }) => (
+          <List.Item
+            title={item.title || "無題の会話"}
+            description={
+              item.last_activity
+                ? `${item.character_name || "キャラクター未設定"} ・ ${formatRelativeTime(
+                    item.last_activity,
+                  )}`
+                : item.character_name || "キャラクター未設定"
+            }
+            titleNumberOfLines={1}
+            descriptionNumberOfLines={1}
+            titleStyle={styles.listTitle}
+            descriptionStyle={styles.listDescription}
+            left={(props) => (
+              item.development_status === "working" && item.message_count > 0 ? (
+                <View style={styles.sessionIconSlot}>
+                  <ActivityIndicator
+                    accessibilityLabel="エージェントが作業中"
+                    size={18}
+                    color="#89b4fa"
+                  />
                 </View>
-              )}
-              onPress={() => {
-                void conversationsRepo.markSessionRead?.(item.id);
-                close();
-                const href = `/(tabs)/chat/${item.id}` as const;
-                if (replaceCurrentChat) {
-                  router.replace(href);
-                } else {
-                  router.push(href);
-                }
-              }}
-              style={styles.listItem}
-            />
-          )}
-        />
-      )}
+              ) : (
+                <List.Icon {...props} icon="message-outline" color="#7c3aed" />
+              )
+            )}
+            right={() => (
+              <View style={styles.sessionMeta}>
+                {item.is_unread && item.development_status !== "working" ? (
+                  <View accessibilityLabel="未読" style={styles.unreadDot} />
+                ) : null}
+                <Text style={styles.itemCount}>{item.message_count}</Text>
+              </View>
+            )}
+            onPress={() => {
+              void conversationsRepo.markSessionRead?.(item.id);
+              close();
+              const href = `/(tabs)/chat/${item.id}` as const;
+              if (replaceCurrentChat) {
+                router.replace(href);
+              } else {
+                router.push(href);
+              }
+            }}
+            style={styles.listItem}
+          />
+        )}
+      />
     </View>
   );
 }
 
-function TaskSidebar({ close }: { close: () => void }) {
+function TaskSidebar({
+  close,
+  header,
+}: {
+  close: () => void;
+  header: React.ReactElement;
+}) {
   const router = useRouter();
   const { projects, selectedProjectId, selectedSpaceId } = useProject();
   const { isAuthenticated, isAnonymous, user } = useAuth();
@@ -416,45 +331,51 @@ function TaskSidebar({ close }: { close: () => void }) {
   );
 
   return (
-    <View style={styles.panel}>
-      <View style={styles.groupHeader}>
-        <Text style={styles.groupLabel}>タスク ({visibleTasks.length})</Text>
-        <IconButton
-          icon="refresh"
-          size={18}
-          iconColor={TEXT}
-          style={styles.smallIconButton}
-          onPress={loadTasks}
-        />
-      </View>
-      {loading && visibleTasks.length === 0 ? (
-        <ActivityIndicator color="#7c3aed" style={styles.loading} />
-      ) : (
-        <FlatList
-          data={visibleTasks}
-          keyExtractor={(item) => item.id}
-          ItemSeparatorComponent={() => <Divider style={styles.divider} />}
-          ListEmptyComponent={
+    <View style={styles.sidebarContainer}>
+      <FlatList
+        style={styles.sidebarList}
+        data={visibleTasks}
+        keyExtractor={(item) => item.id}
+        ItemSeparatorComponent={() => <Divider style={styles.divider} />}
+        ListHeaderComponent={
+          <View>
+            {header}
+            <View style={styles.groupHeader}>
+              <Text style={styles.groupLabel}>タスク ({visibleTasks.length})</Text>
+              <IconButton
+                icon="refresh"
+                size={18}
+                iconColor={TEXT}
+                style={styles.smallIconButton}
+                onPress={loadTasks}
+              />
+            </View>
+          </View>
+        }
+        ListEmptyComponent={
+          loading && visibleTasks.length === 0 ? (
+            <ActivityIndicator color="#7c3aed" style={styles.loading} />
+          ) : (
             <Text style={styles.emptyText}>未完了タスクはありません</Text>
-          }
-          renderItem={({ item }) => (
-            <List.Item
-              title={item.title}
-              description={projectMap.get(item.project_id) || item.project_name || "不明"}
-              titleNumberOfLines={2}
-              descriptionNumberOfLines={1}
-              titleStyle={styles.listTitle}
-              descriptionStyle={styles.listDescription}
-              left={() => <View style={[styles.statusDot, statusDotStyle(item.status)]} />}
-              onPress={() => {
-                close();
-                router.push(`/(tabs)/tasks/${item.id}`);
-              }}
-              style={styles.listItem}
-            />
-          )}
-        />
-      )}
+          )
+        }
+        renderItem={({ item }) => (
+          <List.Item
+            title={item.title}
+            description={projectMap.get(item.project_id) || item.project_name || "不明"}
+            titleNumberOfLines={2}
+            descriptionNumberOfLines={1}
+            titleStyle={styles.listTitle}
+            descriptionStyle={styles.listDescription}
+            left={() => <View style={[styles.statusDot, statusDotStyle(item.status)]} />}
+            onPress={() => {
+              close();
+              router.push(`/(tabs)/tasks/${item.id}`);
+            }}
+            style={styles.listItem}
+          />
+        )}
+      />
     </View>
   );
 }
@@ -465,7 +386,13 @@ function statusDotStyle(status: string) {
   return { borderColor: "#89b4fa" };
 }
 
-function FilesSidebar({ close }: { close: () => void }) {
+function FilesSidebar({
+  close,
+  header,
+}: {
+  close: () => void;
+  header: React.ReactElement;
+}) {
   const router = useRouter();
   const { isAuthenticated, user } = useAuth();
   const { selectedProjectId, selectedProject } = useProject();
@@ -524,78 +451,84 @@ function FilesSidebar({ close }: { close: () => void }) {
   }, [isAuthenticated, loadFiles, source]);
 
   return (
-    <View style={styles.panel}>
-      <View style={styles.groupHeader}>
-        <Text style={styles.groupLabel}>ファイル</Text>
-        <IconButton
-          icon="open-in-new"
-          size={18}
-          iconColor={TEXT}
-          style={styles.smallIconButton}
-          onPress={() => {
-            close();
-            router.push("/(tabs)/filer");
-          }}
-        />
-      </View>
-      <SegmentedButtons
-        value={source}
-        onValueChange={(value) => setSource(value as FilesSource)}
-        style={styles.segment}
-        density="small"
-        buttons={[
-          { value: "local", label: "ローカル", icon: "cellphone" },
-          {
-            value: "server",
-            label: "サーバー",
-            icon: "server",
-            disabled: !isAuthenticated,
-          },
-        ]}
-      />
-      {source === "server" ? (
-        <Text style={styles.filesProjectLabel} numberOfLines={1}>
-          プロジェクト: {projectLabel}
-        </Text>
-      ) : null}
-      {loading ? (
-        <ActivityIndicator color="#7c3aed" style={styles.loading} />
-      ) : (
-        <FlatList
-          data={items}
-          keyExtractor={(item) => `${item.source}:${item.path}`}
-          ItemSeparatorComponent={() => <Divider style={styles.divider} />}
-          ListEmptyComponent={
+    <View style={styles.sidebarContainer}>
+      <FlatList
+        style={styles.sidebarList}
+        data={loading ? [] : items}
+        keyExtractor={(item) => `${item.source}:${item.path}`}
+        ItemSeparatorComponent={() => <Divider style={styles.divider} />}
+        ListHeaderComponent={
+          <View>
+            {header}
+            <View style={styles.groupHeader}>
+              <Text style={styles.groupLabel}>ファイル</Text>
+              <IconButton
+                icon="open-in-new"
+                size={18}
+                iconColor={TEXT}
+                style={styles.smallIconButton}
+                onPress={() => {
+                  close();
+                  router.push("/(tabs)/filer");
+                }}
+              />
+            </View>
+            <SegmentedButtons
+              value={source}
+              onValueChange={(value) => setSource(value as FilesSource)}
+              style={styles.segment}
+              density="small"
+              buttons={[
+                { value: "local", label: "ローカル", icon: "cellphone" },
+                {
+                  value: "server",
+                  label: "サーバー",
+                  icon: "server",
+                  disabled: !isAuthenticated,
+                },
+              ]}
+            />
+            {source === "server" ? (
+              <Text style={styles.filesProjectLabel} numberOfLines={1}>
+                プロジェクト: {projectLabel}
+              </Text>
+            ) : null}
+          </View>
+        }
+        ListEmptyComponent={
+          loading ? (
+            <ActivityIndicator color="#7c3aed" style={styles.loading} />
+          ) : (
             <Text style={styles.emptyText}>
               {needsProjectSelection
                 ? "プロジェクトを選択してください"
                 : "ファイルはありません"}
             </Text>
-          }
-          renderItem={({ item }) => (
-            <List.Item
-              title={item.name}
-              description={item.type === "directory" ? "フォルダ" : item.extension || "ファイル"}
-              titleNumberOfLines={1}
-              descriptionNumberOfLines={1}
-              titleStyle={styles.listTitle}
-              descriptionStyle={styles.listDescription}
-              left={(props) => (
-                <List.Icon
-                  {...props}
-                  icon={item.type === "directory" ? "folder-outline" : "file-outline"}
-                  color={item.type === "directory" ? "#f9e2af" : "#89b4fa"}
-                />
-              )}
-              onPress={() => {
-                close();
-                router.push("/(tabs)/filer");
-              }}
-              style={styles.listItem}
-            />
-          )}
-        />
-      )}
+          )
+        }
+        renderItem={({ item }) => (
+          <List.Item
+            title={item.name}
+            description={item.type === "directory" ? "フォルダ" : item.extension || "ファイル"}
+            titleNumberOfLines={1}
+            descriptionNumberOfLines={1}
+            titleStyle={styles.listTitle}
+            descriptionStyle={styles.listDescription}
+            left={(props) => (
+              <List.Icon
+                {...props}
+                icon={item.type === "directory" ? "folder-outline" : "file-outline"}
+                color={item.type === "directory" ? "#f9e2af" : "#89b4fa"}
+              />
+            )}
+            onPress={() => {
+              close();
+              router.push("/(tabs)/filer");
+            }}
+            style={styles.listItem}
+          />
+        )}
+      />
     </View>
   );
 }
@@ -611,8 +544,10 @@ function AppSidebarContent({ close }: { close: () => void }) {
     router.push(href);
   };
 
-  return (
-    <View style={styles.drawerContent}>
+  // Keep navigation and tab controls in the active list's scroll content so
+  // they cannot consume the entire viewport before the first list row.
+  const header = (
+    <View>
       <View style={styles.header}>
         <View>
           <Text style={styles.appName}>AoiTalk</Text>
@@ -706,12 +641,20 @@ function AppSidebarContent({ close }: { close: () => void }) {
           { value: "files", label: "ファイル", icon: "folder-outline" },
         ]}
       />
+    </View>
+  );
 
+  return (
+    <View style={styles.drawerContent}>
       {tab === "chat" && (
-        <ChatSidebar close={close} replaceCurrentChat={isChatDetail} />
+        <ChatSidebar
+          close={close}
+          replaceCurrentChat={isChatDetail}
+          header={header}
+        />
       )}
-      {tab === "tasks" && <TaskSidebar close={close} />}
-      {tab === "files" && <FilesSidebar close={close} />}
+      {tab === "tasks" && <TaskSidebar close={close} header={header} />}
+      {tab === "files" && <FilesSidebar close={close} header={header} />}
     </View>
   );
 }
@@ -730,6 +673,7 @@ export function AppSidebar({
   const [open, setOpen] = useState(initialOpen);
   const reduceMotion = useReducedMotion();
   const translateX = useRef(new Animated.Value(-drawerWidth)).current;
+  const edgeGestureEnabled = Platform.OS !== "android";
 
   useEffect(() => {
     Animated.timing(translateX, {
@@ -741,6 +685,10 @@ export function AppSidebar({
 
   const close = useCallback(() => setOpen(false), []);
   const openSidebar = useCallback(() => setOpen(true), []);
+  const sidebarController = useMemo(
+    () => ({ openSidebar }),
+    [openSidebar],
+  );
 
   const edgePanResponder = useMemo(
     () =>
@@ -780,33 +728,37 @@ export function AppSidebar({
   }
 
   return (
-    <View style={styles.root}>
-      {children}
-      <View
-        testID="app-sidebar-edge-gesture"
-        style={styles.edgeGesture}
-        {...edgePanResponder.panHandlers}
-      />
-      {open && <Pressable style={styles.scrim} onPress={close} />}
-      <Animated.View
-        testID="app-sidebar-drawer"
-        pointerEvents={open ? "auto" : "none"}
-        style={[
-          styles.drawer,
-          {
-            width: drawerWidth,
-            paddingTop: insets.top,
-            paddingBottom: Math.max(insets.bottom, 12),
-            transform: [{ translateX }],
-          },
-        ]}
-        {...drawerPanResponder.panHandlers}
-      >
-        <Surface style={styles.drawerSurface} elevation={4}>
-          {open ? <AppSidebarContent close={close} /> : null}
-        </Surface>
-      </Animated.View>
-    </View>
+    <AppSidebarContext.Provider value={sidebarController}>
+      <View style={styles.root}>
+        {children}
+        {edgeGestureEnabled ? (
+          <View
+            testID="app-sidebar-edge-gesture"
+            style={styles.edgeGesture}
+            {...edgePanResponder.panHandlers}
+          />
+        ) : null}
+        {open && <Pressable style={styles.scrim} onPress={close} />}
+        <Animated.View
+          testID="app-sidebar-drawer"
+          pointerEvents={open ? "auto" : "none"}
+          style={[
+            styles.drawer,
+            {
+              width: drawerWidth,
+              paddingTop: insets.top,
+              paddingBottom: Math.max(insets.bottom, 12),
+              transform: [{ translateX }],
+            },
+          ]}
+          {...drawerPanResponder.panHandlers}
+        >
+          <Surface style={styles.drawerSurface} elevation={4}>
+            {open ? <AppSidebarContent close={close} /> : null}
+          </Surface>
+        </Animated.View>
+      </View>
+    </AppSidebarContext.Provider>
   );
 }
 
@@ -866,13 +818,6 @@ const styles = StyleSheet.create({
     gap: 8,
     paddingBottom: 8,
   },
-  contextButton: {
-    borderColor: "#45475a",
-    borderRadius: 8,
-  },
-  contextButtonContent: {
-    justifyContent: "flex-start",
-  },
   section: {
     paddingVertical: 6,
     borderTopColor: "#313244",
@@ -907,13 +852,16 @@ const styles = StyleSheet.create({
   segment: {
     marginVertical: 8,
   },
-  panel: {
+  sidebarContainer: {
     flex: 1,
     minHeight: 0,
-    borderTopColor: "#313244",
-    borderTopWidth: StyleSheet.hairlineWidth,
+  },
+  sidebarList: {
+    flex: 1,
   },
   groupHeader: {
+    borderTopColor: "#313244",
+    borderTopWidth: StyleSheet.hairlineWidth,
     height: 42,
     flexDirection: "row",
     alignItems: "center",

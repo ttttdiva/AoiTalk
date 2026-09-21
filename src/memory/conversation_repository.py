@@ -13,8 +13,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import case, select, update, delete, desc, and_, or_, func
 from sqlalchemy.orm import selectinload
 
-from .models import ConversationSession, ConversationMessage, ConversationParticipant
+from .models import (
+    ConversationSession,
+    ConversationMessage,
+    ConversationParticipant,
+    Project,
+    ProjectMember,
+)
 from .database import get_database_manager
+from ..features import Features
+from ..services.project_permissions import has_effective_project_permission
+from ..services.agent_automation_events import record_chat_message_event
+
+
+class ConversationMessageIdempotencyConflict(ValueError):
+    """A retry reused a client id with different message identity/content."""
+
+
+class ConversationWriteAuthorizationError(PermissionError):
+    """The actor lost write access before the locked message insert."""
 
 
 def _monotonic_activity(value):
@@ -43,6 +60,89 @@ class ConversationRepository:
             return self._session
         db_manager = get_database_manager()
         return await db_manager.get_session()
+
+    async def _assert_locked_message_write_access(
+        self,
+        session: AsyncSession,
+        session_row: ConversationSession,
+        *,
+        actor_user_id: str,
+        actor_role: Optional[str] = None,
+    ) -> None:
+        """Re-check ACL after the conversation row lock is acquired.
+
+        The API route performs an early visibility/write check, but a role or
+        project-membership revocation can race that check.  Lock the relevant
+        project/membership/participant rows in the same transaction as the
+        message INSERT so a concurrent revoke cannot commit between the ACL
+        decision and persistence.
+        """
+
+        actor_text = str(actor_user_id or "").strip()
+        if not actor_text:
+            raise ConversationWriteAuthorizationError("conversation write denied")
+
+        if session_row.project_id:
+            try:
+                actor_uuid = uuid.UUID(actor_text)
+            except (TypeError, ValueError, AttributeError) as exc:
+                raise ConversationWriteAuthorizationError(
+                    "conversation project write denied"
+                ) from exc
+            project_result = await session.execute(
+                select(Project.owner_id)
+                .where(
+                    Project.id == session_row.project_id,
+                    Project.deleted_at.is_(None),
+                )
+                .with_for_update()
+            )
+            project_row = project_result.one_or_none()
+            member_result = await session.execute(
+                select(ProjectMember.permissions)
+                .where(
+                    and_(
+                        ProjectMember.project_id == session_row.project_id,
+                        ProjectMember.user_id == actor_uuid,
+                    )
+                )
+                .with_for_update()
+            )
+            member_permissions = member_result.scalar_one_or_none()
+            if project_row is None or not has_effective_project_permission(
+                user_id=actor_uuid,
+                user_role=actor_role,
+                project_owner_id=project_row[0],
+                member_permissions=member_permissions,
+                permission="write",
+            ):
+                raise ConversationWriteAuthorizationError(
+                    "conversation project write denied"
+                )
+
+        # Owners and global admins can write an unbound conversation without a
+        # participant row, but project-bound sessions still passed the durable
+        # project existence/ACL check above.
+        if str(session_row.user_id or "") == actor_text or str(
+            actor_role or ""
+        ).strip().lower() == "admin":
+            return
+
+        participant_result = await session.execute(
+            select(ConversationParticipant.role)
+            .where(
+                and_(
+                    ConversationParticipant.session_id == session_row.id,
+                    ConversationParticipant.participant_type == "user",
+                    ConversationParticipant.participant_id == actor_text,
+                    ConversationParticipant.status == "joined",
+                )
+            )
+            .with_for_update()
+        )
+        participant_role = participant_result.scalar_one_or_none()
+        if participant_role not in {"owner", "admin", "member"}:
+            raise ConversationWriteAuthorizationError("conversation write denied")
     
     # ─── Session CRUD ───────────────────────────────────────────────────
     
@@ -217,28 +317,30 @@ class ConversationRepository:
                 metadata = copy.deepcopy(source_message.message_metadata or {})
                 metadata.pop("agent_run_id", None)
                 metadata.pop("context_snapshot", None)
+                metadata.pop("context_manifest", None)
                 metadata["fork_source_message_id"] = str(source_message.id)
-                session.add(
-                    ConversationMessage(
-                        id=new_id,
-                        session_id=forked.id,
-                        role=source_message.role,
-                        content=source_message.content,
-                        message_metadata=metadata,
-                        sender_type=source_message.sender_type,
-                        sender_id=source_message.sender_id,
-                        sender_display_name=source_message.sender_display_name,
-                        created_at=source_message.created_at,
-                        token_count=source_message.token_count,
-                        parent_message_id=(
-                            copied_ids.get(source_message.parent_message_id)
-                            if source_message.parent_message_id
-                            else None
-                        ),
-                        branch_index=0,
-                        is_active_branch=True,
-                    )
+                copied_message = ConversationMessage(
+                    id=new_id,
+                    session_id=forked.id,
+                    role=source_message.role,
+                    content=source_message.content,
+                    message_metadata=metadata,
+                    sender_type=source_message.sender_type,
+                    sender_id=source_message.sender_id,
+                    sender_display_name=source_message.sender_display_name,
+                    created_at=source_message.created_at,
+                    token_count=source_message.token_count,
+                    parent_message_id=(
+                        copied_ids.get(source_message.parent_message_id)
+                        if source_message.parent_message_id
+                        else None
+                    ),
+                    branch_index=0,
+                    is_active_branch=True,
                 )
+                session.add(copied_message)
+                if Features.virtual_company() and Features.autonomous_agent_runtime():
+                    await record_chat_message_event(session, copied_message, forked)
 
             await session.commit()
             await session.refresh(forked)
@@ -864,6 +966,8 @@ class ConversationRepository:
         sender_type: Optional[str] = None,
         sender_id: Optional[str] = None,
         sender_display_name: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+        actor_role: Optional[str] = None,
     ) -> ConversationMessage:
         """Add a message to a session
         
@@ -879,18 +983,88 @@ class ConversationRepository:
         """
         session = await self._get_session()
         try:
-            await self._ensure_linear_parent_links(session, session_id)
-            result = await session.execute(
-                select(ConversationSession.id).where(
+            session_uuid = uuid.UUID(session_id)
+            # Project-bound automatic memory validation locks Project before
+            # ConversationSession.  Discover the binding without a lock, then
+            # acquire the parent row before the durable session lock so a live
+            # chat write cannot form Session -> Project while the memory path
+            # holds Project -> Session.  The authoritative session row is
+            # re-read immediately afterwards; a concurrent Project deletion
+            # can therefore safely leave the surviving session unbound.
+            bound_project_id = await session.scalar(
+                select(ConversationSession.project_id).where(
                     and_(
-                        ConversationSession.id == uuid.UUID(session_id),
+                        ConversationSession.id == session_uuid,
                         ConversationSession.deleted_at.is_(None),
                     )
                 )
             )
-            session_row = result.first()
+            if bound_project_id is not None:
+                await session.execute(
+                    select(Project.id)
+                    .where(Project.id == bound_project_id)
+                    .with_for_update()
+                )
+
+            # Serialize all writers that participate in the durable
+            # client-message idempotency contract.  The BFF takes the same
+            # row lock, so a retry cannot race the counter update.
+            session_row = await session.scalar(
+                select(ConversationSession)
+                .where(
+                    and_(
+                        ConversationSession.id == session_uuid,
+                        ConversationSession.deleted_at.is_(None),
+                    )
+                )
+                .with_for_update()
+            )
             if session_row is None:
                 raise ValueError("Session not found or deleted")
+
+            if actor_user_id is not None:
+                await self._assert_locked_message_write_access(
+                    session,
+                    session_row,
+                    actor_user_id=str(actor_user_id),
+                    actor_role=actor_role,
+                )
+
+            message_metadata = dict(metadata or {})
+            raw_client_message_id = message_metadata.get("client_message_id")
+            client_message_id = (
+                str(raw_client_message_id).strip()
+                if raw_client_message_id not in (None, "")
+                else None
+            )
+            if client_message_id and len(client_message_id) > 512:
+                raise ValueError("client_message_id exceeds 512 characters")
+
+            if client_message_id:
+                existing = await session.scalar(
+                    select(ConversationMessage)
+                    .where(
+                        and_(
+                            ConversationMessage.session_id == session_uuid,
+                            ConversationMessage.client_message_id
+                            == client_message_id,
+                        )
+                    )
+                    .limit(1)
+                )
+                if existing is not None:
+                    if (
+                        existing.role != role
+                        or existing.content != content
+                        or existing.sender_id != sender_id
+                    ):
+                        raise ConversationMessageIdempotencyConflict(
+                            "client_message_id idempotency conflict"
+                        )
+                    setattr(existing, "_idempotency_replayed", True)
+                    return existing
+
+            await self._ensure_linear_parent_links(session, session_id)
 
             parent = await self._latest_active_message(session, session_id)
             parent_message_id = parent.id if parent else None
@@ -899,24 +1073,30 @@ class ConversationRepository:
             )
 
             message = ConversationMessage(
-                session_id=uuid.UUID(session_id),
+                session_id=session_uuid,
                 role=role,
                 content=content,
                 parent_message_id=parent_message_id,
                 branch_index=branch_index,
                 is_active_branch=True,
-                message_metadata=metadata or {},
+                message_metadata=message_metadata,
+                client_message_id=client_message_id,
                 sender_type=sender_type,
                 sender_id=sender_id,
                 sender_display_name=sender_display_name,
                 token_count=token_count
             )
             session.add(message)
+            if Features.virtual_company() and Features.autonomous_agent_runtime():
+                await record_chat_message_event(session, message, session_row)
             
             # Persist chat activity only for user/assistant turns. System or
             # maintenance rows must not move the sidebar history.
             update_values = {
-                "message_count": ConversationSession.message_count + 1,
+                # Legacy sessions may have a NULL counter.  Coalesce at the
+                # database boundary so the first successful write establishes
+                # the correct numeric count instead of preserving NULL.
+                "message_count": func.coalesce(ConversationSession.message_count, 0) + 1,
             }
             if role in {"user", "assistant"}:
                 update_values["last_activity"] = _monotonic_activity(
@@ -1129,14 +1309,14 @@ class ConversationRepository:
         session = await self._get_session()
         try:
             result = await session.execute(
-                select(ConversationSession.id).where(
+                select(ConversationSession).where(
                     and_(
                         ConversationSession.id == uuid.UUID(session_id),
                         ConversationSession.deleted_at.is_(None),
                     )
                 )
             )
-            session_row = result.first()
+            session_row = result.scalar_one_or_none()
             if session_row is None:
                 raise ValueError("Session not found or deleted")
 
@@ -1151,11 +1331,13 @@ class ConversationRepository:
                 token_count=token_count
             )
             session.add(message)
+            if Features.virtual_company() and Features.autonomous_agent_runtime():
+                await record_chat_message_event(session, message, session_row)
             
             # Persist chat activity only for user/assistant turns. System or
             # maintenance rows must not move the sidebar history.
             update_values = {
-                "message_count": ConversationSession.message_count + 1,
+                "message_count": func.coalesce(ConversationSession.message_count, 0) + 1,
             }
             if role in {"user", "assistant"}:
                 update_values["last_activity"] = _monotonic_activity(
@@ -1234,6 +1416,10 @@ class ConversationRepository:
             )
             
             # Create new message with same parent but new branch_index
+            metadata = copy.deepcopy(original_msg.message_metadata or {})
+            metadata.pop("agent_run_id", None)
+            metadata.pop("context_snapshot", None)
+            metadata.pop("context_manifest", None)
             new_message = ConversationMessage(
                 session_id=original_msg.session_id,
                 role=original_msg.role,
@@ -1241,15 +1427,18 @@ class ConversationRepository:
                 parent_message_id=original_msg.parent_message_id,
                 branch_index=sibling_count,  # New branch
                 is_active_branch=True,
-                message_metadata=original_msg.message_metadata or {},
+                message_metadata=metadata,
                 token_count=None  # Will be recalculated
             )
             session.add(new_message)
+            if Features.virtual_company() and Features.autonomous_agent_runtime():
+                conversation = await session.get(ConversationSession, original_msg.session_id)
+                await record_chat_message_event(session, new_message, conversation)
             await session.execute(
                 update(ConversationSession)
                 .where(ConversationSession.id == original_msg.session_id)
                 .values(
-                    message_count=ConversationSession.message_count + 1,
+                    message_count=func.coalesce(ConversationSession.message_count, 0) + 1,
                     last_activity=_monotonic_activity(datetime.utcnow()),
                 )
             )

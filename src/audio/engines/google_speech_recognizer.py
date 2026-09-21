@@ -2,11 +2,15 @@
 Google Cloud Speech-to-Text recognition implementation
 """
 import io
+import inspect
 import numpy as np
+from collections.abc import Mapping
 from typing import Optional, Generator, Tuple, Dict, Any
 
 from src.services.outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
+    PrivacyError,
     get_privacy_policy_context,
 )
 from src.services.turn_context import get_turn_context
@@ -66,8 +70,22 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
             session_context = inherited.session_context
         if not isinstance(project_metadata, dict):
             project_metadata = inherited.project_metadata
+        privacy_config = self.config
+        # SpeechRecognitionManager passes the engine-local settings mapping,
+        # which may not contain application-wide external_model_privacy.
+        # Resolve the DB-backed application config instead of silently
+        # selecting the gateway's historical direct-mode default.
+        if not isinstance(privacy_config, Mapping) or "external_model_privacy" not in privacy_config:
+            try:
+                from src.config import Config
+
+                privacy_config = Config()
+            except Exception as exc:
+                raise PrivacyError(
+                    "Google Speech privacy configuration is unavailable"
+                ) from exc
         return OutboundPrivacyGateway(
-            self.config,
+            privacy_config,
             user_id=str(
                 self.config.get("user_id")
                 or getattr(turn, "user_id", None)
@@ -94,7 +112,62 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
         payload = protected.payload
         if isinstance(payload, dict) and isinstance(payload.get("audio"), (bytes, bytearray)):
             return bytes(payload["audio"])
-        return bytes(audio_data or b"")
+        # Never fall back to the unreviewed microphone buffer when the
+        # protection result is malformed or omitted.  This helper remains for
+        # compatibility with callers/tests that only perform a preflight; all
+        # real SDK sends use ``_execute_sync`` below.
+        raise PrivacyError("Google Speech privacy protection returned no audio")
+
+    def _descriptor(self, *, action: str) -> EgressDescriptor:
+        """Describe one Google Cloud Speech transaction for audit/review."""
+
+        return EgressDescriptor(
+            action=action,
+            transport="google.cloud.speech",
+            destination="https://speech.googleapis.com",
+            provider="google_speech",
+            tool="speech_recognition.google",
+            model=self.model,
+        )
+
+    def _execute_sync(self, payload: Any, *, action: str, sender) -> Any:
+        """Run a complete SDK call behind the outbound privacy gateway.
+
+        The sender receives the approved payload and is the sole owner of the
+        Google SDK transport.  In particular, it never falls back to the raw
+        audio captured by the recognizer when review/redaction fails.
+        """
+
+        return self._privacy_gateway().execute_sync(
+            payload,
+            provider="google_speech",
+            descriptor=self._descriptor(action=action),
+            sender=sender,
+            base_url="https://speech.googleapis.com",
+            source_kind=action,
+            model=self.model,
+        )
+
+    @staticmethod
+    def _invoke_without_retry(method, *args: Any, **kwargs: Any) -> Any:
+        """Invoke a Google RPC with retries disabled when the API supports it.
+
+        Generated Google clients expose a ``retry`` keyword.  Small test or
+        deployment fakes often expose only ``(*args, **kwargs)`` or a narrow
+        signature; inspect first so compatibility does not require catching a
+        TypeError and replaying the request a second time.
+        """
+
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "retry" in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            kwargs.setdefault("retry", None)
+        return method(*args, **kwargs)
         
     def configure(self, config: Dict[str, Any]) -> None:
         """Configure the recognition engine
@@ -174,24 +247,49 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
         # Process accumulated requests
         if len(self.stream_requests) >= 5:  # Process every 5 chunks
             try:
-                # Gate the complete batch immediately before opening the
-                # Google streaming transport.  Protected/local_only policy
-                # therefore fails closed before ``streaming_recognize``.
                 batch_audio = b"".join(
                     bytes(getattr(item, "audio_content", b"") or b"")
                     for item in self.stream_requests
                 )
-                gated_audio = self._gate_audio(
-                    batch_audio,
-                    source_kind="google_speech_streaming",
+
+                def send_stream(protected_payload: Any):
+                    if not isinstance(protected_payload, Mapping):
+                        raise PrivacyError("Google Speech streaming payload is malformed")
+                    outbound_audio = protected_payload.get("audio")
+                    if not isinstance(outbound_audio, (bytes, bytearray)):
+                        raise PrivacyError("Google Speech streaming audio is unavailable")
+                    requests = iter(
+                        [
+                            speech.StreamingRecognizeRequest(
+                                streaming_config=protected_payload.get(
+                                    "streaming_config", self.streaming_config
+                                )
+                            )
+                        ]
+                        + [
+                            speech.StreamingRecognizeRequest(
+                                audio_content=bytes(outbound_audio)
+                            )
+                        ]
+                    )
+                    # Explicitly disable client-library retries.  A streaming
+                    # request is one audited transaction and must not be
+                    # replayed behind the gateway.
+                    return self._invoke_without_retry(
+                        self.client.streaming_recognize,
+                        requests,
+                    )
+
+                # The complete batch (config + audio) is the reviewed
+                # transaction.  No SDK request is opened before approval.
+                responses = self._execute_sync(
+                    {
+                        "streaming_config": self.streaming_config,
+                        "audio": batch_audio,
+                    },
+                    action="google_speech_streaming",
+                    sender=send_stream,
                 )
-                requests = iter(
-                    [speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)]
-                    + [speech.StreamingRecognizeRequest(audio_content=gated_audio)]
-                )
-                
-                # Get responses
-                responses = self.client.streaming_recognize(requests)
                 
                 for response in responses:
                     for result in response.results:
@@ -218,21 +316,44 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
             return None
             
         try:
-            # Process remaining requests only after the raw-media gate.
             batch_audio = b"".join(
                 bytes(getattr(item, "audio_content", b"") or b"")
                 for item in self.stream_requests
             )
-            gated_audio = self._gate_audio(
-                batch_audio,
-                source_kind="google_speech_streaming_final",
+
+            def send_stream(protected_payload: Any):
+                if not isinstance(protected_payload, Mapping):
+                    raise PrivacyError("Google Speech final payload is malformed")
+                outbound_audio = protected_payload.get("audio")
+                if not isinstance(outbound_audio, (bytes, bytearray)):
+                    raise PrivacyError("Google Speech final audio is unavailable")
+                requests = iter(
+                    [
+                        speech.StreamingRecognizeRequest(
+                            streaming_config=protected_payload.get(
+                                "streaming_config", self.streaming_config
+                            )
+                        )
+                    ]
+                    + [
+                        speech.StreamingRecognizeRequest(
+                            audio_content=bytes(outbound_audio)
+                        )
+                    ]
+                )
+                return self._invoke_without_retry(
+                    self.client.streaming_recognize,
+                    requests,
+                )
+
+            responses = self._execute_sync(
+                {
+                    "streaming_config": self.streaming_config,
+                    "audio": batch_audio,
+                },
+                action="google_speech_streaming_final",
+                sender=send_stream,
             )
-            requests = iter(
-                [speech.StreamingRecognizeRequest(streaming_config=self.streaming_config)]
-                + [speech.StreamingRecognizeRequest(audio_content=gated_audio)]
-            )
-            
-            responses = self.client.streaming_recognize(requests)
             
             final_text = ""
             for response in responses:
@@ -272,9 +393,6 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
             if sample_rate != self.sample_rate or channels != 1:
                 audio_data = self._convert_audio(audio_data, sample_rate, channels, sample_width)
             
-            # Create audio object
-            audio = speech.RecognitionAudio(content=audio_data)
-            
             # Configure recognition
             config = speech.RecognitionConfig(
                 encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
@@ -284,13 +402,26 @@ class GoogleSpeechRecognizer(SpeechRecognizerInterface):
                 model=self.model,
             )
             
-            # Perform recognition only after the raw-media gate.
-            gated_audio = self._gate_audio(
-                audio_data,
-                source_kind="google_speech_recognize",
+            def send_recognition(protected_payload: Any):
+                if not isinstance(protected_payload, Mapping):
+                    raise PrivacyError("Google Speech recognition payload is malformed")
+                outbound_audio = protected_payload.get("audio")
+                if not isinstance(outbound_audio, (bytes, bytearray)):
+                    raise PrivacyError("Google Speech recognition audio is unavailable")
+                audio = speech.RecognitionAudio(content=bytes(outbound_audio))
+                # Explicit retry=None prevents a failed request from silently
+                # replaying user audio outside this transaction boundary.
+                return self._invoke_without_retry(
+                    self.client.recognize,
+                    config=protected_payload.get("config", config),
+                    audio=audio,
+                )
+
+            response = self._execute_sync(
+                {"config": config, "audio": audio_data},
+                action="google_speech_recognize",
+                sender=send_recognition,
             )
-            audio = speech.RecognitionAudio(content=gated_audio)
-            response = self.client.recognize(config=config, audio=audio)
             
             # Extract result
             if response.results and response.results[0].alternatives:

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional, Sequence
 
 from ..memory.models import ConversationMessage
+from .privacy_masking_projection import is_privacy_masking_source
 
 logger = logging.getLogger(__name__)
 
@@ -65,7 +66,11 @@ def is_rejected_generated_title(title: str) -> bool:
 
 def _first_user_message(messages: Sequence[ConversationMessage]) -> Optional[str]:
     for message in messages:
-        if message.role == "user" and _compact_text(message.content):
+        if (
+            message.role == "user"
+            and not is_privacy_masking_source(message)
+            and _compact_text(message.content)
+        ):
             return message.content
     return None
 
@@ -131,6 +136,8 @@ def _has_title_context(messages: Sequence[ConversationMessage]) -> bool:
     for message in messages:
         if not _compact_text(message.content):
             continue
+        if is_privacy_masking_source(message):
+            continue
         if message.role == "user":
             user_count += 1
         elif message.role == "assistant":
@@ -144,6 +151,8 @@ def _prompt_messages(messages: Sequence[ConversationMessage]) -> list[Conversati
     assistant_count = 0
     for message in messages:
         if message.role not in {"user", "assistant"}:
+            continue
+        if is_privacy_masking_source(message):
             continue
         if not _compact_text(message.content):
             continue
@@ -219,6 +228,16 @@ async def ensure_conversation_title(
         messages = await repo.get_active_branch_messages(session_id)
     else:
         messages = await repo.get_session_messages(session_id)
+
+    # A masking turn must not trigger title generation from the raw source
+    # message.  Inspect only the newest user row; older masking operations in
+    # a session must not suppress a later ordinary turn's title update.
+    for latest in reversed(messages or []):
+        if getattr(latest, "role", None) != "user":
+            continue
+        if is_privacy_masking_source(latest):
+            return None
+        break
 
     current_title_raw = str(session.title or "")
     current_title = _compact_text(current_title_raw)

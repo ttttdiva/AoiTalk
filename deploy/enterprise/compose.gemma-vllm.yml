@@ -69,7 +69,7 @@ services:
           raise SystemExit(0 if '${AOITALK_GEMMA_SERVED_MODEL:-google/gemma-4-E4B-it}' in names else 1)"
     networks:
       - aoitalk-network
-    restart: unless-stopped
+    restart: ${AOITALK_RESTART_POLICY:-unless-stopped}
 
 secrets:
   openai_compatible_local_api_key:

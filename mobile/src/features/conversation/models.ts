@@ -208,6 +208,8 @@ export type TimelineItem =
 
 export type SendConversationCommand = {
   message: string;
+  submissionId?: string;
+  retryMessageId?: string;
   projectId?: string | null;
   appId?: string | null;
   appTargetId?: string | null;

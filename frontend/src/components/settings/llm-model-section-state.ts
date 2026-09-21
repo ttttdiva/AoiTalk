@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { useConfirm } from "@/hooks/use-confirm";
 import {
@@ -9,7 +9,7 @@ import {
   resolveEffectiveProviderId,
 } from "@/lib/llm-provider-visibility";
 import {
-  buildClassDraft, canonicalAgentTeamConfig, defaultModeForOptions, modelOptionSettings,
+  buildClassDraft, buildProjectAutomationDraft, canonicalAgentTeamConfig, defaultModeForOptions, modelOptionSettings,
   providerSelection, pyFetch, reasoningEffortOptionsForModel, MODEL_PAGE_SIZE,
   CONNECTION_SETTINGS_PROVIDERS, REASONING_EFFORT_PROVIDERS,
   type LlmEngineResponse, type LlmModelCatalogResponse,
@@ -18,10 +18,14 @@ import {
   type OllamaDeleteResponse, type OllamaPullTask, type ProviderDraft, type ProviderSettingsDraft,
   type SettingsPayload, type SpeechRecognitionSettings, type MageVLSettings,
   type ExternalModelPrivacySettings,
+  type CloudAdvisorSettings,
   type LlamaCppSettingsDraft,
+  type LlamaCppModelRootState,
   type LlamaCppRuntimeProfile,
+  type LocalRuntimeStatus, type LocalRuntimeTask,
   llamaCppDraftFromSettings, llamaCppPayloadFromDraft, llamaCppBaseUrlFromPayload,
-  llamaCppRuntimeProfileForModel,
+  llamaCppRuntimeProfileForModel, managedLocalRuntimeForSelection,
+  cloudAdvisorProviderOptions,
 } from "./llm-model-section-types";
 
 const UNSUPPORTED_CLIP_INGEST_PROVIDERS = new Set(["claude", "grok"]);
@@ -32,6 +36,7 @@ export type RoutingSaveScope =
   | "audio"
   | "video"
   | "clip_ingest"
+  | "project_automation"
   | "agent";
 
 function settingsReasoningEffortOptions(
@@ -83,6 +88,13 @@ export function useLlmModelSection() {
   const [refreshing, setRefreshing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [engineChangeError, setEngineChangeError] = useState<string | null>(null);
+  const [localRuntimeStatus, setLocalRuntimeStatus] = useState<LocalRuntimeStatus | null>(null);
+  const [localRuntimeTask, setLocalRuntimeTask] = useState<LocalRuntimeTask | null>(null);
+  const [localRuntimeLoading, setLocalRuntimeLoading] = useState(false);
+  const [localRuntimePreparing, setLocalRuntimePreparing] = useState(false);
+  const localRuntimePollSeqRef = useRef(0);
+  const localRuntimePrepareRef = useRef<number | null>(null);
+  const localRuntimeActivationRef = useRef<string | null>(null);
   const [pulling, setPulling] = useState(false);
   const [pullInput, setPullInput] = useState("gpt-oss:20b");
   const [task, setTask] = useState<OllamaPullTask | null>(null);
@@ -96,6 +108,10 @@ export function useLlmModelSection() {
     llamaCppDraftFromSettings(),
   );
   const [llamaCppError, setLlamaCppError] = useState<string | null>(null);
+  const [llamaCppModelRootState, setLlamaCppModelRootState] = useState<LlamaCppModelRootState | null>(null);
+  const [llamaCppModelRootLoading, setLlamaCppModelRootLoading] = useState(false);
+  const [llamaCppModelRootSaving, setLlamaCppModelRootSaving] = useState(false);
+  const [llamaCppModelRootError, setLlamaCppModelRootError] = useState<string | null>(null);
   const [delegationEnabled, setDelegationEnabled] = useState(false);
   const [orchestrationMode, setOrchestrationMode] = useState<"standard" | "director">("standard");
   const [chatgptWeb, setChatgptWeb] = useState({
@@ -108,10 +124,20 @@ export function useLlmModelSection() {
     local_provider: "openai_compatible_local", local_model: "", redaction_terms: [],
     trusted_local_hosts: [], raw_media_policy: "block", cache_enabled: true,
   });
+  const [cloudAdvisor, setCloudAdvisor] = useState<CloudAdvisorSettings>({
+    mode: "disabled",
+    provider: "openai",
+    model: "",
+    reasoning_effort: "high",
+  });
+  const [cloudAdvisorProviderIds, setCloudAdvisorProviderIds] = useState<string[]>([
+    "openai",
+    "deepinfra",
+  ]);
   const [imageMode, setImageMode] = useState<"auto" | "always" | "off">("auto");
   const [videoMode, setVideoMode] = useState<"auto" | "off">("auto");
   const [routingDetailsOpen, setRoutingDetailsOpen] = useState(false);
-  const [modelTab, setModelTab] = useState<"language" | "vision" | "audio" | "video" | "clip_ingest">("language");
+  const [modelTab, setModelTab] = useState<"language" | "vision" | "audio" | "video" | "clip_ingest" | "project_automation">("language");
   const [speechRecognition, setSpeechRecognition] = useState<SpeechRecognitionSettings>({});
   const [mageVl, setMageVl] = useState<MageVLSettings>({
     enabled: true,
@@ -133,6 +159,11 @@ export function useLlmModelSection() {
     video: { ...buildClassDraft(undefined, undefined), provider: "mage_vl", model: "microsoft/Mage-VL", inherit: false },
     clip_ingest: { ...buildClassDraft(undefined, undefined), inherit: true },
   });
+  const [projectAutomationDraft, setProjectAutomationDraft] = useState<ModelClassDraft>(
+    () => buildProjectAutomationDraft(undefined, undefined),
+  );
+  const [projectAutomationProviderIds, setProjectAutomationProviderIds] = useState<string[] | null>(null);
+  const [projectAutomationPersistedProvider, setProjectAutomationPersistedProvider] = useState("");
   const [savingRouting, setSavingRouting] = useState(false);
   const [agentTeamConfig, setAgentTeamConfig] = useState<AgentTeamConfig | null>(null);
 
@@ -154,6 +185,10 @@ export function useLlmModelSection() {
   const selectedModel = useMemo(
     () => selectedProvider?.models.find((item) => item.id === selectedModelId) ?? null,
     [selectedModelId, selectedProvider],
+  );
+  const selectedManagedRuntime = useMemo(
+    () => managedLocalRuntimeForSelection(selectedProvider, selectedModel, selectedModelId),
+    [selectedModel, selectedModelId, selectedProvider],
   );
   const selectedRuntimeProfile: LlamaCppRuntimeProfile | null = useMemo(
     () => {
@@ -194,6 +229,16 @@ export function useLlmModelSection() {
       ),
     [providerOptions],
   );
+  const projectAutomationProviders = useMemo(() => {
+    const allowed = projectAutomationProviderIds === null
+      ? null
+      : new Set(projectAutomationProviderIds);
+    return providerOptions.filter(
+      (item) =>
+        item.selection_kind !== "routing_profile" &&
+        (allowed === null || allowed.has(item.id)),
+    );
+  }, [projectAutomationProviderIds, providerOptions]);
   const speechEngine = speechRecognition.current_engine || "whisper";
   const speechModel = speechRecognition.engines?.[speechEngine]?.model || speechEngine;
   const audioSource = classDrafts.audio.engine === "speech_recognition"
@@ -340,16 +385,56 @@ export function useLlmModelSection() {
         selectedModelId,
         selectedRuntimeProfile,
       );
+      // The dedicated resolver is the source of truth for the editable
+      // override.  Do not hydrate an environment-derived effective path into
+      // the input, otherwise saving an unrelated runtime field would silently
+      // persist a machine-specific path.
+      if (llamaCppModelRootState) {
+        nextDraft.model_root = llamaCppModelRootState.model_root_override ?? "";
+      }
       setLlamaCppDraft(
         nextDraft,
       );
       setLlamaCppError(null);
     }
-  }, [provider, selectedModelId, selectedProvider, selectedRuntimeProfile]);
+  }, [llamaCppModelRootState, provider, selectedModelId, selectedProvider, selectedRuntimeProfile]);
+
+  useEffect(() => {
+    if (!expanded || provider !== "openai_compatible_local") return;
+    let active = true;
+    setLlamaCppModelRootLoading(true);
+    setLlamaCppModelRootError(null);
+    void pyFetch<LlamaCppModelRootState>("/llm/llama-cpp/model-root")
+      .then((state) => {
+        if (!active) return;
+        setLlamaCppModelRootState(state);
+        setLlamaCppDraft((current) => ({
+          ...current,
+          model_root: state.model_root_override ?? "",
+        }));
+      })
+      .catch((error) => {
+        if (!active) return;
+        setLlamaCppDraft((current) => ({
+          ...current,
+          model_root: "",
+        }));
+        const message = error instanceof Error
+          ? error.message
+          : "llama.cpp model rootを取得できませんでした";
+        setLlamaCppModelRootError(message);
+      })
+      .finally(() => {
+        if (active) setLlamaCppModelRootLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [expanded, provider]);
 
   useEffect(() => {
     if (provider === "openai_compatible_local" && selectedModel?.base_url) {
-      setBaseUrl(selectedModel.base_url);
+      setBaseUrl((current) => current || selectedModel.base_url || "");
     }
   }, [provider, selectedModel?.base_url]);
 
@@ -365,6 +450,49 @@ export function useLlmModelSection() {
     }
     setModel(selectedProvider.models[0]?.id ?? "");
   }, [current, model, provider, selectedProvider]);
+
+  useEffect(() => {
+    const sequence = ++localRuntimePollSeqRef.current;
+    localRuntimePrepareRef.current = null;
+    localRuntimeActivationRef.current = null;
+    setLocalRuntimeTask(null);
+    setLocalRuntimeStatus(null);
+    setLocalRuntimePreparing(false);
+
+    if (!selectedManagedRuntime || !selectedModelId.trim()) {
+      setLocalRuntimeStatus(null);
+      setLocalRuntimeLoading(false);
+      return;
+    }
+
+    setLocalRuntimeLoading(true);
+    const params = new URLSearchParams({ model: selectedModelId.trim() });
+    void pyFetch<LocalRuntimeStatus>(`/llm/local-runtime/status?${params.toString()}`)
+      .then((status) => {
+        if (localRuntimePollSeqRef.current !== sequence) return;
+        setLocalRuntimeStatus(status);
+      })
+      .catch((error) => {
+        if (localRuntimePollSeqRef.current !== sequence) return;
+        const message = error instanceof Error
+          ? error.message
+          : "ローカルruntimeの状態を取得できませんでした";
+        setLocalRuntimeStatus(null);
+        setEngineChangeError(message);
+        toast.error(message);
+      })
+      .finally(() => {
+        if (localRuntimePollSeqRef.current === sequence) {
+          setLocalRuntimeLoading(false);
+        }
+      });
+
+    return () => {
+      if (localRuntimePollSeqRef.current === sequence) {
+        localRuntimePollSeqRef.current += 1;
+      }
+    };
+  }, [selectedManagedRuntime, selectedModelId]);
 
   useEffect(() => {
     if (!task || task.done) return;
@@ -449,6 +577,7 @@ export function useLlmModelSection() {
                       llama_cpp: {
                         ...item.settings?.llama_cpp,
                         ...settings.llama_cpp,
+                        ...(data.llama_cpp ?? {}),
                         // The API persists the canonical readiness_timeout
                         // key while the catalog exposes both spellings.
                         ...(settings.llama_cpp.readiness_timeout !== undefined
@@ -486,6 +615,165 @@ export function useLlmModelSection() {
     }
   }, []);
 
+  useEffect(() => {
+    const targetModel = selectedModelId.trim();
+    const statusRuntime = String(localRuntimeStatus?.runtime ?? "").trim().toLowerCase();
+    const targetKey = selectedManagedRuntime && targetModel
+      ? `${selectedManagedRuntime}:${targetModel}`
+      : "";
+    const statusMatchesSelection = Boolean(
+      targetKey
+        && localRuntimeStatus?.prepared
+        && localRuntimeStatus.model.trim() === targetModel
+        && statusRuntime === selectedManagedRuntime,
+    );
+    if (!statusMatchesSelection) return;
+
+    if (
+      current?.provider === "openai_compatible_local"
+      && current.model === targetModel
+    ) {
+      localRuntimeActivationRef.current = null;
+      return;
+    }
+    if (
+      saving
+      || localRuntimePreparing
+      || localRuntimeActivationRef.current === targetKey
+    ) {
+      return;
+    }
+
+    localRuntimeActivationRef.current = targetKey;
+    const targetOption = selectedProvider?.models.find((item) => item.id === targetModel);
+    const effortOptions = settingsReasoningEffortOptions(selectedProvider, targetModel);
+    const selectedEffort = effortOptions.length
+      ? defaultModeForOptions(
+        effortOptions,
+        targetOption?.reasoning_effort_default
+          ?? selectedProvider?.settings?.reasoning_effort_default
+          ?? reasoningEffort,
+      )
+      : "";
+    void saveModelSelection("openai_compatible_local", targetModel, {
+      ...(modelOptionSettings(targetOption) ?? {}),
+      ...(selectedEffort ? { reasoning_effort: selectedEffort } : {}),
+    });
+  }, [
+    current,
+    localRuntimePreparing,
+    localRuntimeStatus,
+    reasoningEffort,
+    saveModelSelection,
+    saving,
+    selectedManagedRuntime,
+    selectedModelId,
+    selectedProvider,
+  ]);
+
+  const startLocalRuntimePrepare = useCallback(async () => {
+    const targetModel = selectedModelId.trim();
+    const runtime = selectedManagedRuntime;
+    if (
+      !targetModel
+      || !runtime
+      || saving
+      || localRuntimePrepareRef.current !== null
+    ) return;
+
+    if (
+      localRuntimeStatus?.prepared
+      && localRuntimeStatus.model.trim() === targetModel
+      && String(localRuntimeStatus.runtime ?? "").trim().toLowerCase() === runtime
+    ) {
+      localRuntimeActivationRef.current = null;
+      setLocalRuntimeStatus({ ...localRuntimeStatus });
+      return;
+    }
+
+    const sequence = ++localRuntimePollSeqRef.current;
+    localRuntimePrepareRef.current = sequence;
+    setLocalRuntimePreparing(true);
+    setLocalRuntimeLoading(false);
+    setEngineChangeError(null);
+
+    const statusPath = `/llm/local-runtime/status?${new URLSearchParams({
+      model: targetModel,
+    }).toString()}`;
+    const isCurrentSequence = () => localRuntimePollSeqRef.current === sequence;
+
+    try {
+      let status = localRuntimeStatus;
+      if (
+        !status
+        || status.model !== targetModel
+        || status.runtime !== runtime
+      ) {
+        status = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (!isCurrentSequence()) return;
+        setLocalRuntimeStatus(status);
+      }
+
+      if (!status.prepared) {
+        if (!(status.actions.prepare || status.actions.retry)) {
+          throw new Error(status.reason || "このモデルは自動準備できません");
+        }
+        let nextTask = await pyFetch<LocalRuntimeTask>("/llm/local-runtime/prepare", {
+          method: "POST",
+          body: JSON.stringify({ model: targetModel, runtime }),
+        });
+        if (!isCurrentSequence()) return;
+        setLocalRuntimeTask(nextTask);
+
+        while (!nextTask.done) {
+          if (!nextTask.task_id) {
+            throw new Error("ローカルruntime準備タスクIDを取得できませんでした");
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 1000));
+          if (!isCurrentSequence()) return;
+          nextTask = await pyFetch<LocalRuntimeTask>(
+            `/llm/local-runtime/tasks/${encodeURIComponent(nextTask.task_id)}`,
+          );
+          if (!isCurrentSequence()) return;
+          setLocalRuntimeTask(nextTask);
+        }
+
+        if (nextTask.error || nextTask.status === "failed") {
+          throw new Error(
+            nextTask.reason
+              || nextTask.error
+              || "ローカルruntimeの準備に失敗しました",
+          );
+        }
+
+        status = await pyFetch<LocalRuntimeStatus>(statusPath);
+        if (!isCurrentSequence()) return;
+        setLocalRuntimeStatus(status);
+      }
+
+      if (!status.prepared) {
+        throw new Error(status.reason || "ローカルruntimeの準備が完了していません");
+      }
+    } catch (error) {
+      if (!isCurrentSequence()) return;
+      const message = error instanceof Error
+        ? error.message
+        : "ローカルruntimeの準備に失敗しました";
+      setEngineChangeError(message);
+      toast.error(message);
+    } finally {
+      if (localRuntimePrepareRef.current === sequence) {
+        localRuntimePrepareRef.current = null;
+        setLocalRuntimePreparing(false);
+      }
+    }
+  }, [
+    localRuntimeStatus,
+    saving,
+    selectedManagedRuntime,
+    selectedModelId,
+  ]);
+
   const handleProviderChange = useCallback(
     (nextProvider: string) => {
       setProvider(nextProvider);
@@ -514,6 +802,10 @@ export function useLlmModelSection() {
       if (nextEffort) setReasoningEffort(nextEffort);
       setModel(selection.model);
       setCustomModel(selection.customModel);
+      if (managedLocalRuntimeForSelection(next, nextOption, nextModelId)) {
+        setEngineChangeError(null);
+        return;
+      }
       void saveModelSelection(nextProvider, nextModel, nextSettings);
     },
     [providerDrafts, providerOptions, saveModelSelection],
@@ -541,6 +833,10 @@ export function useLlmModelSection() {
       };
       if (nextSettings?.base_url) setBaseUrl(nextSettings.base_url);
       if (nextEffort) setReasoningEffort(nextEffort);
+      if (managedLocalRuntimeForSelection(selectedProvider, nextOption, nextModel)) {
+        setEngineChangeError(null);
+        return;
+      }
       void saveModelSelection(provider, nextModel, nextSettings);
     },
     [provider, reasoningEffort, saveModelSelection, selectedProvider],
@@ -560,8 +856,13 @@ export function useLlmModelSection() {
   const handleCustomModelConfirm = useCallback(() => {
     const nextModel = customModel.trim();
     if (!nextModel) return;
+    const nextOption = selectedProvider?.models.find((item) => item.id === nextModel);
+    if (managedLocalRuntimeForSelection(selectedProvider, nextOption, nextModel)) {
+      setEngineChangeError(null);
+      return;
+    }
     void saveModelSelection(provider, nextModel);
-  }, [customModel, provider, saveModelSelection]);
+  }, [customModel, provider, saveModelSelection, selectedProvider]);
 
   const handleProviderSettingsSave = useCallback(() => {
     void saveModelSelection(provider, selectedModelId, {
@@ -639,6 +940,32 @@ export function useLlmModelSection() {
     selectedRuntimeProfile,
   ]);
 
+  const saveLlamaCppModelRoot = useCallback(async (nextRoot?: string) => {
+    const modelRoot = (nextRoot ?? llamaCppDraft.model_root ?? "").trim();
+    setLlamaCppModelRootSaving(true);
+    setLlamaCppModelRootError(null);
+    try {
+      const state = await pyFetch<LlamaCppModelRootState>("/llm/llama-cpp/model-root", {
+        method: "PUT",
+        body: JSON.stringify({ model_root: modelRoot }),
+      });
+      setLlamaCppModelRootState(state);
+      setLlamaCppDraft((current) => ({
+        ...current,
+        model_root: state.model_root_override ?? "",
+      }));
+      toast.success(modelRoot ? "llama.cpp model rootを保存しました" : "llama.cpp model rootを既定値へ戻しました");
+    } catch (error) {
+      const message = error instanceof Error
+        ? error.message
+        : "llama.cpp model rootを保存できませんでした";
+      setLlamaCppModelRootError(message);
+      toast.error(message);
+    } finally {
+      setLlamaCppModelRootSaving(false);
+    }
+  }, [llamaCppDraft.model_root]);
+
   const startPull = useCallback(async () => {
     const nextModel = pullInput.trim();
     if (!nextModel) return;
@@ -681,6 +1008,16 @@ export function useLlmModelSection() {
           : undefined
       );
       const routing = data.settings?.model_routing;
+      const projectAutomationRoute = routing?.classes?.project_automation;
+      const projectAutomationProviderSchema =
+        data.schema?.["model_routing.classes.project_automation.provider"];
+      setProjectAutomationProviderIds(
+        Array.isArray(projectAutomationProviderSchema?.values)
+          ? projectAutomationProviderSchema.values
+            .map((item) => String(item || "").trim())
+            .filter(Boolean)
+          : null,
+      );
       setOrchestrationMode(team?.orchestration_mode ?? "standard");
       setChatgptWeb({
         profile_dir: data.settings?.chatgpt_web?.profile_dir ?? "",
@@ -690,6 +1027,30 @@ export function useLlmModelSection() {
       setDelegationEnabled(team?.delegation_enabled ?? false);
       if (team?.schema_version === 3) setAgentTeamConfig(canonicalAgentTeamConfig(team));
       setExternalPrivacy(data.settings?.external_model_privacy ?? {});
+      const loadedCloudAdvisor = data.settings?.cloud_advisor ?? {};
+      const loadedCloudAdvisorProviders = cloudAdvisorProviderOptions(
+        loadedCloudAdvisor,
+        data.schema?.["cloud_advisor.provider"],
+      );
+      const loadedCloudAdvisorProvider = String(loadedCloudAdvisor.provider ?? "")
+        .trim()
+        .toLowerCase();
+      const normalizedCloudAdvisorProvider = loadedCloudAdvisorProviders.some(
+        (item) => item.id === loadedCloudAdvisorProvider,
+      )
+        ? loadedCloudAdvisorProvider
+        : loadedCloudAdvisorProviders[0]?.id ?? "openai";
+      setCloudAdvisor((current) => ({
+        ...current,
+        ...loadedCloudAdvisor,
+        mode: loadedCloudAdvisor.mode ?? current.mode ?? "disabled",
+        provider: normalizedCloudAdvisorProvider,
+        model: loadedCloudAdvisor.model ?? current.model ?? "",
+        reasoning_effort: loadedCloudAdvisor.reasoning_effort
+          ?? current.reasoning_effort
+          ?? "high",
+      }));
+      setCloudAdvisorProviderIds(loadedCloudAdvisorProviders.map((item) => item.id));
       setImageMode(routing?.media?.image_mode ?? "auto");
       setVideoMode(routing?.media?.video_mode ?? "auto");
       const loadedMageVl = data.settings?.mage_vl ?? {};
@@ -718,6 +1079,15 @@ export function useLlmModelSection() {
           providerOptions,
         ),
       });
+      setProjectAutomationDraft(
+        buildProjectAutomationDraft(
+          projectAutomationRoute,
+          providerOptions,
+        ),
+      );
+      setProjectAutomationPersistedProvider(
+        projectAutomationRoute?.provider || "",
+      );
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Agent Team設定を取得できませんでした");
     }
@@ -771,6 +1141,30 @@ export function useLlmModelSection() {
     }
   }, [externalPrivacy]);
 
+  const saveCloudAdvisorSettings = useCallback(async () => {
+    setSavingRouting(true);
+    try {
+      const saveSetting = async (key: string, value: unknown) => {
+        await pyFetch("/settings", {
+          method: "PATCH",
+          body: JSON.stringify({ key, value }),
+        });
+      };
+      await saveSetting("cloud_advisor.mode", cloudAdvisor.mode ?? "disabled");
+      await saveSetting("cloud_advisor.provider", cloudAdvisor.provider ?? "openai");
+      await saveSetting("cloud_advisor.model", cloudAdvisor.model?.trim() ?? "");
+      await saveSetting(
+        "cloud_advisor.reasoning_effort",
+        cloudAdvisor.reasoning_effort ?? "high",
+      );
+      toast.success("Cloud Advisor設定を保存しました");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Cloud Advisor設定を保存できませんでした");
+    } finally {
+      setSavingRouting(false);
+    }
+  }, [cloudAdvisor]);
+
   const saveRoutingSettings = useCallback(async (scope: RoutingSaveScope = "all") => {
     setSavingRouting(true);
     try {
@@ -813,6 +1207,49 @@ export function useLlmModelSection() {
         }
       };
 
+      const saveProjectAutomationRoute = async () => {
+        const prefix = "model_routing.classes.project_automation";
+        const draft = projectAutomationDraft;
+        const inherit = draft.inherit ?? true;
+        const targetModel = (draft.customModel.trim() || draft.model).trim();
+        const providerChanged =
+          draft.provider !== projectAutomationPersistedProvider;
+
+        if (!inherit) {
+          if (providerChanged) {
+            // A provider switch must not leave a transient mixed route such as
+            // new-provider + old-model/base-url. Move execution to the inherited
+            // Base Model before changing any provider-owned dedicated fields.
+            await saveSetting(`${prefix}.mode`, "");
+            await saveSetting(`${prefix}.inherit`, true);
+
+            // A route-level credential belongs to the persisted provider.
+            // Clear it only after the old dedicated route is no longer active.
+            await saveSetting(`${prefix}.api_key`, "");
+          }
+
+          // While the current route is still inherited, dedicated fields can
+          // be populated without changing effective routing. Populate them
+          // first so flipping inherit=false never exposes a partial target.
+          await saveSetting(`${prefix}.provider`, draft.provider);
+          await saveSetting(`${prefix}.model`, targetModel);
+          await saveSetting(`${prefix}.base_url`, draft.baseUrl.trim());
+          await saveSetting(`${prefix}.reasoning_effort`, draft.mode.trim());
+          if (draft.apiKey.trim()) {
+            await saveSetting(`${prefix}.api_key`, draft.apiKey.trim());
+          }
+        }
+
+        // The backend accepts an empty mode and then derives inherit/dedicated
+        // from the boolean. Neutralize a previously explicit mode before
+        // changing inherit, avoiding an invalid intermediate mode/inherit pair.
+        await saveSetting(`${prefix}.mode`, "");
+        await saveSetting(`${prefix}.inherit`, inherit);
+        if (!inherit) {
+          setProjectAutomationPersistedProvider(draft.provider);
+        }
+      };
+
       if (scope === "all" || scope === "vision") {
         await saveSetting("model_routing.media.image_mode", imageMode);
         await saveClass("vision");
@@ -822,6 +1259,9 @@ export function useLlmModelSection() {
       }
       if (scope === "all" || scope === "clip_ingest") {
         await saveClass("clip_ingest");
+      }
+      if (scope === "all" || scope === "project_automation") {
+        await saveProjectAutomationRoute();
       }
 
       if (scope === "all" || scope === "video") {
@@ -875,21 +1315,35 @@ export function useLlmModelSection() {
     } finally {
       setSavingRouting(false);
     }
-  }, [chatgptWeb, classDrafts, imageMode, mageVl, videoMode]);
+  }, [
+    chatgptWeb,
+    classDrafts,
+    imageMode,
+    mageVl,
+    projectAutomationDraft,
+    projectAutomationPersistedProvider,
+    videoMode,
+  ]);
 
   return {
     expanded, setExpanded, catalog, setCatalog, provider, setProvider, model, setModel,
     customModel, setCustomModel, providerDrafts, setProviderDrafts, loading, setLoading,
     refreshing, setRefreshing, saving, setSaving, pulling, setPulling, pullInput, setPullInput,
     engineChangeError,
+    localRuntimeStatus, localRuntimeTask, localRuntimeLoading, localRuntimePreparing,
+    startLocalRuntimePrepare,
     task, setTask, deletingModel, setDeletingModel, modelSearch, setModelSearch, modelPage, setModelPage,
     baseUrl, setBaseUrl, apiKey, setApiKey, reasoningEffort, setReasoningEffort,
     llamaCppDraft, setLlamaCppDraft, llamaCppError,
+    llamaCppModelRootState, llamaCppModelRootLoading, llamaCppModelRootSaving,
+    llamaCppModelRootError, saveLlamaCppModelRoot,
     delegationEnabled, setDelegationEnabled, orchestrationMode, setOrchestrationMode,
     chatgptWeb, setChatgptWeb,
     externalPrivacy, setExternalPrivacy,
+    cloudAdvisor, setCloudAdvisor, cloudAdvisorProviderIds,
     imageMode, setImageMode, videoMode, setVideoMode, mageVl, setMageVl, routingDetailsOpen, setRoutingDetailsOpen, modelTab, setModelTab,
     speechRecognition, setSpeechRecognition, classDrafts, setClassDrafts,
+    projectAutomationDraft, setProjectAutomationDraft, projectAutomationProviders,
     agentTeamConfig, setAgentTeamConfig,
     savingRouting, setSavingRouting, selectedProvider, selectedModelId, selectedModel, current,
     providerOptions,
@@ -901,5 +1355,6 @@ export function useLlmModelSection() {
     showConnectionSettings, showReasoningEffort,
     loadAgentTeamSettings,
     deleteOllamaModel, saveRoutingSettings, saveExternalPrivacySettings,
+    saveCloudAdvisorSettings,
   };
 }

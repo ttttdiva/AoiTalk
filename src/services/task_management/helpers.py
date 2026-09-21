@@ -41,6 +41,7 @@ from ...memory.models import (
 from ...memory.project_repository import ProjectRepository
 from ...task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
 from ..project_color_service import extract_project_color
+from ..project_permissions import normalize_project_member_permissions
 from ..task_reference_service import attach_agent_run_source_reference
 from ._shared import (
     DEFAULT_MEMBER_PERMISSIONS,
@@ -53,7 +54,6 @@ from ._shared import (
     TaskManagementError,
     build_occurrence_schedule,
     build_time_report,
-    correct_likely_timer_started_at,
     normalize_priority,
     normalize_task_status,
     _ensure_reminder_offsets,
@@ -121,6 +121,167 @@ class HelperMixin:
         admin does not silently receive every project's operational data.
         """
         return await ProjectRepository.get_participating_project_ids(session, user_id)
+
+    @staticmethod
+    def _normalize_browse_uuid(value: Any, label: str) -> UUID | None:
+        """Normalize an explicit browse target without treating bad input as absent."""
+
+        if value is None:
+            return None
+        if isinstance(value, UUID):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                return UUID(value.strip())
+            except (TypeError, ValueError, AttributeError):
+                pass
+        raise TaskManagementError(f"Invalid {label}", status_code=400)
+
+    @staticmethod
+    def _is_reserved_inbox_project(project: Project) -> bool:
+        metadata = getattr(project, "project_metadata", None)
+        return bool(
+            getattr(project, "slug", None)
+            == f"inbox-project-{getattr(project, 'owner_id', None)}"
+            or (
+                isinstance(metadata, dict)
+                and metadata.get("isInboxDefault") is True
+            )
+        )
+
+    @staticmethod
+    def _is_reserved_inbox_space(space: Space) -> bool:
+        return getattr(space, "slug", None) == f"inbox-{getattr(space, 'owner_id', None)}"
+
+    async def resolve_browse_project_ids(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        browse_project_id: UUID | str | None = None,
+        browse_space_id: UUID | str | None = None,
+    ) -> list[UUID]:
+        """Resolve one explicit, read-only browse target to exact project IDs.
+
+        The resolver intentionally uses the accessible/read ACL (including the
+        existing global-admin elevation) rather than participation.  It never
+        repairs memberships or broadens a target beyond the requested Project or
+        Space.  Ineligible targets are normalized to 404 to avoid an ACL oracle.
+        """
+
+        project_target = self._normalize_browse_uuid(
+            browse_project_id, "browse_project_id"
+        )
+        space_target = self._normalize_browse_uuid(
+            browse_space_id, "browse_space_id"
+        )
+        if project_target is not None and space_target is not None:
+            raise TaskManagementError(
+                "browse_project_id and browse_space_id are mutually exclusive",
+                status_code=400,
+            )
+        if project_target is None and space_target is None:
+            raise TaskManagementError(
+                "An explicit browse target is required", status_code=400
+            )
+
+        if project_target is not None:
+            project = await ProjectRepository.get_by_id(session, project_target)
+            if project is None or (
+                self._is_reserved_inbox_project(project)
+                and str(getattr(project, "owner_id", "")) != str(user_id)
+            ):
+                raise TaskManagementError("Browse target not found", status_code=404)
+            if not await ProjectRepository.has_permission(
+                session,
+                project_id=project_target,
+                user_id=user_id,
+                permission="read",
+            ):
+                raise TaskManagementError("Browse target not found", status_code=404)
+            return [project_target]
+
+        space_result = await session.execute(
+            select(Space).where(Space.id == space_target)
+        )
+        space = space_result.scalar_one_or_none()
+        if space is None or (
+            self._is_reserved_inbox_space(space)
+            and str(getattr(space, "owner_id", "")) != str(user_id)
+        ):
+            raise TaskManagementError("Browse target not found", status_code=404)
+
+        accessible_ids = await self._get_accessible_project_ids(session, user_id)
+        project_result = await session.execute(
+            select(Project)
+            .where(
+                Project.id.in_(accessible_ids or [UUID(int=0)]),
+                Project.space_id == space_target,
+                Project.deleted_at.is_(None),
+            )
+            .order_by(Project.id.asc())
+        )
+        projects = [
+            project
+            for project in project_result.scalars().all()
+            if not (
+                self._is_reserved_inbox_project(project)
+                and str(getattr(project, "owner_id", "")) != str(user_id)
+            )
+        ]
+        if (
+            not projects
+            and str(getattr(space, "owner_id", "")) != str(user_id)
+        ):
+            user_result = await session.execute(
+                select(User.role).where(User.id == user_id)
+            )
+            user_role = user_result.scalar_one_or_none()
+            if str(user_role or "").lower() != "admin":
+                raise TaskManagementError("Browse target not found", status_code=404)
+        return [project.id for project in projects]
+
+    async def resolve_read_project_ids(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        project_id: UUID | None = None,
+        space_id: UUID | None = None,
+        browse_project_id: UUID | str | None = None,
+        browse_space_id: UUID | str | None = None,
+    ) -> list[UUID]:
+        """Resolve the legacy participating scope or an explicit browse scope."""
+
+        has_browse = browse_project_id is not None or browse_space_id is not None
+        if has_browse:
+            if project_id is not None or space_id is not None:
+                raise TaskManagementError(
+                    "browse scope cannot be combined with project_id or space_id",
+                    status_code=400,
+                )
+            return await self.resolve_browse_project_ids(
+                session,
+                user_id=user_id,
+                browse_project_id=browse_project_id,
+                browse_space_id=browse_space_id,
+            )
+
+        participating_project_ids = await self._get_participating_project_ids(
+            session, user_id
+        )
+        if project_id is not None:
+            await self.require_project_permission(
+                session, project_id=project_id, user_id=user_id, permission="read"
+            )
+            return [project_id] if project_id in participating_project_ids else []
+        if space_id is not None:
+            return await self._filter_project_ids_by_space(
+                session,
+                project_ids=participating_project_ids,
+                space_id=space_id,
+            )
+        return participating_project_ids
 
     async def _filter_project_ids_by_space(
         self,
@@ -203,13 +364,14 @@ class HelperMixin:
         result = await session.execute(
             select(Task)
             .options(
-                selectinload(Task.project),
+                selectinload(Task.project).selectinload(Project.space),
                 selectinload(Task.assignees).selectinload(TaskAssignee.user),
                 selectinload(Task.comments).selectinload(TaskComment.user),
                 selectinload(Task.activities).selectinload(TaskActivity.user),
                 selectinload(Task.recurrence_rule),
                 selectinload(Task.occurrences),
                 selectinload(Task.time_entries).selectinload(TimeEntry.user),
+                selectinload(Task.time_entries).selectinload(TimeEntry.occurrence),
                 selectinload(Task.task_tags).selectinload(TaskTag.tag),
             )
             .where(Task.id == task_id, Task.deleted_at.is_(None))
@@ -459,9 +621,10 @@ class HelperMixin:
         assigned_by: UUID,
         assign_requester_when_empty: bool = False,
     ) -> None:
-        await session.execute(
-            delete(TaskAssignee).where(TaskAssignee.task_id == task.id)
-        )
+        # Validate the complete replacement set before deleting any existing
+        # rows.  An assignee is a durable notification recipient, so accepting
+        # an arbitrary UUID (or a user whose Project membership was revoked)
+        # would turn task assignment into a cross-project data leak.
         unique_ids = []
         seen: set[UUID] = set()
         for assignee_id in assignee_ids:
@@ -472,6 +635,49 @@ class HelperMixin:
 
         if not unique_ids and assign_requester_when_empty:
             unique_ids = [assigned_by]
+
+        # ``task.project_id`` is non-null on persisted Task rows.  Tiny
+        # dependency-free test doubles historically omitted it; keep those
+        # calls side-effect-only while production rows always take the strict
+        # validation path below.
+        task_project_id = getattr(task, "project_id", None)
+        if task_project_id is not None and unique_ids:
+            project = await session.get(Project, task_project_id)
+            if project is None or getattr(project, "deleted_at", None) is not None:
+                raise TaskManagementError("Project not found", status_code=404)
+            for assignee_id in unique_ids:
+                try:
+                    assignee_uuid = UUID(str(assignee_id))
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise TaskManagementError(
+                        "Assignee is not an active Project member", status_code=403
+                    ) from exc
+                user = await session.get(User, assignee_uuid)
+                if user is None or not bool(getattr(user, "is_active", False)):
+                    # Use one uniform denial to avoid turning assignment into
+                    # a user-existence oracle for outsiders/inactive accounts.
+                    raise TaskManagementError(
+                        "Assignee is not an active Project member", status_code=403
+                    )
+                owner_id = getattr(project, "owner_id", None)
+                if owner_id is not None and str(owner_id) == str(assignee_uuid):
+                    continue
+                member = await ProjectRepository.get_member(
+                    session,
+                    task_project_id,
+                    assignee_uuid,
+                )
+                permissions = normalize_project_member_permissions(
+                    getattr(member, "permissions", None) if member is not None else None
+                )
+                if member is None or permissions.get("read") is not True:
+                    raise TaskManagementError(
+                        "Assignee is not an active Project member", status_code=403
+                    )
+
+        await session.execute(
+            delete(TaskAssignee).where(TaskAssignee.task_id == task.id)
+        )
 
         for index, assignee_id in enumerate(unique_ids):
             session.add(
@@ -590,13 +796,18 @@ class HelperMixin:
         activity_type: str,
         user_id: Optional[UUID],
         payload: Optional[dict[str, Any]] = None,
-    ) -> None:
-        session.add(
-            TaskActivity(
-                task_id=task_id,
-                user_id=user_id,
-                activity_type=activity_type,
-                payload=payload or {},
-            )
+        created_at: datetime | None = None,
+    ) -> TaskActivity:
+        activity = TaskActivity(
+            # Assign the identity before flush so the completion candidate can
+            # use the same UUID as its episode fence in this transaction.
+            id=uuid4(),
+            task_id=task_id,
+            user_id=user_id,
+            activity_type=activity_type,
+            payload=payload or {},
+            created_at=created_at or datetime.utcnow(),
         )
+        session.add(activity)
+        return activity
 

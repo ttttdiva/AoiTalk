@@ -1343,6 +1343,33 @@ test.describe("Docs block editor", () => {
     await expect(page.locator('[data-docs-block-id]', { hasText: "空ページから直接入力" })).toBeVisible();
   });
 
+  test("persists a non-empty first-node draft across reload without Enter", async ({ page }) => {
+    const state = createState();
+    state.nodes = state.nodes.filter((node) => node.parent_id === null);
+    state.node_supertags = [];
+    state.field_values = [];
+    await openDocs(page, state);
+
+    const input = page.getByRole("textbox", { name: "最初のノード" });
+    await expect(input).toBeFocused();
+    await input.fill("reload without Enter");
+
+    // Reproduce the Luna failure exactly: the text is visibly present, but
+    // the user does not press Enter before reloading.
+    await page.reload();
+
+    await expect.poll(() =>
+      state.nodes.some(
+        (node) =>
+          node.parent_id === "node-a"
+          && node.title === "reload without Enter",
+      ),
+    ).toBe(true);
+    await expect(
+      page.locator('[data-docs-block-id]', { hasText: "reload without Enter" }),
+    ).toBeVisible();
+  });
+
   test("renders document blocks without forced bullets", async ({ page }, testInfo) => {
     const state = createState();
     await openDocs(page, state);

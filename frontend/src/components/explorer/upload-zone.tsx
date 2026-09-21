@@ -13,9 +13,10 @@ import { uploadFailureToastOptions } from "@/lib/upload-failure";
 interface UploadZoneProps {
   children: React.ReactNode;
   onContextMenu?: (e: React.MouseEvent) => void;
+  disabled?: boolean;
 }
 
-export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
+export function UploadZone({ children, onContextMenu, disabled = false }: UploadZoneProps) {
   const { currentPath, refresh, isHfMode, isHydrusMode, capabilities } =
     useExplorer();
   const [isDragging, setIsDragging] = useState(false);
@@ -23,6 +24,7 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
   const dragCounterRef = useRef(0);
   const hfPath = isHfMode ? parseHfPath(currentPath) : null;
   const uploadEnabled =
+    !disabled &&
     !isHydrusMode &&
     (isHfMode
       ? Boolean(hfPath?.kind === "repo" && hfPath.accountId)
@@ -67,6 +69,7 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
       e.stopPropagation();
       dragCounterRef.current = 0;
       setIsDragging(false);
+      if (disabled) return;
 
       const files = await getDroppedExplorerFiles(e.dataTransfer);
       if (!files || files.length === 0) return;
@@ -123,12 +126,12 @@ export function UploadZone({ children, onContextMenu }: UploadZoneProps) {
         setUploading(false);
       }
     },
-    [currentPath, isHfMode, isHydrusMode, refresh, uploadEnabled],
+    [currentPath, disabled, isHfMode, isHydrusMode, refresh, uploadEnabled],
   );
 
   return (
     <div
-      className="relative flex-1"
+      className="relative min-h-0 flex-1 overflow-hidden"
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}

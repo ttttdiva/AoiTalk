@@ -9,20 +9,29 @@ from abc import ABC, abstractmethod
 from typing import Any, Optional
 
 from ..llm.native_runtime import AgentDefinition as Agent, run_native_agent_once
+from ..llm.deployment_resolver import is_retired_model
 from ..tools.core import ToolDefinition, ToolParam
 
 
 class BaseAgent(ABC):
     """Abstract base class for all specialized agents."""
 
-    def __init__(self, model: str = "gpt-4o-mini"):
+    def __init__(self, model: str = "gpt-5.6-luna"):
         """
         Initialize the base agent.
 
         Args:
             model: The model to use for the agent
         """
-        self.model = model
+        normalized_model = str(model or "").strip()
+        # Character/legacy callers may still pass the retired mini model
+        # explicitly.  Specialist AgentDefinitions are runtime-bearing, so
+        # replace that value before an Agent can ever reach the SDK.
+        self.model = (
+            "gpt-5.6-luna"
+            if not normalized_model or is_retired_model(normalized_model)
+            else normalized_model
+        )
         self._agent: Optional[Agent] = None
 
     @abstractmethod

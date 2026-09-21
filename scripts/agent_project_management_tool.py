@@ -23,15 +23,8 @@ if sys.platform == "win32":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-def find_repo_root(start: Path) -> Path:
-    current = start.resolve()
-    for path in (current, *current.parents):
-        if (path / "CLAUDE.md").exists() or (path / ".git").exists():
-            return path
-    return current
-
-
-REPO_ROOT = find_repo_root(Path(__file__).resolve())
+# このCLIは <repo>/scripts/ に配置する。ZIP展開でも指示ファイルに依存しない。
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 load_dotenv(REPO_ROOT / ".env")

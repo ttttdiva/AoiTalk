@@ -1,0 +1,757 @@
+{
+  "schema_version": 1,
+  "description": "Inventory of process egresses that may carry user, project, or agent-derived data. Keep this list in sync with transport adapters; fixed local/control-plane probes are explicitly allowlisted.",
+  "sinks": [
+    {
+      "path": "src/llm/gemini_engine.py",
+      "symbol": "GeminiLLMClient._send_message_with_deadline",
+      "classification": "external",
+      "provider": "gemini",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/native_runtime.py",
+      "symbol": "AgentTurnRunner._run_core",
+      "classification": "external",
+      "provider": "openai-compatible",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/manager_parts/generation_api.py",
+      "symbol": "GenerationApiMixin._execute_model_request",
+      "classification": "external",
+      "provider": "configured-model-provider",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/specialist_delegate.py",
+      "symbol": "SpecialistDelegationRunner._execute_sync_model_request",
+      "classification": "external",
+      "provider": "configured-model-provider",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/deep_research_service.py",
+      "symbol": "DeepResearchLLMAdapter._generate_openai",
+      "classification": "external",
+      "provider": "openai",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/media_recognition_service.py",
+      "symbol": "MediaRecognitionService._recognize_openai_compatible_image",
+      "classification": "external",
+      "provider": "configured-media-provider",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/audio/engines/gemini_recognizer.py",
+      "symbol": "GeminiSpeechRecognizer.recognize",
+      "classification": "external",
+      "provider": "gemini",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/bot/modes/discord_mode.py",
+      "symbol": "DiscordMode.process_text_with_images",
+      "classification": "external",
+      "provider": "discord-llm",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/bot/utils/nanobanana_service.py",
+      "symbol": "NanobananaProService.generate_image",
+      "classification": "external",
+      "provider": "google-genai",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/basic/web_search.py",
+      "symbol": "openai_web_search_impl",
+      "classification": "external",
+      "provider": "openai",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/basic/grok_x_search.py",
+      "symbol": "grok_x_search",
+      "classification": "external",
+      "provider": "xai",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/basic/weather_tools.py",
+      "symbol": "get_weather_info_impl",
+      "classification": "external",
+      "provider": "weather-api",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/mcp_plugin.py",
+      "symbol": "MCPClient.call_tool",
+      "classification": "external",
+      "provider": "mcp-server",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/web_search_mcp/tools/web_search.py",
+      "symbol": "register",
+      "classification": "external",
+      "provider": "openai",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/web_search_mcp/tools/grok_x_search.py",
+      "symbol": "register",
+      "classification": "external",
+      "provider": "xai",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/utility_mcp/tools/weather.py",
+      "symbol": "register",
+      "classification": "external",
+      "provider": "weather-api",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/x_search_mcp/api_client.py",
+      "symbol": "XSearchAPIClient.search",
+      "classification": "external",
+      "provider": "xai",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/url_ingest_service.py",
+      "symbol": "UrlIngestService._safe_get",
+      "classification": "external",
+      "provider": "user-supplied-url",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/yahoo_realtime_search_service.py",
+      "symbol": "_client_get",
+      "classification": "external",
+      "provider": "yahoo-search",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/google_calendar_service.py",
+      "symbol": "GoogleCalendarService._execute_event_request",
+      "classification": "external",
+      "provider": "google-calendar",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/webex_service.py",
+      "symbol": "WebexService._send_api_request",
+      "classification": "external",
+      "provider": "webex",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/cloud_advisor_service.py",
+      "symbol": "CloudAdvisorCoordinator.consult",
+      "classification": "external",
+      "provider": "cloud-advisor",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/chatgpt_web_provider.py",
+      "symbol": "ChatGPTWebCloudAdvisorAdapter.consult",
+      "classification": "external",
+      "provider": "chatgpt-web",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/knowledge/growi_client.py",
+      "symbol": "GrowiClient._get_json",
+      "classification": "external",
+      "provider": "growi",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/memory/remote_connector.py",
+      "symbol": "RemoteServerConnector._request",
+      "classification": "external",
+      "provider": "remote-server",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/task_management/notifications.py",
+      "symbol": "NotificationMixin.deliver_due_notifications",
+      "classification": "external",
+      "provider": "web-push-or-discord",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/web_push.py",
+      "symbol": "send_web_push",
+      "classification": "external",
+      "provider": "web-push",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tts/engines/nijivoice_engine.py",
+      "symbol": "NijivoiceEngine._execute_external",
+      "classification": "external",
+      "provider": "nijivoice",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/live_voice_service.py",
+      "symbol": "OpenAIRealtimeProvider",
+      "classification": "external",
+      "provider": "openai-realtime",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/mage_vl_service.py",
+      "symbol": "MageVLService",
+      "classification": "external",
+      "provider": "mage-vl",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/import_tools.py",
+      "symbol": "_llm_extract",
+      "classification": "external",
+      "provider": "openai",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/keyword/detectors/speech_rate_detector.py",
+      "symbol": "SpeechRateDetector._extract_with_llm",
+      "classification": "external",
+      "provider": "configured-model-provider",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/image_prompt_builder.py",
+      "symbol": "_generate_scene_tags",
+      "classification": "external",
+      "provider": "gemini",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/heartbeat/safe_webhook.py",
+      "symbol": "_pinned_request",
+      "classification": "external",
+      "provider": "webhook",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "manual_allowlist"
+    },
+    {
+      "path": "src/api/routes/ogp_routes.py",
+      "symbol": "_pinned_ogp_request",
+      "classification": "external",
+      "provider": "user-supplied-ogp-url",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "manual_allowlist"
+    },
+    {
+      "path": "src/tools/external/media_mcp/tools/youtube.py",
+      "symbol": "register",
+      "classification": "external",
+      "provider": "youtube",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/external/media_mcp/tools/niconico.py",
+      "symbol": "register",
+      "classification": "external",
+      "provider": "niconico",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/image_generation.py",
+      "symbol": "generate_image",
+      "classification": "external",
+      "provider": "gemini-image",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "frontend/src/app/api/docs/link-preview/route.ts",
+      "symbol": "POST",
+      "classification": "external",
+      "provider": "user-supplied-url",
+      "boundary": "unresolved",
+      "retry_policy": "disabled",
+      "redirect_policy": "error"
+    },
+    {
+      "path": "frontend/src/app/api/huggingface/file/route.ts",
+      "symbol": "GET",
+      "classification": "external",
+      "provider": "huggingface",
+      "boundary": "unresolved",
+      "retry_policy": "disabled",
+      "redirect_policy": "manual_allowlist",
+      "redirect_max_hops": 5,
+      "redirect_exact_hosts": [
+        "huggingface.co",
+        "cdn-lfs.huggingface.co",
+        "cdn-lfs.hf.co",
+        "hf.co",
+        "cdn-lfs-us-1.hf.co",
+        "cdn-lfs-eu-1.hf.co",
+        "transfer.xethub-eu.hf.co"
+      ],
+      "redirect_single_label_families": [
+        "xethub.hf.co",
+        "aws.cdn.hf.co",
+        "gcp.cdn.hf.co"
+      ],
+      "authorization_policy": "bearer_only_on_exact_canonical_huggingface_co_until_origin_boundary_crossed"
+    },
+    {
+      "path": "mobile/src/lib/mobile-llm.ts",
+      "symbol": "runAdapter",
+      "classification": "external",
+      "provider": "configured-mobile-provider",
+      "boundary": "executeMobileEgress",
+      "retry_policy": "disabled",
+      "redirect_policy": "error"
+    },
+    {
+      "path": "mobile/src/lib/cloud-model-catalog.ts",
+      "symbol": "fetchCloudModels",
+      "classification": "external",
+      "provider": "configured-mobile-provider",
+      "boundary": "executeMobileEgress",
+      "retry_policy": "disabled",
+      "redirect_policy": "error"
+    },
+    {
+      "path": "src/services/deep_research_service.py",
+      "symbol": "DeepResearchSearchClient._search_bound",
+      "classification": "external",
+      "provider": "search-engines",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "bounded_gather",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tts/yomi_linter/adapters.py",
+      "symbol": "VoicevoxCompatibleDictionaryAdapter.apply",
+      "classification": "external",
+      "provider": "voicevox-compatible",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/ollama_engine.py",
+      "symbol": "OllamaClient._execute_chat_request",
+      "classification": "external",
+      "provider": "ollama",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/sglang_engine.py",
+      "symbol": "SGLangClient._create_observed_completion",
+      "classification": "external",
+      "provider": "sglang",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/openai_compatible_local_engine.py",
+      "symbol": "OpenAICompatibleLocalClient._execute_completion_request",
+      "classification": "external",
+      "provider": "openai-compatible-local",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/llm/cli_llm_client.py",
+      "symbol": "CLILLMClient._execute_prompt_tracked_locked",
+      "classification": "external",
+      "provider": "configured-cli",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/memory/dreaming_extractor.py",
+      "symbol": "DreamingMemoryExtractor._call_current_llm",
+      "classification": "external",
+      "provider": "configured-memory-provider",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/comfyui_service.py",
+      "symbol": "ComfyUIService._request_json",
+      "classification": "external",
+      "provider": "comfyui",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/comfyui_service.py",
+      "symbol": "ComfyUIService.upload_image",
+      "classification": "external",
+      "provider": "comfyui",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/services/comfyui_service.py",
+      "symbol": "ComfyUIService.view_bytes",
+      "classification": "external",
+      "provider": "comfyui",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/entertainment/spotify/auth.py",
+      "symbol": "SpotifyManager._wrap_spotify_client",
+      "classification": "external",
+      "provider": "spotify",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/entertainment/spotify/auth.py",
+      "symbol": "set_spotify_auth_code",
+      "classification": "external",
+      "provider": "spotify",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tools/entertainment/video_streaming/stream_manager.py",
+      "symbol": "VideoStreamManager.execute_yt_dlp",
+      "classification": "external",
+      "provider": "youtube",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "separate_transaction",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/tts/yomi_linter/adapters.py",
+      "symbol": "VoicevoxCompatibleDictionaryAdapter.cleanup_owned",
+      "classification": "external",
+      "provider": "voicevox-compatible",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    },
+    {
+      "path": "src/audio/engines/google_speech_recognizer.py",
+      "symbol": "GoogleSpeechRecognizer._execute_sync",
+      "classification": "external",
+      "provider": "google-speech",
+      "boundary": "OutboundPrivacyGateway.execute_sync",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    }
+  ],
+  "allowlisted_patterns": [
+    {
+      "path": "src/crawler_status.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "fixed local crawler health/control plane",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/llm/context_budget.py",
+      "pattern": "urllib\\.request\\.urlopen",
+      "reason": "loopback context-window probe",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/llm/openrouter_provider_routing.py",
+      "pattern": "urllib\\.request\\.urlopen",
+      "reason": "provider directory control-plane metadata",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/content_retention_worker.py",
+      "pattern": "urllib\\.request\\.urlopen",
+      "reason": "fixed retention callback control plane",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/llm_model_catalog.py",
+      "pattern": "urllib\\.request\\.urlopen",
+      "reason": "model catalog control-plane metadata",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/local_llm_runtime_manager.py",
+      "pattern": "urlopen",
+      "reason": "local runtime bootstrap/download control plane",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/service_manager/_local_llm_servers.py",
+      "pattern": "urlopen",
+      "reason": "local model-server health probe",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/ollama_model_service.py",
+      "pattern": "requests\\.",
+      "reason": "local Ollama endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tools/hydrus_browser/client.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "configured local Hydrus endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tools/hydrus_browser/routes.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "inbound compatibility proxy to local Hydrus",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tts/engine_startup.py",
+      "pattern": "requests\\.get",
+      "reason": "local TTS readiness probe",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tts/engines/aivisspeech_engine.py",
+      "pattern": "requests\\.",
+      "reason": "local AivisSpeech endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tts/engines/voicevox_engine.py",
+      "pattern": "requests\\.|ClientSession",
+      "reason": "local VoiceVox endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tts/engines/base_engine.py",
+      "pattern": "ClientSession",
+      "reason": "local TTS base-server lifecycle",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/pricing/updater.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "pricing catalog control plane",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/project_steward_service.py",
+      "pattern": "urlopen",
+      "reason": "fixed project automation health probe",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/outbound_privacy_service.py",
+      "pattern": "AsyncOpenAI",
+      "reason": "local privacy sidecar transport",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/outbound_privacy_service.py",
+      "pattern": "chat\\.completions\\.create",
+      "reason": "local privacy sidecar transport commit",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/token_tracking_service.py",
+      "pattern": "chat\\.completions\\.create",
+      "reason": "non-executable example in token tracking decorator documentation",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tools/external_llm_permission.py",
+      "pattern": "request_external_egress_review",
+      "reason": "in-process permission control plane",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/llm/openai_compatible_local_engine.py",
+      "pattern": "urlopen",
+      "reason": "local OpenAI-compatible health probe",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/llm/sglang_engine.py",
+      "pattern": "OpenAI",
+      "reason": "local sglang-compatible endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/tts/engines/aivisspeech_engine.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "local AivisSpeech endpoint",
+      "classification": "local_control",
+      "boundary": "none_fixed_control",
+      "retry_policy": "disabled",
+      "redirect_policy": "fixed_control"
+    },
+    {
+      "path": "src/services/meeting_local_llm_service.py",
+      "pattern": "httpx\\.AsyncClient",
+      "reason": "meeting processor allows only explicitly trusted local LLM endpoints",
+      "classification": "local_control",
+      "boundary": "OutboundPrivacyGateway.execute",
+      "retry_policy": "disabled",
+      "redirect_policy": "disabled"
+    }
+  ],
+  "unresolved_sinks": [
+    "frontend/src/app/api/docs/link-preview/route.ts:POST inbound user-URL retrieval; redirect is fail-closed and no user payload is sent",
+    "frontend/src/app/api/huggingface/file/route.ts:GET inbound HuggingFace retrieval; provider-scoped bounded manual redirects to reviewed HF Hub/storage/CDN hosts; bearer auth is canonical-huggingface.co-only and permanently dropped after crossing that origin"
+  ]
+}

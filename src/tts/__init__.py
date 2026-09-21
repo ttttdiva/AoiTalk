@@ -10,6 +10,7 @@ from importlib import import_module
 import logging
 
 from src.features import Features
+from src.utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 __all__ = ["TTSManager"]
 
@@ -49,5 +50,6 @@ if _TTS_OUTPUT_ENABLED:
     if not _TTS_DEPENDENCIES_AVAILABLE:
         logger.warning(
             "Optional TTS dependencies are unavailable: "
-            "voicevox-client or vvclient is unavailable"
+            "voicevox-client or vvclient is unavailable",
+            extra=FILE_ONLY_LOG_EXTRA,
         )

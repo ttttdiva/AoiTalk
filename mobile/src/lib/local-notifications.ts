@@ -4,6 +4,7 @@ import { Platform } from "react-native";
 import { and, eq, isNull } from "drizzle-orm";
 import { router } from "expo-router";
 import { getDb, schema } from "../db/client";
+import { runBackgroundSqliteAccess } from "../db/sqlite-write-coordinator";
 
 const CHANNEL_ID = "aoitalk-task-reminders";
 const STORAGE_KEY = "aoitalk.localNotificationSchedule.v1";
@@ -238,11 +239,12 @@ function addReminderCandidates(
   }
 }
 
-async function collectCandidates(): Promise<NotificationCandidate[]> {
+async function collectCandidatesFromSqlite(
+  defaultOffsets: number[],
+): Promise<NotificationCandidate[]> {
   const db = getDb();
   const now = Date.now();
   const horizon = now + SCHEDULE_HORIZON_DAYS * 24 * 60 * 60_000;
-  const defaultOffsets = await readDefaultReminderOffsets();
   const candidates: NotificationCandidate[] = [];
 
   const occurrenceRows = await db
@@ -313,6 +315,16 @@ async function collectCandidates(): Promise<NotificationCandidate[]> {
     })
     .sort((a, b) => a.triggerAt.getTime() - b.triggerAt.getTime())
     .slice(0, MAX_SCHEDULED_NOTIFICATIONS);
+}
+
+async function collectCandidates(): Promise<NotificationCandidate[]> {
+  // AsyncStorage must not hold the SQLite coordinator while waiting. Only the
+  // synchronous-Drizzle-backed database scan is serialized against native
+  // Docs exclusive transactions.
+  const defaultOffsets = await readDefaultReminderOffsets();
+  return runBackgroundSqliteAccess(() =>
+    collectCandidatesFromSqlite(defaultOffsets),
+  );
 }
 
 async function runRescheduleLocalTaskNotificationsFromCache(): Promise<void> {

@@ -19,6 +19,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generator, List, Optional, Set
@@ -33,6 +34,60 @@ SUPPORTED_SHELLS = ("auto", "cmd", "powershell", "bash")
 
 # 停止時に terminate → kill へ切り替えるまでの猶予（秒）
 TERMINATE_GRACE_SECONDS = 3.0
+
+
+class _BoundedStreamCapture:
+    """Thread-safe combined stdout/stderr tail with one exact byte budget."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max(1, int(max_bytes))
+        self._chunks: deque[tuple[bool, bytes]] = deque()
+        self._size = 0
+        self._lock = threading.Lock()
+
+    def append(self, text: str, *, is_stderr: bool) -> None:
+        data = text.encode("utf-8", errors="replace")
+        with self._lock:
+            if len(data) >= self.max_bytes:
+                self._chunks.clear()
+                data = data[-self.max_bytes :]
+                self._chunks.append((is_stderr, data))
+                self._size = len(data)
+                return
+            self._chunks.append((is_stderr, data))
+            self._size += len(data)
+            while self._size > self.max_bytes and self._chunks:
+                stream_kind, oldest = self._chunks.popleft()
+                overflow = self._size - self.max_bytes
+                if len(oldest) > overflow:
+                    oldest = oldest[overflow:]
+                    self._chunks.appendleft((stream_kind, oldest))
+                    self._size -= overflow
+                    break
+                self._size -= len(oldest)
+
+    def text(self) -> tuple[str, str]:
+        with self._lock:
+            chunks = tuple(self._chunks)
+        stdout = b"".join(data for is_stderr, data in chunks if not is_stderr)
+        stderr = b"".join(data for is_stderr, data in chunks if is_stderr)
+        return (
+            stdout.decode("utf-8", errors="replace"),
+            stderr.decode("utf-8", errors="replace"),
+        )
+
+
+def _trusted_stream_output_limit(*, default: int = 32_768) -> int:
+    try:
+        from ...security.harness_execution_scope import (
+            get_current_harness_execution_scope,
+        )
+
+        upper = get_current_harness_execution_scope()
+        limits = getattr(upper, "resource_limits", None)
+        return max(1, int(getattr(limits, "max_output_bytes", default)))
+    except (ImportError, TypeError, ValueError):
+        return max(1, int(default))
 
 
 def build_process_group_kwargs() -> dict:
@@ -395,7 +450,7 @@ class CommandExecutor:
         command: str,
         cwd: Optional[str] = None,
         timeout: Optional[int] = None,
-        shell: Optional[str] = None
+        shell: Optional[str] = None,
     ) -> CommandResult:
         """
         Execute a shell command and return the result.
@@ -716,28 +771,35 @@ class CommandExecutor:
 
         started_at = time.monotonic()
         process = None
-        output_queue: queue.Queue = queue.Queue()
-        stdout_lines: List[str] = []
-        stderr_lines: List[str] = []
+        output_queue: queue.Queue = queue.Queue(maxsize=64)
+        capture = _BoundedStreamCapture(_trusted_stream_output_limit())
+        reader_stop = threading.Event()
         streams_done = 0
 
         def read_stream(stream, is_stderr: bool) -> None:
             try:
                 while True:
-                    line = stream.readline()
+                    line = stream.readline(8192)
                     if line in ("", b""):
                         break
                     if isinstance(line, bytes):
                         line = line.decode("utf-8", errors="replace")
-                    output_queue.put((line, is_stderr))
-                    if is_stderr:
-                        stderr_lines.append(line)
-                    else:
-                        stdout_lines.append(line)
+                    capture.append(line, is_stderr=is_stderr)
+                    while not reader_stop.is_set():
+                        try:
+                            output_queue.put((line, is_stderr), timeout=0.1)
+                            break
+                        except queue.Full:
+                            continue
             except (ValueError, OSError):
                 pass
             finally:
-                output_queue.put((None, is_stderr))
+                while not reader_stop.is_set():
+                    try:
+                        output_queue.put((None, is_stderr), timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
 
         try:
             process = backend.spawn(
@@ -767,15 +829,19 @@ class CommandExecutor:
             while streams_done < 2:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    reader_stop.set()
                     terminate_process_tree(process)
                     try:
-                        process.communicate(timeout=5)
+                        process.wait(timeout=5)
                     except Exception:
                         pass
+                    stdout_thread.join(timeout=1.0)
+                    stderr_thread.join(timeout=1.0)
+                    stdout_text, stderr_text = capture.text()
                     return CommandResult(
                         success=False,
-                        stdout="".join(stdout_lines),
-                        stderr="".join(stderr_lines),
+                        stdout=stdout_text,
+                        stderr=stderr_text,
                         return_code=(
                             process.returncode
                             if process.returncode is not None
@@ -795,28 +861,35 @@ class CommandExecutor:
                     yield line
 
             process.wait(timeout=5)
+            reader_stop.set()
+            stdout_thread.join(timeout=1.0)
+            stderr_thread.join(timeout=1.0)
+            stdout_text, stderr_text = capture.text()
             return CommandResult(
                 success=process.returncode == 0,
-                stdout="".join(stdout_lines),
-                stderr="".join(stderr_lines),
+                stdout=stdout_text,
+                stderr=stderr_text,
                 return_code=process.returncode,
                 duration_seconds=time.monotonic() - started_at,
-                error_message=("".join(stderr_lines)).strip()
+                error_message=stderr_text.strip()
                 if process.returncode
                 else "",
             )
         except GeneratorExit:
+            reader_stop.set()
             if process is not None and process.poll() is None:
                 terminate_process_tree(process)
             raise
         except Exception as exc:
+            reader_stop.set()
             if process is not None and process.poll() is None:
                 terminate_process_tree(process)
             logger.error("Scoped streaming execution failed: %s", exc, exc_info=True)
+            stdout_text, stderr_text = capture.text()
             return CommandResult(
                 success=False,
-                stdout="".join(stdout_lines),
-                stderr="".join(stderr_lines),
+                stdout=stdout_text,
+                stderr=stderr_text,
                 return_code=(
                     process.returncode
                     if process is not None and process.returncode is not None

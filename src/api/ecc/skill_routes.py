@@ -15,6 +15,7 @@ from ...models.ecc_models import SkillCategory, SkillChain, SkillPreset
 from ...skills.loader import save_skill_to_yaml
 from ...skills.models import SkillDefinition, SkillTriggerMode
 from ...skills.registry import get_skill_registry, register_skill
+from ...skills.executor import invoke_resolved_skill
 from ..ecc_helpers import parse_uuid as _parse_uuid
 from .schemas import (
     CreateCategoryRequest,
@@ -365,7 +366,12 @@ def build_skill_router(require_auth: Callable[..., Any]) -> APIRouter:
                             step_params[key] = prev_output
 
                 try:
-                    rendered = skill.render_prompt(current_input, **step_params)
+                    rendered = await invoke_resolved_skill(
+                        skill,
+                        current_input,
+                        invocation_path="chain",
+                        render_kwargs=step_params,
+                    )
                     results.append(
                         {
                             "step": i + 1,

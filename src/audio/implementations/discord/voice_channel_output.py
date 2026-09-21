@@ -35,6 +35,7 @@ class VoiceChannelOutput(BaseAudioOutput):
                             format: str, sample_rate: int) -> None:
         """実際の再生処理"""
         try:
+            loop = asyncio.get_running_loop()
             # メモリ上でFFmpegオーディオソースを作成
             audio_io = io.BytesIO(audio_data)
             
@@ -65,11 +66,11 @@ class VoiceChannelOutput(BaseAudioOutput):
                     print(f"[VoiceChannelOutput] Playback error: {error}")
                 self._playing = False
                 self._current_source = None
-                # イベントループで実行
-                asyncio.run_coroutine_threadsafe(
-                    self._set_done_event(done_event),
-                    asyncio.get_event_loop()
-                )
+                # discord.py invokes this callback from the audio player
+                # thread. Python 3.12+ does not give that thread an implicit
+                # event loop, so schedule onto the loop captured above.
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(done_event.set)
                 
             # Discord音声クライアントで再生
             self.voice_client.play(source, after=after_playback)
@@ -82,10 +83,6 @@ class VoiceChannelOutput(BaseAudioOutput):
             self._current_source = None
             raise
             
-    async def _set_done_event(self, event: asyncio.Event):
-        """イベントをセットする（非同期コンテキスト用）"""
-        event.set()
-        
     async def _stop_internal(self) -> None:
         """実際の停止処理"""
         if self.voice_client.is_playing():

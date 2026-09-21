@@ -72,7 +72,8 @@ function responseModelOf(value: unknown): ChatResponseModelSelection | undefined
     (value as Record<string, unknown>).provider,
   );
   const model = optionalString((value as Record<string, unknown>).model);
-  return provider && model ? { provider, model } : undefined;
+  const effort = optionalString((value as Record<string, unknown>).reasoning_effort);
+  return provider && model ? { provider, model, ...(effort ? { reasoning_effort: effort } : {}) } : undefined;
 }
 
 function storedPayloadOf(

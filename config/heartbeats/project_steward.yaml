@@ -1,0 +1,10 @@
+name: project_steward
+mode: project_steward
+description: Projectごとの状態変化を定期確認するdurable Project Steward heartbeat。
+checklist: |
+  - Project Stewardとして対象Projectの現在状態を確認する
+  - 前回成功時のcursor以降の変化だけを処理対象にする
+  - 根拠のない変更や書き込みを行わない
+interval_minutes: 60
+enabled: true
+notify_channel: websocket

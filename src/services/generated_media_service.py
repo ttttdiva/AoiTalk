@@ -15,6 +15,10 @@ from ..memory.database import get_db_session
 from ..memory.models.conversations import ConversationMessage
 from ..memory.models.generated_media import GeneratedMedia
 from .generated_media_triggers import coerce_trigger, should_generate_roleplay_image
+from .generated_media_storage import (
+    ensure_media_online, get_media_root, remove_media, resolve_path, write_media,
+)
+from .storage_io import StorageError
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +45,7 @@ def is_comfyui_enabled(config: Any | None) -> bool:
 
 
 def _storage_root() -> Path:
-    root = STORAGE_ROOT.resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return get_media_root(STORAGE_ROOT).require_online()
 
 
 def _relative_path(storage_key: str, extension: str) -> str:
@@ -51,7 +53,7 @@ def _relative_path(storage_key: str, extension: str) -> str:
 
 
 def _absolute_path(relative_path: str) -> Path:
-    return (_storage_root().parent / relative_path).resolve()
+    return resolve_path(relative_path, STORAGE_ROOT)
 
 
 def media_public_url(media_id: str) -> str:
@@ -167,7 +169,11 @@ async def purge_stale_generated_media(
     cutoff = current - timedelta(days=max(1, int(failed_after_days)))
     deleted_rows = 0
     deleted_files = 0
-    storage_root = _storage_root()
+    try:
+        await ensure_media_online(STORAGE_ROOT)
+    except StorageError:
+        # Disconnection is not proof that a generated-media file is absent.
+        return {"deleted_rows": 0, "deleted_files": 0}
 
     async with await get_db_session() as session:
         stale = (
@@ -180,13 +186,12 @@ async def purge_stale_generated_media(
         ).scalars().all()
 
         for media in stale:
-            file_path = _absolute_path(media.relative_path)
-            if file_path.exists() and storage_root in file_path.parents:
-                try:
-                    file_path.unlink()
+            try:
+                if await remove_media(media.relative_path, STORAGE_ROOT):
                     deleted_files += 1
-                except OSError as exc:
-                    logger.warning("生成メディアファイル削除失敗: %s", exc)
+            except StorageError as exc:
+                logger.warning("生成メディアの削除を保留: %s", exc)
+                continue
             await session.delete(media)
             deleted_rows += 1
 
@@ -282,9 +287,7 @@ async def generate_roleplay_scene_media(
         if saved_extension and saved_extension != extension:
             extension = saved_extension
             relative = _relative_path(storage_key, extension)
-        destination = _absolute_path(relative)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(image_bytes)
+        await write_media(relative, image_bytes, STORAGE_ROOT)
 
         async with await get_db_session() as session:
             persisted = await session.get(GeneratedMedia, media_id)
@@ -368,9 +371,7 @@ async def generate_play_context_media(
         if saved_extension and saved_extension != extension:
             extension = saved_extension
             relative = _relative_path(storage_key, extension)
-        destination = _absolute_path(relative)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(image_bytes)
+        await write_media(relative, image_bytes, STORAGE_ROOT)
 
         async with await get_db_session() as session:
             persisted = await session.get(GeneratedMedia, media_id)
@@ -453,9 +454,7 @@ async def generate_story_context_media(
         if saved_extension and saved_extension != extension:
             extension = saved_extension
             relative = _relative_path(storage_key, extension)
-        destination = _absolute_path(relative)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(image_bytes)
+        await write_media(relative, image_bytes, STORAGE_ROOT)
 
         async with await get_db_session() as session:
             persisted = await session.get(GeneratedMedia, media_id)
@@ -515,6 +514,8 @@ def resolve_media_file(media: GeneratedMedia) -> Path | None:
         return None
     path = _absolute_path(media.relative_path)
     if not path.exists():
+        # Distinguish a missing child file from a disconnected configured root.
+        _storage_root()
         return None
     root = _storage_root().resolve()
     if root not in path.parents and path != root:

@@ -6,6 +6,7 @@ import { formatDateTimeLocal } from "@/components/tasks/task-form-utils";
 import {
   taskApi,
   type RecurringOccurrenceContext,
+  type Scope,
   type Task,
   type TaskOccurrence,
 } from "@/lib/task-api";
@@ -37,6 +38,7 @@ export function occurrenceToContext(
     start_at: occurrence.start_at ?? "",
     end_at: occurrence.end_at ?? null,
     original_start_at: occurrence.original_start_at ?? occurrence.start_at ?? null,
+    all_day: occurrence.all_day ?? null,
     source_kind: occurrence.source_kind ?? "task_schedule",
     status: occurrence.status ?? null,
   };
@@ -44,6 +46,7 @@ export function occurrenceToContext(
 
 export async function fetchCurrentOccurrenceContext(
   task: Task,
+  scope?: Scope,
 ): Promise<RecurringOccurrenceContext | null> {
   if (!task.has_recurrence || !task.project_id) return null;
   const rangeStart = new Date();
@@ -52,7 +55,7 @@ export async function fetchCurrentOccurrenceContext(
   rangeEnd.setDate(rangeEnd.getDate() + 60);
   rangeEnd.setHours(23, 59, 59, 999);
   const occurrences = await taskApi.listOccurrences(
-    { project_id: task.project_id },
+    scope ?? { project_id: task.project_id },
     formatDateTimeLocal(rangeStart),
     formatDateTimeLocal(rangeEnd),
   );

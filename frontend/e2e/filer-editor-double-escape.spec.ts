@@ -1,6 +1,6 @@
 import { expect, test } from "@playwright/test";
 
-import { addAuthCookie } from "./support/auth";
+import { addAuthCookie, E2E_USER_ID } from "./support/auth";
 
 const project = {
   id: "project-1",
@@ -22,6 +22,32 @@ const space = {
 
 const rootPath = `_projects/project_${project.id}`;
 const textPath = `${rootPath}/notes.txt`;
+const quickLauncherBookmark = {
+  id: "bookmark-quick",
+  user_id: E2E_USER_ID,
+  name: "Quick",
+  path: "aoitalk-bookmark-folder:quick",
+  kind: "folder" as const,
+  parent_id: null,
+  sort_order: 0,
+};
+
+async function dispatchPageScopedEscape(
+  page: import("@playwright/test").Page,
+  repeat = false,
+) {
+  await page.evaluate((isRepeat) => {
+    document.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "Escape",
+        code: "Escape",
+        bubbles: true,
+        cancelable: true,
+        repeat: isRepeat,
+      }),
+    );
+  }, repeat);
+}
 
 async function mockFilerApis(page: import("@playwright/test").Page) {
   await page.route("**/api/**", async (route) => {
@@ -31,7 +57,7 @@ async function mockFilerApis(page: import("@playwright/test").Page) {
       await route.fulfill({
         json: {
           authenticated: true,
-          user: { id: "user-1", username: "tester", role: "admin" },
+          user: { id: E2E_USER_ID, username: "__playwright_e2e__", role: "admin" },
         },
       });
       return;
@@ -102,7 +128,13 @@ async function mockFilerApis(page: import("@playwright/test").Page) {
       return;
     }
     if (url.pathname === "/api/python-proxy/explorer/bookmarks") {
-      await route.fulfill({ json: { success: true, bookmarks: [] } });
+      await route.fulfill({
+        json: { success: true, bookmarks: [quickLauncherBookmark] },
+      });
+      return;
+    }
+    if (url.pathname === "/api/python-proxy/explorer/launchers") {
+      await route.fulfill({ json: { success: true, launchers: [] } });
       return;
     }
     if (url.pathname === "/api/python-proxy/storage/contexts") {
@@ -110,7 +142,7 @@ async function mockFilerApis(page: import("@playwright/test").Page) {
         json: {
           success: true,
           contexts: [],
-          current_context: { type: "personal", id: "user-1" },
+          current_context: { type: "personal", id: E2E_USER_ID },
           is_admin: true,
         },
       });
@@ -234,5 +266,89 @@ test.describe("Filer editor double Escape", () => {
     await expect(page.locator('[data-shell-region="files-editor"]')).toHaveCount(1);
     await page.keyboard.press("Escape");
     await expect(page.locator('[data-shell-region="files-editor"]')).toHaveCount(0);
+  });
+
+  test("counts two page-scoped Escapes while CodeMirror remains the real focus owner", async ({
+    page,
+  }) => {
+    await page.goto("/filer");
+
+    const file = page.locator(`[data-explorer-item-path="${textPath}"]`);
+    await expect(file).toBeVisible();
+    await file.dblclick();
+
+    const editor = page.locator('.cm-content[contenteditable="true"]');
+    const editorRegion = page.locator('[data-shell-region="files-editor"]');
+    await expect(editor).toBeVisible();
+    await expect(editor).toBeFocused();
+
+    // Dispatch from the document rather than re-targeting the editor.  This
+    // matches the independent page/CUA delivery that originally left the
+    // editor open even though CodeMirror retained DOM focus.
+    await dispatchPageScopedEscape(page);
+    await expect(editorRegion).toHaveCount(1);
+    await expect(editor).toBeFocused();
+    await page.waitForTimeout(150);
+    await dispatchPageScopedEscape(page);
+
+    await expect(editorRegion).toHaveCount(0);
+  });
+
+  test("does not discard the first Escape on a null-relatedTarget transition that keeps Files focus", async ({
+    page,
+  }) => {
+    await page.goto("/filer");
+
+    const file = page.locator(`[data-explorer-item-path="${textPath}"]`);
+    await expect(file).toBeVisible();
+    await file.dblclick();
+
+    const editor = page.locator('.cm-content[contenteditable="true"]');
+    const editorRegion = page.locator('[data-shell-region="files-editor"]');
+    await expect(editor).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(editorRegion).toHaveCount(1);
+
+    await page.evaluate(() => {
+      const editor = document.querySelector<HTMLElement>(
+        '.cm-content[contenteditable="true"]',
+      );
+      editor?.dispatchEvent(
+        new FocusEvent("focusout", { bubbles: true, relatedTarget: null }),
+      );
+    });
+    await page.waitForTimeout(50);
+    await expect(editor).toBeFocused();
+
+    await page.keyboard.press("Escape");
+    await expect(editorRegion).toHaveCount(0);
+  });
+
+  test("launcher Escape never becomes the editor's first Escape", async ({
+    page,
+  }) => {
+    await page.goto("/filer");
+
+    const file = page.locator(`[data-explorer-item-path="${textPath}"]`);
+    await expect(file).toBeVisible();
+    await file.dblclick();
+
+    const editorRegion = page.locator('[data-shell-region="files-editor"]');
+    await expect(editorRegion).toHaveCount(1);
+    await page.locator('[data-shell-region="files-canvas"]').focus();
+    await page.keyboard.press("Alt+A");
+
+    const launcher = page.getByTestId("files-bookmark-quick-launcher-menu");
+    await expect(launcher).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(launcher).not.toBeVisible();
+    await expect(editorRegion).toHaveCount(1);
+
+    // The Escape that closed the launcher was blocked and must not have armed
+    // the editor.  The next two distinct presses are the editor sequence.
+    await page.keyboard.press("Escape");
+    await expect(editorRegion).toHaveCount(1);
+    await page.keyboard.press("Escape");
+    await expect(editorRegion).toHaveCount(0);
   });
 });

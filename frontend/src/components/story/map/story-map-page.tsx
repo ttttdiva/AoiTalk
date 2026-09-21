@@ -2,7 +2,7 @@
 
 import "@xyflow/react/dist/style.css";
 import "./story-map-theme.css";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
   Background,
@@ -168,13 +168,13 @@ function StoryMapCanvas({ workId }: { workId: string }) {
   const { resolvedTheme } = useTheme();
   const reactFlow = useReactFlow<StoryMapNode, Edge>();
   const [search, setSearch] = useState("");
-  const [selectedEpisodeId, setSelectedEpisodeId] = useState<string | null>(null);
   const [nodes, setNodes, onNodesChange] = useNodesState<StoryMapNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [menu, setMenu] = useState<StoryMapMenuState | null>(null);
   const [dialog, setDialog] = useState<StoryMapDialogRequest | null>(null);
   const [insertTargetId, setInsertTargetId] = useState<string | null>(null);
   const highlightStore = useMemo(() => createStoryMapHighlightStore(), []);
+  const selectedEpisodeId = useSyncExternalStore(highlightStore.subscribe, highlightStore.read, highlightStore.read);
   const dragSaveTimers = useRef(new Map<string, number>());
   const pendingFocusRef = useRef<string | null>(null);
   const dialogSequenceRef = useRef(0);
@@ -194,7 +194,6 @@ function StoryMapCanvas({ workId }: { workId: string }) {
 
   const applyNodeSelection = useCallback(
     (episodeId: string | null) => {
-      setSelectedEpisodeId(episodeId);
       highlightStore.set(episodeId);
       reactFlow.setNodes((current) =>
         current.map((item) =>

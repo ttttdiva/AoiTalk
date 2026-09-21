@@ -19,7 +19,7 @@ from .models import (
     TaskDependency, TaskRecurrenceRule, TaskOccurrence, TimeEntry,
     TaskReference,
     ProjectNotificationSetting, NotificationDelivery, KnowledgeSourcePermission,
-    KnowledgeSource, ProjectContextPack, ContextMemory, RecordAttachment,
+    KnowledgeSource, ContextMemory, RecordAttachment,
     RecordEvent, RecordField, RecordRow, RecordTable, RecordView,
     AppGrant, AppJob, ProjectApp,
 )
@@ -61,6 +61,16 @@ def user_inbox_space_slug(user_id: UUID) -> str:
 def legacy_user_default_space_slug(user_id: UUID) -> str:
     """過去の FastAPI 実装が作成していた legacy Default スペース slug."""
     return f"default-{user_id}"
+
+
+def is_foreign_default_inbox_project(project: Project, user_id: UUID) -> bool:
+    """Web一覧と同じ予約slug判定。任意の同名Inboxや管理用ACLは変更しない。"""
+    owner_id = getattr(project, "owner_id", None)
+    return bool(
+        owner_id
+        and owner_id != user_id
+        and getattr(project, "slug", None) == user_inbox_project_slug(owner_id)
+    )
 
 
 class ProjectRepository:
@@ -265,6 +275,25 @@ class ProjectRepository:
         row = result.scalar_one_or_none()
         return row if row else None
 
+    @staticmethod
+    async def get_user_inbox_project(
+        session: AsyncSession, user_id: UUID
+    ) -> Optional[Project]:
+        """Return the existing canonical Inbox Project, or None.
+
+        Read-only: never creates, renames, merges, or repairs Inbox Space,
+        Project, or membership rows.
+        """
+        slug = user_inbox_project_slug(user_id)
+        result = await session.execute(
+            select(Project).where(
+                Project.slug == slug,
+                Project.owner_id == user_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        return result.scalar_one_or_none()
+
     # ─── Project CRUD ───────────────────────────────────────────────────
     
     @staticmethod
@@ -281,6 +310,8 @@ class ProjectRepository:
         allow_join_requests: bool = True,
         storage_quota_mb: int = 1000,
         project_metadata: Optional[Dict[str, Any]] = None,
+        *,
+        commit: bool = True,
     ) -> Project:
         """Create a new project
         
@@ -295,6 +326,8 @@ class ProjectRepository:
             allow_join_requests: Whether to accept join requests
             storage_quota_mb: Storage quota in MB
             project_metadata: Optional project metadata payload
+            commit: Commit immediately unless the caller is composing an
+                atomic Project + canonical Docs update.
 
         Returns:
             Created Project
@@ -329,7 +362,22 @@ class ProjectRepository:
         )
         session.add(project)
         await session.flush()
-        
+
+        # A signed verification request binds a request-local run context.
+        # Register the project in the independent provenance ledger before any
+        # dependent membership rows are committed.  Ordinary product writes
+        # have no context and retain their existing metadata unchanged.
+        from ..services.verification_provenance import register_current_entity
+
+        tagged_metadata = await register_current_entity(
+            session,
+            entity_type="project",
+            entity_id=project.id,
+            metadata=project.project_metadata,
+        )
+        if tagged_metadata is not None:
+            project.project_metadata = tagged_metadata
+
         # Add owner as a member with owner role
         owner_member = ProjectMember(
             project_id=project.id,
@@ -344,9 +392,10 @@ class ProjectRepository:
             }
         )
         session.add(owner_member)
-        await session.commit()
-        await session.refresh(project)
-        
+        if commit:
+            await session.commit()
+            await session.refresh(project)
+
         return project
     
     @staticmethod
@@ -432,16 +481,10 @@ class ProjectRepository:
         from ..services.project_permissions import normalize_project_member_permissions
 
         user = await session.get(User, user_id)
-        if getattr(user, "role", None) == "admin":
-            result = await session.execute(
-                select(Project)
-                .where(Project.deleted_at.is_(None))
-                .order_by(Project.updated_at.desc())
-            )
-            return [project.to_dict() for project in result.scalars().all()]
-
-        # Get projects where user is a member, then apply the same explicit
-        # read policy used by project context and task services.
+        is_admin = getattr(user, "role", None) == "admin"
+        # Management access and operational participation are different. Keep
+        # admin-visible projects, but attach the real per-user participation
+        # even for admins so clients never infer membership from visibility.
         query = (
             select(Project, ProjectMember)
             .outerjoin(
@@ -451,23 +494,30 @@ class ProjectRepository:
                     ProjectMember.user_id == user_id,
                 ),
             )
-            .where(
-                Project.deleted_at.is_(None),
-                or_(Project.owner_id == user_id, ProjectMember.user_id == user_id),
-            )
+            .where(Project.deleted_at.is_(None))
             .order_by(Project.updated_at.desc())
         )
-        
+        if not is_admin:
+            query = query.where(
+                or_(Project.owner_id == user_id, ProjectMember.user_id == user_id)
+            )
+
         result = await session.execute(query)
         projects = []
         
         for project, member in result.fetchall():
+            if is_foreign_default_inbox_project(project, user_id):
+                continue
             permissions = normalize_project_member_permissions(
                 member.permissions if member else None
             )
-            if project.owner_id != user_id and permissions.get("read") is not True:
+            is_participating = (
+                project.owner_id == user_id or permissions.get("read") is True
+            )
+            if not is_admin and not is_participating:
                 continue
             proj_dict = project.to_dict()
+            proj_dict["is_participating"] = is_participating
             proj_dict['membership'] = member.to_dict() if member else None
             projects.append(proj_dict)
         
@@ -560,6 +610,8 @@ class ProjectRepository:
     async def update_project(
         session: AsyncSession,
         project_id: UUID,
+        *,
+        commit: bool = True,
         **kwargs
     ) -> Optional[Project]:
         """Update project fields
@@ -567,6 +619,8 @@ class ProjectRepository:
         Args:
             session: Database session
             project_id: Project UUID
+            commit: Commit immediately unless the caller is composing an
+                    atomic Project + canonical Docs update.
             **kwargs: Fields to update (name, description,
                       space_id, is_completed, allow_join_requests,
                       storage_quota_mb, project_metadata)
@@ -590,7 +644,8 @@ class ProjectRepository:
             .where(Project.id == project_id)
             .values(**update_data)
         )
-        await session.commit()
+        if commit:
+            await session.commit()
         
         return await ProjectRepository.get_by_id(session, project_id)
     
@@ -601,6 +656,7 @@ class ProjectRepository:
         *,
         delete_workspace: bool = False,
         workspace_root: str | os.PathLike[str] | None = None,
+        commit: bool = True,
     ) -> bool:
         from ..services.app_operation_lock import project_operation_lock
         from ..services.app_storage import get_workspaces_root
@@ -615,6 +671,7 @@ class ProjectRepository:
                 project_id,
                 delete_workspace=delete_workspace,
                 workspace_root=effective_root,
+                commit=commit,
             )
 
     @staticmethod
@@ -624,6 +681,7 @@ class ProjectRepository:
         *,
         delete_workspace: bool = False,
         workspace_root: str | os.PathLike[str] | None = None,
+        commit: bool = True,
     ) -> bool:
         """Delete a project from the active app surface.
 
@@ -756,7 +814,6 @@ class ProjectRepository:
             await session.execute(delete(RecordView).where(RecordView.table_id.in_(record_table_ids)))
         await session.execute(delete(RecordEvent).where(RecordEvent.project_id == project_id))
 
-        await session.execute(delete(ProjectContextPack).where(ProjectContextPack.project_id == project_id))
         await session.execute(delete(ContextMemory).where(ContextMemory.project_id == project_id))
         await session.execute(delete(NotificationDelivery).where(NotificationDelivery.project_id == project_id))
         await session.execute(delete(LocalTask).where(LocalTask.project_id == project_id))
@@ -808,13 +865,14 @@ class ProjectRepository:
         # Project-scoped grants must be removed explicitly.
         await session.execute(delete(ProjectApp).where(ProjectApp.project_id == project_id))
         await session.execute(delete(AppGrant).where(AppGrant.project_id == project_id))
-        await session.commit()
+        if commit:
+            await session.commit()
         from ..services.app_storage import remove_app_instance
 
         # The DB tombstone/binding deletion is the transaction boundary.  Do
         # not destroy filesystem data before it commits: a DB rollback must
         # leave the instance available for the still-existing binding.
-        if delete_workspace:
+        if commit and delete_workspace:
             try:
                 from ..services.project_workspace_cleanup import remove_project_workspace
 
@@ -823,10 +881,11 @@ class ProjectRepository:
                 remove_project_workspace(project_id, workspace_root=workspace_root)
             except Exception:
                 logger.exception("Project workspace cleanup failed after Project deletion: %s", project_id)
-        try:
-            remove_app_instance(project_id, workspace_root=workspace_root)
-        except Exception:
-            logger.exception("App instance cleanup failed after Project deletion: %s", project_id)
+        if commit:
+            try:
+                remove_app_instance(project_id, workspace_root=workspace_root)
+            except Exception:
+                logger.exception("App instance cleanup failed after Project deletion: %s", project_id)
         return True
 
     @staticmethod

@@ -667,13 +667,20 @@ class DocsClipIngestWorker:
             if target_node is None:
                 raise ClipIngestError("保存直前の取り込み先を確認できません")
             target.node = target_node
-        existing = getattr(plan, "existing_node", None)
-        existing_id = getattr(existing, "id", None) if existing is not None else None
+            target.docs_library_id = getattr(target_node, "docs_library_id", None)
+        existing_id = getattr(plan, "existing_node_id", None)
+        if existing_id is None:
+            existing = getattr(plan, "existing_node", None)
+            if existing is not None:
+                # Legacy lightweight plan objects only. Never invoke an ORM
+                # descriptor on a detached production node.
+                existing_id = existing.__dict__.get("id")
         if existing_id is not None:
             existing_node = await session.get(KnowledgeNode, existing_id)
             if existing_node is None:
                 raise ClipIngestError("保存直前の追記先を確認できません")
             plan.existing_node = existing_node
+            plan.existing_node_id = getattr(existing_node, "id", None)
 
     async def _preflight_scope(
         self,

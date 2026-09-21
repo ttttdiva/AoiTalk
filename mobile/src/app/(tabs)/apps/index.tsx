@@ -73,7 +73,7 @@ export default function AppsListScreen() {
   const router = useRouter();
   const { selectedProjectId } = useProject();
   const { isAuthenticated } = useAuth();
-  const online = useNetworkStore((state) => state.online);
+  const online = useNetworkStore((state) => state.connected ?? state.online);
   const [apps, setApps] = useState<AppSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);

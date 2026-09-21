@@ -10,9 +10,6 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 
-LEGACY_AGENT_MEMORY_DOMAIN = "legacy_agent_memory"
-
-
 @dataclass(frozen=True)
 class ManagedDocsPolicy:
     managed_domain: str
@@ -24,10 +21,15 @@ class ManagedDocsPolicy:
 
 _PREFIX_POLICIES: tuple[tuple[str, ManagedDocsPolicy], ...] = (
     (
-        "agent_memory",
+        "aoitalk_guide",
         ManagedDocsPolicy(
-            managed_domain=LEGACY_AGENT_MEMORY_DOMAIN,
-            allowed_tools=frozenset({"legacy_agent_memory_migration"}),
+            managed_domain="aoitalk_guide",
+            # Only the repository-seeded lifecycle is allowed to update this
+            # subtree.  Generic Docs mutations (including descendants) fail
+            # closed because the policy walks the full ancestor chain.
+            allowed_tools=frozenset({"aoitalk_guide_sync"}),
+            hidden_from_sidebar=False,
+            allow_revival=True,
         ),
     ),
     (
@@ -63,6 +65,7 @@ _PREFIX_POLICIES: tuple[tuple[str, ManagedDocsPolicy], ...] = (
         ),
     ),
 )
+MANAGED_DOCS_MAX_ANCESTOR_DEPTH = 512
 
 
 def policy_for_node(node: Any) -> ManagedDocsPolicy | None:
@@ -70,7 +73,14 @@ def policy_for_node(node: Any) -> ManagedDocsPolicy | None:
     # other nodes, but it must never loosen a known managed domain.
     system_key = str(getattr(node, "system_key", None) or "")
     for prefix, policy in _PREFIX_POLICIES:
-        if system_key == prefix or system_key.startswith(prefix):
+        if prefix == "aoitalk_guide":
+            # The guide root and its colon-delimited descendants are managed;
+            # similarly named application keys (for example
+            # ``aoitalk_guide_backup``) remain ordinary user Docs.
+            matches = system_key == prefix or system_key.startswith(f"{prefix}:")
+        else:
+            matches = system_key == prefix or system_key.startswith(prefix)
+        if matches:
             return policy
 
     props = node.display_props if isinstance(getattr(node, "display_props", None), dict) else {}
@@ -141,8 +151,12 @@ async def assert_managed_docs_tree_mutation_allowed(
     current = node
     visited: set[Any] = set()
     docs_library_id = getattr(node, "docs_library_id", None)
-    while current is not None and getattr(current, "id", None) not in visited:
-        visited.add(getattr(current, "id", None))
+    depth = 0
+    while current is not None:
+        current_id = getattr(current, "id", None)
+        if current_id in visited:
+            raise PermissionError("managed Docs ancestor cycle detected")
+        visited.add(current_id)
         assert_managed_docs_mutation_allowed(
             current,
             tool_name=tool_name,
@@ -152,6 +166,9 @@ async def assert_managed_docs_tree_mutation_allowed(
         parent_id = getattr(current, "parent_id", None)
         if parent_id is None:
             break
+        if depth >= MANAGED_DOCS_MAX_ANCESTOR_DEPTH:
+            raise PermissionError("managed Docs ancestor depth exceeded")
+        depth += 1
         current = await session.get(KnowledgeNode, parent_id)
         if current is None:
             raise PermissionError("managed Docs ancestor could not be resolved")
@@ -160,8 +177,8 @@ async def assert_managed_docs_tree_mutation_allowed(
 
 
 __all__ = [
-    "LEGACY_AGENT_MEMORY_DOMAIN",
     "ManagedDocsPolicy",
+    "MANAGED_DOCS_MAX_ANCESTOR_DEPTH",
     "assert_managed_docs_mutation_allowed",
     "assert_managed_docs_tree_mutation_allowed",
     "managed_display_props",

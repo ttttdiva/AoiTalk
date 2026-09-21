@@ -23,7 +23,15 @@ export function parseTaskTimerDate(
   value: string | null | undefined,
 ): Date | null {
   if (!value) return null;
-  const parsed = parseLocalDateTime(value) ?? new Date(value);
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+
+  // Timer route responses carry an explicit offset.  Parse those as instants
+  // before considering the legacy local-wall-clock fallback; parseLocalDateTime
+  // intentionally accepts offset-looking strings but discards their offset.
+  const parsed = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed)
+    ? new Date(trimmed)
+    : (parseLocalDateTime(trimmed) ?? new Date(trimmed));
   return Number.isNaN(parsed.getTime()) ? null : parsed;
 }
 

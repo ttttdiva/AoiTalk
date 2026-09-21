@@ -46,7 +46,7 @@ class StartupTimer:
         utc_now: Callable[[], datetime] | None = None,
         log_path: str | os.PathLike[str] | None = None,
         run_id: str | None = None,
-        emit_console: bool = True,
+        emit_console: bool | None = None,
     ) -> None:
         self._monotonic = monotonic or time.monotonic
         self._utc_now = utc_now or _default_utc_now
@@ -62,6 +62,12 @@ class StartupTimer:
                 # must remain fail-open even under a faulty test/platform
                 # provider.  The fallback contains no user or secret data.
                 self.run_id = f"startup-{id(self):x}"
+        # ``None`` follows the process debug policy dynamically.  This is
+        # intentionally evaluated for every record rather than only during
+        # construction: the process-wide timer is imported before ``main``
+        # loads ``.env``, so a debug value supplied by that file must still
+        # take effect.  A concrete bool remains an explicit per-timer
+        # override for callers/tests that need deterministic output.
         self.emit_console = emit_console
         self._lock = threading.RLock()
         self._log_path = self._resolve_log_path(log_path)
@@ -193,9 +199,11 @@ class StartupTimer:
         elapsed_ms: float | None = None,
         event: str = "mark",
     ) -> Mapping[str, object]:
-        """Emit one JSON record to console and the per-run JSONL file.
+        """Emit one JSON record to the per-run JSONL file.
 
-        Both destinations receive the exact same JSON line. All failures in
+        The full JSONL stream is always retained.  Raw ``STARTUP_TIMING``
+        console output is a deliberate diagnostic opt-in controlled by
+        ``emit_console`` or ``AOITALK_DEBUG=true``.  All failures in
         serialization, printing, directory creation, or writing are swallowed
         so that observability cannot make startup fail.
         """
@@ -242,7 +250,7 @@ class StartupTimer:
         # Serialize writes from multiple startup threads. Opening per record
         # avoids a leaked descriptor when startup exits unusually early.
         with self._lock:
-            if self.emit_console:
+            if self._console_enabled():
                 try:
                     print(f"STARTUP_TIMING {line}", flush=True)
                 except Exception:
@@ -254,6 +262,26 @@ class StartupTimer:
             except Exception:
                 pass
         return record
+
+    def _console_enabled(self) -> bool:
+        """Return whether raw timing records should be printed.
+
+        ``emit_console`` is kept as a public attribute for backwards
+        compatibility.  ``None`` means "follow debug mode"; any concrete
+        bool is an explicit override.  Environment parsing is deliberately
+        tiny and matches the existing ``AOITALK_DEBUG`` semantics used by
+        :mod:`main` (case-insensitive ``true`` only).
+        """
+
+        if self.emit_console is not None:
+            try:
+                return bool(self.emit_console)
+            except Exception:
+                return False
+        try:
+            return os.getenv("AOITALK_DEBUG", "").lower() == "true"
+        except Exception:
+            return False
 
 
 _GLOBAL_TIMER = StartupTimer()

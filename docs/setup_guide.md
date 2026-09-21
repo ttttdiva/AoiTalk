@@ -176,7 +176,7 @@ venv\Scripts\python.exe -m alembic heads
 
 - `frontend/package.json` の `build` / `build:production` がコマンドの正本です。
 - setup scripts は production build を生成します。
-- repo の検証方針は `AGENTS.md` / `CLAUDE.md` を参照し、変更と無関係な full build を毎回実行しません。
+- repo の検証方針は [AGENTS.md](../AGENTS.md) を参照し、変更と無関係な full build を毎回実行しません。
 
 ## Qdrant
 

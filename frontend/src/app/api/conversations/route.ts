@@ -11,6 +11,7 @@ import { decryptTextIfNeeded, encryptText } from "@/lib/server/field-crypto";
 import {
   canReadProject,
   canWriteProject,
+  canWriteProjectWithExecutor,
   ConversationScopeError,
   messageToSnake,
   validateAppConversationScope,
@@ -310,14 +311,21 @@ export async function POST(request: NextRequest) {
   const initialContent =
     typeof initialMessage?.content === "string" ? initialMessage.content : "";
   const initialClientMessageId =
-    typeof initialMessage?.client_message_id === "string"
-      ? initialMessage.client_message_id
+    typeof initialMessage?.client_message_id === "string" &&
+    initialMessage.client_message_id.trim()
+      ? initialMessage.client_message_id.trim()
       : null;
 
   if (!character_name) {
     return NextResponse.json(
       { detail: "character_nameは必須です" },
       { status: 400 }
+    );
+  }
+  if (initialClientMessageId && initialClientMessageId.length > 512) {
+    return NextResponse.json(
+      { detail: "initial_message.client_message_idは512文字以内で指定してください" },
+      { status: 400 },
     );
   }
 
@@ -473,59 +481,92 @@ export async function POST(request: NextRequest) {
   }
 
   const now = new Date();
-  const result = await db.transaction(async (tx) => {
-    const [session] = await tx
-      .insert(conversationSessions)
-      .values({
-        userId: user.id,
-        characterName: characterSlug,
-        projectId: requestedProjectId,
-        sessionStart: now,
-        lastActivity: now,
-        messageCount: initialContent.trim() ? 1 : 0,
-        isActive: true,
-      })
-      .returning();
+  let result: {
+    session: typeof conversationSessions.$inferSelect;
+    initial_message?: typeof conversationMessages.$inferSelect;
+  };
+  try {
+    result = await db.transaction(async (tx) => {
+      // The request-level project check above is only an early rejection.
+      // Lock and revalidate the Project/membership rows in the creation
+      // transaction so a concurrent permission revoke cannot create a new
+      // project-bound conversation after access has been removed.
+      if (
+        requestedProjectId &&
+        !(await canWriteProjectWithExecutor(
+          tx as unknown as typeof db,
+          requestedProjectId,
+          user,
+        ))
+      ) {
+        throw new ConversationScopeError(
+          403,
+          "プロジェクトへの書き込み権限がありません",
+        );
+      }
 
-    await tx.insert(conversationParticipants).values({
-      sessionId: session.id,
-      participantType: "user",
-      participantId: user.id,
-      displayName: user.displayName || user.username || user.email || user.id,
-      role: "owner",
-      status: "joined",
-      autoRespond: false,
-      participantMetadata: {},
-      createdAt: now,
-      updatedAt: now,
-    });
-
-    let initial_message: typeof conversationMessages.$inferSelect | undefined;
-    if (initialContent.trim()) {
-      [initial_message] = await tx
-        .insert(conversationMessages)
+      const [session] = await tx
+        .insert(conversationSessions)
         .values({
-          sessionId: session.id,
-          role: "user",
-          content: encryptText(initialContent, "conversation_messages.content"),
-          messageMetadata: {
-            ...(initialClientMessageId
-              ? { client_message_id: initialClientMessageId }
-              : {}),
-          },
-          senderType: "user",
-          senderId: user.id,
-          senderDisplayName:
-            user.displayName || user.username || user.email || user.id,
-          createdAt: now,
-          branchIndex: 0,
-          isActiveBranch: true,
+          userId: user.id,
+          characterName: characterSlug,
+          projectId: requestedProjectId,
+          sessionStart: now,
+          lastActivity: now,
+          messageCount: initialContent.trim() ? 1 : 0,
+          isActive: true,
         })
         .returning();
-    }
 
-    return { session, initial_message };
-  });
+      await tx.insert(conversationParticipants).values({
+        sessionId: session.id,
+        participantType: "user",
+        participantId: user.id,
+        displayName: user.displayName || user.username || user.email || user.id,
+        role: "owner",
+        status: "joined",
+        autoRespond: false,
+        participantMetadata: {},
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      let initial_message: typeof conversationMessages.$inferSelect | undefined;
+      if (initialContent.trim()) {
+        [initial_message] = await tx
+          .insert(conversationMessages)
+          .values({
+            sessionId: session.id,
+            role: "user",
+            content: encryptText(initialContent, "conversation_messages.content"),
+            clientMessageId: initialClientMessageId,
+            messageMetadata: {
+              ...(initialClientMessageId
+                ? { client_message_id: initialClientMessageId }
+                : {}),
+            },
+            senderType: "user",
+            senderId: user.id,
+            senderDisplayName:
+              user.displayName || user.username || user.email || user.id,
+            createdAt: now,
+            branchIndex: 0,
+            isActiveBranch: true,
+          })
+          .returning();
+      }
+
+      return { session, initial_message };
+    });
+  } catch (error) {
+    if (error instanceof ConversationScopeError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
 
   return NextResponse.json({
     success: true,

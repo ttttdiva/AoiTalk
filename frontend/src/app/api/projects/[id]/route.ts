@@ -9,6 +9,7 @@ import {
 } from "@/lib/server/project-access";
 import { proxyRequestToPythonApi } from "@/lib/server/python-api-proxy";
 import { canWriteSpace } from "@/lib/server/space-access";
+import { synchronizeProjectInformationTitle } from "@/lib/server/project-information-hierarchy";
 
 function toSnake(row: Record<string, unknown>): Record<string, unknown> {
   const map: Record<string, string> = {
@@ -66,6 +67,11 @@ function isInboxProject(row: { ownerId: string; slug: string; projectMetadata: u
     row.slug === `inbox-project-${row.ownerId}` ||
     metadata.isInboxDefault === true
   );
+}
+
+class ProjectLifecycleInvariantError extends Error {
+  readonly status = 409;
+  readonly code = "project_lifecycle_conflict";
 }
 
 export async function GET(
@@ -127,6 +133,20 @@ export async function PATCH(
       { status: 403 }
     );
   }
+  // Completed Projects retain their canonical Docs row for explicit owner
+  // cleanup.  Do not route a rename through the active bootstrap/repair path:
+  // that would unarchive/re-adopt a retained identity.  Reopening the Project
+  // is the intentional lifecycle transition for a new canonical title.
+  if (
+    name !== undefined
+    && settingsProject.project.isCompleted
+    && String(name).trim() !== String(settingsProject.project.name ?? "").trim()
+  ) {
+    return NextResponse.json(
+      { detail: "完了済みProjectの名前は変更できません。再開してから変更してください" },
+      { status: 409 },
+    );
+  }
 
   const updates: Record<string, unknown> = { updatedAt: new Date() };
   if (name !== undefined) updates.name = name;
@@ -155,14 +175,25 @@ export async function PATCH(
   // Project metadata also contains the bounded management upload
   // idempotency ledger.  Lock and re-read the row in the write transaction so
   // a concurrent upload cannot be erased by a stale metadata snapshot.
-  const updated = await db.transaction(async (tx) => {
-    const [current] = await tx
-      .select()
-      .from(projects)
-      .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
-      .limit(1)
-      .for("update");
-    if (!current) return undefined;
+  let updated: typeof projects.$inferSelect | undefined;
+  try {
+    updated = await db.transaction(async (tx) => {
+      const [current] = await tx
+        .select()
+        .from(projects)
+        .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
+        .limit(1)
+        .for("update");
+      if (!current) return undefined;
+      if (
+        updates.name !== undefined
+        && current.isCompleted
+        && String(updates.name).trim() !== String(current.name ?? "").trim()
+      ) {
+        throw new ProjectLifecycleInvariantError(
+          "完了済みProjectの名前は変更できません。再開してから変更してください",
+        );
+      }
 
     const transactionUpdates: Record<string, unknown> = { ...updates };
     if (
@@ -189,8 +220,34 @@ export async function PATCH(
       .set(transactionUpdates)
       .where(and(eq(projects.id, id), isNull(projects.deletedAt)))
       .returning();
-    return row;
-  });
+    // Project name is the authority for the canonical Project-information
+    // root title.  Keep the pointer/hierarchy lock and title sync in the same
+    // transaction so a failed canonical update rolls back the rename instead
+    // of leaving two competing identities.  Compatibility test doubles may
+    // omit knowledgeNodeId; in that case there is no canonical row to sync.
+    if (
+      row &&
+      transactionUpdates.name !== undefined &&
+      row.knowledgeNodeId &&
+      typeof synchronizeProjectInformationTitle === "function"
+    ) {
+      await synchronizeProjectInformationTitle({
+        project: row,
+        userId: user.id,
+        client: tx,
+      });
+    }
+      return row;
+    });
+  } catch (error) {
+    if (error instanceof ProjectLifecycleInvariantError) {
+      return NextResponse.json(
+        { detail: error.message, code: error.code },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
 
   if (!updated) {
     return NextResponse.json(

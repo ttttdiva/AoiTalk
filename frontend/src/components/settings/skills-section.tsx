@@ -35,6 +35,7 @@ import {
   Video,
 } from "lucide-react";
 import { SkillRecorderDialog } from "@/components/skills/skill-recorder-dialog";
+import { SkillProposalReview } from "@/components/skills/skill-proposal-review";
 import { isScreenRecordingSupported } from "@/lib/skill-recording";
 
 interface Skill {
@@ -345,6 +346,10 @@ export function SkillsSection() {
                 ))}
               </div>
             )}
+
+            <div className="border-t pt-3">
+              <SkillProposalReview onSkillChanged={fetchSkills} />
+            </div>
           </CardContent>
         )}
       </Card>

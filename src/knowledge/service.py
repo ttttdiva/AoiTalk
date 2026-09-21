@@ -13,13 +13,13 @@ import logging
 import mimetypes
 import re
 import uuid
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import yaml
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import JSON, String, and_, any_, case, cast, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -31,9 +31,12 @@ from ..memory.models import (
     KnowledgeLink,
     KnowledgeSource,
     KnowledgeSourcePermission,
-    ProjectMember,
 )
 from .growi_client import build_page_url
+from . import document_dates
+from .storage_scan import scan_source, read_source_file, verify_source_online, source_io_key
+from ..services.storage_io import StorageError, storage_io
+from ..services.storage_roots import lexical_path, relative_parts
 
 
 TEXT_EXTENSIONS = {".txt", ".md", ".csv", ".json", ".yaml", ".yml", ".xml", ".log"}
@@ -43,6 +46,22 @@ DEFAULT_INCLUDE_PATTERNS = ["*.md", "*.txt", "*.pdf", "*.docx", "*.xlsx", "*.ppt
 DEFAULT_EXCLUDE_PATTERNS = [".*", "__pycache__", "node_modules", ".git"]
 # GROWI 取り込みで既定除外する Wiki パス（ゴミ箱・個人ページ）。
 DEFAULT_GROWI_EXCLUDE_PATTERNS = ["/trash/*", "/trash", "/user/*"]
+
+DOCUMENT_DATE_FRONTMATTER_KEYS = document_dates.DOCUMENT_DATE_FRONTMATTER_KEYS
+GROWI_DOCUMENT_DATE_KEYS = document_dates.GROWI_DOCUMENT_DATE_KEYS
+KNOWLEDGE_DOCUMENT_DATE_SOURCES = document_dates.KNOWLEDGE_DOCUMENT_DATE_SOURCES
+# A write/owner source grant is also sufficient to read its contents.  Keep
+# this closed so an unrelated or malformed permission value never becomes an
+# implicit Knowledge read grant.
+KNOWLEDGE_SOURCE_READ_PERMISSIONS = frozenset({"read", "write", "owner"})
+KNOWLEDGE_DOCUMENT_STATUSES = frozenset({"active", "error", "deleted", "inactive"})
+KNOWLEDGE_QUERY_OPERATIONS = frozenset({"count", "list", "group"})
+KNOWLEDGE_QUERY_GROUP_FIELDS = frozenset(
+    {"source_id", "source", "project_id", "extension", "tag", "status", "date_source"}
+)
+KNOWLEDGE_QUERY_ORDER_FIELDS = frozenset({"date", "document_date"})
+KNOWLEDGE_QUERY_ORDER_DIRECTIONS = frozenset({"asc", "desc"})
+KNOWLEDGE_QUERY_MAX_LIMIT = 100
 
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _WIKI_LINK_RE = re.compile(r"\[\[([^\]|#]+)(?:#[^\]|]+)?(?:\|[^\]]+)?\]\]")
@@ -58,6 +77,27 @@ class KnowledgeSearchFilters:
     tags: tuple[str, ...] = ()
     extension: Optional[str] = None
     path_prefix: Optional[str] = None
+    # Server-resolved only: never exposed as a model/API argument.
+    readable_source_ids: Optional[tuple[uuid.UUID, ...]] = None
+
+
+@dataclass(frozen=True)
+class KnowledgeQueryFilters:
+    """Allowlisted filters for exact/count/list Knowledge queries.
+
+    ``document_date`` is the effective UTC date derived during ingestion.  A
+    legacy row whose timezone cannot be recovered remains unknown until
+    source synchronization establishes a current, proven date.
+    """
+
+    source_id: Optional[uuid.UUID | str] = None
+    project_id: Optional[uuid.UUID | str] = None
+    tags: tuple[str, ...] = ()
+    extension: Optional[str] = None
+    path_prefix: Optional[str] = None
+    status: Optional[str] = "active"
+    date_from: Optional[date | datetime | str] = None
+    date_to: Optional[date | datetime | str] = None
 
 
 class KnowledgeService:
@@ -108,7 +148,10 @@ class KnowledgeService:
         write_policy: str = "propose_patch",
         access_policy: Optional[dict[str, Any]] = None,
     ) -> KnowledgeSource:
-        root = KnowledgeService.resolve_root_path(root_path)
+        root = await storage_io.run(
+            source_io_key(root_path), lambda: KnowledgeService.resolve_root_path(root_path),
+            timeout=3,
+        )
         source = KnowledgeSource(
             name=name.strip(),
             description=description,
@@ -207,7 +250,10 @@ class KnowledgeService:
         write_policy: str = "propose_patch",
     ) -> KnowledgeSource:
         """Create or return the managed Knowledge Source for a project workspace."""
-        root = KnowledgeService.resolve_root_path(root_path)
+        root = await storage_io.run(
+            source_io_key(root_path), lambda: KnowledgeService.resolve_root_path(root_path),
+            timeout=3,
+        )
         existing_result = await session.execute(
             select(KnowledgeSource).where(KnowledgeSource.source_type == "project_workspace")
         )
@@ -326,24 +372,34 @@ class KnowledgeService:
             .where(
                 KnowledgeSourcePermission.source_id == source_id,
                 KnowledgeSourcePermission.user_id == actor_user_id,
+                KnowledgeSourcePermission.permission.in_(
+                    KNOWLEDGE_SOURCE_READ_PERMISSIONS
+                ),
             )
             .limit(1)
         )
         if user_perm.scalar_one_or_none():
             return True
-        project_perm = await session.execute(
-            select(KnowledgeSourcePermission.id)
-            .join(
-                ProjectMember,
-                KnowledgeSourcePermission.project_id == ProjectMember.project_id,
-            )
-            .where(
-                KnowledgeSourcePermission.source_id == source_id,
-                ProjectMember.user_id == actor_user_id,
-            )
-            .limit(1)
-        )
-        return project_perm.scalar_one_or_none() is not None
+        # Project access is owned by ProjectRepository/project_permissions.
+        # In particular, a ProjectMember row alone is not a grant: the project
+        # must be live and the member must have an effective ``read`` ACL.
+        from ..memory.project_repository import ProjectRepository
+
+        for permission in source.permissions or []:
+            if (
+                permission.project_id is None
+                or str(permission.permission or "").strip().lower()
+                not in KNOWLEDGE_SOURCE_READ_PERMISSIONS
+            ):
+                continue
+            if await ProjectRepository.has_permission(
+                session,
+                project_id=permission.project_id,
+                user_id=actor_user_id,
+                permission="read",
+            ):
+                return True
+        return False
 
     @staticmethod
     async def can_write_source(
@@ -470,10 +526,27 @@ class KnowledgeService:
                 try:
                     parsed = yaml.safe_load(raw) or {}
                     if isinstance(parsed, dict):
-                        return parsed, body
+                        return KnowledgeService._json_safe_metadata(parsed), body
                 except Exception:
                     return {}, body
         return {}, text
+
+    @staticmethod
+    def _json_safe_metadata(value: Any) -> Any:
+        """Keep YAML metadata safe for the JSON-backed document column."""
+
+        if isinstance(value, (datetime, date)):
+            return value.isoformat()
+        if isinstance(value, dict):
+            return {
+                str(key): KnowledgeService._json_safe_metadata(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [KnowledgeService._json_safe_metadata(item) for item in value]
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        return str(value)
 
     @staticmethod
     def _extract_title(path: Path, frontmatter: dict[str, Any], body: str) -> str:
@@ -502,6 +575,35 @@ class KnowledgeService:
         if isinstance(value, list):
             return [str(item) for item in value if str(item).strip()]
         return [str(value)]
+
+    _parse_document_datetime = staticmethod(document_dates.parse_document_datetime)
+    _frontmatter_document_date = staticmethod(document_dates.frontmatter_document_date)
+    _filename_document_date = staticmethod(document_dates.filename_document_date)
+    _growi_document_date = staticmethod(document_dates.growi_document_date)
+    _derive_document_date = staticmethod(document_dates.derive_document_date)
+
+    @staticmethod
+    def _parse_query_date_bound(
+        value: date | datetime | str,
+        *,
+        end: bool,
+    ) -> tuple[datetime, bool]:
+        """Return a UTC date bound and whether it is an exclusive day end."""
+
+        parsed = KnowledgeService._parse_document_datetime(value)
+        if parsed is None:
+            raise ValueError("date_from/date_to は ISO 8601 日時または日付で指定してください")
+        is_date_only = isinstance(value, date) and not isinstance(value, datetime)
+        if isinstance(value, str):
+            is_date_only = bool(
+                re.fullmatch(
+                    r"(?:\d{4}-\d{2}-\d{2}|\d{4}/\d{2}/\d{2}|\d{8})",
+                    value.strip(),
+                )
+            )
+        if end and is_date_only:
+            return parsed + timedelta(days=1), True
+        return parsed, False
 
     @staticmethod
     def _chunk_text(text: str, *, max_chars: int = 2400) -> list[dict[str, Any]]:
@@ -596,6 +698,10 @@ class KnowledgeService:
             except Exception as exc:
                 logger.exception("Knowledge index sync failed for source %s", source.id)
                 index_payload = {"status": "error", "indexed_chunks": 0, "error": str(exc)}
+        if index_payload and index_payload.get("status") in {"error", "unavailable"}:
+            source.status = "error"
+            source.error_message = "Knowledge derived index synchronization failed; retry source sync"
+            errors.append(source.error_message)
         return {
             "source": source.to_dict(),
             "indexed_files": indexed,
@@ -613,7 +719,7 @@ class KnowledgeService:
         max_files: int,
     ) -> tuple[int, int, list[str]]:
         """ローカルディレクトリソースをファイル走査で同期する。"""
-        root = KnowledgeService.resolve_root_path(source.root_path)
+        root = lexical_path(source.root_path)
 
         existing_result = await session.execute(
             select(KnowledgeDocument).where(KnowledgeDocument.source_id == source.id)
@@ -631,19 +737,32 @@ class KnowledgeService:
             source.exclude_patterns, DEFAULT_EXCLUDE_PATTERNS
         )
 
-        for path in sorted(root.rglob("*"), key=lambda item: str(item).lower()):
-            if indexed >= max_files:
-                break
-            if not path.is_file():
-                continue
-            if not KnowledgeService._matches_patterns(path, root, include, exclude):
-                continue
-
+        try:
+            scan = await scan_source(root, include, exclude, max_files, KnowledgeService._matches_patterns)
+        except (StorageError, OSError) as exc:
+            return 0, 0, [f"Knowledge Source storage unavailable; existing documents preserved: {exc}"]
+        complete = scan.complete
+        errors.extend(scan.errors)
+        # An unregistered legacy mount can leave an empty local mountpoint.
+        # Never interpret that ambiguous state as permission to delete all rows.
+        if not scan.paths and any(doc.status != "deleted" for doc in existing.values()):
+            return 0, 0, ["Knowledge Source is empty or unavailable; existing documents preserved"]
+        for path in scan.paths:
             rel_path = path.relative_to(root).as_posix()
             seen_paths.add(rel_path)
             indexed += 1
-            text, extract_error = KnowledgeService._read_file_text(path)
-            stat = path.stat()
+            try:
+                text, extract_error, stat = await read_source_file(
+                    root, path, KnowledgeService._read_file_text,
+                )
+            except (StorageError, OSError) as exc:
+                complete = False
+                errors.append(f"{rel_path}: storage unavailable; previous document preserved: {exc}")
+                continue
+            if extract_error:
+                complete = False
+                errors.append(f"{rel_path}: {extract_error}; previous document preserved")
+                continue
             digest = KnowledgeService._content_hash(text)
             frontmatter, body = KnowledgeService._parse_frontmatter(text)
             tags = KnowledgeService._normalize_tags(frontmatter)
@@ -662,12 +781,21 @@ class KnowledgeService:
             if document is None:
                 document = KnowledgeDocument(source_id=source.id, path=rel_path)
                 session.add(document)
-            document.resolved_absolute_path = str(path.resolve())
+            document.resolved_absolute_path = str(path)
             document.title = KnowledgeService._extract_title(path, frontmatter, body)
             document.extension = path.suffix.lower()
             document.mime_type = mimetypes.guess_type(path.name)[0]
             document.content_hash = digest
-            document.modified_at = datetime.fromtimestamp(stat.st_mtime)
+            modified_at_utc = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
+            document.modified_at = modified_at_utc.replace(tzinfo=None)
+            (
+                document.document_date,
+                document.document_date_source,
+            ) = KnowledgeService._derive_document_date(
+                frontmatter,
+                rel_path,
+                modified_at=modified_at_utc,
+            )
             document.size_bytes = stat.st_size
             document.frontmatter_json = frontmatter
             document.tags = tags
@@ -719,8 +847,13 @@ class KnowledgeService:
             if extract_error:
                 errors.append(f"{rel_path}: {extract_error}")
 
+        try:
+            await verify_source_online(root)
+        except (StorageError, OSError):
+            complete = False
+            errors.append("Knowledge Source disconnected; unvisited documents preserved")
         for rel_path, document in existing.items():
-            if rel_path not in seen_paths and document.status != "deleted":
+            if complete and not errors and rel_path not in seen_paths and document.status != "deleted":
                 document.status = "deleted"
                 document.updated_at = datetime.utcnow()
 
@@ -775,11 +908,14 @@ class KnowledgeService:
             logger.exception("GROWI ページ列挙に失敗 source=%s", source.id)
             return 0, 0, [str(exc)]
 
+        complete = True
         for page in sorted(pages, key=lambda item: item.path.lower()):
-            if indexed >= max_files:
-                break
             if not KnowledgeService._growi_path_matches(page.path, include, exclude):
                 continue
+            if indexed >= max_files:
+                complete = False
+                errors.append("Source scan incomplete: max_files reached; unvisited documents preserved")
+                break
 
             rel_path = page.path
             seen_paths.add(rel_path)
@@ -797,6 +933,41 @@ class KnowledgeService:
 
             if document is not None and not need_fetch:
                 # 変更なし: 本文再取得もチャンク再構築も行わない。
+                metadata = dict(document.frontmatter_json or {})
+                growi_metadata = dict(metadata.get("growi") or {})
+                if KnowledgeService._parse_document_datetime(page.updated_at) is not None:
+                    growi_metadata["updated_at"] = page.updated_at
+                    document.modified_at = KnowledgeService._parse_iso_datetime(page.updated_at)
+                growi_metadata.update(page_id=page.page_id, change_key=page.change_key)
+                if page.revision_id:
+                    growi_metadata["revision_id"] = page.revision_id
+                metadata["growi"] = growi_metadata
+                document.frontmatter_json = metadata
+                if getattr(document, "document_date_source", None) == "unknown":
+                    # The repair migration explicitly rejected historical
+                    # naive mtime. An unchanged page without fresh date
+                    # evidence must not resurrect that rejected timestamp.
+                    repaired = document_dates.repair_unknown_legacy_date(
+                        metadata, rel_path, growi_updated_at=page.updated_at,
+                    )
+                    document.document_date = repaired.document_date
+                    document.document_date_source = repaired.document_date_source
+                    continue
+                (
+                    document.document_date,
+                    document.document_date_source,
+                ) = KnowledgeService._derive_document_date(
+                    (document.frontmatter_json or {})
+                    if isinstance(document.frontmatter_json, dict)
+                    else {},
+                    rel_path,
+                    growi_updated_at=page.updated_at,
+                    modified_at=(
+                        document.document_date
+                        if getattr(document, "document_date_source", None) == "modified_at"
+                        else None
+                    ),
+                )
                 continue
 
             try:
@@ -844,7 +1015,17 @@ class KnowledgeService:
             document.extension = ".md"
             document.mime_type = "text/markdown"
             document.content_hash = digest
-            document.modified_at = KnowledgeService._parse_iso_datetime(page.updated_at)
+            modified_at = KnowledgeService._parse_iso_datetime(page.updated_at)
+            document.modified_at = modified_at
+            (
+                document.document_date,
+                document.document_date_source,
+            ) = KnowledgeService._derive_document_date(
+                frontmatter,
+                rel_path,
+                growi_updated_at=page.updated_at,
+                modified_at=modified_at,
+            )
             document.size_bytes = len(body.encode("utf-8", errors="replace"))
             document.frontmatter_json = fm_json
             document.tags = tags
@@ -899,7 +1080,7 @@ class KnowledgeService:
                     )
 
         for rel_path, document in existing.items():
-            if rel_path not in seen_paths and document.status != "deleted":
+            if complete and rel_path not in seen_paths and document.status != "deleted":
                 document.status = "deleted"
                 document.updated_at = datetime.utcnow()
 
@@ -924,14 +1105,8 @@ class KnowledgeService:
 
     @staticmethod
     def _parse_iso_datetime(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00")).replace(
-                tzinfo=None
-            )
-        except ValueError:
-            return None
+        parsed = KnowledgeService._parse_document_datetime(value)
+        return parsed.replace(tzinfo=None) if parsed is not None else None
 
     @staticmethod
     def _source_project_id(source: KnowledgeSource) -> Optional[str]:
@@ -970,6 +1145,468 @@ class KnowledgeService:
             "chunks": int(chunk_count or 0),
             "deleted_documents": int(deleted_count or 0),
         }
+
+    @staticmethod
+    async def _readable_source_ids(
+        session: AsyncSession,
+        *,
+        source_id: Optional[uuid.UUID | str],
+        actor_user_id: Optional[uuid.UUID],
+        is_admin: bool,
+    ) -> list[uuid.UUID]:
+        """Batch source grants, using the canonical project ACL evaluator.
+
+        Only authorization metadata is materialized; document queries share
+        this result and never perform per-document or per-project ACL queries.
+        """
+        from ..memory.models import Project, ProjectMember, User
+        from ..services.project_permissions import has_effective_project_permission
+
+        if actor_user_id is None and not is_admin:
+            return []
+        normalized_source_id = KnowledgeService._coerce_uuid(source_id)
+        source_stmt = select(KnowledgeSource.id)
+        if normalized_source_id is not None:
+            source_stmt = source_stmt.where(KnowledgeSource.id == normalized_source_id)
+        if is_admin:
+            return list((await session.execute(source_stmt)).scalars().all())
+        stmt = (
+            source_stmt.add_columns(
+                KnowledgeSource.owner_user_id,
+                KnowledgeSourcePermission.user_id,
+                KnowledgeSourcePermission.permission,
+                Project.id.label("project_id"),
+                Project.owner_id.label("project_owner_id"),
+                User.id.label("actor_id"),
+                User.role.label("user_role"),
+                ProjectMember.permissions.label("member_permissions"),
+            )
+            .outerjoin(KnowledgeSourcePermission,
+                       KnowledgeSourcePermission.source_id == KnowledgeSource.id)
+            .outerjoin(Project, and_(
+                Project.id == KnowledgeSourcePermission.project_id,
+                Project.deleted_at.is_(None),
+            ))
+            .outerjoin(User, User.id == actor_user_id)
+            .outerjoin(ProjectMember, and_(
+                ProjectMember.project_id == Project.id,
+                ProjectMember.user_id == actor_user_id,
+            ))
+        )
+        readable: set[uuid.UUID] = set()
+        for row in (await session.execute(stmt)).all():
+            if row.id in readable:
+                continue
+            direct = (row.user_id == actor_user_id
+                      and row.permission in KNOWLEDGE_SOURCE_READ_PERMISSIONS)
+            project = (
+                row.project_id is not None and row.actor_id is not None
+                and str(row.permission or "").strip().lower()
+                in KNOWLEDGE_SOURCE_READ_PERMISSIONS
+                and has_effective_project_permission(
+                    user_id=actor_user_id, user_role=row.user_role,
+                    project_owner_id=row.project_owner_id,
+                    member_permissions=row.member_permissions, permission="read",
+                )
+            )
+            if row.owner_user_id == actor_user_id or direct or project:
+                readable.add(row.id)
+        return sorted(readable, key=str)
+
+    @staticmethod
+    def _normalize_query_filters(
+        filters: Optional[KnowledgeQueryFilters],
+    ) -> tuple[KnowledgeQueryFilters, Optional[datetime], Optional[datetime], bool]:
+        filters = filters or KnowledgeQueryFilters()
+        source_id = KnowledgeService._coerce_uuid(filters.source_id)
+        project_id = KnowledgeService._coerce_uuid(filters.project_id)
+        raw_tags = filters.tags
+        if isinstance(raw_tags, str):
+            raw_tags = (raw_tags,)
+        tags = tuple(
+            str(tag).strip().lower()
+            for tag in (raw_tags or ())
+            if str(tag).strip()
+        )
+        extension = str(filters.extension or "").strip().lower()
+        if extension and not extension.startswith("."):
+            extension = f".{extension}"
+        path_prefix = str(filters.path_prefix or "").strip().replace("\\", "/")
+        status = str(filters.status or "active").strip().lower()
+        if status not in KNOWLEDGE_DOCUMENT_STATUSES and status != "all":
+            raise ValueError("status is not an allowed Knowledge document status")
+
+        date_from = None
+        date_to = None
+        date_to_exclusive = False
+        if filters.date_from is not None:
+            date_from, _ = KnowledgeService._parse_query_date_bound(
+                filters.date_from,
+                end=False,
+            )
+        if filters.date_to is not None:
+            date_to, date_to_exclusive = KnowledgeService._parse_query_date_bound(
+                filters.date_to,
+                end=True,
+            )
+        if date_from is not None and date_to is not None and date_from > date_to:
+            raise ValueError("date_from must not be later than date_to")
+        normalized = KnowledgeQueryFilters(
+            source_id=source_id,
+            project_id=project_id,
+            tags=tags,
+            extension=extension or None,
+            path_prefix=path_prefix or None,
+            status=status,
+            date_from=filters.date_from,
+            date_to=filters.date_to,
+        )
+        return normalized, date_from, date_to, date_to_exclusive
+
+    @staticmethod
+    def _query_json_values(column: Any, dialect: str) -> Any:
+        """Expand only JSON arrays; legacy null/scalar/object values are empty."""
+        if dialect == "postgresql":
+            array = case(
+                (func.json_typeof(column) == "array", column),
+                else_=cast([], JSON),
+            )
+            return func.json_array_elements_text(array).table_valued("value")
+        if dialect == "sqlite":
+            array = case((func.json_type(column) == "array", column), else_="[]")
+            return func.json_each(array).table_valued("value")
+        raise ValueError("Structured Knowledge queries require PostgreSQL or SQLite")
+
+    @staticmethod
+    def _query_trim(value: Any, dialect: str) -> Any:
+        trim = func.btrim if dialect == "postgresql" else func.trim
+        return trim(cast(value, String), " \t\n\r\v\f")
+
+    @staticmethod
+    async def _structured_query_relation(
+        session: AsyncSession,
+        *,
+        filters: KnowledgeQueryFilters,
+        actor_user_id: Optional[uuid.UUID],
+        is_admin: bool,
+        date_from: Optional[datetime],
+        date_to: Optional[datetime],
+        date_to_exclusive: bool,
+    ) -> Any:
+        readable_source_ids = await KnowledgeService._readable_source_ids(
+            session,
+            source_id=filters.source_id,
+            actor_user_id=actor_user_id,
+            is_admin=is_admin,
+        )
+        dialect = session.get_bind().dialect.name
+        if dialect == "postgresql":
+            # One array parameter avoids asyncpg's bind-count ceiling when a
+            # user can read many sources. ACL rows never multiply documents.
+            from sqlalchemy.dialects.postgresql import ARRAY, UUID
+            source_match = KnowledgeDocument.source_id == any_(
+                cast(readable_source_ids, ARRAY(UUID(as_uuid=True)))
+            )
+        else:
+            source_match = KnowledgeDocument.source_id.in_(readable_source_ids)
+        conditions = [source_match]
+        if filters.status != "all":
+            conditions.append(KnowledgeDocument.status == filters.status)
+        if filters.extension:
+            conditions.append(KnowledgeDocument.extension == filters.extension)
+        if filters.path_prefix:
+            conditions.append(
+                KnowledgeDocument.path.startswith(filters.path_prefix, autoescape=True)
+            )
+        if date_from is not None:
+            conditions.append(KnowledgeDocument.document_date >= date_from)
+        if date_to is not None:
+            if date_to_exclusive:
+                conditions.append(KnowledgeDocument.document_date < date_to)
+            else:
+                conditions.append(KnowledgeDocument.document_date <= date_to)
+
+        if filters.tags:
+            values = KnowledgeService._query_json_values(KnowledgeDocument.tags, dialect)
+            tag = func.lower(KnowledgeService._query_trim(values.c.value, dialect))
+            for wanted in set(filters.tags):
+                conditions.append(select(1).select_from(values).where(tag == wanted).exists())
+        if filters.project_id:
+            values = KnowledgeService._query_json_values(
+                KnowledgeDocument.project_refs, dialect,
+            )
+            conditions.append(select(1).select_from(values).where(
+                values.c.value == str(filters.project_id)
+            ).exists())
+        return (
+            select(
+                KnowledgeDocument.id.label("document_id"), KnowledgeDocument.source_id,
+                KnowledgeSource.name.label("source_name"), KnowledgeDocument.extension,
+                KnowledgeDocument.tags, KnowledgeDocument.project_refs,
+                KnowledgeDocument.status, KnowledgeDocument.document_date_source,
+            )
+            .join(KnowledgeSource, KnowledgeDocument.source_id == KnowledgeSource.id)
+            .where(and_(*conditions))
+            .cte("knowledge_matches")
+        )
+
+    @staticmethod
+    def _structured_groups(matches: Any, group_by: str, dialect: str) -> Any:
+        if group_by in {"tag", "project_id"}:
+            column = matches.c.tags if group_by == "tag" else matches.c.project_refs
+            values = KnowledgeService._query_json_values(column, dialect)
+            trimmed = KnowledgeService._query_trim(values.c.value, dialect)
+            key = trimmed if group_by == "tag" else values.c.value
+            # Outer expansion gives empty arrays their null bucket; DISTINCT
+            # counts each document once even when a JSON array repeats a value.
+            members = select(matches.c.document_id, key.label("key")).select_from(
+                matches.outerjoin(values, trimmed != "")
+            ).distinct().subquery()
+            return select(members.c.key, func.count().label("count")).group_by(
+                members.c.key
+            ).subquery("knowledge_groups")
+        fields = {
+            "source_id": matches.c.source_id,
+            "source": func.nullif(matches.c.source_name, ""),
+            "extension": func.nullif(matches.c.extension, ""),
+            "status": func.nullif(matches.c.status, ""),
+            "date_source": case(
+                (KnowledgeService._query_trim(matches.c.document_date_source, dialect) == "", None),
+                else_=matches.c.document_date_source,
+            ),
+        }
+        key = fields[group_by]
+        return select(key.label("key"), func.count().label("count")).select_from(
+            matches
+        ).group_by(key).subquery("knowledge_groups")
+
+    @staticmethod
+    async def structured_query(
+        session: AsyncSession,
+        *,
+        actor_user_id: Optional[uuid.UUID],
+        is_admin: bool = False,
+        operation: str = "list",
+        filters: Optional[KnowledgeQueryFilters] = None,
+        source_id: Optional[uuid.UUID | str] = None,
+        project_id: Optional[uuid.UUID | str] = None,
+        tags: Optional[Iterable[str]] = None,
+        extension: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        status: Optional[str] = None,
+        date_from: Optional[date | datetime | str] = None,
+        date_to: Optional[date | datetime | str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        order_by: str = "date",
+        order: str = "desc",
+        group_by: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Run an ACL-safe exact Knowledge count, list, or metadata group.
+
+        Every model-facing choice is validated against finite allowlists and
+        translated into SQLAlchemy expressions.  There is intentionally no
+        raw SQL or caller-provided column/expression surface here.
+
+        ``offset`` counts documents for list and buckets for group. Both are
+        bounded by ``limit`` and return ``next_offset`` (None at the end).
+        ``total_matches`` always counts documents; ``group_total`` counts all
+        buckets before pagination. Groups sort by count descending then key;
+        lists sort by date in the requested direction, then path and ID.
+        """
+
+        operation = str(operation or "list").strip().lower()
+        if operation not in KNOWLEDGE_QUERY_OPERATIONS:
+            raise ValueError("operation must be one of: count, list, group")
+        order_by = str(order_by or "date").strip().lower()
+        if order_by not in KNOWLEDGE_QUERY_ORDER_FIELDS:
+            raise ValueError("order_by must be date")
+        order = str(order or "desc").strip().lower()
+        if order not in KNOWLEDGE_QUERY_ORDER_DIRECTIONS:
+            raise ValueError("order must be asc or desc")
+        if group_by is not None:
+            group_by = str(group_by).strip().lower()
+            if group_by not in KNOWLEDGE_QUERY_GROUP_FIELDS:
+                raise ValueError("group_by is not an allowed Knowledge metadata field")
+        if operation == "group" and not group_by:
+            raise ValueError("group_by is required for a group operation")
+        if operation != "group" and group_by:
+            raise ValueError("group_by is only valid for a group operation")
+
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit must be an integer") from exc
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        limit = min(limit, KNOWLEDGE_QUERY_MAX_LIMIT)
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a non-negative integer")
+
+        direct_filter_values = (
+            source_id,
+            project_id,
+            tags,
+            extension,
+            path_prefix,
+            status,
+            date_from,
+            date_to,
+        )
+        if filters is not None and any(value is not None for value in direct_filter_values):
+            raise ValueError("filters cannot be combined with direct Knowledge filters")
+        if filters is None:
+            direct_tags = (
+                (tags,)
+                if isinstance(tags, str)
+                else tuple(tags or ())
+            )
+            filters = KnowledgeQueryFilters(
+                source_id=source_id,
+                project_id=project_id,
+                tags=direct_tags,
+                extension=extension,
+                path_prefix=path_prefix,
+                status=status or "active",
+                date_from=date_from,
+                date_to=date_to,
+            )
+        normalized_filters, date_from, date_to, date_to_exclusive = (
+            KnowledgeService._normalize_query_filters(filters)
+        )
+        matches = await KnowledgeService._structured_query_relation(
+            session,
+            filters=normalized_filters,
+            actor_user_id=actor_user_id,
+            is_admin=is_admin,
+            date_from=date_from,
+            date_to=date_to,
+            date_to_exclusive=date_to_exclusive,
+        )
+        total_count = int((await session.execute(
+            select(func.count()).select_from(matches)
+        )).scalar_one())
+
+        if operation == "count":
+            return {
+                "operation": "count",
+                "count": total_count,
+                "total_matches": total_count,
+            }
+
+        if operation == "group":
+            grouped = KnowledgeService._structured_groups(
+                matches, group_by or "", session.get_bind().dialect.name,
+            )
+            group_total = int((await session.execute(
+                select(func.count()).select_from(grouped)
+            )).scalar_one())
+            result = await session.execute(
+                select(grouped).order_by(
+                    grouped.c.count.desc(), grouped.c.key.asc().nullsfirst(),
+                ).limit(limit).offset(offset)
+            )
+            groups = [
+                {"key": str(row.key) if row.key is not None else None, "count": int(row.count)}
+                for row in result.all()
+            ]
+            has_more = offset + len(groups) < group_total
+            return {
+                "operation": "group",
+                "group_by": group_by,
+                "count": total_count,
+                "total_matches": total_count,
+                "group_total": group_total,
+                "returned": len(groups),
+                "returned_count": len(groups),
+                "limit": limit,
+                "offset": offset,
+                "has_more": has_more,
+                "next_offset": offset + len(groups) if has_more else None,
+                "truncated": group_total > len(groups),
+                "groups": groups,
+            }
+
+        date_order = (
+            KnowledgeDocument.document_date.asc()
+            if order == "asc" else KnowledgeDocument.document_date.desc()
+        )
+        result = await session.execute(
+            select(KnowledgeDocument, KnowledgeSource)
+            .join(KnowledgeSource, KnowledgeDocument.source_id == KnowledgeSource.id)
+            .join(matches, matches.c.document_id == KnowledgeDocument.id)
+            .order_by(date_order.nullslast(), KnowledgeDocument.path.asc(), KnowledgeDocument.id.asc())
+            .limit(limit).offset(offset)
+        )
+        documents = []
+        for document, source in result.all():
+            payload = document.to_dict()
+            payload["source"] = source.to_dict()
+            documents.append(payload)
+        return {
+            "operation": "list",
+            "count": total_count,
+            "total_count": total_count,
+            "total_matches": total_count,
+            "returned_count": len(documents),
+            "returned": len(documents),
+            "truncated": total_count > len(documents),
+            "has_more": offset + len(documents) < total_count,
+            "next_offset": (
+                offset + len(documents) if offset + len(documents) < total_count else None
+            ),
+            "limit": limit,
+            "offset": offset,
+            "order_by": order_by,
+            "order": order,
+            "items": documents,
+            "documents": documents,
+        }
+
+    @staticmethod
+    async def query(
+        session: AsyncSession,
+        *,
+        actor_user_id: Optional[uuid.UUID],
+        is_admin: bool = False,
+        operation: str = "list",
+        filters: Optional[KnowledgeQueryFilters] = None,
+        source_id: Optional[uuid.UUID | str] = None,
+        project_id: Optional[uuid.UUID | str] = None,
+        tags: Optional[Iterable[str]] = None,
+        extension: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        status: Optional[str] = None,
+        date_from: Optional[date | datetime | str] = None,
+        date_to: Optional[date | datetime | str] = None,
+        limit: int = 20,
+        offset: int = 0,
+        order_by: str = "date",
+        order: str = "desc",
+        group_by: Optional[str] = None,
+    ) -> dict[str, Any]:
+        """Compatibility alias for callers that name the operation ``query``."""
+
+        return await KnowledgeService.structured_query(
+            session,
+            actor_user_id=actor_user_id,
+            is_admin=is_admin,
+            operation=operation,
+            filters=filters,
+            source_id=source_id,
+            project_id=project_id,
+            tags=tags,
+            extension=extension,
+            path_prefix=path_prefix,
+            status=status,
+            date_from=date_from,
+            date_to=date_to,
+            limit=limit,
+            offset=offset,
+            order_by=order_by,
+            order=order,
+            group_by=group_by,
+        )
 
     @staticmethod
     async def search(
@@ -1013,12 +1650,19 @@ class KnowledgeService:
     ) -> list[dict[str, Any]]:
         if not query:
             return []
+        readable = await KnowledgeService._readable_source_ids(
+            session, source_id=filters.source_id,
+            actor_user_id=actor_user_id, is_admin=is_admin,
+        )
+        if not readable:
+            return []
+        index_filters = replace(filters, readable_source_ids=tuple(readable))
         try:
             from .index_service import get_knowledge_index_service
 
             index_hits = await get_knowledge_index_service().search(
                 query=query,
-                filters=filters,
+                filters=index_filters,
                 limit=limit,
             )
         except Exception:
@@ -1077,71 +1721,12 @@ class KnowledgeService:
         filters: Optional[KnowledgeSearchFilters] = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        filters = filters or KnowledgeSearchFilters()
-        query = query.strip()
-        terms = [term for term in re.split(r"\s+", query) if term]
-        conditions = [KnowledgeDocument.status == "active"]
-        if filters.source_id:
-            conditions.append(KnowledgeDocument.source_id == filters.source_id)
-        if filters.extension:
-            extension = filters.extension
-            if not extension.startswith("."):
-                extension = f".{extension}"
-            conditions.append(KnowledgeDocument.extension == extension.lower())
-        if filters.path_prefix:
-            conditions.append(KnowledgeDocument.path.ilike(f"{filters.path_prefix}%"))
-        candidate_limit = max(limit * 50, 500) if query else max(limit * 5, limit)
+        from .lexical import search_lexical
 
-        result = await session.execute(
-            select(KnowledgeChunk, KnowledgeDocument, KnowledgeSource)
-            .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
-            .join(KnowledgeSource, KnowledgeDocument.source_id == KnowledgeSource.id)
-            .where(and_(*conditions))
-            .order_by(KnowledgeDocument.updated_at.desc().nullslast())
-            .limit(candidate_limit)
+        return await search_lexical(
+            session, query=query, actor_user_id=actor_user_id,
+            is_admin=is_admin, filters=filters, limit=limit,
         )
-
-        hits: list[dict[str, Any]] = []
-        lower_terms = [term.lower() for term in terms]
-        for chunk, document, source in result.all():
-            if not await KnowledgeService.can_read_source(
-                session,
-                source_id=source.id,
-                actor_user_id=actor_user_id,
-                is_admin=is_admin,
-            ):
-                continue
-            if filters.tags:
-                doc_tags = {str(tag).lower() for tag in document.tags or []}
-                if not all(tag.lower() in doc_tags for tag in filters.tags):
-                    continue
-            if filters.project_id:
-                project_refs = {str(ref) for ref in document.project_refs or []}
-                if str(filters.project_id) not in project_refs:
-                    continue
-            if query:
-                haystack = "\n".join(
-                    [
-                        chunk.text or "",
-                        document.title or "",
-                        document.path or "",
-                    ]
-                ).lower()
-                if not all(term in haystack for term in lower_terms):
-                    continue
-            score = KnowledgeService._lexical_score(query, chunk.text, document)
-            hits.append(
-                KnowledgeService._search_payload(
-                    score=score,
-                    source=source,
-                    document=document,
-                    chunk=chunk,
-                    retrieval="lexical",
-                )
-            )
-            if len(hits) >= limit:
-                break
-        return sorted(hits, key=lambda item: item["score"], reverse=True)
 
     @staticmethod
     async def _passes_search_acl_and_filters(
@@ -1153,6 +1738,10 @@ class KnowledgeService:
         is_admin: bool,
         filters: KnowledgeSearchFilters,
     ) -> bool:
+        if document.status != "active" or document.source_id != source.id:
+            return False
+        if filters.source_id and document.source_id != KnowledgeService._coerce_uuid(filters.source_id):
+            return False
         if not await KnowledgeService.can_read_source(
             session,
             source_id=source.id,
@@ -1300,14 +1889,11 @@ class KnowledgeService:
                 "error": None,
                 "url": build_page_url(source.root_path, document.path),
             }
-        file_path = Path(source.root_path).resolve() / document.path
-        resolved = file_path.resolve()
-        root = Path(source.root_path).resolve()
-        try:
-            resolved.relative_to(root)
-        except ValueError as exc:
-            raise PermissionError("ナレッジソース外のファイルは読めません") from exc
-        text, error = KnowledgeService._read_file_text(resolved)
+        root = lexical_path(source.root_path)
+        file_path = root.joinpath(*relative_parts(document.path))
+        text, error, _stat = await read_source_file(
+            root, file_path, KnowledgeService._read_file_text,
+        )
         return {
             "source": source.to_dict(),
             "document": document.to_dict(),

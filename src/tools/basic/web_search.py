@@ -6,9 +6,14 @@ lightweight search service, depending on `search.provider`.
 """
 import os
 import asyncio
+import contextvars
+import inspect
 import time
+import warnings
 from collections.abc import Mapping
 from types import SimpleNamespace
+
+import httpx
 from ..core import tool
 
 from ...llm.conversation_context import normalize_usage, persist_usage_sync
@@ -16,11 +21,25 @@ from ...llm.conversation_context import normalize_usage, persist_usage_sync
 from ..external_llm_permission import check_permission_sync
 from ...services.quick_search_service import (
     SEARCH_PROVIDER_LOCAL,
+    SearchProviderConfigError,
     get_search_provider,
     local_web_search,
 )
+from ...services.deep_research_service import (
+    DeepResearchProviderError,
+    DeepResearchTransportError,
+)
+from ...services.search_egress_policy import (
+    SearchEgressPreconditionError,
+    assert_openai_hosted_search_ready,
+    assert_public_search_egress_approved,
+    is_enterprise_profile,
+    search_egress_error_message,
+)
 from ...services.outbound_privacy_service import (
+    ExternalProviderBlocked,
     OutboundPrivacyGateway,
+    PrivacyError,
     get_privacy_policy_context,
 )
 from .x_search import (
@@ -67,6 +86,56 @@ def _config_value(config, key: str, default=None):
         if value is not None:
             return value
     return default
+
+
+def _enterprise_profile() -> bool:
+    return is_enterprise_profile()
+
+
+def _hosted_search_precondition(config) -> str | None:
+    """Return a sanitized precondition error before any OpenAI transport."""
+
+    try:
+        assert_openai_hosted_search_ready(config)
+    except SearchEgressPreconditionError as exc:
+        return search_egress_error_message(exc)
+    return None
+
+
+def _configured_openai_api_key(config) -> str:
+    value = _config_value(config, "search.openai_api_key", None)
+    if value is None:
+        value = _config_value(config, "openai_api_key", None)
+    if value is None:
+        value = os.getenv("AOITALK_SEARCH_OPENAI_API_KEY")
+    if value is None:
+        value = os.getenv("OPENAI_API_KEY")
+    return str(value or "").strip()
+
+
+def _sanitized_search_error(exc: Exception, *, hosted: bool = False) -> str:
+    if isinstance(exc, SearchEgressPreconditionError):
+        return search_egress_error_message(exc)
+    if isinstance(exc, DeepResearchTransportError):
+        if exc.code == "engine_timeout":
+            return "検索エンジンが制限時間を超えました（engine_timeout）。ネットワーク設定を確認してください。"
+        return "検索エグレスに到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+    if isinstance(exc, DeepResearchProviderError):
+        return "検索プロバイダが利用できませんでした（provider_failed）。設定とサービス状態を確認してください。"
+    if isinstance(exc, ExternalProviderBlocked):
+        return "検索はプライバシーポリシーにより停止しました（privacy_protection_failed）。"
+    if isinstance(exc, PrivacyError):
+        return "検索はプライバシー保護に失敗したため停止しました（privacy_protection_failed）。"
+    if isinstance(exc, (httpx.TimeoutException, TimeoutError)):
+        return "検索エグレスに到達できませんでした（egress_unreachable）。ネットワーク設定を確認してください。"
+    if isinstance(exc, (httpx.ConnectError, httpx.NetworkError)):
+        return "検索エグレスに到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status in {401, 403}:
+            return "検索の認証情報が無効です（credential_invalid）。"
+        return "検索エグレスが要求を拒否しました（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+    return "Hosted Web検索に失敗しました（hosted_search_failed）。設定と承認済みエグレスを確認してください。" if hosted else "Web検索に失敗しました。"
 
 
 def get_openai_search_model(config) -> str:
@@ -230,6 +299,120 @@ def _privacy_gateway_for_config(config, usage_context=None) -> OutboundPrivacyGa
     )
 
 
+def _web_search_egress_descriptor(model: str, *, destination: str = "https://api.openai.com/v1/responses"):
+    """Build the canonical descriptor without making import-time assumptions.
+
+    ``EgressDescriptor`` is supplied by the privacy boundary.  Keeping this
+    tiny resolver lazy preserves importability for stripped deployments that
+    do not ship the new boundary implementation yet; production always gets
+    the real dataclass instance.
+    """
+
+    try:
+        from ...services.outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="web_search",
+            transport="openai.responses.create",
+            destination=destination,
+            provider="openai",
+            tool="web_search",
+            model=str(model or ""),
+        )
+    except ImportError:  # pragma: no cover - compatibility with old embeds
+        return SimpleNamespace(
+            action="web_search",
+            transport="openai.responses.create",
+            destination=destination,
+            provider="openai",
+            tool="web_search",
+            model=str(model or ""),
+        )
+
+
+def _execute_search_sync(
+    gateway: OutboundPrivacyGateway,
+    payload,
+    *,
+    model: str,
+    sender,
+    destination: str = "https://api.openai.com/v1/responses",
+):
+    """Cross the privacy boundary exactly once before Hosted Search transport.
+
+    The production gateway path invokes ``execute_sync`` and lets that method
+    perform masking, review, and the single sender call as one transaction.
+    """
+
+    descriptor = _web_search_egress_descriptor(model, destination=destination)
+    execute = getattr(gateway, "execute_sync", None)
+    if callable(execute):
+        return execute(
+            payload,
+            provider="openai",
+            descriptor=descriptor,
+            sender=sender,
+            base_url="https://api.openai.com/v1",
+            source_kind="web_search",
+            model=model,
+        )
+
+    # A few embedded/test gateways from before the transaction API only expose
+    # ``protect_sync``.  Keep a deliberately narrow compatibility bridge while
+    # deployments roll forward: the old protector must return an explicit
+    # ``final_payload`` or ``payload`` value, and that value alone is passed to
+    # the sender.  There is never a raw-payload fallback, and production's
+    # OutboundPrivacyGateway always takes the execute path above.
+    protect = getattr(gateway, "protect_sync", None)
+    if not callable(protect):
+        raise PrivacyError("outbound privacy gateway does not support execution")
+    warnings.warn(
+        "protect_sync-only outbound privacy gateways are deprecated; implement execute_sync",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    kwargs = {
+        "provider": "openai",
+        "base_url": "https://api.openai.com/v1",
+        "source_kind": "web_search",
+        "model": model,
+        "descriptor": descriptor,
+    }
+    try:
+        protected = protect(payload, **kwargs)
+    except TypeError as exc:
+        # Preserve compatibility with an older positional-only protector, but
+        # do not retry arbitrary provider TypeErrors that could duplicate work.
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        kwargs.pop("descriptor", None)
+        protected = protect(payload, **kwargs)
+
+    marker = object()
+    final_payload = marker
+    if isinstance(protected, Mapping):
+        final_payload = protected.get("final_payload", marker)
+        if final_payload is marker:
+            final_payload = protected.get("payload", marker)
+    else:
+        final_payload = getattr(protected, "final_payload", marker)
+        if final_payload is marker:
+            final_payload = getattr(protected, "payload", marker)
+    if final_payload is marker or final_payload is None:
+        raise PrivacyError("legacy privacy protector returned no explicit final payload")
+    sent = sender(final_payload)
+    if inspect.isawaitable(sent):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(sent)
+        # This helper is used from a synchronous adapter and normally runs on
+        # a worker thread.  If an embed invokes it on an active loop, refuse to
+        # nest the loop rather than risking an unbounded/raw send.
+        raise PrivacyError("legacy outbound sender cannot await on an active loop")
+    return sent
+
+
 def _run_async(coro_factory, timeout: int = 45):
     try:
         asyncio.get_running_loop()
@@ -238,9 +421,25 @@ def _run_async(coro_factory, timeout: int = 45):
 
     import concurrent.futures
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(lambda: asyncio.run(coro_factory()))
+    # This helper is used from synchronous tool adapters that may themselves
+    # run inside an active event loop.  Do not use a ``with`` block here:
+    # ``ThreadPoolExecutor.__exit__`` waits for a timed-out coroutine, turning
+    # the advertised fail-fast timeout into an unbounded request (and keeping
+    # the raw query alive in the caller).  A cancelled future cannot stop a
+    # coroutine already executing, but ``shutdown(wait=False)`` lets the tool
+    # return its sanitized error promptly while the provider's own finite
+    # HTTP timeout settles in the background.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    # Preserve request-local privacy and permission scopes when synchronous
+    # adapters run a coroutine on a helper thread.
+    context = contextvars.copy_context()
+    future = executor.submit(context.run, lambda: asyncio.run(coro_factory()))
+    try:
         return future.result(timeout=timeout)
+    finally:
+        if not future.done():
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _response_citation_urls(response) -> list[str]:
@@ -264,7 +463,6 @@ def openai_web_search_impl(
     usage_context=None,
     config=None,
     *,
-    _preprotected_payload=None,
     _privacy_gateway: OutboundPrivacyGateway | None = None,
     _resolved_model: str | None = None,
 ) -> str:
@@ -281,10 +479,18 @@ def openai_web_search_impl(
     started = time.monotonic()
     active_gateway = _privacy_gateway
     try:
-        # OpenAI APIキーを確認
-        api_key = os.getenv('OPENAI_API_KEY')
+        # Enterprise Hosted Search is an explicitly approved capability.  Do
+        # not construct a privacy gateway or probe/retry a route that lacks a
+        # valid provider credential or approved egress.
+        try:
+            assert_openai_hosted_search_ready(config)
+        except SearchEgressPreconditionError as exc:
+            return search_egress_error_message(exc)
+        # Personal callers retain the historical direct transport path, but a
+        # zero-byte key is still rejected before opening the HTTP client.
+        api_key = _configured_openai_api_key(config)
         if not api_key:
-            return "Web検索を使用するにはOPENAI_API_KEYが必要です。"
+            return "検索の前提条件を満たせません（credential_missing）。管理者に検索プロバイダの認証情報を設定してください。"
 
         # OpenAI SDKのResponses APIでHosted Web Searchを実行
         try:
@@ -297,37 +503,120 @@ def openai_web_search_impl(
 
             async def run_search():
                 nonlocal active_gateway
-                client = OpenAI(api_key=api_key)
-                request_input = (
-                    "あなたはWeb検索アシスタントです。"
-                    "与えられたクエリについて最新の情報を検索し、"
-                    "簡潔で正確な回答を日本語で提供してください。\n\n"
-                    f"検索クエリ: {query}"
-                )
-                if _preprotected_payload is None:
-                    gateway = _privacy_gateway or _privacy_gateway_for_config(
-                        config, usage_context
+                try:
+                    client = OpenAI(
+                        api_key=api_key,
+                        timeout=httpx.Timeout(8.0, connect=2.0),
+                        max_retries=0,
                     )
-                    protected = gateway.protect_sync(
-                        {"input": request_input},
-                        provider="openai",
-                        source_kind="web_search",
-                        model=requested_model,
+                except TypeError as exc:
+                    # Small test/dry-run adapters may expose only ``api_key``;
+                    # the production SDK receives the explicit timeout/retry
+                    # contract above.  Do not swallow unrelated constructor
+                    # TypeErrors.
+                    if "unexpected keyword argument" not in str(exc):
+                        raise
+                    client = OpenAI(api_key=api_key)
+                try:
+                    request_input = (
+                        "あなたはWeb検索アシスタントです。"
+                        "与えられたクエリについて最新の情報を検索し、"
+                        "簡潔で正確な回答を日本語で提供してください。\n\n"
+                        f"検索クエリ: {query}"
                     )
-                    _payload = protected.payload
+                    if _privacy_gateway is not None:
+                        gateway = _privacy_gateway
+                    else:
+                        try:
+                            gateway = _privacy_gateway_for_config(
+                                config, usage_context
+                            )
+                        except TypeError as exc:
+                            # Legacy embedders sometimes monkeypatch the
+                            # resolver with its original one-argument shape.
+                            # Retry only that signature mismatch; unrelated
+                            # TypeErrors must remain fail-closed.
+                            if "positional" not in str(exc) and "argument" not in str(exc):
+                                raise
+                            gateway = _privacy_gateway_for_config(config)
                     active_gateway = gateway
-                else:
-                    _payload = _preprotected_payload
-                request_input = str(
-                    _payload.get("input", request_input)
-                    if isinstance(_payload, Mapping)
-                    else request_input
-                )
-                return client.responses.create(
-                    model=requested_model,
-                    tools=[{"type": "web_search_preview"}],
-                    input=request_input,
-                )
+
+                    expected_tools = [{"type": "web_search_preview"}]
+                    request_payload = {
+                        "model": requested_model,
+                        "tools": expected_tools,
+                        "input": request_input,
+                    }
+
+                    def send(protected_payload):
+                        """Send the exact payload approved by the gateway once."""
+
+                        if not isinstance(protected_payload, Mapping):
+                            raise PrivacyError(
+                                "privacy protection returned no protected payload"
+                            )
+
+                        # The production transaction reviews the complete
+                        # Responses request.  Validate fixed route fields and
+                        # forward the reviewed mapping unchanged so the final
+                        # editor value is the exact SDK payload.
+                        if set(protected_payload) == {"model", "tools", "input"}:
+                            final_model = protected_payload.get("model")
+                            final_tools = protected_payload.get("tools")
+                            final_input = protected_payload.get("input")
+                            if final_model != requested_model:
+                                raise PrivacyError("web search model binding changed")
+                            if final_tools != expected_tools:
+                                raise PrivacyError("web search tool binding changed")
+                            if (
+                                not isinstance(final_input, str)
+                                or not final_input.strip()
+                            ):
+                                raise PrivacyError(
+                                    "privacy protection returned no protected input"
+                                )
+                            return client.responses.create(**dict(protected_payload))
+
+                        # Compatibility-only branch for old protect-only
+                        # embedding adapters.  Production always takes the
+                        # full-wire execute path above.
+                        if set(protected_payload) != {"input"}:
+                            raise PrivacyError("web search outbound payload is malformed")
+                        protected_input = protected_payload.get("input")
+                        if (
+                            not isinstance(protected_input, str)
+                            or not protected_input.strip()
+                        ):
+                            raise PrivacyError(
+                                "privacy protection returned no protected input"
+                            )
+                        return client.responses.create(
+                            model=requested_model,
+                            tools=expected_tools,
+                            input=protected_input,
+                        )
+
+                    # This is the sole privacy/transport boundary.  In
+                    # particular, no pre-protected payload is carried into the
+                    # function and no second review is attempted here.
+                    return _execute_search_sync(
+                        gateway,
+                        request_payload,
+                        model=requested_model,
+                        sender=send,
+                    )
+                finally:
+                    # The OpenAI client owns an httpx transport.  Close it at
+                    # the request boundary when the SDK/test adapter exposes
+                    # a close hook; no transport object is retained globally.
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        try:
+                            closed = close()
+                            if inspect.isawaitable(closed):
+                                await closed
+                        except Exception:
+                            pass
 
             response = _run_async(run_search, timeout=45)
             if response:
@@ -359,12 +648,12 @@ def openai_web_search_impl(
                 return "検索結果を取得できませんでした。"
 
         except Exception as e:
-            error_msg = f"OpenAI Web検索エラー: {str(e)}"
+            error_msg = _sanitized_search_error(e, hosted=True)
             print(f"[Tool] web_search エラー: {error_msg}")
             return error_msg
 
     except Exception as e:
-        error_msg = f"Web検索エラー: {str(e)}"
+        error_msg = _sanitized_search_error(e, hosted=True)
         print(f"[Tool] web_search エラー: {error_msg}")
         return error_msg
 
@@ -375,7 +664,7 @@ def local_web_search_impl(query: str, config=None) -> str:
     try:
         return local_web_search(query, config=config)
     except Exception as e:
-        error_msg = f"汎用Web検索エラー: {str(e)}"
+        error_msg = _sanitized_search_error(e)
         print(f"[Tool] web_search エラー: {error_msg}")
         return error_msg
 
@@ -423,9 +712,41 @@ def _try_yahoo_x_search(
             max_results=max_results,
             timeout_seconds=45,
             privacy_gateway=gateway,
+            config=config,
         )
     except Exception as exc:  # noqa: BLE001 - fallback is intentional
-        print(f"[Tool] Yahoo X検索をスキップしました: {exc}")
+        # Personal compatibility keeps the historical fallback.  Enterprise
+        # must not turn a Yahoo outage into an implicit second external
+        # provider call (especially an approved Hosted OpenAI route).
+        if _enterprise_profile():
+            print("[Tool] Yahoo X検索を停止しました（egress_unreachable）")
+            return "X検索（Yahooリアルタイム）に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
+        print("[Tool] Yahoo X検索をスキップしました（provider_unreachable）")
+        return None
+    status = str(
+        result.get("status", "")
+        if isinstance(result, Mapping)
+        else getattr(result, "status", "")
+    ).strip().lower()
+    if status in {"blocked", "privacy_blocked"}:
+        if _enterprise_profile():
+            return "X検索（Yahooリアルタイム）はプライバシーポリシーにより停止しました。"
+        return None
+    if status in {"timeout"}:
+        if _enterprise_profile():
+            return "X検索（Yahooリアルタイム）が制限時間を超えました（engine_timeout）。ネットワーク設定を確認してください。"
+        return None
+    if status in {
+        "egress_unreachable",
+        "network_error",
+        "http_error",
+        "redirect_rejected",
+        "invalid_endpoint",
+        "body_too_large",
+        "parse_error",
+    }:
+        if _enterprise_profile():
+            return "X検索（Yahooリアルタイム）に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
         return None
     if not yahoo_result_has_results(result):
         return None
@@ -449,11 +770,37 @@ def web_search_with_config(query: str, config=None, *, usage_context=None) -> st
     if active_config is None:
         return "検索はプライバシー設定を解決できないため停止しました。"
 
+    try:
+        provider = get_search_provider(active_config)
+    except SearchProviderConfigError:
+        return "検索の前提条件を満たせません（provider_invalid）。検索プロバイダ設定を確認してください。"
+
+    # Enterprise's explicit local provider is an operator-owned route.  Do
+    # not let the X/Yahoo convenience shortcut silently turn it into a public
+    # request; the local route must be resolved by the configured internal
+    # engine instead.
+    if provider == SEARCH_PROVIDER_LOCAL and _enterprise_profile():
+        return local_web_search_impl(query, active_config)
+
     # Explicit X URLs and strong X-search wording are a hard route to the
-    # canonical Yahoo backend.  This intentionally runs before provider
-    # selection and before the OpenAI/local permission seams.  Only an empty
-    # or failed Yahoo response reaches the existing provider fallback.
+    # canonical Yahoo backend.  Enterprise must pass the shared egress gate
+    # before this route constructs a privacy gateway or starts Yahoo HTTP.
+    # Personal deployments retain the historical Yahoo-first behaviour.
     if _is_x_search_route(query):
+        if _enterprise_profile():
+            try:
+                endpoint = _config_value(
+                    active_config,
+                    "deep_research.yahoo_realtime_url",
+                    _config_value(active_config, "search.yahoo_realtime_url", None),
+                )
+                assert_public_search_egress_approved(
+                    active_config,
+                    engine="yahoo_realtime",
+                    endpoint=endpoint,
+                )
+            except SearchEgressPreconditionError as exc:
+                return search_egress_error_message(exc)
         yahoo_result = _try_yahoo_x_search(
             query,
             config=active_config,
@@ -461,8 +808,6 @@ def web_search_with_config(query: str, config=None, *, usage_context=None) -> st
         )
         if yahoo_result:
             return yahoo_result
-
-    provider = get_search_provider(active_config)
 
     if provider == SEARCH_PROVIDER_LOCAL:
         return local_web_search_impl(query, active_config)
@@ -472,52 +817,93 @@ def web_search_with_config(query: str, config=None, *, usage_context=None) -> st
     except ValueError as exc:
         return f"検索は設定不備により停止しました: {exc}"
 
-    # Redact/protect before opening the tool permission UI.  This keeps the
-    # UI from displaying raw secrets while retaining the legacy confirmation
-    # seam and preventing a second gateway review at transport time.
-    request_input = (
-        "あなたはWeb検索アシスタントです。"
-        "与えられたクエリについて最新の情報を検索し、"
-        "簡潔で正確な回答を日本語で提供してください。\n\n"
-        f"検索クエリ: {query}"
-    )
-    try:
-        gateway = _privacy_gateway_for_config(active_config)
-        protected = gateway.protect_sync(
-            {"input": request_input},
-            provider="openai",
-            source_kind="web_search",
-            model=requested_model,
-        )
-        protected_payload = protected.payload
-        protected_input = str(
-            protected_payload.get("input", request_input)
-            if isinstance(protected_payload, Mapping)
-            else request_input
-        )
-    except Exception as exc:  # noqa: BLE001
-        return f"検索はプライバシーポリシーにより停止しました: {exc}"
+    # Credential and approved-egress checks are payload-independent.  Perform
+    # them before privacy review/permission UI so an unusable Hosted route
+    # fails quickly without displaying or transporting a protected query.
+    hosted_precondition = _hosted_search_precondition(active_config)
+    if hosted_precondition:
+        return hosted_precondition
+    # The provider credential is a payload-independent prerequisite for both
+    # Personal and Enterprise Hosted Search.  Check it before privacy
+    # redaction, permission UI, and transport so a missing key cannot display
+    # or retain a protected query and the tool fails fast consistently across
+    # profiles.
+    if not _configured_openai_api_key(active_config):
+        return "検索の前提条件を満たせません（credential_missing）。管理者に検索プロバイダの認証情報を設定してください。"
 
-    # Keep the historical tool argument shape (the query only) but source its
-    # value from the already-protected request body.
-    permission_query = protected_input
-    if "検索クエリ:" in permission_query:
-        permission_query = permission_query.split("検索クエリ:", 1)[1].strip()
-    approved = check_permission_sync(
-        tool_name="web_search",
-        tool_args={"query": permission_query},
-        description=f"OpenAI APIによるWeb検索: 「{permission_query}」",
-    )
+    # Keep compatibility with pre-transaction embedders used by older
+    # integrations/tests.  A current gateway is passed through untouched and
+    # performs the sole masking/review transaction inside
+    # ``openai_web_search_impl``.  A legacy protect-only gateway may provide a
+    # display-safe permission query, but only after it returns an explicit
+    # payload; malformed protectors fail closed before the permission UI.
+    permission_query = query
+    active_gateway = None
+    try:
+        try:
+            active_gateway = _privacy_gateway_for_config(active_config, usage_context)
+        except TypeError as exc:
+            if "positional argument" not in str(exc) and "unexpected keyword argument" not in str(exc):
+                raise
+            active_gateway = _privacy_gateway_for_config(active_config)
+        if not callable(getattr(active_gateway, "execute_sync", None)):
+            protect = getattr(active_gateway, "protect_sync", None)
+            if not callable(protect):
+                raise PrivacyError("outbound privacy gateway does not support execution")
+            preview = protect(
+                {"input": (
+                    "あなたはWeb検索アシスタントです。"
+                    "与えられたクエリについて最新の情報を検索し、"
+                    "簡潔で正確な回答を日本語で提供してください。\n\n"
+                    f"検索クエリ: {query}"
+                )},
+                provider="openai",
+                source_kind="web_search",
+                model=requested_model,
+            )
+            preview_payload = getattr(preview, "payload", preview)
+            if not isinstance(preview_payload, Mapping) or not isinstance(
+                preview_payload.get("input"), str
+            ) or not preview_payload["input"].strip():
+                raise PrivacyError("privacy protection returned no protected input")
+            permission_query = preview_payload["input"]
+            if "検索クエリ:" in permission_query:
+                permission_query = permission_query.split("検索クエリ:", 1)[1].strip()
+        
+    except Exception as exc:  # noqa: BLE001
+        # Only legacy protect-only gateways use this preflight.  Current
+        # gateways never see payload text until the permission check has
+        # passed, preserving the canonical egress transaction ordering.
+        if active_gateway is not None and not callable(
+            getattr(active_gateway, "execute_sync", None)
+        ):
+            return _sanitized_search_error(exc, hosted=True)
+        # A current gateway construction failure is also fail-closed, but do
+        # not expose provider/credential details in the tool result.
+        return _sanitized_search_error(exc, hosted=True)
+
+    # The ordinary tool permission is a separate capability check.  It runs
+    # before the privacy transaction, so cancellation never starts a sidecar,
+    # review callback, or provider transport.  The gateway itself receives
+    # the original request only inside ``openai_web_search_impl`` and decides
+    # the final masked wire payload immediately before ``responses.create``.
+    try:
+        approved = check_permission_sync(
+            tool_name="web_search",
+            tool_args={"query": permission_query},
+            description=f"OpenAI APIによるWeb検索: 「{permission_query}」",
+        )
+    except Exception as exc:
+        return _sanitized_search_error(exc, hosted=True)
 
     if not approved:
         return "ユーザーによって検索がキャンセルされました。"
 
     return openai_web_search_impl(
-        permission_query,
+        query,
         usage_context=usage_context or active_config,
         config=active_config,
-        _preprotected_payload=protected_payload,
-        _privacy_gateway=gateway,
+        _privacy_gateway=active_gateway,
         _resolved_model=requested_model,
     )
 

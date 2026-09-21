@@ -54,6 +54,7 @@ export type FilerRefresh = () => void | boolean | Promise<void | boolean>;
 // ─── モジュールレベルストア ───
 
 let undoState: FilerUndoState = createFilerUndoState();
+let undoScopeGeneration = 0;
 const listeners = new Set<() => void>();
 
 function setUndoState(next: FilerUndoState) {
@@ -75,6 +76,7 @@ export function getFilerUndoSnapshot(): FilerUndoState {
 
 /** タブ切り替えなどでスタックを全消去する。 */
 export function clearFilerUndoHistory(): void {
+  undoScopeGeneration += 1;
   setUndoState(clearFilerUndoState());
 }
 
@@ -104,6 +106,70 @@ export function registerHydrusViewHandlers(
   };
 }
 
+// ─── Explorer 表示ハンドラ ───
+
+/**
+ * 通常の Files 一覧で削除中の項目を即時反映するための表示側ハンドラ。
+ * Hydrus/HF/レコードテーブルはそれぞれ専用の削除経路を持つため、
+ * runFilerDelete からは通常の explorer ターゲットにだけ呼び出す。
+ */
+export interface ExplorerDeleteViewHandlers {
+  /** 削除 API 完了まで表示だけ先に隠す（tombstone）。 */
+  hide: (paths: string[]) => ExplorerDeleteViewOperation | void;
+  /** 旧登録側との互換用。新規登録側は hide が返す operation を使う。 */
+  rollback?: (paths: string[]) => void;
+  /** 旧登録側との互換用。新規登録側は hide が返す operation を使う。 */
+  commit?: (paths: string[]) => void;
+  /** Undo で通常 Files の削除済み tombstone を復帰する。 */
+  restore?: (paths: string[]) => void;
+}
+
+/**
+ * 一つの削除操作が取得する opaque handle。
+ *
+ * モジュール singleton を API 完了後に再参照すると、Provider の差し替え
+ * （principal / tab 境界）後に古い操作が新しい一覧を更新してしまうため、
+ * hide の戻り値だけを通じて確定・ロールバックする。
+ */
+export interface ExplorerDeleteViewOperation {
+  commit: (paths: string[]) => void;
+  rollback: (paths: string[]) => void;
+}
+
+let explorerDeleteViewHandlers: ExplorerDeleteViewHandlers | null = null;
+
+function createExplorerDeleteViewOperation(
+  handlers: ExplorerDeleteViewHandlers | null,
+  paths: string[],
+): ExplorerDeleteViewOperation | null {
+  if (!handlers || paths.length === 0) return null;
+  const operation = handlers.hide(paths);
+  if (
+    operation &&
+    typeof operation.commit === "function" &&
+    typeof operation.rollback === "function"
+  ) {
+    return operation;
+  }
+  // Keep pre-handle registrations working while still capturing the exact
+  // handler object at operation start (never re-read the module singleton).
+  return {
+    commit: (ownedPaths) => handlers.commit?.(ownedPaths),
+    rollback: (ownedPaths) => handlers.rollback?.(ownedPaths),
+  };
+}
+
+export function registerExplorerDeleteViewHandlers(
+  handlers: ExplorerDeleteViewHandlers,
+): () => void {
+  explorerDeleteViewHandlers = handlers;
+  return () => {
+    if (explorerDeleteViewHandlers === handlers) {
+      explorerDeleteViewHandlers = null;
+    }
+  };
+}
+
 // ─── 共通ヘルパ ───
 
 function parentDir(path: string): string {
@@ -117,6 +183,17 @@ async function runRefresh(refresh?: FilerRefresh): Promise<boolean> {
   // Context-backed refresh returns false when a newer navigation superseded
   // the operation. Legacy callers return void and remain successful.
   return result !== false;
+}
+
+/**
+ * 削除の UI 確定を refresh の完了に依存させない。refresh は権威データの
+ * 再取得用なので、失敗しても削除 API の成否を上書きしない。
+ */
+function scheduleDeleteRefresh(refresh?: FilerRefresh): void {
+  if (!refresh) return;
+  void runRefresh(refresh).catch((error: unknown) => {
+    console.error("[Files] 削除後の一覧更新に失敗しました:", error);
+  });
 }
 
 // ─── 削除 ───
@@ -158,8 +235,8 @@ export interface RunFilerDeleteParams {
   refresh?: FilerRefresh;
   /** 確認ダイアログ。未指定時は確認が必要な操作をスキップする。 */
   confirm?: ConfirmFn;
-  /** 削除成功時に呼ばれる（選択解除など） */
-  onDeleted?: () => void;
+  /** 削除成功時に呼ばれる（選択解除など）。成功したパスだけが渡される。 */
+  onDeleted?: (deletedPaths?: string[]) => void;
 }
 
 /**
@@ -171,6 +248,14 @@ export async function runFilerDelete(
 ): Promise<boolean> {
   const { targets, capabilities, confirm, refresh, onDeleted } = params;
   if (!capabilities.canDelete || targets.length === 0) return false;
+  const operationUndoScopeGeneration = undoScopeGeneration;
+
+  // Capture singleton registrations before any confirmation/network await.
+  // A principal/tab switch may replace the current Provider while this
+  // operation is in flight; its opaque handle must remain bound to this
+  // captured registration and never be applied to the replacement Provider.
+  const deleteViewHandlers = explorerDeleteViewHandlers;
+  const operationHydrusHandlers = hydrusViewHandlers;
 
   const recordTables = targets.filter((t) => t.isRecordTable);
   const others = targets.filter((t) => !t.isRecordTable);
@@ -222,14 +307,43 @@ export async function runFilerDelete(
     if (!ok) return false;
   }
 
+  // 確認がすべて完了した時点で、通常の Files だけを表示から先に隠す。
+  // HF / Hydrus / レコードテーブルにはこの tombstone を適用しない。
+  const regularPaths = regularTargets.map((target) => target.path);
+  const deleteViewOperation = createExplorerDeleteViewOperation(
+    deleteViewHandlers,
+    regularPaths,
+  );
+
   // 途中で失敗しても、成功済み分は必ず Undo スタックへ積む
   const trashed: FilerDeleteUndoItem[] = [];
   const hydrusDeletedIds: number[] = [];
+  const deletedRegularPaths: string[] = [];
+  const successfulDeletedPathSet = new Set<string>();
   // 識別子が欠けていて削除できなかった .dbtable
   const skippedNames: string[] = [];
   let touchedNonHydrus = false;
 
+  const markDeleted = (path: string) => {
+    successfulDeletedPathSet.add(path);
+  };
+  const successfulDeletedPaths = () => {
+    const seen = new Set<string>();
+    return targets.flatMap((target) => {
+      if (!successfulDeletedPathSet.has(target.path) || seen.has(target.path)) {
+        return [];
+      }
+      seen.add(target.path);
+      return [target.path];
+    });
+  };
+  const notifyDeleted = () => {
+    const deletedPaths = successfulDeletedPaths();
+    if (deletedPaths.length > 0) onDeleted?.(deletedPaths);
+  };
+
   const commitUndoEntries = () => {
+    if (operationUndoScopeGeneration !== undoScopeGeneration) return false;
     const entries: FilerUndoEntry[] = [];
     if (capabilities.deleteUndoable && hydrusDeletedIds.length > 0) {
       entries.push({ kind: "hydrus-delete", fileIds: [...hydrusDeletedIds] });
@@ -252,6 +366,7 @@ export async function runFilerDelete(
       }
       touchedNonHydrus = true;
       await deleteProjectRecordTable(table.projectId, table.tableId);
+      markDeleted(target.path);
     }
 
     if (hfTargets.length > 0) {
@@ -261,23 +376,34 @@ export async function runFilerDelete(
         isDirectory: target.isDirectory,
       }));
       await hfDeleteFiles(items);
+      for (const target of hfTargets) markDeleted(target.path);
     }
 
     if (hydrusTargets.length > 0) {
-      const fileIds = hydrusTargets
-        .map((target) => parseHydrusFileId(target.path))
-        .filter((id): id is number => id !== null);
+      const hydrusItems = hydrusTargets.flatMap((target) => {
+        const fileId = parseHydrusFileId(target.path);
+        return fileId === null ? [] : [{ target, fileId }];
+      });
+      for (const target of hydrusTargets) {
+        if (parseHydrusFileId(target.path) === null) skippedNames.push(target.name);
+      }
+      const fileIds = hydrusItems.map(({ fileId }) => fileId);
       if (fileIds.length > 0) {
         await hydrusDeleteFiles(fileIds);
         hydrusDeletedIds.push(...fileIds);
         // Hydrus は refresh が使えないので表示側から直接取り除く
-        hydrusViewHandlers?.prune(fileIds);
+        operationHydrusHandlers?.prune(fileIds);
+        for (const { target } of hydrusItems) markDeleted(target.path);
       }
     }
 
     for (const target of regularTargets) {
       touchedNonHydrus = true;
       const result = await explorerDelete(target.path);
+      // API の成功直後に記録する。後続ターゲットが失敗してもこの項目は
+      // commit 対象として確定し、未試行分だけ rollback する。
+      deletedRegularPaths.push(target.path);
+      markDeleted(target.path);
       if (result.trash?.token) {
         trashed.push({
           token: result.trash.token,
@@ -288,17 +414,31 @@ export async function runFilerDelete(
   } catch (error) {
     // 成功済み分を捨てないよう、エラー時も Undo エントリを確定させる
     commitUndoEntries();
-    if (touchedNonHydrus) await runRefresh(refresh);
+    if (deletedRegularPaths.length > 0) {
+      deleteViewOperation?.commit(deletedRegularPaths);
+    }
+    notifyDeleted();
+    const deletedRegularSet = new Set(deletedRegularPaths);
+    const rollbackPaths = regularPaths.filter(
+      (path) => !deletedRegularSet.has(path),
+    );
+    if (rollbackPaths.length > 0) {
+      deleteViewOperation?.rollback(rollbackPaths);
+    }
+    if (touchedNonHydrus) scheduleDeleteRefresh(refresh);
     toast.error(`削除に失敗しました: ${explorerErrorMessage(error)}`);
     return false;
   }
 
   const undoable = commitUndoEntries();
-  onDeleted?.();
+  if (deletedRegularPaths.length > 0) {
+    deleteViewOperation?.commit(deletedRegularPaths);
+  }
+  notifyDeleted();
   // Hydrus のみの削除では explorer の一覧APIを叩かない（失敗してエラー表示になるため）
-  if (touchedNonHydrus) await runRefresh(refresh);
+  if (touchedNonHydrus) scheduleDeleteRefresh(refresh);
 
-  const deletedCount = targets.length - skippedNames.length;
+  const deletedCount = successfulDeletedPaths().length;
   if (deletedCount === 0) {
     toast.error(`削除できませんでした: ${skippedNames.join(", ")}`);
     return false;
@@ -306,7 +446,7 @@ export async function runFilerDelete(
 
   const message =
     deletedCount === 1
-      ? `「${targets.find((t) => !skippedNames.includes(t.name))?.name ?? targets[0].name}」を削除しました`
+      ? `「${targets.find((t) => successfulDeletedPathSet.has(t.path))?.name ?? targets[0].name}」を削除しました`
       : `${deletedCount}件を削除しました`;
   if (undoable) {
     // .dbtable / HF は元に戻せないため、混在時は対象範囲を明示する
@@ -567,6 +707,7 @@ async function applyFilerUndoEntry(
   direction: "undo" | "redo",
 ): Promise<FilerUndoEntry> {
   if (entry.kind === "delete") {
+    const deleteViewHandlers = explorerDeleteViewHandlers;
     if (direction === "undo") {
       const restored: FilerDeleteUndoItem[] = [];
       for (const item of entry.entries) {
@@ -575,20 +716,44 @@ async function applyFilerUndoEntry(
           token: item.token,
           originalPath: result.restored_path || item.originalPath,
         });
+        // Call the handler captured at operation start.  The Provider's
+        // scope-guarded callback turns this into a no-op after a boundary.
+        deleteViewHandlers?.restore?.([item.originalPath]);
       }
       return { kind: "delete", entries: restored };
     }
+    const regularPaths = entry.entries.map((item) => item.originalPath);
+    const deleteViewOperation = createExplorerDeleteViewOperation(
+      deleteViewHandlers,
+      regularPaths,
+    );
     const deleted: FilerDeleteUndoItem[] = [];
-    for (const item of entry.entries) {
-      const result = await explorerDelete(item.originalPath);
-      if (!result.trash?.token) {
-        throw new Error("削除の取り消し情報を取得できませんでした");
+    const successfulPaths: string[] = [];
+    try {
+      for (const item of entry.entries) {
+        const result = await explorerDelete(item.originalPath);
+        if (!result.trash?.token) {
+          throw new Error("削除の取り消し情報を取得できませんでした");
+        }
+        deleted.push({
+          token: result.trash.token,
+          originalPath: result.trash.original_path || item.originalPath,
+        });
+        successfulPaths.push(item.originalPath);
       }
-      deleted.push({
-        token: result.trash.token,
-        originalPath: result.trash.original_path || item.originalPath,
-      });
+    } catch (error) {
+      const committedPaths = [...successfulPaths];
+      if (committedPaths.length > 0) {
+        deleteViewOperation?.commit(committedPaths);
+      }
+      const committedSet = new Set(committedPaths);
+      const rollbackPaths = regularPaths.filter((path) => !committedSet.has(path));
+      if (rollbackPaths.length > 0) {
+        deleteViewOperation?.rollback(rollbackPaths);
+      }
+      throw error;
     }
+    deleteViewOperation?.commit(successfulPaths);
     return { kind: "delete", entries: deleted };
   }
 
@@ -632,12 +797,13 @@ async function applyFilerUndoEntry(
   }
 
   // hydrus-delete: 表示側もページキャッシュを迂回して直接更新する
+  const operationHydrusHandlers = hydrusViewHandlers;
   if (direction === "undo") {
     await hydrusUndeleteFiles(entry.fileIds);
-    hydrusViewHandlers?.restore(entry.fileIds);
+    operationHydrusHandlers?.restore(entry.fileIds);
   } else {
     await hydrusDeleteFiles(entry.fileIds);
-    hydrusViewHandlers?.prune(entry.fileIds);
+    operationHydrusHandlers?.prune(entry.fileIds);
   }
   return { kind: "hydrus-delete", fileIds: entry.fileIds };
 }

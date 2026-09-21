@@ -45,6 +45,16 @@ type PageHit = {
   breadcrumb: string[];
 };
 
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+}
+
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     credentials: "include",
@@ -52,8 +62,16 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     ...init,
   });
   if (!response.ok) {
-    const body = await response.json().catch(() => ({ detail: response.statusText }));
-    throw new Error(body.detail || response.statusText);
+    const body = await response.json().catch(() => null) as {
+      detail?: unknown;
+    } | null;
+    const detail = typeof body?.detail === "string"
+      ? body.detail
+      : response.statusText;
+    throw new ApiError(
+      response.status,
+      detail || `HTTP ${response.status}`,
+    );
   }
   return response.json();
 }
@@ -65,6 +83,8 @@ export function ClipIngestTargetsSection() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [pages, setPages] = useState<PageHit[]>([]);
+  const [pageSearchLoading, setPageSearchLoading] = useState(false);
+  const [pageSearchError, setPageSearchError] = useState<string | null>(null);
   const [sectionOpen, setSectionOpen] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
@@ -85,19 +105,48 @@ export function ClipIngestTargetsSection() {
   }, []);
 
   useEffect(() => {
-    if (!pickerOpen) return;
+    if (!pickerOpen) {
+      setPages([]);
+      setPageSearchLoading(false);
+      setPageSearchError(null);
+      return;
+    }
+
     const controller = new AbortController();
+    setPages([]);
+    setPageSearchLoading(true);
+    setPageSearchError(null);
+
     const timer = window.setTimeout(() => {
-      fetch(`/api/docs/pages?q=${encodeURIComponent(query)}&limit=30`, {
+      apiFetch<{ pages: PageHit[] }>(
+        `/api/docs/pages?q=${encodeURIComponent(query)}&limit=30&writable=true`,
+        {
         signal: controller.signal,
-      })
-        .then((response) => response.ok ? response.json() as Promise<{ pages: PageHit[] }> : { pages: [] })
+        },
+      )
         .then((data) => setPages(
           (data.pages ?? []).filter((page) =>
             isAllowedClipIngestTarget(page),
           ),
         ))
-        .catch(() => { if (!controller.signal.aborted) setPages([]); });
+        .catch((error: unknown) => {
+          if (controller.signal.aborted) return;
+          setPages([]);
+          if (error instanceof ApiError) {
+            setPageSearchError(
+              `ページを検索できません (HTTP ${error.status}): ${error.message}`,
+            );
+            return;
+          }
+          setPageSearchError(
+            `ページ検索の通信に失敗しました: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setPageSearchLoading(false);
+        });
     }, 80);
     return () => { controller.abort(); window.clearTimeout(timer); };
   }, [pickerOpen, query]);
@@ -264,7 +313,7 @@ export function ClipIngestTargetsSection() {
       <CommandDialog open={pickerOpen} onOpenChange={setPickerOpen} title="クリップ取り込み先を追加" description="既存のDocsノードをタイトルまたはエイリアスで検索します">
         <Command shouldFilter={false}>
           <CommandInput value={query} onValueChange={setQuery} placeholder="ページ名またはエイリアス..." />
-          <CommandList><CommandEmpty>該当するページがありません</CommandEmpty><CommandGroup heading={query.trim() ? "ページを検索" : "最近のDocsページ"}>
+          <CommandList><CommandEmpty data-testid="clip-ingest-page-search-status">{pageSearchLoading ? "検索中..." : pageSearchError ?? "該当するページがありません"}</CommandEmpty><CommandGroup heading={query.trim() ? "ページを検索" : "最近のDocsページ"}>
             {pages.map((page) => <CommandItem key={page.id} value={`${page.title} ${page.aliases.join(" ")}`} onSelect={() => addPage(page)} className="items-start">
               <FileText className="mt-0.5 size-4 text-muted-foreground" /><div className="min-w-0"><div className="truncate font-medium">{page.title}</div><div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground"><span className="truncate">{page.breadcrumb.join(" / ") || "Docs"}</span>{page.aliases.length ? <span className="inline-flex min-w-0 items-center gap-1 truncate"><Tags className="size-3" />{page.aliases.join(", ")}</span> : null}</div></div>
             </CommandItem>)}

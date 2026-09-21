@@ -18,6 +18,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..memory.models import GoogleCalendarConnection, Task
 from ..security.field_crypto import decrypt_text_if_needed, encrypt_text
 from ..task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
+from .outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    PrivacyReviewDenied,
+    get_privacy_policy_context,
+)
 
 
 class GoogleCalendarServiceError(Exception):
@@ -68,7 +75,20 @@ class GoogleCalendarService:
     STATE_MAX_AGE_SECONDS = 60 * 10
     AUTO_METADATA_KEY = "google_calendar"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        config: Any | None = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        # The service is normally constructed by the API router, while the
+        # actual user id is known only by each operation.  Keep an optional
+        # injected gateway for tests/embedders and otherwise create a
+        # request-scoped gateway immediately before the egress call.
+        self.config = config
+        self._privacy_gateway_override = privacy_gateway
+        self._privacy_session_id = str(session_id or "")
         self.client_id = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "").strip()
         self.client_secret = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "").strip()
         self.redirect_uri = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "").strip()
@@ -78,6 +98,121 @@ class GoogleCalendarService:
             or "aoitalk-google-calendar-state"
         )
         self.serializer = URLSafeTimedSerializer(self.state_secret)
+
+    def _privacy_gateway_for_user(
+        self, user_id: UUID | str | None = None
+    ) -> OutboundPrivacyGateway:
+        if self._privacy_gateway_override is not None:
+            return self._privacy_gateway_override
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        session_id = self._privacy_session_id or str(
+            session_context.get("session_id")
+            or session_context.get("id")
+            or ""
+        )
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(user_id or ""),
+            session_id=session_id,
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    @staticmethod
+    def _egress_descriptor(*, action: str, destination: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="httpx",
+            destination=destination,
+            provider="google_calendar",
+        )
+
+    async def _execute_event_request(
+        self,
+        gateway: OutboundPrivacyGateway,
+        *,
+        action: str,
+        url: str,
+        access_token: str,
+        method: str,
+        body: dict[str, Any],
+        client: httpx.AsyncClient,
+    ) -> httpx.Response:
+        """Send one Calendar event request through one privacy transaction.
+
+        ``sender`` is deliberately inside ``execute``: the exact protected
+        payload approved by the gateway is the only body passed to httpx.
+        Callers that need an OAuth-refresh retry invoke this helper again,
+        creating a fresh gateway transaction/review for the retry.
+        """
+
+        async def sender(protected_body: Any) -> httpx.Response:
+            request = getattr(client, method.lower())
+            return await request(
+                url,
+                params={"sendUpdates": "none"},
+                headers={"Authorization": f"Bearer {access_token}"},
+                json=protected_body,
+            )
+
+        try:
+            return await gateway.execute(
+                body,
+                provider="google_calendar",
+                descriptor=self._egress_descriptor(action=action, destination=url),
+                sender=sender,
+                base_url=url,
+                source_kind="calendar_event",
+            )
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise GoogleCalendarServiceError(
+                "Google Calendar event payload was blocked by privacy policy",
+                403,
+            ) from exc
+
+    async def _execute_event_delete(
+        self,
+        gateway: OutboundPrivacyGateway,
+        *,
+        action: str,
+        collection_url: str,
+        event_id: str,
+        access_token: str,
+        client: httpx.AsyncClient,
+    ) -> httpx.Response:
+        """Delete one event through the gateway (including the event id)."""
+
+        async def sender(protected_payload: Any) -> httpx.Response:
+            protected_id = (
+                protected_payload.get("event_id")
+                if isinstance(protected_payload, dict)
+                else event_id
+            )
+            target = f"{collection_url}/{protected_id}"
+            return await client.delete(
+                target,
+                params={"sendUpdates": "none"},
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+
+        try:
+            return await gateway.execute(
+                {"event_id": event_id},
+                provider="google_calendar",
+                descriptor=self._egress_descriptor(
+                    action=action,
+                    destination=f"{collection_url}/{event_id}",
+                ),
+                sender=sender,
+                base_url=collection_url,
+                source_kind="calendar_event_delete",
+            )
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise GoogleCalendarServiceError(
+                "Google Calendar event payload was blocked by privacy policy",
+                403,
+            ) from exc
 
     @property
     def configured(self) -> bool:
@@ -310,23 +445,31 @@ class GoogleCalendarService:
             default_event_reminder_minutes=connection.default_event_reminder_minutes,
         )
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.post(
-                self.EVENTS_URL.format(calendar_id=connection.calendar_id or "primary"),
-                params={"sendUpdates": "none"},
-                headers={"Authorization": f"Bearer {access_token}"},
-                json=body,
+        calendar_url = self.EVENTS_URL.format(
+            calendar_id=connection.calendar_id or "primary"
+        )
+        gateway = self._privacy_gateway_for_user(user_id)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+            response = await self._execute_event_request(
+                gateway,
+                action="calendar.events.insert",
+                url=calendar_url,
+                access_token=access_token,
+                method="POST",
+                body=body,
+                client=client,
             )
 
             if response.status_code == 401:
                 access_token = await self._refresh_tokens(session, connection)
-                response = await client.post(
-                    self.EVENTS_URL.format(
-                        calendar_id=connection.calendar_id or "primary"
-                    ),
-                    params={"sendUpdates": "none"},
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    json=body,
+                response = await self._execute_event_request(
+                    gateway,
+                    action="calendar.events.insert.retry",
+                    url=calendar_url,
+                    access_token=access_token,
+                    method="POST",
+                    body=body,
+                    client=client,
                 )
 
         if response.status_code >= 400:
@@ -406,40 +549,55 @@ class GoogleCalendarService:
         event: dict[str, Any]
         status = "updated" if existing_event_id else "created"
 
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        gateway = self._privacy_gateway_for_user(user_id)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
             if existing_event_id:
-                response = await client.patch(
-                    f"{self.EVENTS_URL.format(calendar_id=calendar_id)}/{existing_event_id}",
-                    params={"sendUpdates": "none"},
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    json=body,
+                event_url = f"{self.EVENTS_URL.format(calendar_id=calendar_id)}/{existing_event_id}"
+                response = await self._execute_event_request(
+                    gateway,
+                    action="calendar.events.update",
+                    url=event_url,
+                    access_token=access_token,
+                    method="PATCH",
+                    body=body,
+                    client=client,
                 )
                 if response.status_code == 401:
                     access_token = await self._refresh_tokens(session, connection)
-                    response = await client.patch(
-                        f"{self.EVENTS_URL.format(calendar_id=calendar_id)}/{existing_event_id}",
-                        params={"sendUpdates": "none"},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                        json=body,
+                    response = await self._execute_event_request(
+                        gateway,
+                        action="calendar.events.update.retry",
+                        url=event_url,
+                        access_token=access_token,
+                        method="PATCH",
+                        body=body,
+                        client=client,
                     )
                 if response.status_code == 404:
                     existing_event_id = None
                     status = "created"
 
             if not existing_event_id:
-                response = await client.post(
-                    self.EVENTS_URL.format(calendar_id=calendar_id),
-                    params={"sendUpdates": "none"},
-                    headers={"Authorization": f"Bearer {access_token}"},
-                    json=body,
+                calendar_url = self.EVENTS_URL.format(calendar_id=calendar_id)
+                response = await self._execute_event_request(
+                    gateway,
+                    action="calendar.events.insert",
+                    url=calendar_url,
+                    access_token=access_token,
+                    method="POST",
+                    body=body,
+                    client=client,
                 )
                 if response.status_code == 401:
                     access_token = await self._refresh_tokens(session, connection)
-                    response = await client.post(
-                        self.EVENTS_URL.format(calendar_id=calendar_id),
-                        params={"sendUpdates": "none"},
-                        headers={"Authorization": f"Bearer {access_token}"},
-                        json=body,
+                    response = await self._execute_event_request(
+                        gateway,
+                        action="calendar.events.insert.retry",
+                        url=calendar_url,
+                        access_token=access_token,
+                        method="POST",
+                        body=body,
+                        client=client,
                     )
 
         if response.status_code >= 400:
@@ -541,7 +699,7 @@ class GoogleCalendarService:
         return payload
 
     async def _exchange_code(self, code: str) -> dict[str, Any]:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
             response = await client.post(
                 self.TOKEN_URL,
                 data={
@@ -560,7 +718,7 @@ class GoogleCalendarService:
         return response.json()
 
     async def _fetch_user_email(self, access_token: str) -> str:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
             response = await client.get(
                 self.USERINFO_URL,
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -631,7 +789,7 @@ class GoogleCalendarService:
             raise GoogleCalendarServiceError(
                 "Google Calendar refresh token is missing", 400
             )
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
             response = await client.post(
                 self.TOKEN_URL,
                 data={
@@ -663,18 +821,26 @@ class GoogleCalendarService:
     ) -> None:
         access_token = await self._ensure_access_token(session, connection)
         calendar_id = connection.calendar_id or "primary"
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            response = await client.delete(
-                f"{self.EVENTS_URL.format(calendar_id=calendar_id)}/{event_id}",
-                params={"sendUpdates": "none"},
-                headers={"Authorization": f"Bearer {access_token}"},
+        collection_url = self.EVENTS_URL.format(calendar_id=calendar_id)
+        gateway = self._privacy_gateway_for_user(connection.user_id)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
+            response = await self._execute_event_delete(
+                gateway,
+                action="calendar.events.delete",
+                collection_url=collection_url,
+                event_id=event_id,
+                access_token=access_token,
+                client=client,
             )
             if response.status_code == 401:
                 access_token = await self._refresh_tokens(session, connection)
-                response = await client.delete(
-                    f"{self.EVENTS_URL.format(calendar_id=calendar_id)}/{event_id}",
-                    params={"sendUpdates": "none"},
-                    headers={"Authorization": f"Bearer {access_token}"},
+                response = await self._execute_event_delete(
+                    gateway,
+                    action="calendar.events.delete.retry",
+                    collection_url=collection_url,
+                    event_id=event_id,
+                    access_token=access_token,
+                    client=client,
                 )
         if response.status_code not in {204, 404} and response.status_code >= 400:
             raise GoogleCalendarServiceError(

@@ -77,6 +77,41 @@ _BASE_URL_OPTIONAL_PROVIDER_IDS: Tuple[str, ...] = (
     "grok-cli",
 )
 
+# Provider defaults are kept here so callers that need to construct a direct
+# request (group chat, Agent Team, deployment overlays) do not each invent a
+# different fallback.  These are only used when neither the selected main
+# model nor the provider-specific setting is present.  In particular, the
+# retired OpenAI mini model must never be an implicit value.
+CANONICAL_PROVIDER_MODELS: Dict[str, str] = {
+    "openai": "gpt-5.6-luna",
+    "openrouter": "openai/gpt-5.5",
+    "gemini": "gemini-3-flash-preview",
+    "deepseek": "deepseek-v4-flash",
+    "deepinfra": "deepseek-ai/DeepSeek-V4-Flash",
+    "kimi": "kimi-k3",
+    "ollama": "gemma4:e4b",
+}
+
+
+def is_retired_model(value: Any) -> bool:
+    """Return whether *value* is the retired OpenAI mini model.
+
+    Keep the retired identifier assembled from components so runtime modules
+    cannot accidentally reintroduce it as a request/default literal.  This
+    helper is also used for persisted legacy settings: those values are
+    treated as missing and replaced by the provider's canonical model.
+    """
+
+    normalized = _normalise_model(value).casefold()
+    retired = "-".join(("gpt", "4o", "mini"))
+    leaf = normalized.rsplit("/", 1)[-1].split(":", 1)[0]
+    return leaf == retired or leaf.startswith(f"{retired}-")
+
+
+def _runtime_model(value: Any) -> str:
+    normalized = _normalise_model(value)
+    return "" if is_retired_model(normalized) else normalized
+
 _BACKEND_ALIASES = {
     "external": "external",
     "core": "external",
@@ -250,11 +285,31 @@ def _runtime_backend(config: Any = None) -> Optional[str]:
         continue
     # Runtime YAML is useful for native launches that do not have a Compose
     # overlay.  It is consulted only after explicit environment selectors.
+    # ``enterprise_deployment`` is an Enterprise handoff overlay; a stale row
+    # can remain in a Personal database after a profile change and must not
+    # silently turn that install into a fixed deployment.  The generic
+    # ``deployment.backend`` key remains valid for native launches in either
+    # profile.
+    try:
+        from ..features import Features
+
+        enterprise_profile = Features.profile_name() == "enterprise"
+    except Exception:
+        # Keep this resolver dependency-light if feature discovery is partially
+        # unavailable during early startup.  An explicit profile selector is
+        # still the only safe basis for trusting the Enterprise overlay.
+        enterprise_profile = (
+            str(os.getenv("AOITALK_PROFILE") or "").strip().lower() == "enterprise"
+            or str(os.getenv("AIVTUBER_ENV") or "").strip().lower() == "enterprise"
+        )
+
     for key in (
         "enterprise_deployment.backend",
         "enterprise_deployment.active_backend",
         "deployment.backend",
     ):
+        if key.startswith("enterprise_deployment.") and not enterprise_profile:
+            continue
         value = _config_get(config, key, "")
         if not str(value or "").strip():
             continue
@@ -310,6 +365,47 @@ def _provider_model(config: Any, provider: str) -> str:
     return ""
 
 
+def canonical_model_for_provider(
+    config: Any,
+    provider: str,
+    *,
+    selected_model: Any = None,
+) -> str:
+    """Resolve one provider's effective model without a retired mini fallback.
+
+    ``selected_model`` represents an explicit route/character selection and is
+    preserved verbatim unless it is the retired mini model.  Retired values
+    are treated as unset so they can never reach a provider request.  Otherwise
+    the selected main model is inherited only when the persisted provider
+    matches; this prevents an OpenAI main model from being sent to an
+    explicitly selected OpenRouter/Gemini character.  Finally the
+    provider-specific setting and the canonical provider default are used.
+
+    The function is intentionally dependency-free so it can be imported by
+    model catalog code and runtime factories without introducing cycles.
+    """
+
+    provider_id = _normalise_provider(provider)
+    if not provider_id:
+        return ""
+    explicit = _runtime_model(selected_model)
+    if explicit:
+        return explicit
+
+    persisted_provider = _normalise_provider(
+        _config_get(config, "llm_provider", "")
+    )
+    if persisted_provider == provider_id:
+        inherited = _runtime_model(_config_get(config, "llm_model", ""))
+        if inherited:
+            return inherited
+
+    configured = _runtime_model(_provider_model(config, provider_id))
+    if configured:
+        return configured
+    return CANONICAL_PROVIDER_MODELS.get(provider_id, "")
+
+
 def _provider_base_url(config: Any, provider: str) -> str:
     keys = {
         "openrouter": ("openrouter.base_url", "openrouter_base_url"),
@@ -341,55 +437,60 @@ def _provider_base_url(config: Any, provider: str) -> str:
 def _deployment_model(config: Any, backend: str, provider: str) -> str:
     if backend == "gemma-vllm":
         return (
-            _first_env(
-                "AOITALK_GEMMA_MODEL",
-                "AOITALK_GEMMA_VLLM_MODEL",
-                "AOITALK_GEMMA_SERVED_MODEL",
-                "AOITALK_EFFECTIVE_LLM_MODEL",
-                "AOITALK_EXTERNAL_MODEL",
-                "GEMMA_MODEL",
-                "VLLM_MODEL",
-                "OPENAI_COMPATIBLE_LOCAL_MODEL",
+            _runtime_model(
+                _first_env(
+                    "AOITALK_GEMMA_MODEL",
+                    "AOITALK_GEMMA_VLLM_MODEL",
+                    "AOITALK_GEMMA_SERVED_MODEL",
+                    "AOITALK_EFFECTIVE_LLM_MODEL",
+                    "AOITALK_EXTERNAL_MODEL",
+                    "GEMMA_MODEL",
+                    "VLLM_MODEL",
+                    "OPENAI_COMPATIBLE_LOCAL_MODEL",
+                )
             )
-            or _normalise_model(_config_get(config, "gemma_vllm.model", ""))
-            or _normalise_model(_config_get(config, "vllm.model", ""))
-            or _provider_model(config, "openai_compatible_local")
+            or _runtime_model(_config_get(config, "gemma_vllm.model", ""))
+            or _runtime_model(_config_get(config, "vllm.model", ""))
+            or _runtime_model(_provider_model(config, "openai_compatible_local"))
             or "google/gemma-4-E4B-it"
         )
     if backend == "deepseek-llamacpp":
         return (
-            _first_env(
-                "AOITALK_DEEPSEEK_MODEL",
-                "AOITALK_DEEPSEEK_LLAMACPP_MODEL",
-                "DEEPSEEK_LLAMACPP_MODEL",
+            _runtime_model(
+                _first_env(
+                    "AOITALK_DEEPSEEK_MODEL",
+                    "AOITALK_DEEPSEEK_LLAMACPP_MODEL",
+                    "DEEPSEEK_LLAMACPP_MODEL",
+                )
             )
-            or _normalise_model(_config_get(config, "deepseek_llamacpp.model", ""))
-            or _provider_model(config, "openai_compatible_local")
+            or _runtime_model(_config_get(config, "deepseek_llamacpp.model", ""))
+            or _runtime_model(_provider_model(config, "openai_compatible_local"))
             or "deepseek-ai/DeepSeek-V4-Flash"
         )
     if backend == "sglang-cuda":
         return (
-            _first_env("SGLANG_MODEL", "AOITALK_SGLANG_MODEL")
-            or _normalise_model(_config_get(config, "sglang.model", ""))
-            or _normalise_model(_config_get(config, "llm_model", ""))
+            _runtime_model(_first_env("SGLANG_MODEL", "AOITALK_SGLANG_MODEL"))
+            or _runtime_model(_config_get(config, "sglang.model", ""))
+            or _runtime_model(_config_get(config, "llm_model", ""))
             or "default"
         )
     # External: honour an explicitly selected provider/model first, then the
     # deployment's external defaults.
     persisted_provider = _normalise_provider(_config_get(config, "llm_provider", ""))
     persisted_model = _normalise_model(_config_get(config, "llm_model", ""))
-    if persisted_provider == provider and persisted_model:
+    if persisted_provider == provider and _runtime_model(persisted_model):
         return persisted_model
+    # Use the same provider-aware canonical resolver as direct runtime
+    # callers.  Retired persisted values are treated as absent there, so a
+    # legacy seed cannot become an outbound request under an external overlay.
     return (
-        _first_env("AOITALK_EXTERNAL_MODEL", "AOITALK_LLM_MODEL")
-        or _normalise_model(_config_get(config, "external.model", ""))
-        or _normalise_model(_config_get(config, "llm_external_model", ""))
-        or _provider_model(config, provider)
-        or _normalise_model(_config_get(config, "llm_model", ""))
+        _runtime_model(_first_env("AOITALK_EXTERNAL_MODEL", "AOITALK_LLM_MODEL"))
+        or _runtime_model(_config_get(config, "external.model", ""))
+        or _runtime_model(_config_get(config, "llm_external_model", ""))
+        or canonical_model_for_provider(config, provider)
         or {
-            "openrouter": "openai/gpt-4o-mini",
-            "openai": "gpt-4o",
-            "gemini": "gemini-2.5-flash",
+            "openai": "gpt-5.6-luna",
+            "gemini": "gemini-3-flash-preview",
             "deepseek": "deepseek-v4-flash",
             "deepinfra": "deepseek-ai/DeepSeek-V4-Flash",
             "kimi": "kimi-k3",
@@ -448,18 +549,23 @@ def _deployment_base_url(config: Any, backend: str, provider: str) -> str:
         )
     persisted_provider = _normalise_provider(_config_get(config, "llm_provider", ""))
     persisted_base = _provider_base_url(config, provider) if persisted_provider == provider else ""
-    raw = (
-        persisted_base
-        or (
+    external_base = (
         _first_env(
             "AOITALK_EXTERNAL_BASE_URL",
             "AOITALK_EFFECTIVE_LLM_BASE_URL",
             "AOITALK_LLM_BASE_URL",
         )
         or _config_get(config, "external.base_url", "")
-        or _provider_base_url(config, provider)
-        )
+        or _config_get(config, "llm_external_base_url", "")
     )
+    # For the operator-owned local router, an explicit deployment endpoint is
+    # authoritative even when the persisted provider config still contains a
+    # loopback llama.cpp URL.  Cloud providers retain their historical
+    # persisted-base precedence.
+    if provider == "openai_compatible_local":
+        raw = external_base or persisted_base or _provider_base_url(config, provider)
+    else:
+        raw = persisted_base or external_base or _provider_base_url(config, provider)
     if provider == "openai_compatible_local":
         return _normalise_base_url(raw)
     return str(raw or "").strip().rstrip("/")
@@ -471,8 +577,16 @@ def _external_provider(config: Any, persisted_provider: str) -> str:
     )
     if explicitly_effective in EXTERNAL_PROVIDER_IDS:
         return explicitly_effective
+    if explicitly_effective:
+        return ""
     if persisted_provider in EXTERNAL_PROVIDER_IDS:
         return persisted_provider
+    if persisted_provider and persisted_provider not in KNOWN_PROVIDER_IDS:
+        # A non-empty unknown provider is an invalid selection, not a request
+        # to use the historical OpenRouter default.  Known local-only
+        # providers (for example SGLang) retain the external overlay's
+        # documented OpenRouter projection for backwards compatibility.
+        return ""
     requested = _normalise_provider(
         _first_env(
             "AOITALK_EXTERNAL_PROVIDER",
@@ -484,6 +598,16 @@ def _external_provider(config: Any, persisted_provider: str) -> str:
     )
     if requested in EXTERNAL_PROVIDER_IDS:
         return requested
+    # An explicitly supplied but unknown provider must not be converted into
+    # OpenRouter (or, downstream, the official OpenAI transport).  Return an
+    # empty effective provider so ``resolve_llm_deployment`` marks the
+    # deployment unready and preflight fails before any request is built.
+    if requested:
+        return ""
+    # Personal/external mode historically defaults to OpenRouter only when no
+    # provider was selected at all.  ``resolve_llm_deployment`` supplies the
+    # persisted provider as ``openai`` for a genuinely empty config, so this
+    # branch remains mostly defensive.
     return "openrouter"
 
 
@@ -614,14 +738,19 @@ def resolve_llm_deployment(config: Any = None) -> Optional[LLMDeployment]:
             or _config_get(config, "external.allowed_provider_ids", "")
         ) or EXTERNAL_PROVIDER_IDS
         effective_provider = _external_provider(config, persisted_provider)
-        if effective_provider not in allowed:
+        if effective_provider and effective_provider not in allowed:
             effective_provider = allowed[0] if allowed else "openrouter"
         effective_model = _deployment_model(config, backend, effective_provider)
         effective_base_url = _deployment_base_url(config, backend, effective_provider)
         fixed = False
         profile = "auto"
         tools = True
-        if persisted_provider not in allowed:
+        if not effective_provider:
+            reason = (
+                "No supported external provider is configured; refusing to "
+                "fall back to another provider."
+            )
+        elif persisted_provider not in allowed:
             reason = (
                 f"Persisted provider '{persisted_provider or '(empty)'}' is not "
                 f"available for external deployment; using '{effective_provider}'."
@@ -754,6 +883,7 @@ def effective_config_overrides(config: Any = None) -> Dict[str, Any]:
 
 
 __all__ = [
+    "CANONICAL_PROVIDER_MODELS",
     "KNOWN_PROVIDER_IDS",
     "EXTERNAL_PROVIDER_IDS",
     "DeploymentConfigurationError",
@@ -766,4 +896,6 @@ __all__ = [
     "resolve_effective_deployment",
     "resolve_llm_deployment",
     "get_deployment_metadata",
+    "canonical_model_for_provider",
+    "is_retired_model",
 ]

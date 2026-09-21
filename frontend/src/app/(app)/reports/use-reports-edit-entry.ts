@@ -14,7 +14,6 @@ import {
   type Space,
   type TimeEntry,
 } from "@/lib/task-api";
-import { formatLocalDateTime } from "@/lib/date-time";
 import {
   toLocalHM,
   toLocalYMD,
@@ -22,6 +21,7 @@ import {
   parseDurationInput,
   formatDurationInput,
   combineDateTime,
+  toExplicitInstant,
 } from "./reports-utils";
 
 export function useReportsEditEntry({
@@ -174,7 +174,7 @@ export function useReportsEditEntry({
       try {
         if (isEditingRunning) {
           await taskApi.updateTimeEntry(editingEntry.id, {
-            started_at: formatLocalDateTime(newStart),
+            started_at: toExplicitInstant(newStart),
             note: editNote,
           });
         } else {
@@ -186,8 +186,8 @@ export function useReportsEditEntry({
             return;
           }
           await taskApi.updateTimeEntry(editingEntry.id, {
-            started_at: formatLocalDateTime(newStart),
-            ended_at: formatLocalDateTime(newEnd),
+            started_at: toExplicitInstant(newStart),
+            ended_at: toExplicitInstant(newEnd),
             note: editNote,
           });
         }
@@ -264,8 +264,8 @@ export function useReportsEditEntry({
     try {
       await taskApi.createTimeEntry({
         task_id: editingEntry.task_id,
-        started_at: editingEntry.started_at,
-        ended_at: editingEntry.ended_at,
+        started_at: toExplicitInstant(editingEntry.started_at),
+        ended_at: toExplicitInstant(editingEntry.ended_at),
         note: editingEntry.note || undefined,
       });
       closeEditDialog();

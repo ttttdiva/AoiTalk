@@ -85,7 +85,7 @@ class GMAgent(BaseAgent):
 
     def __init__(
         self,
-        model: str = "gpt-4o-mini",
+        model: str = "gpt-5.6-luna",
         setting: str = "",
         current_scene: str = "",
         characters: str = "",

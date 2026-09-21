@@ -6,9 +6,12 @@ import json
 import math
 import os
 import re
+import socket
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -21,9 +24,19 @@ from src.services.provider_runtime_ownership import (
     enrich_provider_payload,
     provider_runtime_ownership,
 )
-from src.llm.deployment_resolver import resolve_llm_deployment
+from src.services.local_llm_runtime_manager import ManagedLocalRuntimeManager
+from src.services.local_llm_paths import (
+    canonicalize_llama_cpp_model_root_override,
+    resolve_llama_cpp_model_root,
+)
+from src.llm.deployment_resolver import is_retired_model, resolve_llm_deployment
 from src.llm.sglang_url import enterprise_sglang_model, resolve_sglang_base_url
 from src.llm.openai_compatible_local_profiles import (
+    FREETOKEN_DEFAULT_HOST,
+    FREETOKEN_DEFAULT_PORT,
+    freetoken_model_profile,
+    freetoken_model_profiles,
+    managed_local_runtime_for_model,
     LLAMA_CPP_DEFAULT_CONTEXT_SIZE,
     LLAMA_CPP_DEFAULT_GPU_LAYERS,
     LLAMA_CPP_DEFAULT_HOST,
@@ -83,7 +96,6 @@ LLM_ENGINE_OPTIONS = [
         "label": "Gemini 2.5 Pro",
     },
     {"provider": "openai", "model": "gpt-4o", "label": "GPT-4o"},
-    {"provider": "openai", "model": "gpt-4o-mini", "label": "GPT-4o mini"},
     {"provider": "openai", "model": "gpt-5.5", "label": "GPT-5.5"},
 ]
 
@@ -133,8 +145,15 @@ def model_supports_vision(provider: str, model: str) -> bool | None:
     model_id = str(model or "").strip().lower()
     if not provider_id or not model_id:
         return None
-    local_or_unknown = {"sglang", "openai_compatible_local", "ollama"}
-    if provider_id in local_or_unknown:
+    if is_retired_model(model_id):
+        return None
+    if provider_id == "openai_compatible_local":
+        capabilities = llama_cpp_profile_capabilities(model_id)
+        media = capabilities.get("media") if isinstance(capabilities, dict) else None
+        if isinstance(media, dict) and isinstance(media.get("image"), bool):
+            return media["image"]
+        return None
+    if provider_id in {"sglang", "ollama"}:
         return None
     if provider_id == "gemini":
         return True
@@ -193,6 +212,9 @@ STATIC_MODEL_CATALOG = {
         },
     ],
     "openai": [
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
+        {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra"},
+        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"},
         {"id": "gpt-5.5", "label": "GPT-5.5"},
         {"id": "gpt-5.5-pro", "label": "GPT-5.5 pro"},
         {"id": "gpt-5.4", "label": "GPT-5.4"},
@@ -422,7 +444,29 @@ def _llama_cpp_model_catalog_entries() -> List[Dict[str, Any]]:
             "runtime_profile": runtime_profile,
             "base_url": f"http://{LLAMA_CPP_DEFAULT_HOST}:{LLAMA_CPP_DEFAULT_PORT}/v1",
             "runtime": "llama_cpp",
+            "runtime_distribution": runtime_profile.get("runtime_distribution", "stock"),
+            "source_repository": runtime_profile.get("source_repository"),
+            "quantization": runtime_profile.get("quantization"),
+            "default_context_size": runtime_profile.get("default_context_size"),
+            "native_context_size": runtime_profile.get("native_context_size"),
+            "auxiliary_artifacts": list(runtime_profile.get("auxiliary_artifacts") or []),
+            "sampling_defaults": dict(runtime_profile.get("sampling_defaults") or {}),
         }
+        for key in (
+            "gguf_filenames",
+            "gguf_shard_count",
+            "gguf_repository_subdir",
+            "default_gpu_layers",
+            "required_llama_cpp_commit",
+            "minimum_llama_cpp_build",
+        ):
+            if key in runtime_profile:
+                value = runtime_profile[key]
+                entry[key] = (
+                    list(value)
+                    if key == "gguf_filenames" and isinstance(value, (list, tuple))
+                    else value
+                )
         if isinstance(mtp_metadata, dict):
             entry["mtp"] = dict(mtp_metadata)
         effort_metadata = llama_cpp_reasoning_effort_metadata(profile=runtime_profile)
@@ -445,8 +489,44 @@ def _llama_cpp_model_catalog_entries() -> List[Dict[str, Any]]:
             media = capabilities.get("media")
             if isinstance(media, dict):
                 entry["media"] = dict(media)
+                entry["image"] = bool(media.get("image"))
+                entry["audio"] = bool(media.get("audio"))
+            entry["reasoning"] = bool(capabilities.get("reasoning"))
+            entry["tools"] = bool(capabilities.get("tools"))
         entries.append(entry)
     return entries
+
+
+def _freetoken_model_catalog_entries() -> List[Dict[str, Any]]:
+    entries: List[Dict[str, Any]] = []
+    for profile in freetoken_model_profiles():
+        runtime_profile = dict(profile)
+        model_id = str(runtime_profile.get("id") or "").strip()
+        capabilities = runtime_profile.get("capabilities")
+        entry: Dict[str, Any] = {
+            "id": model_id,
+            "label": str(runtime_profile.get("label") or model_id),
+            "description": str(runtime_profile.get("description") or "").strip(),
+            "details": {
+                key: value
+                for key, value in runtime_profile.items()
+                if key not in {"id", "label", "description"}
+            },
+            "runtime_profile": runtime_profile,
+            "runtime": "freetoken",
+            "base_url": (
+                f"http://{FREETOKEN_DEFAULT_HOST}:{FREETOKEN_DEFAULT_PORT}/v1"
+            ),
+        }
+        if isinstance(capabilities, dict):
+            entry["supports_reasoning"] = bool(capabilities.get("reasoning"))
+            entry["supports_tools"] = bool(capabilities.get("tools"))
+            media = capabilities.get("media")
+            if isinstance(media, dict):
+                entry["media"] = dict(media)
+        entries.append(entry)
+    return entries
+
 
 PROVIDER_CAPABILITIES = {
     "openai": ProviderCapabilities(
@@ -575,6 +655,14 @@ OLLAMA_INCOMPATIBLE_MODEL_IDS = {
 
 LOCAL_MODEL_LABELS: dict[str, str] = {}
 
+
+def _safe_model_id(value: Any) -> str:
+    """Normalize a model ID and drop the retired OpenAI mini family."""
+
+    normalized = str(value or "").strip()
+    return "" if is_retired_model(normalized) else normalized
+
+
 def model_option(model_id: str, label: Optional[str] = None, **extra: Any) -> Dict[str, Any]:
     model_id_text = str(model_id)
     option = {
@@ -590,7 +678,7 @@ def dedupe_models(models: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     result = []
     for model in models:
         model_id = str(model.get("id") or model.get("model") or "").strip()
-        if not model_id or model_id in seen:
+        if not model_id or is_retired_model(model_id) or model_id in seen:
             continue
         seen.add(model_id)
         next_model = dict(model)
@@ -662,8 +750,16 @@ def enrich_model_reasoning_options(
             provider,
             str(next_model.get("id") or ""),
         )
-        if options:
-            next_model["reasoning_effort_options"] = options
+        # Even [] is authoritative: clients must not borrow the currently
+        # running model's Fast/Thinking control for a different selection.
+        next_model["reasoning_effort_options"] = options
+        next_model["reasoning_effort_default"] = (
+            reasoning_effort_default_for_model(provider, str(next_model.get("id") or ""))
+            or (default_llm_mode_for_options(options) if options else None)
+        )
+        next_model["reasoning_effort_kind"] = llm_mode_kind_for_provider(
+            provider, str(next_model.get("id") or "")
+        )
         result.append(next_model)
     return result
 
@@ -934,6 +1030,55 @@ def default_fetch_json(
         return json.loads(response.read().decode("utf-8"))
 
 
+def _loopback_endpoint_unreachable(
+    url: str,
+    *,
+    timeout: float = 0.2,
+) -> bool:
+    """Fail fast for a dead local runtime before the HTTP timeout elapses.
+
+    Windows can leave a closed loopback port in a SYN-timeout state.  The
+    normal discovery timeout is intentionally long enough for a healthy model
+    server, but paying it for every dead local candidate starves metadata
+    requests.  Only loopback hosts are probed here; remote endpoints retain
+    the normal HTTP timeout and custom fetchers used by tests are unaffected.
+    """
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        host = (parsed.hostname or "").strip().lower()
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            return False
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme.lower() == "https" else 80
+        connection = socket.create_connection((host, port), timeout=timeout)
+        connection.close()
+        return False
+    except (OSError, ValueError):
+        return True
+
+
+def _personal_compose_sglang_endpoint(url: str) -> bool:
+    """Return whether a Docker-only SGLang hostname is inactive in Personal.
+
+    The Enterprise compose overlay owns the ``sglang`` service name.  On a
+    Personal host that name is not resolvable, and Windows can spend several
+    seconds in DNS retry before the HTTP timeout fires.  Do not suppress an
+    explicitly configured IP/FQDN or an Enterprise runtime.
+    """
+
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.hostname or "").strip().lower() != "sglang":
+            return False
+        from ..features import Features
+
+        return Features.profile_name() != "enterprise"
+    except Exception:
+        return False
+
+
 def _config_get(config: Any, key: str, default: Any = None) -> Any:
     getter = getattr(config, "get", None)
     if callable(getter):
@@ -965,6 +1110,7 @@ def _static_models(provider: str) -> List[Dict[str, Any]]:
             macos_openai_compatible_local_model_options()
             + catalog_items
             + _llama_cpp_model_catalog_entries()
+            + _freetoken_model_catalog_entries()
         )
 
     models = []
@@ -1385,6 +1531,81 @@ def _openai_compatible_local_models(
     cfg: Any,
     fetch_json: Callable[..., Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
+    return _discover_openai_compatible_local_models(cfg, fetch_json).models
+
+
+@dataclass(frozen=True)
+class _ModelDiscoveryResult:
+    """Runtime model discovery result used by chat-facing projections."""
+
+    models: List[Dict[str, Any]]
+    state: str
+    error: Optional[str] = None
+
+
+def _discovered_openai_compatible_model(
+    model_id: str,
+    base_url: str,
+) -> Dict[str, Any]:
+    """Build metadata for one ID returned by an OpenAI-compatible server.
+
+    Profile metadata is enrichment only.  The ID itself is accepted solely
+    because the server returned it from ``/v1/models``.
+    """
+
+    llama_profile = llama_cpp_model_profile(model_id)
+    profile = local_server_profile_for_model(model_id) or {}
+    server_meta = {
+        key: value
+        for key, value in profile.items()
+        if key in {"server", "server_label"}
+    }
+    profile_metadata: Dict[str, Any] = {}
+    if llama_profile:
+        profile_metadata = {
+            "runtime": "llama_cpp",
+            "runtime_profile": llama_profile,
+            "details": dict(llama_profile),
+        }
+        if isinstance(llama_profile.get("mtp"), dict):
+            profile_metadata["mtp"] = dict(llama_profile["mtp"])
+        capabilities = llama_cpp_profile_capabilities(profile=llama_profile)
+        if isinstance(capabilities, dict):
+            profile_metadata.update(
+                {
+                    "supports_reasoning": bool(capabilities.get("reasoning")),
+                    "supports_tools": bool(capabilities.get("tools")),
+                    "supports_media": bool(
+                        isinstance(capabilities.get("media"), dict)
+                        and any(capabilities["media"].values())
+                    ),
+                }
+            )
+            media = capabilities.get("media")
+            if isinstance(media, dict):
+                profile_metadata["media"] = dict(media)
+    return model_option(
+        model_id,
+        source="service-api",
+        source_label="API取得",
+        base_url=base_url,
+        **profile_metadata,
+        **server_meta,
+    )
+
+
+def _discover_openai_compatible_local_models(
+    cfg: Any,
+    fetch_json: Callable[..., Dict[str, Any]],
+) -> _ModelDiscoveryResult:
+    """Discover models from the effective local runtime, fail-closed.
+
+    A successful response (including an empty ``data`` array) is authoritative
+    for the runtime.  If every endpoint fails or returns malformed data, the
+    result is an error with no models; static/profile/cache entries are never
+    substituted here.
+    """
+
     api_key = (
         _config_get(cfg, "openai_compatible_local.api_key")
         or _config_get(cfg, "openai_compatible_local_api_key")
@@ -1392,65 +1613,296 @@ def _openai_compatible_local_models(
         or "dummy"
     )
     models: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    successful_response = False
+    errors: List[str] = []
     for base_url in openai_compatible_local_discovery_base_urls(cfg):
+        models_url = f"{base_url.rstrip('/')}/models"
+        if (
+            fetch_json is default_fetch_json
+            and _loopback_endpoint_unreachable(models_url)
+        ):
+            errors.append("endpoint_unreachable")
+            continue
         try:
             data = fetch_json(
-                f"{base_url.rstrip('/')}/models",
+                models_url,
                 headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
                 timeout=1.5,
             )
-        except Exception:
+        except Exception as exc:
+            errors.append(type(exc).__name__)
             continue
-        for item in data.get("data", []):
-            if not isinstance(item, dict) or not item.get("id"):
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            errors.append("invalid_response")
+            continue
+        successful_response = True
+        for item in data["data"]:
+            if not isinstance(item, dict):
                 continue
-            model_id = item.get("id")
-            llama_profile = llama_cpp_model_profile(str(model_id))
-            profile = local_server_profile_for_model(str(model_id)) or {}
-            server_meta = {
-                key: value
-                for key, value in profile.items()
-                if key in {"server", "server_label"}
-            }
-            profile_metadata: Dict[str, Any] = {}
-            if llama_profile:
-                profile_metadata = {
-                    "runtime": "llama_cpp",
-                    "runtime_profile": llama_profile,
-                    "details": dict(llama_profile),
-                }
-                if isinstance(llama_profile.get("mtp"), dict):
-                    profile_metadata["mtp"] = dict(llama_profile["mtp"])
-                capabilities = llama_cpp_profile_capabilities(
-                    profile=llama_profile
-                )
-                if isinstance(capabilities, dict):
-                    profile_metadata.update(
-                        {
-                            "supports_reasoning": bool(
-                                capabilities.get("reasoning")
-                            ),
-                            "supports_tools": bool(capabilities.get("tools")),
-                            "supports_media": bool(
-                                isinstance(capabilities.get("media"), dict)
-                                and any(capabilities["media"].values())
-                            ),
-                        }
-                    )
-                    media = capabilities.get("media")
-                    if isinstance(media, dict):
-                        profile_metadata["media"] = dict(media)
-            models.append(
+            model_id = str(item.get("id") or "").strip()
+            if not model_id or model_id in seen_ids:
+                continue
+            seen_ids.add(model_id)
+            models.append(_discovered_openai_compatible_model(model_id, base_url))
+    if successful_response:
+        return _ModelDiscoveryResult(
+            models=dedupe_models(models),
+            state="available" if models else "empty",
+            error=None,
+        )
+    return _ModelDiscoveryResult(
+        models=[],
+        state="error",
+        error="OpenAI互換runtimeのモデル一覧を取得できませんでした"
+        + (f" ({', '.join(errors[:3])})" if errors else ""),
+    )
+
+
+def _discover_sglang_models(
+    cfg: Any,
+    fetch_json: Callable[..., Dict[str, Any]],
+) -> _ModelDiscoveryResult:
+    """Discover the models actually served by SGLang."""
+
+    try:
+        models_url = f"{resolve_sglang_base_url(cfg).rstrip('/')}/models"
+        if fetch_json is default_fetch_json and _personal_compose_sglang_endpoint(models_url):
+            raise OSError("inactive_personal_sglang_endpoint")
+        if (
+            fetch_json is default_fetch_json
+            and _loopback_endpoint_unreachable(models_url)
+        ):
+            raise OSError("endpoint_unreachable")
+        data = fetch_json(
+            models_url,
+            timeout=1.5,
+        )
+    except Exception as exc:
+        return _ModelDiscoveryResult(
+            models=[],
+            state="error",
+            error=f"SGLangモデル一覧を取得できませんでした ({type(exc).__name__})",
+        )
+    if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+        return _ModelDiscoveryResult(
+            models=[],
+            state="error",
+            error="SGLangモデル一覧の応答形式が不正です",
+        )
+    models = [
+        model_option(item.get("id"), source="service-api", source_label="API取得")
+        for item in data["data"]
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    ]
+    return _ModelDiscoveryResult(
+        models=dedupe_models(models),
+        state="available" if models else "empty",
+        error=None,
+    )
+
+
+def _global_hidden_provider_ids(cfg: Any) -> List[str]:
+    raw = _config_get(cfg, "llm_provider_visibility.hidden_provider_ids", [])
+    if isinstance(raw, str):
+        values = raw.split(",")
+    elif isinstance(raw, (list, tuple, set)):
+        values = raw
+    else:
+        values = []
+    result: List[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = str(value or "").strip().lower()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            result.append(normalized)
+    return result
+
+
+def _chat_available_models(
+    provider: str,
+    cfg: Any,
+    catalog_models: List[Dict[str, Any]],
+    *,
+    ollama_model_manager: Any = None,
+    ollama_installed_models: Optional[Dict[str, Any]] = None,
+    fetch_json: Callable[..., Dict[str, Any]] = default_fetch_json,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Optional[str]]]:
+    """Return models safe for chat selection and their discovery state."""
+
+    if provider == "openai_compatible_local":
+        result = _discover_openai_compatible_local_models(cfg, fetch_json)
+        return result.models, {"state": result.state, "error": result.error}
+    if provider == "sglang":
+        result = _discover_sglang_models(cfg, fetch_json)
+        return result.models, {"state": result.state, "error": result.error}
+    if provider == "ollama":
+        if ollama_model_manager is None and ollama_installed_models is None:
+            return [], {"state": "error", "error": "Ollamaモデル一覧を確認できません"}
+        try:
+            installed = ollama_installed_models
+            if installed is None:
+                installed = ollama_model_manager.list_models()
+            models = [
                 model_option(
-                    model_id,
-                    source="service-api",
-                    source_label="API取得",
-                    base_url=base_url,
-                    **profile_metadata,
-                    **server_meta,
+                    model_info.get("name") or model_info.get("model"),
+                    str(model_info.get("name") or model_info.get("model")),
+                    installed=True,
+                    size=model_info.get("size"),
+                    details=model_info.get("details"),
+                    source="installed",
+                    source_label="インストール済み",
                 )
-            )
-    return models
+                for model_info in installed.get("models", [])
+                if isinstance(model_info, dict)
+                and not _is_ollama_incompatible_model(
+                    model_info.get("name") or model_info.get("model")
+                )
+                and str(model_info.get("name") or model_info.get("model") or "").strip()
+            ]
+            models = dedupe_models(models)
+            return models, {"state": "available" if models else "empty", "error": None}
+        except Exception as exc:
+            return [], {
+                "state": "error",
+                "error": f"Ollamaモデル一覧を取得できませんでした ({type(exc).__name__})",
+            }
+    # Cloud/CLI providers retain their existing provider-specific catalog
+    # semantics.  Their catalog entries are the established source of truth.
+    return catalog_models, {"state": "catalog", "error": None}
+
+
+def _launchable_llama_cpp_models(
+    cfg: Any,
+    catalog_models: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Advertise installed, auto-startable targets even while llama-server is off.
+
+    Endpoint discovery alone creates a cold-start deadlock: Chat cannot select
+    the model whose first turn would start the server. Use the same read-only
+    runtime resolver as session preflight; static names or cached models alone
+    never prove that a target can be launched. Manual/external endpoints still
+    require successful server discovery.
+    """
+    from src.service_manager import resolve_llama_cpp_runtime
+
+    candidates = {str(profile["id"]) for profile in llama_cpp_model_profiles()}
+    saved_model = provider_saved_model("openai_compatible_local", cfg)
+    if saved_model:
+        candidates.add(saved_model)
+    launchable = []
+    for option in catalog_models:
+        model_id = str(option.get("id") or "").strip()
+        if model_id not in candidates:
+            continue
+        if not provider_runtime_ownership(
+            "openai_compatible_local", cfg, model=model_id
+        ).managed_runtime:
+            continue
+        resolved = resolve_llama_cpp_runtime(cfg, model=model_id)
+        if not (
+            resolved.get("managed")
+            and resolved.get("auto_start")
+            and resolved.get("state") == "ready"
+        ):
+            continue
+        launchable.append({
+            **option,
+            "source": "managed-local",
+            "source_label": "インストール済み（送信時に自動起動）",
+            "installed": True,
+            "managed_runtime": True,
+        })
+    return launchable
+
+
+def _freetoken_catalog_settings(cfg: Any, model: str) -> Dict[str, Any]:
+    profile = freetoken_model_profile(model)
+    selected_model = str((profile or {}).get("id") or model or "").strip()
+    ownership = provider_runtime_ownership(
+        "openai_compatible_local", cfg, model=selected_model
+    )
+    raw = _config_get(cfg, "openai_compatible_local.freetoken", {})
+    raw = raw if isinstance(raw, dict) else {}
+    host = str(
+        os.environ.get("FREETOKEN_HOST")
+        or raw.get("host")
+        or FREETOKEN_DEFAULT_HOST
+    ).strip() or FREETOKEN_DEFAULT_HOST
+    try:
+        port = int(
+            os.environ.get("FREETOKEN_PORT")
+            or raw.get("port", FREETOKEN_DEFAULT_PORT)
+        )
+    except (TypeError, ValueError):
+        port = FREETOKEN_DEFAULT_PORT
+    if not (1 <= port <= 65535):
+        port = FREETOKEN_DEFAULT_PORT
+
+    try:
+        status = ManagedLocalRuntimeManager(cfg).status(
+            selected_model,
+            "freetoken",
+        )
+    except Exception:
+        status = {}
+    runtime_status = str(status.get("status") or "unknown")
+    return {
+        "runtime": "freetoken",
+        "server_profile": "freetoken",
+        "runtime_profile": profile,
+        "base_url": openai_compatible_local_base_url(
+            cfg,
+            model=selected_model,
+        ),
+        "host": host,
+        "port": port,
+        "auto_start": ownership.managed_runtime,
+        "runtime_state": (
+            runtime_status if ownership.managed_runtime else "external"
+        ),
+        "runtime_status": runtime_status,
+        "runtime_installed": bool(status.get("runtime_installed")),
+        "model_installed": bool(status.get("model_installed")),
+        "prepared": bool(status.get("prepared")),
+        "prepare_supported": bool(status.get("prepare_supported", False)),
+        "process_owner": ownership.process_owner,
+        "managed_runtime": ownership.managed_runtime,
+        "server_state": ownership.server_state,
+        "ownership": ownership.to_dict(),
+    }
+
+
+def _enrich_freetoken_catalog_models(
+    cfg: Any,
+    models: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    enriched: List[Dict[str, Any]] = []
+    for model in models:
+        model_id = str(model.get("id") or "").strip()
+        if managed_local_runtime_for_model(cfg, model_id) != "freetoken":
+            enriched.append(model)
+            continue
+        if model.get("runtime") == "freetoken" and "runtime_state" in model:
+            enriched.append(model)
+            continue
+        settings = _freetoken_catalog_settings(cfg, model_id)
+        next_model = dict(model)
+        for key in (
+            "runtime",
+            "runtime_state",
+            "runtime_status",
+            "host",
+            "port",
+            "process_owner",
+            "managed_runtime",
+            "ownership",
+        ):
+            next_model[key] = settings[key]
+        next_model["runtime_profile"] = freetoken_model_profile(model_id)
+        enriched.append(next_model)
+    return enriched
 
 
 def provider_models(
@@ -1460,6 +1912,7 @@ def provider_models(
     include_remote: bool = False,
     cached_models: Optional[List[Dict[str, Any]]] = None,
     ollama_model_manager: Any = None,
+    ollama_installed_models: Optional[Dict[str, Any]] = None,
     fetch_json: Callable[..., Dict[str, Any]] = default_fetch_json,
 ) -> Tuple[List[Dict[str, Any]], Optional[str]]:
     models = dedupe_models((cached_models or []) + _static_models(provider))
@@ -1493,7 +1946,9 @@ def provider_models(
 
     if provider == "ollama" and ollama_model_manager is not None:
         try:
-            installed = ollama_model_manager.list_models()
+            installed = ollama_installed_models
+            if installed is None:
+                installed = ollama_model_manager.list_models()
             installed_models = []
             for model_info in installed.get("models", []):
                 name = model_info.get("name") or model_info.get("model")
@@ -1517,6 +1972,7 @@ def provider_models(
 
     if provider == "sglang":
         enterprise_model = _enterprise_sglang_model(cfg)
+        enterprise_model = _safe_model_id(enterprise_model)
         if enterprise_model:
             models = [
                 model
@@ -1533,6 +1989,9 @@ def provider_models(
                         source_label="Enterprise設定",
                     )
                 ]
+
+    if provider == "openai_compatible_local":
+        models = _enrich_freetoken_catalog_models(cfg, models)
 
     media_capabilities = {
         "openai": {"image": True, "audio": False},
@@ -1569,6 +2028,7 @@ _MTP_RUNTIME_FIELDS = (
     "mtp_reason",
     "mtp_artifact_path",
     "mtp_resolved_model_path",
+    "mtp_variant_model_path",
     "mtp_mode",
 )
 
@@ -1613,6 +2073,7 @@ def _llama_cpp_mtp_projection(
             or "local-modelは外部OpenAI互換serverのため、AoiTalkはMTPを管理しません。",
             "mtp_artifact_path": "",
             "mtp_resolved_model_path": "",
+            "mtp_variant_model_path": "",
             "mtp_mode": "unavailable",
         }
 
@@ -1627,6 +2088,7 @@ def _llama_cpp_mtp_projection(
     artifact_path = str(artifact_path or "")
     resolved_artifact_path = _pick("mtp_resolved_model_path", artifact_path)
     resolved_artifact_path = str(resolved_artifact_path or "")
+    variant_model_path = str(_pick("mtp_variant_model_path", "") or "")
     mode = str(_pick("mtp_mode", profile_mtp.get("mode", "unavailable")) or "unavailable")
     model_path = _pick("mtp_model_path", "")
     model_path = str(model_path or "")
@@ -1638,6 +2100,8 @@ def _llama_cpp_mtp_projection(
         if mode != "companion":
             artifact_path = ""
             resolved_artifact_path = ""
+    if not supported or mode != "embedded":
+        variant_model_path = ""
 
     available_value = _pick("mtp_available", None)
     status_value = _pick("mtp_status", None)
@@ -1662,6 +2126,12 @@ def _llama_cpp_mtp_projection(
         else:
             status = "unavailable"
 
+    # A discovered path is useful only while the embedded variant is actually
+    # available. Do not expose a stale absolute path after a failed nested
+    # runtime/CLI compatibility check or a partial bundle.
+    if not available:
+        variant_model_path = ""
+
     reason = reason_value
     if reason is None or str(reason).strip() == "":
         reason = profile_mtp.get("reason") or profile_mtp.get("ui_notice")
@@ -1675,6 +2145,7 @@ def _llama_cpp_mtp_projection(
         "mtp_reason": reason,
         "mtp_artifact_path": artifact_path,
         "mtp_resolved_model_path": resolved_artifact_path,
+        "mtp_variant_model_path": variant_model_path,
         "mtp_mode": mode,
     }
 
@@ -1696,6 +2167,27 @@ def _llama_cpp_catalog_settings(cfg: Any, model: Optional[str] = None) -> Dict[s
 
     raw = _config_get(cfg, "openai_compatible_local.llama_cpp", {})
     raw = dict(raw) if isinstance(raw, dict) else {}
+    try:
+        model_root_resolution = resolve_llama_cpp_model_root(cfg, settings=raw)
+    except ValueError:
+        # Catalog reads must remain available when an older persisted setting
+        # is malformed or points through a rejected path.  The dedicated
+        # model-root endpoint still reports the validation error and accepts
+        # an empty reset; rendering the UI against the repository-local
+        # default keeps that recovery action reachable.
+        model_root_resolution = resolve_llama_cpp_model_root(
+            cfg,
+            explicit="",
+        )
+    try:
+        model_root_override = canonicalize_llama_cpp_model_root_override(
+            raw.get("model_root"),
+            create=False,
+        )
+    except ValueError:
+        # Keep catalog construction deterministic for a stale invalid setting;
+        # the dedicated settings endpoint still rejects that value on write.
+        model_root_override = None
     selected_model = str(
         model
         or _config_get(cfg, "openai_compatible_local.model", "")
@@ -1803,16 +2295,28 @@ def _llama_cpp_catalog_settings(cfg: Any, model: Optional[str] = None) -> Dict[s
         if model_profile and model_profile.get("default_context_size")
         else LLAMA_CPP_DEFAULT_CONTEXT_SIZE,
     )
-    gpu_layers = _value("gpu_layers", LLAMA_CPP_DEFAULT_GPU_LAYERS)
+    gpu_layers_default = (
+        model_profile.get("default_gpu_layers")
+        if model_profile and model_profile.get("default_gpu_layers") is not None
+        else LLAMA_CPP_DEFAULT_GPU_LAYERS
+    )
+    gpu_layers = _value("gpu_layers", gpu_layers_default)
     timeout = _value("readiness_timeout", LLAMA_CPP_DEFAULT_READINESS_TIMEOUT)
     try:
         context_size = int(context_size)
     except (TypeError, ValueError):
         context_size = LLAMA_CPP_DEFAULT_CONTEXT_SIZE
-    try:
-        gpu_layers = int(gpu_layers)
-    except (TypeError, ValueError):
-        gpu_layers = LLAMA_CPP_DEFAULT_GPU_LAYERS
+    if isinstance(gpu_layers, str) and gpu_layers.strip().casefold() == "auto":
+        gpu_layers = "auto"
+    else:
+        try:
+            gpu_layers = int(gpu_layers)
+        except (TypeError, ValueError):
+            gpu_layers = (
+                "auto"
+                if str(gpu_layers_default).strip().casefold() == "auto"
+                else LLAMA_CPP_DEFAULT_GPU_LAYERS
+            )
     try:
         timeout = float(timeout)
     except (TypeError, ValueError):
@@ -1882,6 +2386,10 @@ def _llama_cpp_catalog_settings(cfg: Any, model: Optional[str] = None) -> Dict[s
         "base_url": base_url,
         "executable": str(canonical_settings.get("executable", _value("executable", "")) or ""),
         "model_path": str(canonical_settings.get("model_path", _value("model_path", "")) or ""),
+        "model_root": str(model_root_resolution.path),
+        "model_root_default": str(model_root_resolution.default),
+        "model_root_override": str(model_root_override or ""),
+        "model_root_source": model_root_resolution.source,
         "model_alias": str(canonical_settings.get("model_alias", model_alias) or model_alias),
         "host": str(canonical_settings.get("host", host) or host),
         "port": canonical_settings.get("port", port),
@@ -1920,6 +2428,17 @@ def _llama_cpp_catalog_settings(cfg: Any, model: Optional[str] = None) -> Dict[s
         or profile_details.get("native_context_length"),
         "native_context_size": profile_details.get("native_context_size"),
         "gguf_filename": profile_details.get("gguf_filename"),
+        "gguf_filenames": (
+            list(profile_details.get("gguf_filenames"))
+            if isinstance(profile_details.get("gguf_filenames"), (list, tuple))
+            else []
+        ),
+        "gguf_shard_count": profile_details.get("gguf_shard_count"),
+        "gguf_repository_subdir": profile_details.get("gguf_repository_subdir"),
+        "default_gpu_layers": profile_details.get("default_gpu_layers"),
+        "required_llama_cpp_commit": profile_details.get(
+            "required_llama_cpp_commit"
+        ),
         "source_repository": profile_details.get("source_repository"),
         "source_url": profile_details.get("source_url"),
         "minimum_llama_cpp_build": profile_details.get("minimum_llama_cpp_build"),
@@ -1986,14 +2505,27 @@ def provider_settings(
             or os.environ.get("OPENAI_COMPATIBLE_LOCAL_API_KEY")
             or ""
         )
-        runtime_settings = _llama_cpp_catalog_settings(cfg, model)
         selected_runtime_model = str(
             model
             or _config_get(cfg, "openai_compatible_local.model", "")
             or _config_get(cfg, "llm_model", "")
             or ""
         ).strip().casefold()
-        selected_profile = llama_cpp_model_profile(model or selected_runtime_model)
+        runtime_identity = managed_local_runtime_for_model(
+            cfg,
+            selected_runtime_model,
+        )
+        if runtime_identity == "freetoken":
+            runtime_settings = _freetoken_catalog_settings(
+                cfg,
+                selected_runtime_model,
+            )
+            selected_profile = freetoken_model_profile(selected_runtime_model)
+        else:
+            runtime_settings = _llama_cpp_catalog_settings(cfg, model)
+            selected_profile = llama_cpp_model_profile(
+                model or selected_runtime_model
+            )
         ownership = provider_runtime_ownership(
             "openai_compatible_local",
             cfg,
@@ -2007,7 +2539,18 @@ def provider_settings(
         configured_tools = bool(
             _config_get(cfg, "openai_compatible_local.enable_tools", False)
         )
-        if _llama_cpp_profile_capability(
+        profile_capabilities = (
+            selected_profile.get("capabilities")
+            if isinstance(selected_profile, dict)
+            else None
+        )
+        if runtime_identity == "freetoken":
+            configured_tools = bool(
+                configured_tools
+                and isinstance(profile_capabilities, dict)
+                and profile_capabilities.get("tools")
+            )
+        elif _llama_cpp_profile_capability(
             model or selected_runtime_model,
             "tools",
         ) is False:
@@ -2029,11 +2572,31 @@ def provider_settings(
             ),
             "runtime": runtime_settings["runtime"],
             "runtime_settings": runtime_settings,
-            "llama_cpp": runtime_settings,
+            "llama_cpp": (
+                runtime_settings if runtime_identity != "freetoken" else {}
+            ),
+            "freetoken": (
+                runtime_settings if runtime_identity == "freetoken" else {}
+            ),
             "runtime_profile": selected_profile,
             "process_owner": ownership.process_owner,
             "managed_runtime": runtime_owned,
             "ownership": ownership.to_dict(),
+            **(
+                {
+                    key: runtime_settings.get(key)
+                    for key in (
+                        "runtime_state",
+                        "runtime_status",
+                        "runtime_installed",
+                        "model_installed",
+                        "prepared",
+                        "prepare_supported",
+                    )
+                }
+                if runtime_identity == "freetoken"
+                else {}
+            ),
             # Keep the active selection's MTP projection available both in
             # the canonical llama_cpp settings object and at provider level
             # for clients that do not recursively inspect runtime_settings.
@@ -2373,12 +2936,16 @@ def provider_saved_model(provider: str, cfg: Any) -> Optional[str]:
     current_p = _config_get(cfg, "llm_provider", "openai")
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
     if provider == current_p and current_m:
-        return str(current_m)
+        candidate = str(current_m).strip()
+        if candidate and not is_retired_model(candidate):
+            return candidate
 
     for key in PROVIDER_MODEL_CONFIG_KEYS.get(provider, ()):
         value = _config_get(cfg, key)
         if value:
-            return str(value)
+            candidate = str(value).strip()
+            if candidate and not is_retired_model(candidate):
+                return candidate
 
     return None
 
@@ -2392,7 +2959,7 @@ def agent_team_models_by_provider(cfg: Any) -> Dict[str, List[Dict[str, str]]]:
         route = resolve_agent_team_v3_route(cfg, subagent_id) or {}
         provider = str(route.get("provider") or "").strip()
         model = str(route.get("model") or "").strip()
-        if not provider or not model:
+        if not provider or not model or is_retired_model(model):
             continue
         result.setdefault(provider, []).append(
             {
@@ -2414,13 +2981,78 @@ def build_model_catalog(
     refresh_provider: Optional[str] = None,
     cached_catalog: Optional[Dict[str, Any]] = None,
     fetch_json: Callable[..., Dict[str, Any]] = default_fetch_json,
+    include_runtime_models: bool = False,
 ) -> Dict[str, Any]:
     current_p = _config_get(cfg, "llm_provider", "openai")
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
+    current_m = "" if is_retired_model(current_m) else str(current_m or "").strip()
     deployment = resolve_llm_deployment(cfg)
     team_models = agent_team_models_by_provider(cfg)
     providers = []
     refresh_target = (refresh_provider or "").strip() or None
+
+    # Runtime discovery is synchronous by design (the public catalog builder
+    # is also used by CLI callers), but local/SGLang probes must not be
+    # serialized. A dead loopback endpoint otherwise costs one timeout per
+    # provider (~1.5s each), making metadata requests exceed the browser
+    # timeout even when the selected provider is a cloud model. The probes are
+    # read-only and independent, so run both network checks in parallel and
+    # consume their results in the stable provider order below.
+    runtime_discovery_results: dict[str, _ModelDiscoveryResult] = {}
+    ollama_installed_models: Optional[Dict[str, Any]] = None
+    if include_runtime_models:
+        probe_functions: dict[str, Callable[..., Any]] = {
+            "sglang": _discover_sglang_models,
+            "openai_compatible_local": _discover_openai_compatible_local_models,
+        }
+        if ollama_model_manager is not None:
+            probe_functions["ollama"] = (
+                lambda _cfg, _fetch: ollama_model_manager.list_models()
+            )
+        probe_targets: list[tuple[str, Callable[..., Any]]] = []
+        for runtime_provider, probe in probe_functions.items():
+            provider_available = True
+            if deployment is not None:
+                provider_available, _ = deployment.provider_available(runtime_provider)
+            fixed_provider = bool(
+                deployment is not None
+                and deployment.fixed
+                and runtime_provider == deployment.effective_provider
+            )
+            if provider_available and not fixed_provider:
+                probe_targets.append((runtime_provider, probe))
+
+        if probe_targets:
+            with ThreadPoolExecutor(
+                max_workers=len(probe_targets),
+                thread_name_prefix="aoi-llm-discovery",
+            ) as executor:
+                futures = {
+                    provider: executor.submit(probe, cfg, fetch_json)
+                    for provider, probe in probe_targets
+                }
+                for provider, future in futures.items():
+                    try:
+                        result = future.result()
+                        if provider == "ollama":
+                            ollama_installed_models = result
+                        else:
+                            runtime_discovery_results[provider] = result
+                    except Exception as exc:
+                        # Individual helpers are fail-closed, but preserve
+                        # that contract for custom fetchers/test doubles that
+                        # raise outside the helper itself.
+                        if provider == "ollama":
+                            ollama_installed_models = {
+                                "success": False,
+                                "models": [],
+                            }
+                        else:
+                            runtime_discovery_results[provider] = _ModelDiscoveryResult(
+                                models=[],
+                                state="error",
+                                error=f"{provider}モデル一覧を取得できませんでした ({type(exc).__name__})",
+                            )
 
     for provider in PROVIDER_ORDER:
         provider_available = True
@@ -2438,6 +3070,7 @@ def build_model_catalog(
             and deployment.fixed
             and provider == deployment.effective_provider
         )
+        runtime_discovery = runtime_discovery_results.get(provider)
         if not provider_available:
             # Do not even call provider_models for blocked providers.  This is
             # important for an Enterprise deployment where stale ``sglang``
@@ -2458,11 +3091,77 @@ def build_model_catalog(
             models, error = provider_models(
                 provider,
                 cfg,
-                include_remote=should_refresh,
+                # The runtime probe already supplies the authoritative model
+                # list for strict providers. Avoid issuing the same /models
+                # request a second time on an explicit catalog refresh.
+                include_remote=should_refresh and runtime_discovery is None,
                 cached_models=cached_provider_models(provider, cached_catalog),
                 ollama_model_manager=ollama_model_manager,
+                ollama_installed_models=ollama_installed_models,
                 fetch_json=fetch_json,
             )
+            if runtime_discovery is not None and provider in {
+                "openai_compatible_local",
+                "sglang",
+            }:
+                models = dedupe_models(
+                    runtime_discovery.models + models
+                )
+                if runtime_discovery.error and not error:
+                    error = runtime_discovery.error
+        # ``models`` is the settings/download catalog and intentionally keeps
+        # static profiles, cached suggestions and saved selections.  Chat
+        # must use a separate projection that represents what the runtime can
+        # serve right now; local discovery failures are therefore fail-closed.
+        if not provider_available:
+            chat_models: List[Dict[str, Any]] = []
+            availability: Dict[str, Optional[str]] = {
+                "state": "blocked",
+                "error": availability_reason,
+            }
+        elif fixed_provider:
+            # A fixed deployment is the runtime authority even though its
+            # endpoint is intentionally not probed.
+            chat_models = [dict(model) for model in models]
+            chat_models = enrich_openai_model_context_metadata(provider, chat_models)
+            chat_models = enrich_model_reasoning_options(provider, chat_models)
+            if provider == "openai_compatible_local":
+                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
+            availability = {"state": "available", "error": None}
+        elif not include_runtime_models and provider in {
+            "openai_compatible_local",
+            "ollama",
+            "sglang",
+        }:
+            # Settings callers can opt into runtime probing, but the default
+            # catalog build remains side-effect-free and preserves the full
+            # static/download catalog for configuration screens.
+            chat_models = []
+            availability = {"state": "not_checked", "error": None}
+        elif provider in runtime_discovery_results:
+            discovery = runtime_discovery_results[provider]
+            chat_models = discovery.models
+            availability = {
+                "state": discovery.state,
+                "error": discovery.error,
+            }
+            chat_models = enrich_openai_model_context_metadata(provider, chat_models)
+            chat_models = enrich_model_reasoning_options(provider, chat_models)
+            if provider == "openai_compatible_local":
+                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
+        else:
+            chat_models, availability = _chat_available_models(
+                provider,
+                cfg,
+                models,
+                ollama_model_manager=ollama_model_manager,
+                ollama_installed_models=ollama_installed_models,
+                fetch_json=fetch_json,
+            )
+            chat_models = enrich_openai_model_context_metadata(provider, chat_models)
+            chat_models = enrich_model_reasoning_options(provider, chat_models)
+            if provider == "openai_compatible_local":
+                chat_models = _enrich_freetoken_catalog_models(cfg, chat_models)
         saved_model = provider_saved_model(provider, cfg) if provider_available else None
         enterprise_model = (
             enterprise_sglang_model(cfg)
@@ -2472,10 +3171,11 @@ def build_model_catalog(
         if fixed_provider and deployment is not None:
             saved_model = deployment.effective_model
             enterprise_model = ""
+        saved_model = _safe_model_id(saved_model)
         if enterprise_model:
             # Stale DB/team values must never be reinserted after the provider
             # list has been narrowed to the model actually served by SGLang.
-            saved_model = enterprise_model
+            saved_model = _safe_model_id(enterprise_model)
         if provider == "ollama" and _is_ollama_incompatible_model(saved_model):
             saved_model = None
         if saved_model and not any(m["id"] == saved_model for m in models):
@@ -2520,8 +3220,25 @@ def build_model_catalog(
         configured_provider_model = saved_model
         if not configured_provider_model and models:
             configured_provider_model = str(models[0]["id"])
+        models = dedupe_models(models)
         models = enrich_openai_model_context_metadata(provider, models)
         models = enrich_model_reasoning_options(provider, models)
+        if provider == "openai_compatible_local":
+            models = _enrich_freetoken_catalog_models(cfg, models)
+            if include_runtime_models and provider_available and not fixed_provider:
+                launchable = _launchable_llama_cpp_models(cfg, models)
+                if launchable:
+                    # Keep served metadata authoritative for duplicates, while
+                    # retaining other installed models for an on-demand switch.
+                    chat_models = dedupe_models(chat_models + launchable)
+                    availability = {"state": "available", "error": None}
+        if provider not in {"openai_compatible_local", "ollama", "sglang"}:
+            # Cloud/CLI providers retain the established catalog semantics,
+            # including explicitly configured custom models and Agent Team
+            # routes inserted above.  Only local runtime-bound providers use
+            # the strict discovery projection.
+            chat_models = [dict(model) for model in models]
+            availability = {"state": "catalog", "error": None}
         settings = provider_settings(provider, cfg, configured_provider_model)
         if fixed_provider and deployment is not None:
             settings = dict(settings)
@@ -2536,6 +3253,11 @@ def build_model_catalog(
             "id": provider,
             "label": LLM_PROVIDER_LABELS.get(provider, provider),
             "models": models,
+            # Served or locally launchable models for chat/re-generation. Keep
+            # the settings catalog above unchanged for download/configuration.
+            "chat_models": chat_models,
+            "available_models": chat_models,
+            "availability": availability,
             "configured_model": configured_provider_model or "",
             "supports_custom_model": not (
                 (provider == "sglang" and bool(enterprise_model))
@@ -2589,6 +3311,25 @@ def build_model_catalog(
                 routing_profile_id="free-team",
             )
         ],
+        "chat_models": [
+            model_option(
+                "free-team",
+                "無料Team",
+                description="複数の無料API枠・プロモーションクレジット・CLI枠を安全に自動使用します",
+                selection_kind="routing_profile",
+                routing_profile_id="free-team",
+            )
+        ],
+        "available_models": [
+            model_option(
+                "free-team",
+                "無料Team",
+                description="複数の無料API枠・プロモーションクレジット・CLI枠を安全に自動使用します",
+                selection_kind="routing_profile",
+                routing_profile_id="free-team",
+            )
+        ],
+        "availability": {"state": "available", "error": None},
         "configured_model": "free-team",
         "supports_custom_model": False,
         "capabilities": ProviderCapabilities(
@@ -2618,6 +3359,9 @@ def build_model_catalog(
     result = {
         "current": {"provider": current_p, "model": current_m},
         "providers": providers,
+        "provider_visibility": {
+            "hidden_provider_ids": _global_hidden_provider_ids(cfg),
+        },
     }
     if deployment is not None:
         result["deployment"] = deployment.metadata()
@@ -2649,19 +3393,25 @@ def configured_provider_model(
     current_p = _config_get(cfg, "llm_provider", "openai")
     current_m = _config_get(cfg, "llm_model", "gpt-4o")
     if provider == current_p and current_m:
-        if provider == "ollama" and _is_ollama_incompatible_model(current_m):
+        current_model = _safe_model_id(current_m)
+        if not current_model:
             return ""
-        return str(current_m)
+        if provider == "ollama" and _is_ollama_incompatible_model(current_model):
+            return ""
+        return current_model
 
     for key in PROVIDER_MODEL_CONFIG_KEYS.get(provider, ()):
         value = _config_get(cfg, key)
         if value:
-            if provider == "ollama" and _is_ollama_incompatible_model(value):
+            configured_model = _safe_model_id(value)
+            if not configured_model:
                 continue
-            return str(value)
+            if provider == "ollama" and _is_ollama_incompatible_model(configured_model):
+                continue
+            return configured_model
 
     for model in models or []:
-        model_id = str(model.get("id") or model.get("model") or "").strip()
+        model_id = _safe_model_id(model.get("id") or model.get("model"))
         if model_id:
             return model_id
 
@@ -2686,14 +3436,21 @@ def build_engine_options(
         cfg,
         ollama_model_manager=ollama_model_manager,
         include_remote=False,
+        include_runtime_models=True,
     )
-    current_p = _config_get(cfg, "llm_provider", "openai")
-    current_m = _config_get(cfg, "llm_model", "gpt-4o")
+    hidden_provider_ids = set(_global_hidden_provider_ids(cfg))
+    current_p = str(_config_get(cfg, "llm_provider", "") or "").strip().lower()
+    current_m = _safe_model_id(_config_get(cfg, "llm_model", ""))
     deployment = resolve_llm_deployment(cfg)
     result = []
 
     for provider in catalog["providers"]:
         provider_id = provider["id"]
+        if str(provider_id).strip().lower() in hidden_provider_ids:
+            # Global provider visibility is a presentation preference only.
+            # It affects the compact engine choices, never route/API
+            # authorization or the underlying catalog/configuration data.
+            continue
         if deployment is not None:
             available, availability_reason = deployment.provider_available(provider_id)
             if not available:
@@ -2707,8 +3464,38 @@ def build_engine_options(
         ):
             continue
 
-        models = provider.get("models") or []
+        models = provider.get("chat_models")
+        if not isinstance(models, list):
+            # Compatibility with older catalog payloads.  New responses
+            # always include chat_models, including an explicit empty list.
+            models = provider.get("models") or []
+        if not models:
+            # An unavailable runtime must not become a selectable engine just
+            # because its settings catalog contains static/profile entries.
+            continue
         model_id = configured_provider_model(provider_id, cfg, models)
+        if not any(
+            str(item.get("id") or item.get("model") or "").strip() == model_id
+            for item in models
+            if isinstance(item, dict)
+        ):
+            # A provider may expose a newly served model while its persisted
+            # model is stale.  Do not silently switch that route to another
+            # model in the compact engine list; the user must explicitly
+            # reselect one of the runtime-served options.
+            explicit_model = current_m if provider_id == current_p else ""
+            if not explicit_model:
+                for key in PROVIDER_MODEL_CONFIG_KEYS.get(provider_id, ()):
+                    candidate = _safe_model_id(_config_get(cfg, key, ""))
+                    if candidate:
+                        explicit_model = candidate
+                        break
+            if explicit_model:
+                continue
+            first_model = models[0] if isinstance(models[0], dict) else {}
+            model_id = str(first_model.get("id") or first_model.get("model") or "").strip()
+        if not model_id:
+            continue
         option = {
                 "provider": provider_id,
                 "model": model_id,
@@ -2719,23 +3506,9 @@ def build_engine_options(
             option["availability_reason"] = None
         result.append(option)
 
-    current_model_supported = not (
-        current_p == "ollama" and _is_ollama_incompatible_model(current_m)
-    )
-    deployment = resolve_llm_deployment(cfg)
-    if deployment is not None and current_p not in deployment.allowed_provider_ids:
-        current_model_supported = False
-    if current_model_supported and not any(
-        option["provider"] == current_p and option["model"] == current_m
-        for option in result
-    ):
-        result.insert(
-            0,
-            {
-                "provider": str(current_p),
-                "model": str(current_m),
-                "label": header_engine_label(str(current_p), str(current_m)),
-            },
-        )
+    # Do not prepend a persisted/current model that the runtime did not
+    # advertise.  Keeping the value in config is fine; presenting it as a
+    # usable engine would be a silent fallback and would reintroduce stale
+    # local/profile models into the chat UI.
 
     return result

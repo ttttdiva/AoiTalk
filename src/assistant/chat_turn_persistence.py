@@ -22,12 +22,15 @@ from ..llm.conversation_context import (
 )
 from ..memory.manager import ConversationMemoryManager
 from ..memory.models import ConversationMessage
+from ..services.agent_run_service import sanitize_assistant_display_text
+from ..services.privacy_masking_projection import is_privacy_masking_source
 
 PromptMessage = dict[str, Any]
 _CACHED_GENERATION_METADATA_KEYS = frozenset(
     {
         "cache_usage",
         "context_snapshot",
+        "context_manifest",
         "conversation_state",
         "free_team_route",
         "generation_metrics",
@@ -135,7 +138,12 @@ def reset_turn_generation_metadata(llm_client: Any) -> None:
         "_history_active_model_transcript": [],
         "_last_context_snapshots": [],
         "_last_turn_tool_records": [],
+        "_last_tool_calls": [],
+        "_last_audit_tool_calls": [],
+        "_last_agentic_completion_evidence": {},
+        "_last_generation_failure": None,
         "_last_turn_tool_rounds_exhausted": False,
+        "_last_turn_tool_loop_failed": False,
         "_last_usage_records": [],
         "_last_generation_metadata": {},
         "_last_usage": {},
@@ -149,6 +157,14 @@ def reset_turn_generation_metadata(llm_client: Any) -> None:
                 setattr(llm_client, attribute, empty_value)
             except Exception:
                 pass
+    states = getattr(llm_client, "_native_completed_agent_run_states", None)
+    lock = getattr(llm_client, "_native_completed_agent_run_states_lock", None)
+    if isinstance(states, dict) and hasattr(lock, "__enter__"):
+        try:
+            with lock:
+                states.clear()
+        except Exception:
+            pass
 
 
 def without_cached_generation_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
@@ -341,15 +357,12 @@ class ChatTurnPersistence:
             sender_display_name=sender_display_name,
             **message_identity,
         )
-        if message is not None:
-            try:
-                from ..services.project_qa_candidate_service import (
-                    queue_project_qa_candidate_extraction,
-                )
-
-                queue_project_qa_candidate_extraction(message.id)
-            except Exception:
-                pass
+        # Project Q&A is curated from the completed user+assistant turn by
+        # the durable ScopedMemoryJob worker.  Do not enqueue a second,
+        # user-only fire-and-forget task here: that path used to classify any
+        # question-shaped fragment as human-facing Project Q&A before an
+        # answer existed.  Keeping persistence side-effect free also means a
+        # retried/edited user message cannot create a duplicate raw candidate.
         return message
 
     async def load_message(
@@ -399,11 +412,14 @@ class ChatTurnPersistence:
             return None
         if not await self._ensure_ready():
             return None
+        safe_content = sanitize_assistant_display_text(content)
+        if not safe_content:
+            return None
         message_identity = {"message_id": message_id} if message_id else {}
         return await self.memory_manager.add_message_to_session(
             session_id=session_id,
             role="assistant",
-            content=content,
+            content=safe_content,
             metadata=metadata or {},
             sender_type=sender_type,
             sender_id=sender_id,
@@ -443,6 +459,24 @@ class ChatTurnPersistence:
             if msg.role not in {"system", "user", "assistant"}:
                 continue
             metadata = getattr(msg, "message_metadata", None) or getattr(msg, "metadata", None) or {}
+            # ``/masking`` intentionally keeps the raw user row in the durable
+            # transcript for audit/UI purposes, but that row is not a prompt
+            # source.  A masking source must never flow back into a later
+            # provider request through persisted history.  Keep the filtering
+            # structural (metadata-only); user-authored marker-like text is
+            # not authority.
+            if is_privacy_masking_source(msg):
+                continue
+            # Help rows remain visible in the transcript for the user, but a
+            # trusted Help turn is deliberately one-shot: its Guide prompt
+            # and answer must not become ambient context for the next normal
+            # provider request.  Keep this metadata-only so user-authored
+            # text containing ``/help`` is never treated as authority.
+            if (
+                isinstance(metadata, dict)
+                and isinstance(metadata.get("aoitalk_help"), dict)
+            ):
+                continue
             if (
                 isinstance(metadata, dict)
                 and metadata.get("delivery_mode") == "immediate_interrupt"

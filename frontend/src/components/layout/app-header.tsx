@@ -1,8 +1,19 @@
 "use client";
 
-import { AppSelect } from "@/components/ui/app-select";
+import {
+  AppSelect,
+  type AppSelectOpenChangeDetails,
+} from "@/components/ui/app-select";
 
-import { useEffect, useState, useCallback, useRef } from "react";
+import {
+  useEffect,
+  useState,
+  useCallback,
+  useRef,
+  type Dispatch,
+  type MutableRefObject,
+  type SetStateAction,
+} from "react";
 import useSWR from "swr";
 import { usePathname, useRouter } from "next/navigation";
 import {
@@ -26,6 +37,7 @@ import { useTheme } from "@/contexts/theme-context";
 import { taskApi, type TimeEntry } from "@/lib/task-api";
 import { toast } from "sonner";
 import { formatTimerClock, getElapsedTimerSeconds } from "@/lib/task-time";
+import { isAzureWikiHostname } from "@/lib/browser-branding";
 import { performAdminRestart } from "@/components/layout/global-admin-restart";
 import {
   clearPersistentCache,
@@ -48,6 +60,10 @@ import { NotificationBellPopover } from "@/components/layout/sidebar/notificatio
 import { useShellChrome } from "@/components/layout/shell-context";
 import { useRuntimeContext } from "@/contexts/runtime-context";
 import { ResourceColorDot } from "@/components/projects/resource-color-picker";
+import {
+  OPEN_HEADER_PROJECT_SELECTOR_EVENT,
+  OPEN_HEADER_SPACE_SELECTOR_EVENT,
+} from "@/lib/header-selector-shortcuts";
 
 type AuthStatus = {
   authenticated?: boolean;
@@ -61,6 +77,21 @@ type AuthStatus = {
 };
 
 export const USER_SETTINGS_HREF = "/settings#account";
+
+function canRestoreShortcutFocus(element: HTMLElement): boolean {
+  if (!element.isConnected) return false;
+  if ("disabled" in element && Boolean((element as HTMLButtonElement).disabled)) {
+    return false;
+  }
+  if (
+    element.closest(
+      '[hidden], [aria-disabled="true"], [aria-hidden="true"], [inert]',
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
 
 
 function useActiveTimer() {
@@ -117,6 +148,7 @@ function useActiveTimer() {
 
   // 経過時間を毎秒更新 + ブラウザタブタイトル更新
   useEffect(() => {
+    const preserveWikiTitle = isAzureWikiHostname(window.location.hostname);
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -134,7 +166,7 @@ function useActiveTimer() {
       return;
     }
 
-    if (typeof document !== "undefined" && originalTitleRef.current === null) {
+    if (!preserveWikiTitle && originalTitleRef.current === null) {
       originalTitleRef.current = document.title;
     }
 
@@ -143,7 +175,7 @@ function useActiveTimer() {
         getElapsedTimerSeconds(activeEntry.started_at),
       );
       setElapsedValue(display);
-      if (typeof document !== "undefined") {
+      if (!preserveWikiTitle) {
         const taskPart = activeEntry.task_title
           ? ` - ${activeEntry.task_title}`
           : "";
@@ -202,6 +234,7 @@ function getWorkspaceTitle(pathname: string | null): string {
   if (pathname.startsWith("/docs")) return "Docs";
   if (pathname.startsWith("/filer")) return "Files";
   if (pathname.startsWith("/reports")) return "レポート";
+  if (pathname.startsWith("/operations")) return "Operations";
   if (pathname.startsWith("/projects")) return "プロジェクト";
   if (pathname.startsWith("/scenarios")) return "Story";
   if (pathname.startsWith("/trpg")) return "TRPG";
@@ -244,6 +277,12 @@ export function AppHeader() {
   const [loggingOut, setLoggingOut] = useState(false);
   const [themeMounted, setThemeMounted] = useState(false);
   const avatarInputRef = useRef<HTMLInputElement>(null);
+  const [spaceSelectorOpen, setSpaceSelectorOpen] = useState(false);
+  const [projectSelectorOpen, setProjectSelectorOpen] = useState(false);
+  const spaceSelectorOpenRef = useRef(false);
+  const projectSelectorOpenRef = useRef(false);
+  const spaceShortcutRestoreRef = useRef<HTMLElement | null>(null);
+  const projectShortcutRestoreRef = useRef<HTMLElement | null>(null);
   const visibleResolvedTheme = themeMounted ? resolvedTheme : "light";
   const nextThemeLabel = visibleResolvedTheme === "dark" ? "ライト" : "ダーク";
   const selectedSpace = spaces.find((space) => space.id === selectedSpaceId);
@@ -257,6 +296,87 @@ export function AppHeader() {
   useEffect(() => {
     setThemeMounted(true);
   }, []);
+
+  const openHeaderSelector = useCallback(
+    (
+      available: boolean,
+      openRef: MutableRefObject<boolean>,
+      setOpen: Dispatch<SetStateAction<boolean>>,
+      restoreRef: MutableRefObject<HTMLElement | null>,
+    ) => {
+      if (!available || openRef.current || restoreRef.current !== null) return;
+      const active = document.activeElement;
+      if (active instanceof HTMLElement) {
+        restoreRef.current = active;
+      }
+      openRef.current = true;
+      setOpen(true);
+    },
+    [],
+  );
+
+  const handleSelectorOpenChange = useCallback(
+    (
+      openRef: MutableRefObject<boolean>,
+      setOpen: Dispatch<SetStateAction<boolean>>,
+      restoreRef: MutableRefObject<HTMLElement | null>,
+      open: boolean,
+      details?: AppSelectOpenChangeDetails,
+    ) => {
+      openRef.current = open;
+      setOpen(open);
+      if (open) return;
+      if (!restoreRef.current) return;
+      if (details?.reason !== "escape-key") {
+        restoreRef.current = null;
+      }
+    },
+    [],
+  );
+
+  const handleSelectorOpenChangeComplete = useCallback(
+    (restoreRef: MutableRefObject<HTMLElement | null>, open: boolean) => {
+      if (open) return;
+      const saved = restoreRef.current;
+      restoreRef.current = null;
+      if (!saved) return;
+      requestAnimationFrame(() => {
+        if (!canRestoreShortcutFocus(saved)) return;
+        try {
+          saved.focus();
+        } catch {
+          // Detached or inert targets must not surface as uncaught exceptions.
+        }
+      });
+    },
+    [],
+  );
+
+  useEffect(() => {
+    const onOpenSpace = () =>
+      openHeaderSelector(
+        spaces.length > 0,
+        spaceSelectorOpenRef,
+        setSpaceSelectorOpen,
+        spaceShortcutRestoreRef,
+      );
+    const onOpenProject = () =>
+      openHeaderSelector(
+        projects.length > 0,
+        projectSelectorOpenRef,
+        setProjectSelectorOpen,
+        projectShortcutRestoreRef,
+      );
+    window.addEventListener(OPEN_HEADER_SPACE_SELECTOR_EVENT, onOpenSpace);
+    window.addEventListener(OPEN_HEADER_PROJECT_SELECTOR_EVENT, onOpenProject);
+    return () => {
+      window.removeEventListener(OPEN_HEADER_SPACE_SELECTOR_EVENT, onOpenSpace);
+      window.removeEventListener(
+        OPEN_HEADER_PROJECT_SELECTOR_EVENT,
+        onOpenProject,
+      );
+    };
+  }, [openHeaderSelector, projects.length, spaces.length]);
 
 
   // 認証状態の取得を SWR に委譲（マウント時取得のみ・自動 revalidation なし）。
@@ -460,6 +580,22 @@ export function AppHeader() {
                 aria-label="スペース選択"
                 value={selectedSpaceId ?? ""}
                 onChange={(event) => setSelectedSpaceId(event.target.value)}
+                open={spaceSelectorOpen}
+                onOpenChange={(open, details) =>
+                  handleSelectorOpenChange(
+                    spaceSelectorOpenRef,
+                    setSpaceSelectorOpen,
+                    spaceShortcutRestoreRef,
+                    open,
+                    details,
+                  )
+                }
+                onOpenChangeComplete={(open) =>
+                  handleSelectorOpenChangeComplete(
+                    spaceShortcutRestoreRef,
+                    open,
+                  )
+                }
                 triggerContent={
                   <span className="truncate">
                     {selectedSpace?.source === "remote" ? "[EP] " : ""}
@@ -498,6 +634,22 @@ export function AppHeader() {
                 aria-label="プロジェクト選択"
                 value={selectedProjectId ?? ""}
                 onChange={(event) => setSelectedProjectId(event.target.value)}
+                open={projectSelectorOpen}
+                onOpenChange={(open, details) =>
+                  handleSelectorOpenChange(
+                    projectSelectorOpenRef,
+                    setProjectSelectorOpen,
+                    projectShortcutRestoreRef,
+                    open,
+                    details,
+                  )
+                }
+                onOpenChangeComplete={(open) =>
+                  handleSelectorOpenChangeComplete(
+                    projectShortcutRestoreRef,
+                    open,
+                  )
+                }
                 triggerContent={
                   <span className="truncate">
                     {selectedProject?.source === "remote" ? "[EP] " : ""}
@@ -679,7 +831,7 @@ export function AppHeader() {
             </DropdownMenuItem>
             <DropdownMenuItem
               mnemonic="S"
-              onClick={() => router.push(USER_SETTINGS_HREF)}
+              onClick={() => router.push(USER_SETTINGS_HREF, { scroll: false })}
             >
               <Settings className="mr-2 size-4" />
               ユーザー設定

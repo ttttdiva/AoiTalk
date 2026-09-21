@@ -5,7 +5,8 @@ Response handling for AoiTalk Voice Assistant Framework
 import asyncio
 import inspect
 import time
-from typing import Optional, Set, Dict, Any
+import uuid
+from typing import Optional, Set, Dict, Any, Mapping
 from src.tools.keyword.character_manager import get_character_manager
 from src.llm.generation_error import (
     GenerationFailure,
@@ -14,6 +15,7 @@ from src.llm.generation_error import (
 )
 from src.llm.generation_cancellation import (
     GenerationInterrupted,
+    PlanningInteractionTerminated,
     get_current_generation_cancellation,
     raise_if_generation_interrupted,
 )
@@ -26,6 +28,38 @@ from src.services.agent_team_service import (
     continuation_state_for_prompt,
     get_current_continuation_state,
 )
+
+
+def _canonical_uuid_text(value: Any) -> Optional[str]:
+    """Normalize UUID-bearing IDs before comparing or persisting them."""
+
+    if value in (None, ""):
+        return None
+    try:
+        return str(uuid.UUID(str(value).strip()))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _strongest_bounded_privacy_mode(*values: Any) -> str:
+    """Return the strongest recognized privacy mode from bounded metadata.
+
+    A provider snapshot may be stale when a reusable client switches
+    Projects.  Only this small, policy-bearing field may survive that scope
+    mismatch; arbitrary labels and identifiers are intentionally ignored.
+    """
+
+    rank = {"direct": 0, "protected": 1, "local_only": 2}
+    selected = "direct"
+    for value in values:
+        if isinstance(value, Mapping):
+            value = value.get("privacy_mode")
+        if not isinstance(value, str):
+            continue
+        mode = value.strip().casefold()
+        if mode in rank and rank[mode] > rank[selected]:
+            selected = mode
+    return selected
 
 
 class ResponseHandler:
@@ -248,6 +282,17 @@ class ResponseHandler:
         utterance as evidence, so callers can pass it separately.
         """
         streamed_final_response: Optional[str] = None
+        try:
+            from ..services.turn_context import get_turn_context
+
+            suppress_automatic_context = bool(
+                get_turn_context().suppress_automatic_context
+            )
+        except Exception:
+            # Lightweight/legacy callers may not bind a TurnContext. Preserve
+            # historical memory behaviour for those ordinary turns while
+            # never making a malformed context an authorization signal.
+            suppress_automatic_context = False
         max_interrupts = 8
         cancellation_handle = get_current_generation_cancellation()
         generation_run_id = (
@@ -338,6 +383,12 @@ class ResponseHandler:
         async def _generation_tool_calls() -> list[Any]:
             """Read only this run's completed tool ledger when available."""
 
+            if suppress_automatic_context:
+                # Help/controller turns have no provider tools.  Never fall
+                # back to a shared client's prior-turn diagnostics while
+                # deciding whether an empty response may be retried or failed.
+                return []
+
             if generation_run_id:
                 getter = getattr(
                     self.llm_client,
@@ -383,6 +434,11 @@ class ResponseHandler:
             # Do not erase run-keyed audit evidence before AgentRun failure
             # persistence has a chance to peek and acknowledge it.  Runs with
             # no tools retain the historical cleanup behavior.
+            if suppress_automatic_context:
+                # Help has no retry/accept lifecycle to clean up.  In
+                # particular, do not let a coincidentally reused run id erase
+                # ordinary provider state.
+                return
             if await _generation_has_tool_activity():
                 print(
                     f"[{task_id}] ツール監査を保持したままgeneration runを終了します"
@@ -391,6 +447,11 @@ class ResponseHandler:
             await notify_generation_lifecycle("discard_generation_run")
 
         async def notify_generation_lifecycle(method_name: str) -> Any:
+            if suppress_automatic_context:
+                # AoiTalk Help is a single isolated provider request; it must
+                # not prepare, accept, or discard a shared client's ordinary
+                # generation ledger.
+                return None
             if not generation_run_id and method_name != "discard_generation_run":
                 return None
             method = getattr(self.llm_client, method_name, None)
@@ -576,6 +637,8 @@ class ResponseHandler:
                 try:
                     return await run_generation_attempt(generation_text)
                 except GenerationInterrupted as interrupt:
+                    if suppress_automatic_context:
+                        raise
                     await notify_generation_lifecycle("prepare_generation_retry")
                     instructions = await interrupt.resolve_instructions()
                     if not instructions:
@@ -658,6 +721,8 @@ class ResponseHandler:
                 response = await run_generation_with_interrupts(text)
             except asyncio.CancelledError:
                 raise
+            except PlanningInteractionTerminated:
+                raise
             except Exception as e:
                 failure = classify_generation_error(e)
                 print(
@@ -676,8 +741,13 @@ class ResponseHandler:
 
             # プロジェクトコンテキスト起因の失敗フォールバック:
             # include_project_context が有効な状態で失敗した場合、コンテキストなしで1回だけ再試行する。
-            if not response and self._project_context_enabled() and not (
-                await _generation_has_tool_activity()
+            if (
+                not response
+                and not suppress_automatic_context
+                and self._project_context_enabled()
+                and not (
+                    await _generation_has_tool_activity()
+                )
             ):
                 print(
                     f"[{task_id}] プロジェクトコンテキスト有効時に生成失敗。"
@@ -694,6 +764,8 @@ class ResponseHandler:
                 try:
                     retry_response = await run_generation_with_interrupts(text)
                 except asyncio.CancelledError:
+                    raise
+                except PlanningInteractionTerminated:
                     raise
                 except Exception as e:
                     failure = classify_generation_error(e)
@@ -730,46 +802,50 @@ class ResponseHandler:
             if hasattr(self.llm_client, 'recognizer') and self.llm_client.recognizer:
                 self.llm_client.recognizer.add_assistant_output(response)
 
-            dreaming_context = self._capture_dreaming_memory_context()
-            dreaming_user_input = (
-                evidence_user_input if evidence_user_input is not None else text
-            )
-            # Persist the extraction request before returning the answer. The
-            # worker may be cancelled during shutdown, but the pending row can
-            # then be retried on the next active turn instead of disappearing.
-            memory_job = await self._enqueue_dreaming_memory(
-                dreaming_user_input,
-                response,
-                user_id=dreaming_context["user_id"],
-                session_id=dreaming_context["session_id"],
-                project_id=dreaming_context["project_id"],
-                message_id=dreaming_context["message_id"],
-            )
-            processor_overridden = (
-                getattr(self._process_dreaming_memory, "__func__", None)
-                is not ResponseHandler._process_dreaming_memory
-            )
-            memory_coroutine = None
-            if processor_overridden:
-                memory_coroutine = self._process_dreaming_memory(
+            if not suppress_automatic_context:
+                dreaming_context = self._capture_dreaming_memory_context()
+                dreaming_user_input = (
+                    evidence_user_input if evidence_user_input is not None else text
+                )
+                # Persist the extraction request before returning the answer.
+                # The worker may be cancelled during shutdown, but the pending
+                # row can then be retried on the next active turn instead of
+                # disappearing. Reserved Help turns deliberately skip this
+                # entire branch: memory extraction is a write and may invoke a
+                # second provider with conversation context.
+                memory_job = await self._enqueue_dreaming_memory(
                     dreaming_user_input,
                     response,
                     user_id=dreaming_context["user_id"],
                     session_id=dreaming_context["session_id"],
                     project_id=dreaming_context["project_id"],
-                    llm_client=self.llm_client,
+                    message_id=dreaming_context["message_id"],
                 )
-            elif memory_job and dreaming_context["user_id"]:
-                memory_coroutine = self._process_dreaming_memory_job(
-                    memory_job["id"],
-                    user_id=str(dreaming_context["user_id"]),
-                    llm_client=self.llm_client,
+                processor_overridden = (
+                    getattr(self._process_dreaming_memory, "__func__", None)
+                    is not ResponseHandler._process_dreaming_memory
                 )
-            if memory_coroutine is not None:
-                memory_task = asyncio.create_task(memory_coroutine)
-                self.active_tasks.add(memory_task)
-                memory_task.add_done_callback(self.active_tasks.discard)
-            self._schedule_deferred_project_fact_reflection(text, response)
+                memory_coroutine = None
+                if processor_overridden:
+                    memory_coroutine = self._process_dreaming_memory(
+                        dreaming_user_input,
+                        response,
+                        user_id=dreaming_context["user_id"],
+                        session_id=dreaming_context["session_id"],
+                        project_id=dreaming_context["project_id"],
+                        llm_client=self.llm_client,
+                    )
+                elif memory_job and dreaming_context["user_id"]:
+                    memory_coroutine = self._process_dreaming_memory_job(
+                        memory_job["id"],
+                        user_id=str(dreaming_context["user_id"]),
+                        llm_client=self.llm_client,
+                    )
+                if memory_coroutine is not None:
+                    memory_task = asyncio.create_task(memory_coroutine)
+                    self.active_tasks.add(memory_task)
+                    memory_task.add_done_callback(self.active_tasks.discard)
+                self._schedule_deferred_project_fact_reflection(text, response)
 
             return response
 
@@ -783,6 +859,10 @@ class ResponseHandler:
     def _project_context_enabled(self) -> bool:
         """現在の LLM クライアントでプロジェクトコンテキスト注入が有効かどうか。"""
         try:
+            from ..services.turn_context import get_turn_context
+
+            if bool(get_turn_context().suppress_automatic_context):
+                return False
             from ..services.project_context import project_context_enabled_for_client
 
             return project_context_enabled_for_client(self.llm_client)
@@ -830,7 +910,10 @@ class ResponseHandler:
                 # a bound TurnContext) must not persist the selected Project
                 # as an implicit memory target in a background task.
                 project_id = None
-            message_id = turn.message_id or turn.client_message_id
+            # ``client_message_id`` is a transport/idempotency identifier,
+            # not provenance for a persisted ConversationMessage.  Never
+            # mint a canonical ``chat:<UUID>`` evidence identity from it.
+            message_id = turn.message_id
         except Exception:
             message_id = None
         return {
@@ -1215,26 +1298,91 @@ class ResponseHandler:
         """Persist one settings-aware extraction job before background work."""
         try:
             from ..services.scoped_memory_job_service import enqueue_scoped_memory_job
+            from ..services.agent_run_service import get_current_agent_run_id
 
             context = self._capture_dreaming_memory_context()
             user_id = user_id or context["user_id"]
             session_id = session_id or context["session_id"]
             message_id = message_id or context["message_id"]
-            if not self._project_context_enabled():
+            canonical_project_id = _canonical_uuid_text(project_id)
+            if canonical_project_id:
+                project_id = canonical_project_id
+            project_context_enabled = self._project_context_enabled()
+            if not project_context_enabled:
                 project_id = None
+            elif project_id:
+                # A Project auto-capture job is grounded in the persisted
+                # ConversationMessage row.  If that row was not materialized
+                # (for example, save_user_message failed) or the caller only
+                # supplied a transport identifier, keep the turn eligible for
+                # User/Docs processing but never create a durable Project
+                # Memory without canonical chat provenance.
+                try:
+                    uuid.UUID(str(message_id))
+                except (TypeError, ValueError, AttributeError):
+                    project_id = None
             if not user_id or not session_id:
                 return None
-            return await enqueue_scoped_memory_job(
-                user_id=str(user_id),
-                session_id=str(session_id),
-                project_id=project_id,
-                user_input=user_input,
-                assistant_response=assistant_response,
-                message_id=message_id,
-                privacy_config=getattr(self.llm_client, "config", None),
-                session_context=getattr(self.llm_client, "_privacy_session_context", None),
-                project_metadata=getattr(self.llm_client, "_privacy_project_metadata", None),
+            # Privacy/project metadata is a separate provider-side snapshot;
+            # clearing only the Project ID is insufficient when a reused
+            # client still carries the previous Project's metadata.  Pass an
+            # explicit empty mapping whenever this turn has no enabled,
+            # selected Project so the job cannot inherit stale context.
+            raw_project_metadata = getattr(
+                self.llm_client, "_privacy_project_metadata", None
             )
+            project_metadata: Mapping[str, Any] | dict[str, Any]
+            if (
+                project_context_enabled
+                and project_id
+                and isinstance(raw_project_metadata, Mapping)
+            ):
+                project_metadata = dict(raw_project_metadata)
+                claimed_project_id = project_metadata.get("project_id")
+                if claimed_project_id in (None, ""):
+                    project_metadata = {
+                        key: value
+                        for key, value in project_metadata.items()
+                        if key == "privacy_mode"
+                    }
+                elif _canonical_uuid_text(claimed_project_id) != str(project_id):
+                    # A reusable provider may still carry the previous
+                    # Project's snapshot (or an unbound metadata mapping).
+                    # Do not let stale/unbound metadata cross into the newly
+                    # selected Project's job.  Preserve only the strongest
+                    # bounded privacy policy so a stale snapshot cannot
+                    # weaken a protected/local-only turn to direct mode.
+                    claimed_mode = _strongest_bounded_privacy_mode(
+                        project_metadata
+                    )
+                    project_metadata = (
+                        {"privacy_mode": claimed_mode}
+                        if claimed_mode != "direct"
+                        else {}
+                    )
+            else:
+                project_metadata = {}
+            # The active AgentRun id is server-bound and therefore safe to
+            # carry as a provenance pointer.  Curation uses the corresponding
+            # durable tool-call ledger to suppress only Docs suggestions that
+            # were actually written in this turn.
+            agent_run_id = get_current_agent_run_id()
+            enqueue_kwargs = {
+                "user_id": str(user_id),
+                "session_id": str(session_id),
+                "project_id": project_id,
+                "user_input": user_input,
+                "assistant_response": assistant_response,
+                "message_id": message_id,
+                "privacy_config": getattr(self.llm_client, "config", None),
+                "session_context": getattr(
+                    self.llm_client, "_privacy_session_context", None
+                ),
+                "project_metadata": project_metadata,
+            }
+            if agent_run_id:
+                enqueue_kwargs["agent_run_id"] = str(agent_run_id)
+            return await enqueue_scoped_memory_job(**enqueue_kwargs)
         except Exception as e:
             print(f"[DreamingMemory] ジョブ登録エラー（無視）: {e}")
             return None

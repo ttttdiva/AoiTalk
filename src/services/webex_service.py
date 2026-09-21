@@ -21,6 +21,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import WebexConnection, WebexSpaceSelection
 from ..security.field_crypto import decrypt_text_if_needed, encrypt_text
+from .outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    PrivacyReviewDenied,
+    get_privacy_policy_context,
+)
 
 
 def _utcnow() -> datetime:
@@ -62,7 +69,13 @@ class WebexService:
         self,
         *,
         client_factory: Optional[Callable[[], Any]] = None,
+        config: Any | None = None,
+        privacy_gateway: OutboundPrivacyGateway | None = None,
+        session_id: str | None = None,
     ) -> None:
+        self.config = config
+        self._privacy_gateway_override = privacy_gateway
+        self._privacy_session_id = str(session_id or "")
         self.client_id = os.getenv("WEBEX_CLIENT_ID", "").strip()
         self.client_secret = os.getenv("WEBEX_CLIENT_SECRET", "").strip()
         self.redirect_uri = os.getenv("WEBEX_REDIRECT_URI", "").strip()
@@ -78,6 +91,35 @@ class WebexService:
         )
         self._client_factory = client_factory or (
             lambda: httpx.AsyncClient(timeout=20.0, follow_redirects=False)
+        )
+
+    def _privacy_gateway_for_user(
+        self, user_id: UUID | str | None = None
+    ) -> OutboundPrivacyGateway:
+        if self._privacy_gateway_override is not None:
+            return self._privacy_gateway_override
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        session_id = self._privacy_session_id or str(
+            session_context.get("session_id")
+            or session_context.get("id")
+            or ""
+        )
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(user_id or ""),
+            session_id=session_id,
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    @staticmethod
+    def _egress_descriptor(*, action: str, destination: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="httpx",
+            destination=destination,
+            provider="webex",
         )
 
     @property
@@ -634,10 +676,14 @@ class WebexService:
     ) -> tuple[dict[str, Any], Optional[str]]:
         url = self._normalize_api_url(path_or_url)
         access_token = await self._ensure_access_token(session, connection)
+        gateway = self._privacy_gateway_for_user(getattr(connection, "user_id", None))
         response = await self._send_api_request(
             url,
             access_token=access_token,
             params=params,
+            gateway=gateway,
+            action="webex.api.get",
+            user_id=getattr(connection, "user_id", None),
         )
         if response.status_code == 401:
             access_token = await self._refresh_tokens(session, connection)
@@ -645,6 +691,9 @@ class WebexService:
                 url,
                 access_token=access_token,
                 params=params,
+                gateway=gateway,
+                action="webex.api.get.retry",
+                user_id=getattr(connection, "user_id", None),
             )
         if response.status_code >= 400:
             status_code = 429 if response.status_code == 429 else 502
@@ -666,16 +715,43 @@ class WebexService:
         *,
         access_token: str,
         params: Optional[dict[str, Any]],
+        gateway: OutboundPrivacyGateway | None = None,
+        action: str = "webex.api.get",
+        user_id: UUID | str | None = None,
     ) -> httpx.Response:
-        async with self._client_factory() as client:
-            return await client.get(
-                url,
-                params=params,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Accept": "application/json",
-                },
+        active_gateway = gateway or self._privacy_gateway_for_user(user_id)
+
+        async def sender(protected_payload: Any) -> httpx.Response:
+            if not isinstance(protected_payload, dict) or "params" not in protected_payload:
+                raise PrivacyError("Webex reviewed payload is malformed")
+            protected_params = protected_payload.get("params")
+            if not isinstance(protected_params, dict):
+                raise PrivacyError("Webex reviewed params are malformed")
+            async with self._client_factory() as client:
+                return await client.get(
+                    url,
+                    params=protected_params,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Accept": "application/json",
+                    },
+                    follow_redirects=False,
+                )
+
+        try:
+            return await active_gateway.execute(
+                {"params": dict(params or {})},
+                provider="webex",
+                descriptor=self._egress_descriptor(action=action, destination=url),
+                sender=sender,
+                base_url=url,
+                source_kind="webex_api_request",
             )
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise WebexServiceError(
+                "Webex API payload was blocked by privacy policy",
+                403,
+            ) from exc
 
     async def _exchange_code(
         self,
@@ -695,6 +771,7 @@ class WebexService:
                     "code_verifier": code_verifier,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=False,
             )
         if response.status_code >= 400:
             raise WebexServiceError(
@@ -715,6 +792,7 @@ class WebexService:
                     "Authorization": f"Bearer {access_token}",
                     "Accept": "application/json",
                 },
+                follow_redirects=False,
             )
         if response.status_code >= 400:
             raise WebexServiceError(
@@ -761,6 +839,7 @@ class WebexService:
                     "refresh_token": refresh_token,
                 },
                 headers={"Content-Type": "application/x-www-form-urlencoded"},
+                follow_redirects=False,
             )
         if response.status_code >= 400:
             raise WebexServiceError(

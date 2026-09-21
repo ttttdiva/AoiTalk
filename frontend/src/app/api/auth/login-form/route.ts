@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { users } from "@/db/schema";
 import { eq } from "drizzle-orm";
+import { users } from "@/db/schema";
+import { attachSessionCookie, createSessionToken } from "@/lib/auth";
 import {
-  attachSessionCookie,
-  createSessionToken,
-  verifyPassword,
-} from "@/lib/auth";
+  authFailureReason,
+  authenticatePasswordViaPython,
+  CanonicalAuthError,
+  isUnavailableAuthError,
+  normalizeCredentialSource,
+} from "@/lib/server/password-auth";
 import {
   isEnterpriseProfile,
   recordWebUILoginLog,
@@ -44,12 +47,36 @@ function safeLoginDestination(rawNext: FormDataEntryValue | null, baseUrl: strin
   try {
     const url = new URL(rawNext, baseUrl);
     const base = new URL(baseUrl);
-    if (url.origin !== base.origin) return "/chat";
+    if (url.origin !== base.origin || url.pathname.startsWith("//")) return "/chat";
     if (url.pathname === "/login" || url.pathname.startsWith("/api/auth/")) return "/chat";
     return `${url.pathname}${url.search}${url.hash}`;
   } catch {
     return "/chat";
   }
+}
+
+// Preserve the browser's origin when a trusted proxy rewrites the Host header.
+function redirectWithinSite(url: URL): NextResponse {
+  return new NextResponse(null, {
+    status: 303,
+    headers: { Location: `${url.pathname}${url.search}${url.hash}` },
+  });
+}
+
+function redirectForAuthFailure(
+  loginUrl: URL,
+  error: unknown,
+): NextResponse {
+  if (error instanceof CanonicalAuthError && error.code === "account_disabled") {
+    loginUrl.searchParams.set("error", "inactive");
+  } else if (error instanceof CanonicalAuthError && error.code === "ad_provisioning_conflict") {
+    loginUrl.searchParams.set("error", "auth_conflict");
+  } else if (isUnavailableAuthError(error)) {
+    loginUrl.searchParams.set("error", "auth_unavailable");
+  } else {
+    loginUrl.searchParams.set("error", "auth_failed");
+  }
+  return redirectWithinSite(loginUrl);
 }
 
 export async function POST(request: NextRequest) {
@@ -61,21 +88,27 @@ export async function POST(request: NextRequest) {
   }
   const usernameEntry = formData.get("username");
   const passwordEntry = formData.get("password");
+  const credentialSourceEntry = formData.get("credential_source");
   const next = formData.get("next");
   if (
     (usernameEntry != null && typeof usernameEntry !== "string") ||
     (passwordEntry != null && typeof passwordEntry !== "string") ||
+    (credentialSourceEntry != null && typeof credentialSourceEntry !== "string") ||
     (next != null && typeof next !== "string") ||
-    (typeof usernameEntry === "string" &&
-      usernameEntry.length > MAX_USERNAME_LENGTH) ||
-    (typeof passwordEntry === "string" &&
-      passwordEntry.length > MAX_PASSWORD_LENGTH) ||
+    (typeof usernameEntry === "string" && usernameEntry.length > MAX_USERNAME_LENGTH) ||
+    (typeof passwordEntry === "string" && passwordEntry.length > MAX_PASSWORD_LENGTH) ||
+    (typeof credentialSourceEntry === "string" &&
+      normalizeCredentialSource(credentialSourceEntry) === null) ||
     (typeof next === "string" && next.length > MAX_NEXT_LENGTH)
   ) {
     return NextResponse.json({ detail: "Invalid login input" }, { status: 400 });
   }
   const username = usernameEntry ?? "";
   const password = passwordEntry ?? "";
+  const credentialSource =
+    typeof credentialSourceEntry === "string"
+      ? normalizeCredentialSource(credentialSourceEntry) ?? undefined
+      : undefined;
   const host = request.headers.get("host") || "localhost:3002";
   const protocol = request.headers.get("x-forwarded-proto") || "http";
   const baseUrl = `${protocol}://${host}`;
@@ -89,71 +122,34 @@ export async function POST(request: NextRequest) {
       failureReason: "missing_credentials",
     })) loginUrl.searchParams.set("error", "audit_unavailable");
     if (loginUrl.searchParams.get("error") === "audit_unavailable") {
-      return NextResponse.redirect(loginUrl, { status: 303 });
+      return redirectWithinSite(loginUrl);
     }
     loginUrl.searchParams.set("error", "missing");
-    return NextResponse.redirect(loginUrl, { status: 303 });
+    return redirectWithinSite(loginUrl);
   }
 
   const guarded = await withLoginThrottle(request, username, async (tx) => {
-    const [user] = await tx
-      .select()
-      .from(users)
-      .where(eq(users.username, username))
-      .limit(1);
-
-    if (!user || !user.passwordHash) {
+    let authenticated: Awaited<ReturnType<typeof authenticatePasswordViaPython>>;
+    try {
+      authenticated = await authenticatePasswordViaPython(request, {
+        username,
+        password,
+        credentialSource,
+      });
+    } catch (error) {
       if (await failedLoginAuditUnavailable({
         username,
         request,
-        failureReason: "invalid_credentials",
+        failureReason: authFailureReason(error),
         executor: tx,
-      })) loginUrl.searchParams.set("error", "audit_unavailable");
-      if (loginUrl.searchParams.get("error") === "audit_unavailable") {
-        return NextResponse.redirect(loginUrl, { status: 303 });
+      })) {
+        loginUrl.searchParams.set("error", "audit_unavailable");
+        return redirectWithinSite(loginUrl);
       }
-      loginUrl.searchParams.set("error", "auth_failed");
-      return NextResponse.redirect(loginUrl, { status: 303 });
+      return redirectForAuthFailure(loginUrl, error);
     }
 
-    const valid = await verifyPassword(password, user.passwordHash);
-    if (!valid) {
-      if (await failedLoginAuditUnavailable({
-        username,
-        request,
-        failureReason: "invalid_credentials",
-        executor: tx,
-      })) loginUrl.searchParams.set("error", "audit_unavailable");
-      if (loginUrl.searchParams.get("error") === "audit_unavailable") {
-        return NextResponse.redirect(loginUrl, { status: 303 });
-      }
-      loginUrl.searchParams.set("error", "auth_failed");
-      return NextResponse.redirect(loginUrl, { status: 303 });
-    }
-
-    if (!user.isActive) {
-      if (await failedLoginAuditUnavailable({
-        username: user.username,
-        request,
-        failureReason: "account_disabled",
-        executor: tx,
-      })) loginUrl.searchParams.set("error", "audit_unavailable");
-      if (loginUrl.searchParams.get("error") === "audit_unavailable") {
-        return NextResponse.redirect(loginUrl, { status: 303 });
-      }
-      loginUrl.searchParams.set("error", "inactive");
-      return NextResponse.redirect(loginUrl, { status: 303 });
-    }
-
-    // Set-Cookie を確実にリダイレクトレスポンスに乗せるため、
-    // cookies() API ではなく NextResponse.cookies.set() を使う
-    const token = await createSessionToken(
-      user.id,
-      !!user.isPasswordResetRequired,
-      user.sessionVersion ?? 1,
-    );
-
-    // last_login更新
+    const user = authenticated.user;
     const auditRecorded = await recordWebUILoginLog({
       username: user.username,
       action: "login",
@@ -163,7 +159,7 @@ export async function POST(request: NextRequest) {
     });
     if (!auditRecorded && isEnterpriseProfile()) {
       loginUrl.searchParams.set("error", "audit_unavailable");
-      return NextResponse.redirect(loginUrl, { status: 303 });
+      return redirectWithinSite(loginUrl);
     }
 
     await tx
@@ -171,17 +167,19 @@ export async function POST(request: NextRequest) {
       .set({ lastLogin: new Date() })
       .where(eq(users.id, user.id));
 
-    // A user with an initial password must not enter the regular app layout yet:
-    // the sidebar/providers mounted there immediately call protected APIs and
-    // turn the reset-required session into an apparent logout.  Keep this
-    // redirect on the minimal auth route until the password change endpoint has
-    // issued a fresh, non-reset session token.
-    const destination = user.isPasswordResetRequired
+    // Set-Cookie を確実にリダイレクトレスポンスに乗せるため、
+    // cookies() API ではなく NextResponse.cookies.set() を使う
+    const token = await createSessionToken(
+      user.id,
+      user.password_reset_required,
+      user.session_version,
+    );
+
+    // A user with an initial password must not enter the regular app layout yet.
+    const destination = user.password_reset_required
       ? "/change-password"
       : safeLoginDestination(next, baseUrl);
-    const response = NextResponse.redirect(new URL(destination, baseUrl), {
-      status: 303,
-    });
+    const response = redirectWithinSite(new URL(destination, baseUrl));
     attachSessionCookie(response, token, protocol === "https");
     return response;
   });

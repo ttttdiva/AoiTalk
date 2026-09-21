@@ -155,10 +155,17 @@ export default function RootLayout() {
     let currentAppState = AppState.currentState;
     setSyncExecutionActive(currentAppState === "active");
     let cancelScheduledSync: (() => void) | null = null;
+    // Root refreshes talk to the AoiTalk API.  `online` is Internet-only and
+    // must not suppress a server hosted on the current LAN.  The `online`
+    // fallback keeps older test/embedding state objects compatible.
+    const hasServerNetworkPath = (state: {
+      connected?: boolean;
+      online?: boolean;
+    }): boolean => state.connected ?? state.online ?? false;
     const scheduleRootSync = () => {
       if (
         currentAppState !== "active" ||
-        !useNetworkStore.getState().online
+        !hasServerNetworkPath(useNetworkStore.getState())
       ) {
         return;
       }
@@ -168,7 +175,7 @@ export default function RootLayout() {
       );
     };
     const unsubscribe = useNetworkStore.subscribe((state, prevState) => {
-      if (state.online && !prevState.online) {
+      if (hasServerNetworkPath(state) && !hasServerNetworkPath(prevState)) {
         scheduleRootSync();
       }
     });

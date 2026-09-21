@@ -14,6 +14,9 @@ import { hasProjectPermission } from "@/lib/server/project-permissions";
 import {
   canReadProjectId,
   canWriteProjectId,
+  hasTaskBrowseScopeParams,
+  resolveReadScope,
+  TaskBrowseScopeError,
 } from "@/lib/server/task-route-utils";
 import {
   exceedsUploadSizeLimit,
@@ -77,7 +80,7 @@ async function loadTask(id: string) {
 }
 
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const user = await getSession();
@@ -86,8 +89,27 @@ export async function GET(
   }
 
   const { id } = await params;
+  let browseProjectIds: string[] | null = null;
+  const searchParams = new URL(request.url).searchParams;
+  if (hasTaskBrowseScopeParams(searchParams)) {
+    try {
+      const scope = await resolveReadScope(user, searchParams);
+      if (scope.explicit) browseProjectIds = scope.projectIds;
+    } catch (error) {
+      if (error instanceof TaskBrowseScopeError) {
+        return NextResponse.json(
+          { detail: error.message },
+          { status: error.status },
+        );
+      }
+      throw error;
+    }
+  }
   const task = await loadTask(id);
   if (!task) {
+    return NextResponse.json({ detail: "Task not found" }, { status: 404 });
+  }
+  if (browseProjectIds && !browseProjectIds.includes(task.projectId)) {
     return NextResponse.json({ detail: "Task not found" }, { status: 404 });
   }
   if (!(await canReadProjectId(user, task.projectId))) {
@@ -113,6 +135,12 @@ export async function POST(
   }
 
   const { id } = await params;
+  if (hasTaskBrowseScopeParams(new URL(request.url).searchParams)) {
+    return NextResponse.json(
+      { detail: "Browse scope is read-only" },
+      { status: 400 },
+    );
+  }
   const task = await loadTask(id);
   if (!task) {
     return NextResponse.json({ detail: "Task not found" }, { status: 404 });

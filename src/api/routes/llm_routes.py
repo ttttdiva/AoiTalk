@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -39,6 +40,10 @@ from ...services.provider_runtime_ownership import (
     ProviderRuntimeOwnership,
     provider_runtime_ownership,
 )
+from ...services.local_llm_paths import (
+    canonicalize_llama_cpp_model_root_override,
+    resolve_llama_cpp_model_root,
+)
 from ...features import Features
 from ...llm.openrouter_provider_routing import (
     MODEL_PROVIDER_OPTIONS_CONFIG_KEY,
@@ -53,8 +58,13 @@ from ...llm.deployment_resolver import (
     resolve_llm_deployment,
 )
 from ...llm.openai_compatible_local_profiles import (
+    llama_cpp_auxiliary_artifacts,
+    freetoken_model_profile,
     llama_cpp_model_profile,
     llama_cpp_reasoning_effort_metadata,
+    llama_cpp_runtime_distribution,
+    managed_local_runtime_for_model,
+    openai_compatible_local_base_url,
 )
 from ..router_helpers import cookie_auth_dependency
 from .payloads import OllamaModelPayload, OllamaPullPayload
@@ -75,6 +85,52 @@ logger = logging.getLogger(__name__)
 
 
 from ..broadcast_scope import broadcast_llm_state_change
+
+
+def _attach_server_timing(
+    response: JSONResponse,
+    name: str,
+    started_at: float,
+) -> JSONResponse:
+    """Attach a stable, proxy-safe Server-Timing diagnostic to *response*.
+
+    Metadata routes are frequently called by both the browser and the BFF.  A
+    response header keeps the diagnostic additive (the JSON contracts remain
+    unchanged) and survives proxy forwarding without exposing configuration or
+    request details.
+    """
+
+    duration_ms = max(0.0, (time.perf_counter() - started_at) * 1000.0)
+    response.headers["Server-Timing"] = f"{name};dur={duration_ms:.1f}"
+    return response
+
+
+def _llama_cpp_model_root_payload(config: Any, *, success: bool | None = None) -> dict[str, Any]:
+    """Return the canonical llama.cpp model-root settings envelope."""
+
+    resolved = resolve_llama_cpp_model_root(config)
+    getter = getattr(config, "get", None)
+    raw = (
+        config.get("openai_compatible_local", {}).get("llama_cpp", {})
+        if isinstance(config, dict)
+        else getter("openai_compatible_local.llama_cpp", {})
+        if callable(getter)
+        else {}
+    )
+    raw = raw if isinstance(raw, dict) else {}
+    override = canonicalize_llama_cpp_model_root_override(
+        raw.get("model_root"),
+        create=False,
+    )
+    payload: dict[str, Any] = {
+        "model_root": str(resolved.path),
+        "model_root_default": str(resolved.default),
+        "model_root_override": str(override or ""),
+        "model_root_source": resolved.source,
+    }
+    if success is not None:
+        payload["success"] = bool(success)
+    return payload
 
 
 class _ConfigOverlay:
@@ -204,6 +260,14 @@ def _persist_config_changes(
             raise RuntimeError("Failed to persist LLM configuration")
         for key, value in changes.items():
             _set_dotted_mapping_value(live_mapping, key, copy.deepcopy(value))
+        return
+
+    if isinstance(config, dict):
+        # Lightweight route/test configurations do not expose Config.set or a
+        # persistence backend.  Keep their in-memory dotted mapping coherent;
+        # production Config instances take the DB-backed branch above.
+        for key, value in changes.items():
+            _set_dotted_mapping_value(config, key, copy.deepcopy(value))
         return
 
     previous_values = {
@@ -485,6 +549,7 @@ def _selection_runtime_ownership(
     model: str,
     *,
     llama_cpp_settings: dict[str, Any] | None = None,
+    freetoken_settings: dict[str, Any] | None = None,
 ) -> ProviderRuntimeOwnership:
     """Resolve ownership against a requested (possibly staged) selection.
 
@@ -503,6 +568,10 @@ def _selection_runtime_ownership(
     }
     for key, value in (llama_cpp_settings or {}).items():
         changes[f"openai_compatible_local.llama_cpp.{key}"] = value
+    for key, value in (freetoken_settings or {}).items():
+        changes[
+            f"openai_compatible_local.freetoken.{key}"
+        ] = value
     candidate = _ConfigOverlay(config, changes) if changes else config
     return provider_runtime_ownership(provider_id, candidate, model=model)
 
@@ -524,6 +593,152 @@ _LLAMA_CPP_SETTING_KEYS = {
     # actually use them; callers must not encode MTP flags in extra_args.
     "mtp_enabled",
 }
+
+_FREETOKEN_SETTING_KEYS = {
+    "host",
+    "port",
+    "auto_start",
+    "readiness_timeout",
+    "extra_args",
+}
+
+
+def _normalize_freetoken_request_settings(
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    """Validate the writable FreeToken engine-switch settings."""
+
+    raw = body.get("freetoken")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="freetoken はオブジェクトで指定してください",
+        )
+
+    unknown = sorted(set(raw) - _FREETOKEN_SETTING_KEYS)
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "FreeTokenの未対応設定: "
+                + ", ".join(str(item) for item in unknown)
+            ),
+        )
+
+    result: dict[str, Any] = {}
+    if "host" in raw:
+        host = raw["host"]
+        if not isinstance(host, str) or not host.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.host は空でない文字列で指定してください",
+            )
+        result["host"] = host.strip()
+
+    if "port" in raw:
+        value = raw["port"]
+        if isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.port は整数で指定してください",
+            )
+        try:
+            port = int(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.port は整数で指定してください",
+            ) from None
+        if not 1 <= port <= 65535:
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.port の値が範囲外です",
+            )
+        result["port"] = port
+
+    if "auto_start" in raw:
+        value = raw["auto_start"]
+        if not isinstance(value, (bool, int, str)):
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.auto_start は真偽値で指定してください",
+            )
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized not in {
+                "1",
+                "0",
+                "true",
+                "false",
+                "yes",
+                "no",
+                "on",
+                "off",
+            }:
+                raise HTTPException(
+                    status_code=400,
+                    detail="freetoken.auto_start は真偽値で指定してください",
+                )
+            value = normalized in {"1", "true", "yes", "on"}
+        result["auto_start"] = bool(value)
+
+    if "readiness_timeout" in raw:
+        value = raw["readiness_timeout"]
+        if isinstance(value, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.readiness_timeout は正数で指定してください",
+            )
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.readiness_timeout は正数で指定してください",
+            ) from None
+        if timeout <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="freetoken.readiness_timeout は正数で指定してください",
+            )
+        result["readiness_timeout"] = timeout
+
+    if "extra_args" in raw:
+        value = raw["extra_args"]
+        if isinstance(value, str):
+            normalized_extra_args: Any = value
+        elif isinstance(value, list) and all(
+            isinstance(item, (str, int, float))
+            for item in value
+        ):
+            normalized_extra_args = [
+                str(item)
+                for item in value
+                if str(item).strip()
+            ]
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "freetoken.extra_args は文字列または配列で指定してください"
+                ),
+            )
+        try:
+            from src.service_manager._local_llm_servers import (
+                _validate_freetoken_extra_args,
+            )
+
+            _validate_freetoken_extra_args(normalized_extra_args)
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+        result["extra_args"] = normalized_extra_args
+
+    return result
 
 
 def _normalize_llama_cpp_request_settings(body: dict[str, Any]) -> dict[str, Any]:
@@ -569,6 +784,11 @@ def _normalize_llama_cpp_request_settings(body: dict[str, Any]) -> dict[str, Any
         "native_context_length",
         "native_context_size",
         "gguf_filename",
+        "gguf_filenames",
+        "gguf_shard_count",
+        "gguf_repository_subdir",
+        "default_gpu_layers",
+        "required_llama_cpp_commit",
         "source_url",
         "reasoning_tools_minimum_llama_cpp_build",
         "supports_reasoning",
@@ -592,11 +812,17 @@ def _normalize_llama_cpp_request_settings(body: dict[str, Any]) -> dict[str, Any
         "mtp_artifact_path",
         "mtp_model_path",
         "mtp_resolved_model_path",
+        "mtp_variant_model_path",
         "mtp_mode",
         "mtp_default_enabled",
         "mtp_artifact_filename",
         "mtp_compatibility",
         "mtp_ui_notice",
+        # Flattened aliases emitted by older catalog clients; nested MTP
+        # metadata is descriptive and never writable either way.
+        "mtp_minimum_llama_cpp_build",
+        "mtp_required_llama_cpp_commit",
+        "mtp_embedded_variant",
     }
     unknown = sorted(
         set(raw) - _LLAMA_CPP_SETTING_KEYS - {"readiness_timeout_seconds"} - readonly_keys
@@ -611,9 +837,22 @@ def _normalize_llama_cpp_request_settings(body: dict[str, Any]) -> dict[str, Any
     for key in ("executable", "model_path", "model_root", "model_alias", "host"):
         if key in raw:
             value = raw[key]
+            if key == "model_root" and value is None:
+                result[key] = ""
+                continue
             if not isinstance(value, str):
                 raise HTTPException(status_code=400, detail=f"llama_cpp.{key} は文字列で指定してください")
-            result[key] = value.strip()
+            if key == "model_root":
+                try:
+                    canonical_root = canonicalize_llama_cpp_model_root_override(
+                        value,
+                        create=True,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                result[key] = str(canonical_root or "")
+            else:
+                result[key] = value.strip()
     for key in ("port", "context_size"):
         if key in raw:
             try:
@@ -624,10 +863,17 @@ def _normalize_llama_cpp_request_settings(body: dict[str, Any]) -> dict[str, Any
                 raise HTTPException(status_code=400, detail=f"llama_cpp.{key} の値が範囲外です")
             result[key] = value
     if "gpu_layers" in raw:
-        try:
-            result["gpu_layers"] = int(raw["gpu_layers"])
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="llama_cpp.gpu_layers は整数で指定してください")
+        value = raw["gpu_layers"]
+        if isinstance(value, str) and value.strip().casefold() == "auto":
+            result["gpu_layers"] = "auto"
+        else:
+            try:
+                result["gpu_layers"] = int(value)
+            except (TypeError, ValueError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="llama_cpp.gpu_layers は整数またはautoで指定してください",
+                )
     if "extra_args" in raw:
         value = raw["extra_args"]
         if isinstance(value, str):
@@ -715,9 +961,332 @@ def _llama_cpp_runtime_settings_changed(
     return normalize_openai_compatible_base_url(old_base_url) != normalize_openai_compatible_base_url(new_base_url)
 
 
+def _freetoken_runtime_settings_changed(
+    config: Any,
+    *,
+    model: str,
+    settings: dict[str, Any],
+) -> bool:
+    """Detect same-model FreeToken runtime edits without mutating config."""
+
+    if not settings:
+        return False
+    from src.service_manager import _config_get
+
+    previous_provider = str(
+        _config_get(config, "llm_provider", "") or ""
+    ).strip().casefold()
+    previous_model = str(
+        _config_get(config, "openai_compatible_local.model", "")
+        or _config_get(config, "llm_model", "")
+        or ""
+    ).strip()
+    if (
+        previous_provider != "openai_compatible_local"
+        or previous_model != model
+    ):
+        return False
+
+    from src.service_manager import _freetoken_settings
+
+    previous_settings = _freetoken_settings(
+        config,
+        model=model,
+    )
+    return any(
+        previous_settings.get(key) != value
+        for key, value in settings.items()
+    )
+
+
+def _local_runtime_public_reason(state: dict[str, Any]) -> str | None:
+    """Return a path/secret-free explanation for one manager state."""
+
+    status = str(state.get("status") or "").strip().lower()
+    reasons = {
+        "external": "This model is not managed by AoiTalk.",
+        "installer_required": (
+            "This runtime requires an interactive/manual installer on this platform."
+        ),
+        "unsupported": "This managed runtime is not supported on this platform.",
+        "runtime_missing": (
+            "The managed runtime executable is not installed or configured."
+        ),
+        "manual_model_required": (
+            "This managed profile requires a manually provided model artifact."
+        ),
+        "model_missing": "The managed model artifact is not prepared.",
+        "failed": (
+            "Managed local runtime preparation failed. "
+            "Check server logs for details."
+        ),
+        "not_found": "Local runtime prepare task not found.",
+    }
+    return reasons.get(status)
+
+
+def _local_runtime_api_payload(
+    state: dict[str, Any],
+    config: Any = None,
+) -> dict[str, Any]:
+    """Project manager state without exposing local paths or raw exceptions."""
+
+    runtime = str(state.get("runtime") or "").strip() or None
+    phase = str(state.get("phase") or "unknown").strip() or "unknown"
+    status = str(state.get("status") or "unknown").strip() or "unknown"
+    task_id = str(state.get("task_id") or "").strip() or None
+    model = str(state.get("model") or "").strip()
+    runtime_installed = bool(state.get("runtime_installed"))
+    model_installed = bool(state.get("model_installed"))
+    prepared = bool(state.get("prepared"))
+    done = bool(state.get("done"))
+    prepare_supported = bool(state.get("prepare_supported", False))
+    reason = _local_runtime_public_reason(state)
+    managed = runtime is not None
+    platform_supported = bool(managed and status not in {"installer_required", "unsupported"})
+    runtime_version = (
+        str(state["runtime_version"]).strip()
+        if isinstance(state.get("runtime_version"), str)
+        and str(state["runtime_version"]).strip()
+        else None
+    )
+    runtime_build = (
+        state.get("runtime_build")
+        if isinstance(state.get("runtime_build"), int)
+        and not isinstance(state.get("runtime_build"), bool)
+        else None
+    )
+    runtime_install_source = str(state.get("runtime_install_source") or "").strip() or None
+    runtime_release = str(state.get("runtime_release") or "").strip() or None
+    runtime_asset = str(state.get("runtime_asset") or "").strip() or None
+
+    runtime_install_state = (
+        state.get("runtime_install")
+        if isinstance(state.get("runtime_install"), dict)
+        else {}
+    )
+    model_artifact_state = (
+        state.get("model_artifact")
+        if isinstance(state.get("model_artifact"), dict)
+        else {}
+    )
+    server_state = (
+        state.get("server")
+        if isinstance(state.get("server"), dict)
+        else {}
+    )
+    state_actions = (
+        state.get("actions")
+        if isinstance(state.get("actions"), dict)
+        else {}
+    )
+
+    profile = (
+        llama_cpp_model_profile(model)
+        if runtime == "llama_cpp"
+        else freetoken_model_profile(model)
+        if runtime == "freetoken"
+        else None
+    )
+    auxiliary_contract = []
+    if runtime == "llama_cpp" and profile is not None:
+        try:
+            auxiliary_contract = llama_cpp_auxiliary_artifacts(profile=profile)
+        except ValueError:
+            auxiliary_contract = []
+    runtime_distribution = (
+        llama_cpp_runtime_distribution(profile=profile)
+        if runtime == "llama_cpp"
+        else None
+    )
+    auxiliary_projection = [
+        {
+            **artifact,
+            "status": "installed" if model_installed else "missing",
+            "installed": model_installed,
+        }
+        for artifact in auxiliary_contract
+    ]
+    profile_downloadable = bool(
+        profile
+        and profile.get("source_repository")
+        and (runtime == "freetoken" or profile.get("gguf_filename"))
+    )
+    explicit_runtime_downloadable = runtime_install_state.get(
+        "downloadable",
+        state.get("runtime_downloadable"),
+    )
+    runtime_downloadable = (
+        explicit_runtime_downloadable
+        if isinstance(explicit_runtime_downloadable, bool)
+        else bool(runtime == "llama_cpp" and platform_supported)
+    )
+    explicit_model_downloadable = model_artifact_state.get(
+        "downloadable",
+        state.get("model_artifact_downloadable", state.get("model_downloadable")),
+    )
+    model_downloadable = (
+        explicit_model_downloadable
+        if isinstance(explicit_model_downloadable, bool)
+        else profile_downloadable
+    )
+
+    if runtime is None:
+        runtime_install_status = "not_applicable"
+    elif runtime_installed:
+        runtime_install_status = "installed"
+    elif status in {"installer_required", "unsupported"}:
+        runtime_install_status = status
+    else:
+        runtime_install_status = "missing"
+
+    if runtime is None:
+        model_artifact_status = "not_applicable"
+    elif model_installed:
+        model_artifact_status = "installed"
+    elif not done and phase in {"queued", "model", "verify"}:
+        model_artifact_status = "preparing"
+    elif status == "failed":
+        model_artifact_status = "failed"
+    elif status == "manual_model_required":
+        model_artifact_status = "manual_required"
+    else:
+        model_artifact_status = "missing"
+
+    running_value = server_state.get("running", state.get("server_running"))
+    ready_value = server_state.get("ready", state.get("server_ready"))
+    server_running = running_value if isinstance(running_value, bool) else False
+    server_ready = ready_value if isinstance(ready_value, bool) else None
+    server_base_url = None
+    if managed and model:
+        try:
+            server_base_url = openai_compatible_local_base_url(
+                config,
+                model=model,
+            )
+        except Exception:
+            server_base_url = None
+
+    def _explicit_action(name: str) -> bool:
+        for value in (
+            state_actions.get(name),
+            state.get(f"supports_{name}"),
+            state.get(f"{name}_supported"),
+        ):
+            if isinstance(value, bool):
+                return value
+        return False
+
+    return {
+        "task_id": task_id,
+        "model": model,
+        "runtime": runtime,
+        "runtime_distribution": runtime_distribution,
+        "managed": managed,
+        "platform_supported": platform_supported,
+        "phase": phase,
+        "status": status,
+        "completed": int(state.get("completed") or 0),
+        "total": int(state.get("total") or 0),
+        "percent": int(state.get("percent") or 0),
+        "done": done,
+        # Never expose the manager's raw exception text here. Download/runtime
+        # failures may contain local filesystem paths or upstream diagnostics.
+        "error": reason if state.get("error") else None,
+        "runtime_installed": runtime_installed,
+        "model_installed": model_installed,
+        "prepared": prepared,
+        "started_at": (
+            state.get("started_at")
+            if isinstance(state.get("started_at"), str)
+            else None
+        ),
+        "updated_at": (
+            state.get("updated_at")
+            if isinstance(state.get("updated_at"), str)
+            else None
+        ),
+        "prepare_supported": prepare_supported,
+        "runtime_version": runtime_version,
+        "runtime_build": runtime_build,
+        "runtime_install_source": runtime_install_source,
+        "runtime_release": runtime_release,
+        "runtime_asset": runtime_asset,
+        "runtime_install": {
+            "runtime": runtime,
+            **(
+                {"distribution": runtime_distribution}
+                if runtime_distribution
+                else {}
+            ),
+            "installed": runtime_installed,
+            "status": runtime_install_status,
+            "installer_required": status == "installer_required",
+            "version": runtime_version,
+            "build": runtime_build,
+            "install_source": runtime_install_source,
+            "release": runtime_release,
+            "asset": runtime_asset,
+            "downloadable": runtime_downloadable,
+        },
+        "model_artifact": {
+            "installed": model_installed,
+            "status": model_artifact_status,
+            "managed": managed,
+            "downloadable": model_downloadable,
+            "primary_filename": (
+                str(profile.get("gguf_filename") or "")
+                if profile and runtime == "llama_cpp"
+                else None
+            ),
+            "auxiliary_artifacts": auxiliary_projection,
+        },
+        # B2a prepares runtime/model artifacts only. Server launch/readiness is
+        # intentionally not inferred from filesystem state.
+        "server": {
+            "status": str(
+                server_state.get("status")
+                or ("not_checked" if managed else "external")
+            ),
+            "running": server_running,
+            "ready": server_ready if managed else False,
+            "base_url": server_base_url,
+        },
+        "actions": {
+            "prepare": bool(
+                prepare_supported and done and not prepared
+            ),
+            "poll": bool(task_id and not done),
+            "retry": bool(
+                prepare_supported
+                and done
+                and status == "failed"
+            ),
+            "installer_required": status == "installer_required",
+            "start": _explicit_action("start"),
+            "stop": _explicit_action("stop"),
+            "delete_model": _explicit_action("delete_model"),
+        },
+        "reason": reason,
+    }
+
+
 def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
     """LLM mode / models / engine / Ollama 管理ルートを登録する"""
     require_auth = cookie_auth_dependency(server._enforce_cookie_auth)
+
+    local_runtime_manager = getattr(
+        server,
+        "_local_llm_runtime_manager",
+        None,
+    )
+    if local_runtime_manager is None:
+        # Lightweight route tests and fallback server implementations do not
+        # necessarily construct the production WebChatServer.
+        from ...services.local_llm_runtime_manager import ManagedLocalRuntimeManager
+
+        local_runtime_manager = ManagedLocalRuntimeManager(server.config)
+        server._local_llm_runtime_manager = local_runtime_manager
 
     async def _resolve_request_user_id(request: Request) -> str | None:
         user_resolver = getattr(server, "_get_user_info_from_request", None)
@@ -761,6 +1330,166 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
         if not allowed:
             raise HTTPException(status_code=404, detail="Session not found")
+
+    @app.get("/api/llm/local-runtime/status")
+    async def get_local_runtime_status(
+        model: str = Query(..., min_length=1),
+        _: None = Depends(require_auth),
+    ):
+        model_id = str(model or "").strip()
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model は必須です")
+        try:
+            state = await asyncio.to_thread(
+                local_runtime_manager.status,
+                model_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            logger.exception("Managed local runtime status failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to inspect managed local runtime",
+            ) from None
+        return JSONResponse(_local_runtime_api_payload(state, server.config))
+
+    @app.post("/api/llm/local-runtime/prepare")
+    async def prepare_local_runtime(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        await _require_global_config_admin(request)
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="JSON objectを指定してください",
+            ) from exc
+        if not isinstance(body, dict):
+            raise HTTPException(
+                status_code=400,
+                detail="JSON objectを指定してください",
+            )
+
+        model_id = str(body.get("model") or "").strip()
+        if not model_id:
+            raise HTTPException(status_code=400, detail="model は必須です")
+
+        runtime_value = body.get("runtime")
+        if runtime_value is not None and not isinstance(runtime_value, str):
+            raise HTTPException(
+                status_code=400,
+                detail="runtime は文字列で指定してください",
+            )
+        runtime = (
+            str(runtime_value).strip()
+            if isinstance(runtime_value, str) and runtime_value.strip()
+            else None
+        )
+
+        try:
+            state = await asyncio.to_thread(
+                local_runtime_manager.start_prepare,
+                model_id,
+                runtime,
+            )
+        except ValueError as exc:
+            # Includes unknown/untrusted profiles and explicit
+            # profile/runtime mismatches.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception:
+            logger.exception("Managed local runtime prepare failed to start")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to start managed local runtime preparation",
+            ) from None
+        return JSONResponse(_local_runtime_api_payload(state, server.config))
+
+    @app.get("/api/llm/local-runtime/tasks/{task_id}")
+    async def get_local_runtime_task(
+        task_id: str,
+        _: None = Depends(require_auth),
+    ):
+        clean_task_id = str(task_id or "").strip()
+        if not clean_task_id:
+            raise HTTPException(status_code=400, detail="task_id は必須です")
+        try:
+            state = await asyncio.to_thread(
+                local_runtime_manager.get_task,
+                clean_task_id,
+            )
+        except Exception:
+            logger.exception("Managed local runtime task lookup failed")
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to inspect managed local runtime task",
+            ) from None
+
+        payload = _local_runtime_api_payload(state, server.config)
+        return JSONResponse(
+            payload,
+            status_code=404 if payload["status"] == "not_found" else 200,
+        )
+
+    @app.get("/api/llm/llama-cpp/model-root")
+    async def get_llama_cpp_model_root(_: None = Depends(require_auth)):
+        """Return the effective canonical GGUF model root and provenance."""
+
+        try:
+            return JSONResponse(_llama_cpp_model_root_payload(server.config))
+        except ValueError as exc:
+            # A stale persisted path should be visible as a client/config
+            # error, not leak a raw traceback or cause an unrelated 500.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/api/llm/llama-cpp/model-root")
+    async def put_llama_cpp_model_root(
+        request: Request,
+        _: None = Depends(require_auth),
+    ):
+        """Persist one canonical model root; empty input restores the default."""
+
+        await _require_global_config_admin(request)
+        try:
+            body = await request.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="JSON objectを指定してください",
+            ) from exc
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="JSON objectを指定してください")
+        if "model_root" in body:
+            raw_value = body.get("model_root")
+        elif "path" in body:
+            # ``path`` was used by one early settings client; retain this
+            # narrow alias while keeping model_root the canonical contract.
+            raw_value = body.get("path")
+        else:
+            raise HTTPException(status_code=400, detail="model_root は必須です")
+        if raw_value is not None and not isinstance(raw_value, str):
+            raise HTTPException(status_code=400, detail="model_root は文字列またはnullで指定してください")
+        try:
+            canonical = canonicalize_llama_cpp_model_root_override(
+                raw_value,
+                create=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        _persist_config_changes(
+            server.config,
+            {
+                "openai_compatible_local.llama_cpp.model_root": str(canonical or ""),
+            },
+        )
+        try:
+            return JSONResponse(
+                _llama_cpp_model_root_payload(server.config, success=True)
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ── LLM Mode API Endpoints ──────────────────────────────────────────
     @app.get("/api/llm/mode")
@@ -968,6 +1697,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         include_remote: bool = False,
         refresh_provider: Optional[str] = None,
         cached_catalog: Optional[Dict[str, Any]] = None,
+        include_runtime_models: bool = True,
     ):
         return build_llm_model_catalog(
             cfg,
@@ -975,6 +1705,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             include_remote=include_remote,
             refresh_provider=refresh_provider,
             cached_catalog=cached_catalog,
+            include_runtime_models=include_runtime_models,
         )
 
     def _build_engine_list(cfg):
@@ -991,12 +1722,18 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         _: None = Depends(require_auth),
     ):
         """Return provider-grouped model options for the settings screen."""
-        cached_catalog = load_model_catalog_cache()
-        catalog = _build_model_catalog(
+        started_at = time.perf_counter()
+        # Catalog construction performs synchronous local/provider discovery
+        # and cache I/O. Keep it off the FastAPI event loop; positional
+        # arguments make the wrapper safe for lightweight test doubles that do
+        # not accept keyword arguments.
+        cached_catalog = await asyncio.to_thread(load_model_catalog_cache)
+        catalog = await asyncio.to_thread(
+            _build_model_catalog,
             server.config,
-            include_remote=refresh,
-            refresh_provider=provider,
-            cached_catalog=cached_catalog,
+            refresh,
+            provider,
+            cached_catalog,
         )
         if refresh and provider:
             refreshed_provider = next(
@@ -1004,26 +1741,32 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 None,
             )
             if refreshed_provider:
-                next_cache = update_model_catalog_cache(
+                next_cache = await asyncio.to_thread(
+                    update_model_catalog_cache,
                     cached_catalog,
                     provider,
                     refreshed_provider.get("models") or [],
                 )
                 if next_cache != cached_catalog:
                     try:
-                        save_model_catalog_cache(next_cache)
-                        catalog = _build_model_catalog(
+                        await asyncio.to_thread(save_model_catalog_cache, next_cache)
+                        catalog = await asyncio.to_thread(
+                            _build_model_catalog,
                             server.config,
-                            include_remote=False,
-                            refresh_provider=None,
-                            cached_catalog=next_cache,
+                            False,
+                            None,
+                            next_cache,
                         )
                     except Exception as exc:
                         logger.warning(
                             "Failed to save LLM model catalog cache: %s",
                             exc,
                         )
-        return JSONResponse(catalog)
+        return _attach_server_timing(
+            JSONResponse(catalog),
+            "aoi_llm_models",
+            started_at,
+        )
 
     @app.get("/api/llm/openrouter/provider-routing")
     async def get_openrouter_provider_routing(
@@ -1100,8 +1843,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
         )
 
     @app.get("/api/llm/engine")
-    async def get_llm_engine():
+    async def get_llm_engine(
+        include_available: bool = Query(True),
+    ):
         """現在のLLMエンジン情報と利用可能エンジン一覧を返す"""
+        started_at = time.perf_counter()
         provider = server.config.get("llm_provider", "openai")
         model = server.config.get("llm_model", "gpt-4o")
         deployment = resolve_llm_deployment(server.config)
@@ -1111,51 +1857,135 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             "model": model,
             "persisted_provider": provider,
             "persisted_model": model,
-            "available": _build_engine_list(server.config),
+            "available_included": include_available,
             "execution_profile": execution_profile_envelope(server.config),
             "effective_main": resolve_execution_main_route(server.config),
         }
+        if include_available:
+            # The compact list performs the same synchronous discovery as the
+            # full model catalog. Keep it opt-out for callers that already
+            # fetch /api/llm/models while preserving the legacy default.
+            response["available"] = await asyncio.to_thread(
+                _build_engine_list,
+                server.config,
+            )
+        else:
+            # Keep the response shape stable for consumers that always parse
+            # ``available`` while explicitly signalling that discovery was
+            # skipped via ``available_included`` above.
+            response["available"] = []
         if deployment_payload is not None:
             response["deployment"] = deployment_payload
             response["effective_provider"] = deployment.effective_provider
             response["effective_model"] = deployment.effective_model
-        return JSONResponse(response)
+        if str(provider).strip().lower() == "openai_compatible_local":
+            try:
+                response["llama_cpp"] = _llama_cpp_model_root_payload(server.config)
+            except ValueError:
+                # Keep the legacy engine envelope available even when an old
+                # persisted path is stale; the dedicated model-root endpoint
+                # reports the actionable validation error.
+                pass
+        return _attach_server_timing(
+            JSONResponse(response),
+            "aoi_llm_engine",
+            started_at,
+        )
 
     @app.post("/api/llm/engine")
     async def set_llm_engine(request: Request, _: None = Depends(require_auth)):
         """Switch the active LLM engine (provider/model)."""
+        started_at = time.perf_counter()
         await _require_global_config_admin(request)
         try:
             body = await request.json()
             provider = str(body.get("provider", "")).strip()
             model = str(body.get("model", "")).strip()
             base_url = body.get("base_url")
-            llama_model_profile = (
-                llama_cpp_model_profile(model)
+
+            if not provider or not model:
+                raise HTTPException(
+                    status_code=400,
+                    detail="provider と model は必須です",
+                )
+
+            selected_managed_runtime = (
+                managed_local_runtime_for_model(
+                    server.config,
+                    model,
+                )
                 if provider == "openai_compatible_local"
                 else None
             )
-            llama_profile_selected = llama_model_profile is not None
-            llama_cpp_settings = (
-                _normalize_llama_cpp_request_settings(body)
-                if provider == "openai_compatible_local"
-                else {}
-            )
-            # ``local-model`` is the explicit external OpenAI-compatible
-            # sentinel.  Ignore nested llama.cpp controls for it so a stale
-            # path/alias cannot replace the operator-provided base URL.
+            freetoken_selected = selected_managed_runtime == "freetoken"
+            freetoken_settings: dict[str, Any] = {}
+
+            if freetoken_selected:
+                forbidden_llama_input = bool(
+                    body.get("llama_cpp") not in (None, {})
+                    or body.get("runtime_settings") not in (None, {})
+                    or isinstance(body.get("runtime"), dict)
+                    or any(key in body for key in _LLAMA_CPP_SETTING_KEYS)
+                )
+                if forbidden_llama_input:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "FreeTokenではllama_cpp runtime設定を指定できません。"
+                            "freetokenオブジェクトを使用してください"
+                        ),
+                    )
+                if (
+                    isinstance(base_url, str)
+                    and base_url.strip()
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "FreeTokenの接続先はfreetoken.host/portで"
+                            "指定してください"
+                        ),
+                    )
+                if body.get("reasoning_effort") not in (None, ""):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "FreeTokenではllama.cpp reasoning_effortを"
+                            "指定できません"
+                        ),
+                    )
+                freetoken_settings = (
+                    _normalize_freetoken_request_settings(body)
+                )
+                llama_model_profile = None
+                llama_profile_selected = False
+                llama_cpp_settings = {}
+            else:
+                llama_model_profile = (
+                    llama_cpp_model_profile(model)
+                    if provider == "openai_compatible_local"
+                    else None
+                )
+                llama_profile_selected = llama_model_profile is not None
+                llama_cpp_settings = (
+                    _normalize_llama_cpp_request_settings(body)
+                    if provider == "openai_compatible_local"
+                    else {}
+                )
+                # ``local-model`` is the explicit external OpenAI-compatible
+                # sentinel.  Ignore nested llama.cpp controls for it so a stale
+                # path/alias cannot replace the operator-provided base URL.
+                if (
+                    provider == "openai_compatible_local"
+                    and model.casefold() == "local-model"
+                ):
+                    llama_cpp_settings = {}
+
+            requested_reasoning_effort = body.get("reasoning_effort")
             if (
                 provider == "openai_compatible_local"
-                and model.casefold() == "local-model"
-            ):
-                llama_cpp_settings = {}
-            if not provider or not model:
-                raise HTTPException(
-                    status_code=400, detail="provider と model は必須です"
-                )
-            requested_reasoning_effort = body.get("reasoning_effort")
-            if provider == "openai_compatible_local" and isinstance(
-                requested_reasoning_effort, str
+                and not freetoken_selected
+                and isinstance(requested_reasoning_effort, str)
             ):
                 effort_metadata = llama_cpp_reasoning_effort_metadata(model)
                 normalized_effort = requested_reasoning_effort.strip().lower()
@@ -1168,6 +1998,9 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                         ),
                     )
             deployment = resolve_llm_deployment(server.config)
+            persist_user_config = not (
+                deployment is not None and deployment.fixed
+            )
             try:
                 preflight_deployment(
                     server.config,
@@ -1180,6 +2013,35 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # rejected before config persistence or client creation.
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+            if freetoken_selected:
+                try:
+                    runtime_state = await asyncio.to_thread(
+                        local_runtime_manager.status,
+                        model,
+                        "freetoken",
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=str(exc),
+                    ) from exc
+                except Exception:
+                    logger.exception(
+                        "Failed to inspect FreeToken runtime before engine switch"
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to inspect FreeToken runtime",
+                    ) from None
+                if not bool(runtime_state.get("prepared")):
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "FreeToken runtime/model is not prepared. "
+                            "Prepare the managed runtime before switching."
+                        ),
+                    )
+
             # Process ownership, rather than the presence of a known profile,
             # is the only lifecycle gate.  Resolve it against a read-only
             # overlay so a request carrying ``auto_start=false`` is treated as
@@ -1191,6 +2053,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     provider,
                     model,
                     llama_cpp_settings=llama_cpp_settings,
+                    freetoken_settings=freetoken_settings,
                 )
                 if provider == "openai_compatible_local"
                 else None
@@ -1205,8 +2068,24 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     model=model,
                     settings=llama_cpp_settings,
                 )
-                if provider == "openai_compatible_local" and next_managed_runtime
+                if (
+                    provider == "openai_compatible_local"
+                    and not freetoken_selected
+                    and next_managed_runtime
+                )
                 else False
+            )
+            freetoken_runtime_changed = (
+                _freetoken_runtime_settings_changed(
+                    server.config,
+                    model=model,
+                    settings=freetoken_settings,
+                )
+                if freetoken_selected
+                else False
+            )
+            local_runtime_changed = (
+                llama_cpp_runtime_changed or freetoken_runtime_changed
             )
 
             if (
@@ -1329,13 +2208,28 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             if (
                 provider == "openai_compatible_local"
+                and not freetoken_selected
+                and llama_cpp_settings
+            ):
+                # llama_cpp.host/port are canonical for an explicit manual or
+                # managed runtime request; derive the client URL before
+                # validation and persistence so a stale base_url cannot target
+                # another listener.  ``auto_start=false`` remains operator
+                # owned but must still round-trip its explicit endpoint.
+                from src.service_manager import _llama_cpp_base_url
+
+                base_url = _llama_cpp_base_url(
+                    server.config,
+                    model=model,
+                    overrides=llama_cpp_settings,
+                )
+            if (
+                provider == "openai_compatible_local"
                 and next_managed_runtime
+                and not freetoken_selected
                 and not (deployment is not None and deployment.fixed)
             ):
-                if llama_cpp_settings or llama_profile_selected:
-                    # llama_cpp.host/port are canonical for this runtime;
-                    # derive the client URL before validation and persistence
-                    # so a stale base_url cannot target another listener.
+                if llama_profile_selected and not llama_cpp_settings:
                     from src.service_manager import _llama_cpp_base_url
 
                     base_url = _llama_cpp_base_url(
@@ -1375,9 +2269,27 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 previous_runtime_ownership is not None
                 and previous_runtime_ownership.managed_runtime
             )
+            previous_local_settings = server.config.get(
+                "openai_compatible_local", {}
+            )
+            previous_llama_settings = (
+                previous_local_settings.get("llama_cpp", {})
+                if isinstance(previous_local_settings, dict)
+                else {}
+            )
+            previous_llama_runtime_configured = bool(
+                isinstance(previous_llama_settings, dict)
+                and any(
+                    value not in (None, "", [], {})
+                    for value in previous_llama_settings.values()
+                )
+            )
             next_profile = (
                 llama_cpp_model_profile(model)
-                if provider == "openai_compatible_local"
+                if (
+                    provider == "openai_compatible_local"
+                    and not freetoken_selected
+                )
                 else None
             )
             previous_selection_id = str(
@@ -1395,9 +2307,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 )
             )
             if (
-                profile_changed
+                persist_user_config
+                and profile_changed
                 and provider == "openai_compatible_local"
                 and next_managed_runtime
+                and not freetoken_selected
             ):
                 from src.service_manager._local_llm_servers import (
                     _PROFILE_RUNTIME_SETTING_KEYS,
@@ -1416,11 +2330,43 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                             f"openai_compatible_local.llama_cpp.{profile_key}"
                         ] = None
 
+            # An unprofiled local-model/custom endpoint is external unless
+            # the request supplies an explicit runtime configuration.  Do not
+            # let a previous managed or stale llama.cpp mapping silently
+            # follow that endpoint (especially its model path/alias).  The
+            # explicit-settings case remains available for advanced manual
+            # llama-server users and is persisted below.
+            if (
+                persist_user_config
+                and provider == "openai_compatible_local"
+                and not freetoken_selected
+                and not llama_cpp_settings
+                and next_profile is None
+                and previous_llama_runtime_configured
+                and previous_model.casefold() != model.casefold()
+            ):
+                for runtime_key in (
+                    "executable",
+                    "model_path",
+                    "model_root",
+                    "model_alias",
+                    "context_size",
+                    "gpu_layers",
+                    "extra_args",
+                    "auto_start",
+                    "readiness_timeout",
+                    "reasoning_effort",
+                    "mtp_enabled",
+                ):
+                    config_changes[
+                        f"openai_compatible_local.llama_cpp.{runtime_key}"
+                    ] = None
+
             def _apply_config(key: str, next_value: Any) -> None:
                 # Deployment overrides are runtime-only.  Do not rewrite the
                 # persisted DB selection merely because the UI confirms the
                 # fixed effective model; it remains visible in diagnostics.
-                if deployment is not None and deployment.fixed:
+                if not persist_user_config:
                     return
                 config_changes[key] = next_value
 
@@ -1441,7 +2387,22 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 _apply_config("ollama.model", model)
             elif provider == "openai_compatible_local":
                 _apply_config("openai_compatible_local.model", model)
-                if next_managed_runtime:
+                if freetoken_selected:
+                    for setting_key, setting_value in freetoken_settings.items():
+                        _apply_config(
+                            f"openai_compatible_local.freetoken.{setting_key}",
+                            setting_value,
+                        )
+                elif next_managed_runtime:
+                    for setting_key, setting_value in llama_cpp_settings.items():
+                        _apply_config(
+                            f"openai_compatible_local.llama_cpp.{setting_key}",
+                            setting_value,
+                        )
+                elif llama_cpp_settings:
+                    # ``auto_start=false`` is an intentional operator-owned
+                    # manual runtime, but its explicit settings still need to
+                    # be persisted for the next launch/config round-trip.
                     for setting_key, setting_value in llama_cpp_settings.items():
                         _apply_config(
                             f"openai_compatible_local.llama_cpp.{setting_key}",
@@ -1483,8 +2444,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             if (
                 provider == "openai_compatible_local"
-                and next_managed_runtime
-                and (llama_cpp_settings or llama_profile_selected)
+                and not freetoken_selected
+                and (
+                    bool(llama_cpp_settings)
+                    or (next_managed_runtime and llama_profile_selected)
+                )
                 and isinstance(base_url, str)
                 and base_url.strip()
             ):
@@ -1503,7 +2467,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     _apply_config(f"{provider}.base_url", base_url.strip())
                 elif provider == "sglang":
                     _apply_config("sglang_base_url", base_url.strip())
-            elif provider == "openai_compatible_local" and next_managed_runtime:
+            elif (
+                provider == "openai_compatible_local"
+                and next_managed_runtime
+                and not freetoken_selected
+            ):
                 from src.llm.openai_compatible_local_profiles import (
                     local_server_profile_for_model,
                 )
@@ -1579,7 +2547,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                             detail="DeepInfraの推論モードは none / low / medium / high から選択してください",
                         )
                     _apply_config("deepinfra.reasoning_effort", effort)
-                elif effort and provider == "openai_compatible_local":
+                elif (
+                    effort
+                    and provider == "openai_compatible_local"
+                    and not freetoken_selected
+                ):
                     metadata = llama_cpp_reasoning_effort_metadata(model)
                     if metadata is not None:
                         if effort not in metadata["options"]:
@@ -1600,8 +2572,15 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             )
 
             if (
-                provider == "openai_compatible_local"
-                and next_managed_runtime
+                persist_user_config
+                and provider == "openai_compatible_local"
+                # Persist registered profile runtime state regardless of
+                # process ownership.  ``auto_start=false`` intentionally
+                # selects an operator-owned endpoint, but its per-profile
+                # settings must still round-trip through the same resolver
+                # and canonical dotted-key patch as a managed selection.
+                and (next_managed_runtime or llama_profile_selected)
+                and not freetoken_selected
                 and should_resolve_llama_cpp_runtime_for_engine_switch(
                     server.config,
                     model=model,
@@ -1638,6 +2617,14 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                     "mtp_enabled",
                 ):
                     if setting_key not in llama_cpp_settings:
+                        # Keep an existing operator-owned selection
+                        # operator-owned when switching profiles without an
+                        # explicit auto_start request.  The resolver's
+                        # profile default is still recorded in the target
+                        # profile entry below, while the top-level value
+                        # remains the user's explicit ownership choice.
+                        if setting_key == "auto_start" and not next_managed_runtime:
+                            continue
                         config_changes[
                             f"openai_compatible_local.llama_cpp.{setting_key}"
                         ] = resolved_llama_settings.get(setting_key)
@@ -1663,8 +2650,11 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
             local_switch_in_progress = (
                 previous_provider == "openai_compatible_local"
                 and provider == "openai_compatible_local"
-                and next_managed_runtime
-                and (should_stop_previous_local_server or llama_cpp_runtime_changed)
+                and (
+                    previous_runtime_managed
+                    or next_managed_runtime
+                )
+                and local_runtime_changed
             )
 
             def _compensate_local_server_switch() -> None:
@@ -1696,7 +2686,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
             if (
                 provider == "openai_compatible_local"
-                and next_managed_runtime
+                and (next_managed_runtime or freetoken_selected)
                 and not (deployment is not None and deployment.fixed)
             ):
                 from src.service_manager import (
@@ -1710,18 +2700,22 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                             stop_owned_openai_compatible_local_servers_respecting_generation_leases
                         )
                         if stopped_local_servers:
+                            local_switch_in_progress = True
+                        if stopped_local_servers:
                             logger.info(
                                 "Stopped %s managed OpenAI-compatible local server "
                                 "process(es) before local model switch",
                                 stopped_local_servers,
                             )
 
-                    await asyncio.to_thread(
+                    started_local_server = await asyncio.to_thread(
                         ensure_openai_compatible_local_server,
                         staged_config,
                         raise_on_launch_error=True,
-                        force_restart=llama_cpp_runtime_changed,
+                        force_restart=local_runtime_changed,
                     )
+                    if started_local_server:
+                        local_switch_in_progress = True
                 except Exception as exc:
                     await asyncio.to_thread(_compensate_local_server_switch)
                     raise HTTPException(status_code=400, detail=str(exc))
@@ -1751,7 +2745,8 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
 
                 old_client = server._llm_client
                 old_runtime_mode = server._current_llm_mode
-                config_changes["llm_runtime_mode"] = next_runtime_mode
+                if persist_user_config:
+                    config_changes["llm_runtime_mode"] = next_runtime_mode
 
                 # The production setter assigns first and catches callback
                 # failures, so activate the ready client before DB commit.
@@ -1762,12 +2757,13 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 except Exception:
                     _restore_llm_client(server, old_client)
                     raise
-                try:
-                    _persist_config_changes(server.config, config_changes)
-                except Exception:
-                    _restore_llm_client(server, old_client)
-                    server._current_llm_mode = old_runtime_mode
-                    raise
+                if persist_user_config:
+                    try:
+                        _persist_config_changes(server.config, config_changes)
+                    except Exception:
+                        _restore_llm_client(server, old_client)
+                        server._current_llm_mode = old_runtime_mode
+                        raise
             except Exception:
                 await asyncio.to_thread(_compensate_local_server_switch)
                 raise
@@ -1835,7 +2831,7 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 # WebSocket notification outage as non-fatal to the REST API.
                 logger.warning("Failed to broadcast LLM engine change", exc_info=True)
 
-            opts = _build_engine_list(server.config)
+            opts = await asyncio.to_thread(_build_engine_list, server.config)
             label = next(
                 (
                     o["label"]
@@ -1854,7 +2850,18 @@ def register_llm_routes(app: FastAPI, server: "WebChatServer") -> None:
                 response["deployment"] = deployment.metadata()
                 response["effective_provider"] = deployment.effective_provider
                 response["effective_model"] = deployment.effective_model
-            return JSONResponse(response)
+            if provider == "openai_compatible_local":
+                try:
+                    response["llama_cpp"] = _llama_cpp_model_root_payload(
+                        server.config
+                    )
+                except ValueError:
+                    pass
+            return _attach_server_timing(
+                JSONResponse(response),
+                "aoi_llm_engine",
+                started_at,
+            )
         except HTTPException:
             raise
         except Exception as e:

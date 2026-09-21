@@ -23,6 +23,14 @@ from urllib.parse import quote
 
 import httpx
 
+from ..services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    PrivacyReviewDenied,
+    get_privacy_policy_context,
+)
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_TIMEOUT = 20.0
@@ -34,6 +42,14 @@ _MAX_LIST_ITERATIONS = 1000
 
 class GrowiClientError(RuntimeError):
     """GROWI への接続・応答に関する失敗。"""
+
+
+class GrowiPrivacyBlockedError(GrowiClientError):
+    """GROWI egress was denied by the outbound privacy policy."""
+
+
+class GrowiIncompleteListingError(GrowiClientError):
+    """A partial listing cannot prove that missing documents were deleted."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +73,10 @@ class GrowiClient:
     api_token: str
     timeout: float = _DEFAULT_TIMEOUT
     endpoint_overrides: dict[str, str] = field(default_factory=dict)
+    config: Any | None = None
+    privacy_gateway: OutboundPrivacyGateway | None = None
+    user_id: str | None = None
+    session_id: str | None = None
 
     def __post_init__(self) -> None:
         self.base_url = self.base_url.rstrip("/")
@@ -64,6 +84,34 @@ class GrowiClient:
             raise GrowiClientError("GROWI のベースURLが空です")
         if not self.api_token:
             raise GrowiClientError("GROWI の API トークンが空です")
+
+    def _privacy_gateway(self) -> OutboundPrivacyGateway:
+        if self.privacy_gateway is not None:
+            return self.privacy_gateway
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        session_id = str(
+            self.session_id
+            or session_context.get("session_id")
+            or session_context.get("id")
+            or ""
+        )
+        return OutboundPrivacyGateway(
+            self.config,
+            user_id=str(self.user_id or ""),
+            session_id=session_id,
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    @staticmethod
+    def _egress_descriptor(*, action: str, destination: str) -> EgressDescriptor:
+        return EgressDescriptor(
+            action=action,
+            transport="httpx",
+            destination=destination,
+            provider="growi",
+        )
 
     # ------------------------------------------------------------------
     # 低レベル HTTP
@@ -83,10 +131,38 @@ class GrowiClient:
         path: str,
         params: dict[str, Any],
     ) -> Any:
-        merged = {"access_token": self.api_token, **params}
         url = self._url(path)
+
+        async def sender(protected_payload: Any) -> httpx.Response:
+            if not isinstance(protected_payload, dict) or "params" not in protected_payload:
+                raise PrivacyError("GROWI reviewed payload is malformed")
+            protected_params = protected_payload.get("params")
+            if not isinstance(protected_params, dict):
+                raise PrivacyError("GROWI reviewed params are malformed")
+            merged = {"access_token": self.api_token, **dict(protected_params)}
+            return await client.get(
+                url,
+                params=merged,
+                headers=self._headers(),
+                follow_redirects=False,
+            )
+
         try:
-            response = await client.get(url, params=merged, headers=self._headers())
+            response = await self._privacy_gateway().execute(
+                {"params": dict(params or {})},
+                provider="growi",
+                descriptor=self._egress_descriptor(
+                    action="growi.api.get",
+                    destination=url,
+                ),
+                sender=sender,
+                base_url=url,
+                source_kind="growi_api_request",
+            )
+        except (PrivacyError, PrivacyReviewDenied) as exc:
+            raise GrowiPrivacyBlockedError(
+                "GROWI payload was blocked by privacy policy"
+            ) from exc
         except httpx.HTTPError as exc:
             raise GrowiClientError(f"GROWI への接続に失敗しました ({url}): {exc}") from exc
         if response.status_code == 401:
@@ -107,12 +183,14 @@ class GrowiClient:
     # ------------------------------------------------------------------
     async def test_connection(self) -> dict[str, Any]:
         """疎通とトークンの有効性を軽く確認する。"""
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             endpoint = self.endpoint_overrides.get("list", "/_api/v3/pages/list")
             try:
                 data = await self._get_json(client, endpoint, {"path": "/", "limit": 1})
                 pages = self._extract_pages(data)
                 return {"ok": True, "sample_count": len(pages)}
+            except GrowiPrivacyBlockedError:
+                raise
             except GrowiClientError:
                 # v3 が無い古い GROWI 向けに classic API で再確認。
                 data = await self._get_json(
@@ -126,9 +204,11 @@ class GrowiClient:
     # ------------------------------------------------------------------
     async def list_pages(self, root_path: str = "/") -> list[GrowiPage]:
         """root_path 配下の全ページを列挙する。"""
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             try:
                 return await self._list_pages_v3(client, root_path)
+            except (GrowiPrivacyBlockedError, GrowiIncompleteListingError):
+                raise
             except GrowiClientError as exc:
                 logger.warning("GROWI v3 列挙に失敗、classic API で再試行: %s", exc)
                 return await self._list_pages_classic(client, root_path)
@@ -145,16 +225,22 @@ class GrowiClient:
                 endpoint,
                 {"path": root_path, "limit": _LIST_PAGE_SIZE, "page": page_number},
             )
-            pages = self._extract_pages(data)
+            pages = self._require_listing_pages(data)
             if not pages:
                 break
+            previous_count = len(collected)
             for item in pages:
                 parsed = self._parse_page_item(item)
-                if parsed:
-                    collected[parsed.page_id] = parsed
+                if parsed is None:
+                    raise GrowiIncompleteListingError("GROWI page listing has an invalid page identity")
+                collected[parsed.page_id] = parsed
+            if len(collected) == previous_count:
+                raise GrowiIncompleteListingError("GROWI page listing did not advance")
             if len(pages) < _LIST_PAGE_SIZE:
                 break
             page_number += 1
+        else:
+            raise GrowiIncompleteListingError("GROWI page listing reached its pagination limit")
         return list(collected.values())
 
     async def _list_pages_classic(
@@ -163,11 +249,15 @@ class GrowiClient:
         data = await self._get_json(
             client, "/_api/pages.list", {"path": root_path, "limit": 1000}
         )
+        pages = self._require_listing_pages(data)
+        if len(pages) >= 1000:
+            raise GrowiIncompleteListingError("GROWI classic listing may be truncated at 1000 pages")
         collected: dict[str, GrowiPage] = {}
-        for item in self._extract_pages(data):
+        for item in pages:
             parsed = self._parse_page_item(item)
-            if parsed:
-                collected[parsed.page_id] = parsed
+            if parsed is None:
+                raise GrowiIncompleteListingError("GROWI classic listing has an invalid page identity")
+            collected[parsed.page_id] = parsed
         return list(collected.values())
 
     # ------------------------------------------------------------------
@@ -175,13 +265,15 @@ class GrowiClient:
     # ------------------------------------------------------------------
     async def get_page_body(self, page: GrowiPage) -> str:
         """ページの Markdown 本文を取得する。"""
-        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=self.timeout, follow_redirects=False) as client:
             endpoint = self.endpoint_overrides.get("page", "/_api/v3/page")
             try:
                 data = await self._get_json(client, endpoint, {"pageId": page.page_id})
                 body = self._extract_body(data)
                 if body is not None:
                     return body
+            except GrowiPrivacyBlockedError:
+                raise
             except GrowiClientError as exc:
                 logger.debug("GROWI v3 本文取得に失敗、classic で再試行: %s", exc)
             data = await self._get_json(
@@ -193,6 +285,17 @@ class GrowiClient:
     # ------------------------------------------------------------------
     # 応答パース（GROWI のバージョン差を吸収）
     # ------------------------------------------------------------------
+    @staticmethod
+    def _require_listing_pages(data: Any) -> list[dict[str, Any]]:
+        if isinstance(data, dict):
+            for key in ("pages", "data"):
+                pages = data.get(key)
+                if isinstance(pages, list):
+                    if all(isinstance(item, dict) for item in pages):
+                        return pages
+                    break
+        raise GrowiIncompleteListingError("GROWI page listing is malformed; source documents preserved")
+
     @staticmethod
     def _extract_pages(data: Any) -> list[dict[str, Any]]:
         if not isinstance(data, dict):

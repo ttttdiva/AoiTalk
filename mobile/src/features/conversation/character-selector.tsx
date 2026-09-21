@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -60,6 +60,16 @@ export function CharacterSelector({
     [characters, currentSlug],
   );
   const currentLabel = currentCharacter?.name || currentSlug || "未設定";
+  useEffect(() => {
+    let active = true;
+    // Resolve the display name from the device cache without waiting for the
+    // user to open the picker, and without a network round trip on navigation.
+    void characterApi.getOfflineList(false, currentSlug).then((cached) => {
+      if (active) setCharacters(cached);
+    }).catch(() => undefined);
+    return () => { active = false; };
+  }, [currentSlug, session?.id]);
+
 
   const open = () => {
     setVisible(true);
@@ -85,7 +95,7 @@ export function CharacterSelector({
 
       // 端末内の一覧を表示した後で、オンラインならサーバーの最新一覧へ更新する。
       try {
-        const onlineCharacters = await characterApi.list();
+        const onlineCharacters = await characterApi.refreshCache();
         if (onlineCharacters.length > 0) setCharacters(onlineCharacters);
       } catch (error) {
         if (!canKeepOfflineCharacters(error)) {
@@ -136,7 +146,7 @@ export function CharacterSelector({
         ]}
       >
         <Text style={styles.chipLabel} numberOfLines={1}>
-          キャラ: {currentLabel}
+          {currentLabel}
         </Text>
         <Text style={styles.chevron}>⌄</Text>
       </Pressable>
@@ -243,12 +253,14 @@ export function CharacterSelector({
 
 const styles = StyleSheet.create({
   chip: {
-    maxWidth: 172,
+    maxWidth: "100%",
+    minHeight: 44,
+    flexShrink: 1,
     flexDirection: "row",
     alignItems: "center",
     borderRadius: 12,
-    backgroundColor: "#313244",
-    paddingHorizontal: 9,
+    backgroundColor: "transparent",
+    paddingHorizontal: 6,
     paddingVertical: 5,
   },
   chipUnavailable: { opacity: 0.72 },
@@ -256,8 +268,8 @@ const styles = StyleSheet.create({
     minWidth: 0,
     flexShrink: 1,
     color: "#cdd6f4",
-    fontSize: 11,
-    fontWeight: "700",
+    fontSize: 13,
+    fontWeight: "600",
   },
   chevron: { color: "#a6adc8", fontSize: 12, marginLeft: 3 },
   dialog: { backgroundColor: "#1e1e2e" },

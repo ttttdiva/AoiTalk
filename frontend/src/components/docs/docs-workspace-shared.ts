@@ -1,6 +1,5 @@
 import {
   hasMeaningfulBlockTitle,
-  isExplicitBlankParagraph,
   type DocsBlockSnapshot,
 } from "@/lib/docs-block-model";
 import { plainDocsTitle } from "@/lib/docs-title";
@@ -12,6 +11,7 @@ import type {
   DocsSupertag,
   DocsAiSuggestion,
 } from "./types";
+import { isDocsExplicitBlankNode } from "./types";
 import {
   buildChildrenByParent,
   fieldValueToDraft,
@@ -167,7 +167,13 @@ export function writeCollapsed(value: Set<string>, key = COLLAPSED_KEY) {
 }
 
 export function nodeText(node: DocsNode) {
-  if (isExplicitBlankParagraph(node.title, node.body_json, node.node_type)) return "";
+  if (isDocsExplicitBlankNode(node)) return "";
+  if (
+    !hasMeaningfulBlockTitle(node.title)
+    && typeof node.system_key === "string"
+    && (node.system_key.trim() === "project_information_root"
+      || node.system_key.trim().startsWith("project_information:"))
+  ) return "案件情報 (stale)";
   return plainDocsTitle(node.title || node.body_text) || "Untitled";
 }
 
@@ -178,14 +184,23 @@ export function nodeText(node: DocsNode) {
  * rendering arbitrary blank nodes as "Untitled".
  */
 export function isDocsNodeTitleVisible(
-  node: Pick<DocsNode, "title"> & Partial<Pick<DocsNode, "body_json" | "node_type">>,
+  node: Pick<DocsNode, "title"> & Partial<Pick<DocsNode, "body_json" | "node_type" | "system_key" | "is_explicit_blank">>,
 ) {
   // The serialized Docs contract always carries a string title. Treat an
   // absent field from older/partial client snapshots as visible for
   // backwards compatibility; only an explicit blank title is a legacy row.
   if (typeof node.title !== "string") return true;
   if (hasMeaningfulBlockTitle(node.title)) return true;
-  return isExplicitBlankParagraph(node.title, node.body_json, node.node_type);
+  if (
+    typeof node.system_key === "string"
+    && (node.system_key.trim() === "project_information_root"
+      || node.system_key.trim().startsWith("project_information:"))
+  ) return true;
+  return isDocsExplicitBlankNode({
+    ...node,
+    node_type: node.node_type ?? "node",
+    system_key: node.system_key ?? null,
+  });
 }
 
 /**

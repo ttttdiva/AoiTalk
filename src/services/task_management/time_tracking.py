@@ -37,7 +37,15 @@ from ...memory.models import (
     KnowledgeSupertag,
 )
 from ...memory.project_repository import ProjectRepository
-from ...task_time import DEFAULT_TASK_TIMEZONE, normalize_task_timezone
+from ...task_time import (
+    DEFAULT_TASK_TIMEZONE,
+    normalize_task_timezone,
+    timer_api_datetime,
+    timer_api_datetime_value,
+    timer_db_datetime,
+    timer_duration_seconds,
+    timer_now_db,
+)
 from ..project_color_service import extract_project_color
 from ..task_reference_service import attach_agent_run_source_reference
 from ._shared import (
@@ -51,7 +59,6 @@ from ._shared import (
     TaskManagementError,
     build_occurrence_schedule,
     build_time_report,
-    correct_likely_timer_started_at,
     normalize_priority,
     normalize_task_status,
     _ensure_reminder_offsets,
@@ -74,19 +81,24 @@ class TimeTrackingMixin:
         """TimeEntry.to_dict() に Web BFF 互換のフィールドを追加して返す。
 
         Web の time-entries 系レスポンス（project_color / space_id / space_name /
-        original_started_at / original_ended_at とタイマー開始時刻補正）に合わせる。
+        original_started_at / original_ended_at and explicit timer offsets).
         """
         data = entry.to_dict()
+        # TimeEntry columns are naive deployment-zone wall-clock values in
+        # PostgreSQL.  Every timer-facing response uses one explicit-offset
+        # serializer so list/active/start/stop/detail all agree.
+        data["started_at"] = timer_api_datetime(entry.started_at)
+        data["ended_at"] = timer_api_datetime(entry.ended_at)
+        db_started_at = timer_db_datetime(entry.started_at)
+        db_ended_at = timer_db_datetime(entry.ended_at)
+        data["duration_seconds"] = (
+            timer_duration_seconds(db_started_at, db_ended_at)
+            if db_started_at is not None and db_ended_at is not None
+            else None
+        )
         task = entry.task
         project = task.project if task is not None else None
         space = project.space if project is not None else None
-
-        if entry.ended_at is None:
-            corrected = correct_likely_timer_started_at(
-                entry.started_at, entry.created_at, entry.source
-            )
-            if corrected is not None and corrected is not entry.started_at:
-                data["started_at"] = corrected.isoformat()
 
         data["project_color"] = (
             extract_project_color(project.project_metadata)
@@ -97,15 +109,11 @@ class TimeTrackingMixin:
         data["space_name"] = space.name if space is not None else None
 
         metadata = entry.entry_metadata or {}
-        data["original_started_at"] = (
+        data["original_started_at"] = timer_api_datetime_value(
             metadata.get("original_started_at")
-            if isinstance(metadata.get("original_started_at"), str)
-            else None
         )
-        data["original_ended_at"] = (
+        data["original_ended_at"] = timer_api_datetime_value(
             metadata.get("original_ended_at")
-            if isinstance(metadata.get("original_ended_at"), str)
-            else None
         )
         return data
 
@@ -189,8 +197,9 @@ class TimeTrackingMixin:
             )
         )
         active_entry = active_result.scalar_one_or_none()
-        # DB のローカル壁時計時刻規約に合わせる（Web BFF の localtimestamp と同じ）。
-        now = datetime.now()
+        # Store a naive wall-clock value in the configured deployment zone;
+        # do not rely on the host operating system timezone.
+        now = timer_now_db()
         if active_entry is not None:
             active_entry.ended_at = now
             await self._record_activity(
@@ -257,13 +266,10 @@ class TimeTrackingMixin:
         if entry is None:
             raise TaskManagementError("No active timer found", status_code=404)
 
-        corrected_started_at = correct_likely_timer_started_at(
-            entry.started_at, entry.created_at, entry.source
-        )
-        if corrected_started_at is not None and corrected_started_at != entry.started_at:
-            entry.started_at = corrected_started_at
-        # DB のローカル壁時計時刻規約に合わせる。
-        entry.ended_at = datetime.now()
+        # Keep the original DB start untouched.  Older code rewrote starts
+        # using an 8--10 hour heuristic at stop time, which corrupted valid
+        # long/manual entries.  Only the stop wall-clock is generated here.
+        entry.ended_at = timer_now_db()
         await self._record_activity(
             session,
             task_id=entry.task_id,
@@ -288,6 +294,8 @@ class TimeTrackingMixin:
         source: str = "manual",
         note: Optional[str] = None,
     ) -> dict[str, Any]:
+        started_at = timer_db_datetime(started_at)
+        ended_at = timer_db_datetime(ended_at)
         if ended_at <= started_at:
             raise TaskManagementError(
                 "ended_at must be after started_at", status_code=400
@@ -362,9 +370,9 @@ class TimeTrackingMixin:
         entry.entry_metadata = metadata
 
         if started_at is not None:
-            entry.started_at = started_at
+            entry.started_at = timer_db_datetime(started_at)
         if ended_at is not None:
-            entry.ended_at = ended_at
+            entry.ended_at = timer_db_datetime(ended_at)
         if note is not None:
             entry.note = note
         if entry.ended_at and entry.started_at and entry.ended_at <= entry.started_at:
@@ -405,29 +413,23 @@ class TimeTrackingMixin:
         user_id: UUID,
         project_id: Optional[UUID] = None,
         space_id: Optional[UUID] = None,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
         task_id: Optional[UUID] = None,
         active_only: bool = False,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
     ) -> list[dict[str, Any]]:
-        participating_project_ids = await self._get_participating_project_ids(
-            session, user_id
+        date_from = timer_db_datetime(date_from)
+        date_to = timer_db_datetime(date_to)
+        participating_project_ids = await self.resolve_read_project_ids(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            space_id=space_id,
+            browse_project_id=browse_project_id,
+            browse_space_id=browse_space_id,
         )
-        if project_id is not None:
-            await self.require_project_permission(
-                session, project_id=project_id, user_id=user_id, permission="read"
-            )
-            participating_project_ids = (
-                [project_id]
-                if project_id in participating_project_ids
-                else []
-            )
-        elif space_id is not None:
-            participating_project_ids = await self._filter_project_ids_by_space(
-                session,
-                project_ids=participating_project_ids,
-                space_id=space_id,
-            )
         if not participating_project_ids:
             return []
 
@@ -469,27 +471,21 @@ class TimeTrackingMixin:
         user_id: UUID,
         project_id: Optional[UUID] = None,
         space_id: Optional[UUID] = None,
+        browse_project_id: Optional[UUID | str] = None,
+        browse_space_id: Optional[UUID | str] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
     ) -> dict[str, Any]:
-        participating_project_ids = await self._get_participating_project_ids(
-            session, user_id
+        date_from = timer_db_datetime(date_from)
+        date_to = timer_db_datetime(date_to)
+        participating_project_ids = await self.resolve_read_project_ids(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            space_id=space_id,
+            browse_project_id=browse_project_id,
+            browse_space_id=browse_space_id,
         )
-        if project_id is not None:
-            await self.require_project_permission(
-                session, project_id=project_id, user_id=user_id, permission="read"
-            )
-            participating_project_ids = (
-                [project_id]
-                if project_id in participating_project_ids
-                else []
-            )
-        elif space_id is not None:
-            participating_project_ids = await self._filter_project_ids_by_space(
-                session,
-                project_ids=participating_project_ids,
-                space_id=space_id,
-            )
         if not participating_project_ids:
             return build_time_report([])
 
@@ -514,11 +510,6 @@ class TimeTrackingMixin:
         result = await session.execute(stmt)
         rows = []
         for entry, task in result.fetchall():
-            started_at = entry.started_at
-            if entry.ended_at is None:
-                started_at = correct_likely_timer_started_at(
-                    entry.started_at, entry.created_at, entry.source
-                )
             rows.append(
                 {
                     "task_id": str(task.id),
@@ -530,7 +521,7 @@ class TimeTrackingMixin:
                     "user_id": str(entry.user_id),
                     "username": entry.user.username if entry.user else None,
                     "display_name": entry.user.display_name if entry.user else None,
-                    "started_at": started_at,
+                    "started_at": entry.started_at,
                     "ended_at": entry.ended_at,
                 }
             )

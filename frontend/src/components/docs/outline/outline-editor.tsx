@@ -38,7 +38,6 @@ import {
   blankParagraphBodyJson,
   clearBlankParagraphMarker,
   hasMeaningfulBlockTitle,
-  isExplicitBlankParagraph,
   markdownShortcutPatchForTitle,
   markdownShortcutPrefixForTitle,
   parseIndentedMarkdownBlocks,
@@ -51,10 +50,25 @@ import { renderDocsInlineHtml, docsRowBlockClass } from "@/lib/docs-block-render
 import { createEditorImageInsertExtension } from "@/components/editor/image-insert-extension";
 import { selectNextOccurrenceKeymap } from "@/components/editor/code-mirror-shared";
 import { cn } from "@/lib/utils";
-import type { DocsAiSuggestion, DocsAttachment, DocsField, DocsFieldValue, DocsNode, DocsProject, DocsSupertag } from "@/components/docs/types";
+import {
+  canMutateDocsNode,
+  docsCanonicalNodeTitle,
+  docsProjectIdFromSystemKey,
+  docsNodeProtectionMessage,
+  isDocsExplicitBlankNode,
+  isDocsProjectCanonicalNode,
+  isDocsStaleProjectNode,
+  type DocsAiSuggestion,
+  type DocsAttachment,
+  type DocsField,
+  type DocsFieldValue,
+  type DocsNode,
+  type DocsProject,
+  type DocsSupertag,
+} from "@/components/docs/types";
 import { FieldControl } from "@/components/docs/field-control";
 import { DocsSupertagChip } from "@/components/docs/docs-supertag-chip";
-import { fieldValueToDraft } from "@/components/docs/docs-utils";
+import { docsFieldType, fieldValueToDraft } from "@/components/docs/docs-utils";
 import { MarkdownContent } from "@/components/ui/markdown-content";
 import type { Task } from "@/lib/task-api";
 
@@ -228,9 +242,14 @@ export type DocsEditorContextValue = {
   onOpenTask?: (taskId: string) => void;
   onFocused: (nodeId: string | null) => void;
   onCommitPending?: (operation: Promise<boolean> | null) => void;
-  onCommitTitle: (node: DocsNode, title: string, patch?: Partial<Pick<DocsNode, "body_json" | "body_text" | "node_type" | "display_props" | "description">>) => Promise<void> | void;
+  onCommitTitle: (node: DocsNode, title: string, patch?: Partial<Pick<DocsNode, "body_json" | "body_text" | "node_type" | "display_props" | "description">>) => Promise<void | DocsNode> | void;
   onDraftChange?: (node: DocsNode, title: string) => void;
   onCommitSuccess?: (nodeId: string, committedDraft: string) => void;
+  /** Workspace lifecycle gate for structural/identity mutations. */
+  canMutateNode?: (node: DocsNode, action: "archive" | "move" | "taskify" | "tag" | "title" | "content") => boolean;
+  /** Owner/admin gate for the dedicated stale Project-information cleanup. */
+  canCleanupNode?: (node: DocsNode) => boolean;
+  onNodeProtection?: (node: DocsNode, action: string) => void;
   // Workspace Undo/Redo can update a node while its CodeMirror view remains
   // mounted. The revision lets the editor reconcile that view before blur.
   historySync?: {
@@ -252,6 +271,7 @@ export type DocsEditorContextValue = {
   onToggleCheckbox: (node: DocsNode) => Promise<void> | void;
   onToggleCollapsed: (nodeId: string) => void;
   onDuplicateNode: (node: DocsNode) => Promise<void> | void;
+  onCleanupNode?: (node: DocsNode) => Promise<void> | void;
   onApplyTag: (node: DocsNode, tag: DocsSupertag) => Promise<void> | void;
   onRemoveTag?: (node: DocsNode, tag: DocsSupertag) => Promise<void> | void;
   onOpenTag?: (tag: DocsSupertag) => void;
@@ -301,6 +321,8 @@ export function createDocsEditorContextValue(
     onOpenNode: () => {},
     onFocused: () => {},
     onCommitTitle: () => {},
+    canMutateNode: (node, action) => canMutateDocsNode(node, action),
+    canCleanupNode: undefined,
     onCreateNode: () => {
       throw new Error("onCreateNode が指定されていません");
     },
@@ -309,6 +331,7 @@ export function createDocsEditorContextValue(
     onToggleCheckbox: () => {},
     onToggleCollapsed: () => {},
     onDuplicateNode: () => {},
+    onCleanupNode: undefined,
     onApplyTag: () => {},
     onSaveField: () => {},
     onInsertImages: () => {},
@@ -832,7 +855,7 @@ function EditableTypedContentBlock({
   node: DocsNode;
   onCommitTitle: DocsEditorContextValue["onCommitTitle"];
 }) {
-  const { readOnly = false } = useDocsEditorContext();
+  const { readOnly = false, canMutateNode } = useDocsEditorContext();
   const block = docsTypedContentBlock(node.body_json, node.title);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -840,7 +863,8 @@ function EditableTypedContentBlock({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const viewRef = useRef<EditorView | null>(null);
   const content = block?.content ?? "";
-  const canEdit = !readOnly && node.permission !== "read";
+  const canEdit = !readOnly
+    && (canMutateNode?.(node, "content") ?? canMutateDocsNode(node, "content"));
 
   useEffect(() => {
     if (!editing || !block || !hostRef.current || viewRef.current) return;
@@ -871,7 +895,13 @@ function EditableTypedContentBlock({
 
   useEffect(() => {
     if (editing || !block) return;
-    setError(null);
+    let disposed = false;
+    void Promise.resolve().then(() => {
+      if (!disposed) setError(null);
+    });
+    return () => {
+      disposed = true;
+    };
   }, [block, editing]);
 
   if (!block) return null;
@@ -1041,6 +1071,8 @@ export function OutlineBlockEditor({
     onCommitTitle,
     onDraftChange,
     onCommitSuccess,
+    canMutateNode: canMutateNodeFromWorkspace,
+    onNodeProtection,
     historySync,
     onUndo,
     onRedo,
@@ -1050,6 +1082,8 @@ export function OutlineBlockEditor({
     onToggleCheckbox,
     onToggleCollapsed,
     onDuplicateNode,
+    onCleanupNode,
+    canCleanupNode,
     onApplyTag,
     onRemoveTag,
     onOpenTag,
@@ -1065,6 +1099,14 @@ export function OutlineBlockEditor({
     onCreateFieldCandidate,
     onSuggestionStatus,
   } = useDocsEditorContext();
+  const canMutateNodeForAction = useCallback((node: DocsNode, action: "archive" | "move" | "taskify" | "tag" | "title" | "content") => (
+    canMutateNodeFromWorkspace?.(node, action) ?? canMutateDocsNode(node, action)
+  ), [canMutateNodeFromWorkspace]);
+  const rejectProtectedAction = useCallback((node: DocsNode, action: string) => {
+    if (canMutateNodeForAction(node, action as "archive" | "move" | "taskify" | "tag" | "title" | "content")) return false;
+    onNodeProtection?.(node, action);
+    return true;
+  }, [canMutateNodeForAction, onNodeProtection]);
   const onUndoRef = useRef(onUndo);
   onUndoRef.current = onUndo;
   const onRedoRef = useRef(onRedo);
@@ -1634,6 +1676,28 @@ export function OutlineBlockEditor({
     if (existing) return existing;
     const operation = (async () => {
       try {
+        const protectedCanonical = isDocsProjectCanonicalNode(row.node) && !isDocsStaleProjectNode(row.node);
+        if (protectedCanonical) {
+          // The visible title of a Project-information root is an identity,
+          // not an ordinary outline draft.  Never send a blank/renamed title
+          // through the generic PATCH route; restore the server-provided
+          // canonical title (or the last known non-empty value) instead.
+          const canonicalTitle = docsCanonicalNodeTitle(row.node) ?? row.node.title;
+          if (hasMeaningfulBlockTitle(canonicalTitle)) {
+            const normalized = await onCommitTitle(row.node, canonicalTitle);
+            const normalizedNode = normalized && typeof normalized === "object" && "title" in normalized
+              ? normalized as DocsNode
+              : null;
+            const title = normalizedNode?.title || canonicalTitle;
+            if (title !== draftAtCommit) syncCommittedEditorDraft(row.node.id, title, {
+              ...row,
+              node: { ...row.node, title, body_text: normalizedNode?.body_text ?? (row.node.body_text || title) },
+            });
+            onCommitSuccess?.(row.node.id, draftAtCommit);
+            if (title !== draftAtCommit) onCommitSuccess?.(row.node.id, title);
+          }
+          return false;
+        }
         // An explicitly cleared ordinary outline paragraph is a real draft,
         // not a transient placeholder. Persist the canonical blank marker and
         // keep the editor value empty even when the save is asynchronous.
@@ -1678,15 +1742,26 @@ export function OutlineBlockEditor({
                   ...(shortcut.kind === "checkbox" ? { show_checkbox: true, checked: shortcut.checked === true } : {}),
                 },
               }
-            : isExplicitBlankParagraph(row.node.title, row.node.body_json, row.node.node_type)
+            : isDocsExplicitBlankNode(row.node)
               ? {
                   body_json: clearBlankParagraphMarker(row.node.body_json),
                   body_text: draftAtCommit,
                   node_type: row.node.node_type,
                 }
               : undefined;
-        await onCommitTitle(row.node, shortcut?.title ?? draftAtCommit, patch);
+        const committed = await onCommitTitle(row.node, shortcut?.title ?? draftAtCommit, patch);
+        const normalizedNode = committed && typeof committed === "object" && "title" in committed
+          ? committed as DocsNode
+          : null;
+        const normalizedTitle = normalizedNode?.title;
+        if (normalizedTitle && normalizedTitle !== (shortcut?.title ?? draftAtCommit)) {
+          syncCommittedEditorDraft(row.node.id, normalizedTitle, {
+            ...row,
+            node: { ...row.node, ...normalizedNode, title: normalizedTitle, body_text: normalizedNode.body_text ?? normalizedTitle },
+          });
+        }
         onCommitSuccess?.(row.node.id, draftAtCommit);
+        if (normalizedTitle && normalizedTitle !== draftAtCommit) onCommitSuccess?.(row.node.id, normalizedTitle);
         return false;
       } catch (error) {
         // Do not reconcile a failed draft to the server value. The mounted
@@ -1702,7 +1777,7 @@ export function OutlineBlockEditor({
     commitPromisesRef.current.set(commitKey, operation);
     onCommitPending?.(operation);
     return operation;
-  }, [onCommitPending, onCommitSuccess, onCommitTitle, onFieldShorthand]);
+  }, [onCommitPending, onCommitSuccess, onCommitTitle, onFieldShorthand, syncCommittedEditorDraft]);
 
   const executeSlashCommand = useCallback((commandId: SlashCommandId) => {
     const state = slashCommandRef.current;
@@ -1838,8 +1913,13 @@ export function OutlineBlockEditor({
     const targetIndex = rowsRef.current.findIndex((item) => item.node.id === nodeId);
     if (outlineVirtualized && targetIndex >= 0) rowVirtualizer.scrollToIndex(targetIndex, { align: "auto" });
     const row = rowsRef.current.find((item) => item.node.id === nodeId);
+    const nextColumn = Math.max(0, column);
+    // CodeMirror mounts in a layout effect, before the ordinary effect that
+    // mirrors caretColumn state into this ref. Keep the requested caret
+    // synchronous so a first click cannot mount the editor at a stale column.
+    caretColumnRef.current = nextColumn;
     if (editingNodeIdRef.current === nodeId && editorViewRef.current) {
-      const position = Math.max(0, Math.min(column, editorViewRef.current.state.doc.length));
+      const position = Math.min(nextColumn, editorViewRef.current.state.doc.length);
       editorViewRef.current.dispatch({ selection: EditorSelection.cursor(position) });
       editorViewRef.current.focus();
       onSelectNode(nodeId);
@@ -1858,7 +1938,7 @@ export function OutlineBlockEditor({
       setPendingFocusDraft({ nodeId, title: fallbackTitle });
       setEditingNodeId(nodeId);
       setDraft(fallbackTitle);
-      setCaretColumn(column);
+      setCaretColumn(nextColumn);
       onSelectNode(nodeId);
       onFocused(nodeId);
       return;
@@ -1868,7 +1948,7 @@ export function OutlineBlockEditor({
     editingNodeIdRef.current = nodeId;
     setEditingNodeId(nodeId);
     setDraft(row.node.title);
-    setCaretColumn(Math.max(0, column));
+    setCaretColumn(nextColumn);
     onSelectNode(nodeId);
     onFocused(nodeId);
   }, [commitNodeDraft, onFocused, onSelectNode, outlineVirtualized, rowVirtualizer]);
@@ -2095,11 +2175,8 @@ export function OutlineBlockEditor({
               key: "Mod-z",
               preventDefault: true,
               run: (currentView) => {
-                const initialPersistedBlank = isExplicitBlankParagraph(
-                  editingRow.node.title,
-                  editingRow.node.body_json,
-                  editingRow.node.node_type,
-                ) && currentView.state.doc.toString() === "" && !editorUserEditedRef.current;
+                const initialPersistedBlank = isDocsExplicitBlankNode(editingRow.node)
+                  && currentView.state.doc.toString() === "" && !editorUserEditedRef.current;
                 if (!initialPersistedBlank && undoDepth(currentView.state) > 0) return undo(currentView);
                 const fallback = onUndoRef.current;
                 if (!fallback) return false;
@@ -2146,6 +2223,7 @@ export function OutlineBlockEditor({
               key: "Alt-ArrowUp",
               run: () => {
                 if (composingRef.current) return true;
+                if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
                 void enqueueStructuralMutation(async () => {
                   const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[index];
@@ -2163,6 +2241,7 @@ export function OutlineBlockEditor({
               key: "Alt-ArrowDown",
               run: () => {
                 if (composingRef.current) return true;
+                if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
                 void enqueueStructuralMutation(async () => {
                   const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[index];
@@ -2262,10 +2341,15 @@ export function OutlineBlockEditor({
                       ? editorSessionRef.current.view
                       : view;
                     const currentText = currentView.state.doc.toString();
-                    const currentCursor = currentView.state.selection.main.head;
-                    const currentParts = splitBlockTitle(currentText, currentCursor);
+                    const currentSelection = currentView.state.selection.main;
+                    const replacingSelection = !currentSelection.empty;
+                    const structuralText = replacingSelection
+                      ? currentText.slice(0, currentSelection.from) + currentText.slice(currentSelection.to)
+                      : currentText;
+                    const currentCursor = replacingSelection ? currentSelection.from : currentSelection.head;
+                    const currentParts = splitBlockTitle(structuralText, currentCursor);
                     const currentKind = docsBlockKind(currentRow.node);
-                    const currentTitleIsBlank = !hasMeaningfulBlockTitle(currentText);
+                    const currentTitleIsBlank = !hasMeaningfulBlockTitle(structuralText);
                     const index = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
                     if (index < 0) return;
                     const parentId = currentRow.node.parent_id;
@@ -2307,8 +2391,9 @@ export function OutlineBlockEditor({
 
                     // At the start of a non-empty row, keep the current node
                     // intact and insert a persisted blank sibling before it.
-                    if (currentCursor === 0 && hasMeaningfulBlockTitle(currentText)) {
-                      await commitNodeDraft(currentRow.node.id, currentText, currentRow);
+                    if (currentCursor === 0 && hasMeaningfulBlockTitle(structuralText)) {
+                      await commitNodeDraft(currentRow.node.id, structuralText, currentRow);
+                      if (replacingSelection) syncCommittedEditorDraft(currentRow.node.id, structuralText, currentRow);
                       const savedIndex = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
                       const savedRow = rowsRef.current[savedIndex] ?? currentRow;
                       const savedPrevious = previousSiblingRow(rowsRef.current, savedIndex);
@@ -2327,9 +2412,10 @@ export function OutlineBlockEditor({
 
                     // Empty rows (including an explicit persisted blank) and
                     // line-end Enter create another blank sibling.
-                    if (currentTitleIsBlank || currentCursor >= currentText.length) {
-                      if (hasMeaningfulBlockTitle(currentText)) {
-                        await commitNodeDraft(currentRow.node.id, currentText, currentRow);
+                    if (currentTitleIsBlank || currentCursor >= structuralText.length) {
+                      if (hasMeaningfulBlockTitle(structuralText) || replacingSelection) {
+                        await commitNodeDraft(currentRow.node.id, structuralText, currentRow);
+                        if (replacingSelection) syncCommittedEditorDraft(currentRow.node.id, structuralText, currentRow);
                       }
                       const savedIndex = rowsRef.current.findIndex((row) => row.node.id === currentRow.node.id);
                       const savedRow = rowsRef.current[savedIndex] ?? currentRow;
@@ -2374,6 +2460,7 @@ export function OutlineBlockEditor({
               key: "Tab",
               run: () => {
                 if (composingRef.current) return true;
+                if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
                 void enqueueStructuralMutation(async () => {
                   const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[index];
@@ -2396,6 +2483,7 @@ export function OutlineBlockEditor({
               key: "Shift-Tab",
               run: () => {
                 if (composingRef.current) return true;
+                if (editingRow && rejectProtectedAction(editingRow.node, "move")) return true;
                 void enqueueStructuralMutation(async () => {
                   const index = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[index];
@@ -2522,6 +2610,7 @@ export function OutlineBlockEditor({
                   const currentIndex = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[currentIndex];
                   if (!current) return;
+                  if (rejectProtectedAction(current.node, "archive")) return;
                   const currentSession = editorSessionFor(current.node.id);
                   const currentText = currentSession?.view.state.doc.toString() ?? view.state.doc.toString();
                   const currentKind = docsBlockKind(current.node);
@@ -2554,7 +2643,7 @@ export function OutlineBlockEditor({
                   }
                   if (hasChildRows) return;
                   const previous = previousSiblingRow(rowsRef.current, currentIndex);
-                  if (isExplicitBlankParagraph(current.node.title, current.node.body_json, current.node.node_type)) {
+                  if (isDocsExplicitBlankNode(current.node)) {
                     if (!previous) {
                       await onArchiveNode(current.node);
                       onNavigateToDocumentTitle?.();
@@ -2565,13 +2654,14 @@ export function OutlineBlockEditor({
                     return;
                   }
                   if (!previous) return;
+                  if (rejectProtectedAction(previous.node, "title")) return;
                   const merged = `${previous.node.title}${currentText}`;
                   // Archive only after the target save succeeds. A rejected
                   // commit leaves both nodes and the user's draft intact.
                   await onCommitTitle(
                     previous.node,
                     merged,
-                    isExplicitBlankParagraph(previous.node.title, previous.node.body_json, previous.node.node_type)
+                    isDocsExplicitBlankNode(previous.node)
                       ? { body_json: clearBlankParagraphMarker(previous.node.body_json), body_text: merged, node_type: "node" }
                       : undefined,
                   );
@@ -2595,6 +2685,7 @@ export function OutlineBlockEditor({
                   const currentIndex = rowsRef.current.findIndex((row) => row.node.id === editingRow.node.id);
                   const current = rowsRef.current[currentIndex];
                   if (!current) return;
+                  if (rejectProtectedAction(current.node, "title")) return;
                   const currentSession = editorSessionFor(current.node.id);
                   const currentText = currentSession?.view.state.doc.toString() ?? view.state.doc.toString();
                   const next = nextSiblingRow(rowsRef.current, currentIndex);
@@ -2602,13 +2693,25 @@ export function OutlineBlockEditor({
                   const nextIndex = rowsRef.current.findIndex((row) => row.node.id === next.node.id);
                   const nextHasChildren = hasChildren(next, rowsRef.current, nextIndex) || Boolean(nodeHasChildren?.(next.node.id));
                   if (nextHasChildren) return;
+                  if (rejectProtectedAction(next.node, "archive")) return;
                   const merged = `${currentText}${next.node.title}`;
-                  const mergedPatch = isExplicitBlankParagraph(current.node.title, current.node.body_json, current.node.node_type)
-                    ? { body_json: clearBlankParagraphMarker(current.node.body_json), body_text: merged, node_type: "node" as const }
+                  const mergedPatch = isDocsExplicitBlankNode(current.node)
+                    ? (
+                        merged === ""
+                          // Deleting one of two consecutive intentional blanks
+                          // keeps the surviving paragraph a valid persisted blank.
+                          ? { body_json: blankParagraphBodyJson(current.node.body_json), body_text: "", node_type: "node" as const }
+                          : { body_json: clearBlankParagraphMarker(current.node.body_json), body_text: merged, node_type: "node" as const }
+                      )
                     : undefined;
                   syncCommittedEditorDraft(current.node.id, merged, {
                     ...current,
-                    node: { ...current.node, ...(mergedPatch ?? {}), title: merged, body_text: merged },
+                    node: {
+                      ...current.node,
+                      ...(mergedPatch ?? {}),
+                      title: merged,
+                      body_text: mergedPatch?.body_text ?? merged,
+                    },
                   });
                   await onCommitTitle(
                     current.node,
@@ -3052,6 +3155,109 @@ export function OutlineBlockEditor({
     : pendingFieldOwnerRow
       ? (fieldCandidatesForRow?.(pendingFieldOwnerRow) ?? pendingFieldOwnerRow.fields ?? [])
       : [];
+
+  useEffect(() => {
+    const persistPendingDraftOnPageHide = (event: PageTransitionEvent) => {
+      // A BFCache page keeps this React instance and its editor-only draft
+      // alive. Persisting here would permanently leave the local commit guard
+      // claimed when the cached page is restored. A later non-BFCache
+      // pagehide (including reload) will persist the draft normally.
+      if (event.persisted) return;
+
+      // Enter already owns the normal commit lifecycle. Do not race an
+      // in-flight create or reinterpret an unfinished /field interaction as
+      // a normal Docs node while the document is leaving.
+      if (
+        pendingBlankCommitRef.current
+        || pendingField
+        || pendingFieldCreateRef.current
+        || pendingFieldSuggestion
+      ) {
+        return;
+      }
+
+      // Read from the DOM rather than the last React render. pagehide can run
+      // immediately after an input event and the DOM value is the strongest
+      // representation of what the user can currently see.
+      const input = editorRootRef.current?.querySelector<HTMLInputElement>(
+        "[data-docs-blank-row-input]",
+      );
+      const title = input?.value ?? "";
+      if (!hasMeaningfulBlockTitle(title)) return;
+
+      // The empty-page input has no pendingBlankRow until the first explicit
+      // structural operation. Reconstruct the same insertion used by the
+      // renderer instead of persisting an unrelated root node.
+      const currentInsertion = pendingBlankRowRef.current ?? (
+        rowsRef.current.length === 0 && emptyParentId
+          ? {
+              parentId: emptyParentId,
+              afterNodeId: null,
+              kind: "paragraph" as const,
+              depth: 0,
+            }
+          : null
+      );
+      if (!currentInsertion) return;
+
+      // Resolve a possibly-moved anchor against the latest row projection,
+      // matching the ordinary Enter commit path.
+      const anchor = currentInsertion.afterNodeId
+        ? rowsRef.current.find(
+            (item) => item.node.id === currentInsertion.afterNodeId,
+          ) ?? null
+        : null;
+      const insertion = anchor
+        ? {
+            parentId: anchor.node.parent_id,
+            afterNodeId: anchor.node.id,
+            kind: currentInsertion.kind,
+            depth: anchor.depth,
+          }
+        : currentInsertion;
+
+      const markdownShortcut = markdownShortcutPatchForTitle(
+        title,
+        insertion.kind,
+      );
+      const persistedTitle = markdownShortcut?.title ?? title;
+      const persistedKind = markdownShortcut?.kind ?? insertion.kind;
+
+      // pagehide can be followed by blur in either order. Claim the pending
+      // commit synchronously so the same visible draft is never created
+      // twice.
+      pendingBlankCommitRef.current = true;
+      pendingCreateFocusRef.current = false;
+      pendingCreateIdRef.current = null;
+
+      try {
+        // Evaluate onCreateNode synchronously. The workspace starts a
+        // keepalive POST before this page's JavaScript context is discarded.
+        const operation = onCreateNode({
+          parentId: insertion.parentId,
+          afterNodeId: insertion.afterNodeId,
+          title: persistedTitle,
+          kind: persistedKind,
+          checked: markdownShortcut?.checked,
+          focusOnCreate: false,
+        });
+        void Promise.resolve(operation).catch(() => undefined);
+      } catch {
+        // The page is already leaving; there is no meaningful rollback UI.
+      }
+    };
+
+    window.addEventListener("pagehide", persistPendingDraftOnPageHide);
+    return () => {
+      window.removeEventListener("pagehide", persistPendingDraftOnPageHide);
+    };
+  }, [
+    emptyParentId,
+    onCreateNode,
+    pendingField,
+    pendingFieldSuggestion,
+  ]);
+
   const renderBlankRowInput = (row: PendingBlankRow, key?: string) => (
     <div
       key={key}
@@ -3323,8 +3529,64 @@ export function OutlineBlockEditor({
               pendingBlankCommitRef.current = true;
               pendingCreateIdRef.current = null;
               setPendingBlankCommit(true);
-              void Promise.resolve()
-                .then(() => onCreateNode({
+
+              const handleCreateSuccess = (created: DocsNode) => {
+                if (pendingCreateGenerationRef.current !== createGeneration) return;
+                // Keep the editor-only row model: successful entry commits
+                // exactly once, then immediately exposes the next sibling
+                // row rather than leaving focus on the saved node.
+                const nextRow: PendingBlankRow = {
+                  parentId: created.parent_id,
+                  afterNodeId: created.id,
+                  kind: persistedKind,
+                  depth: insertion.depth,
+                };
+                pendingCreateIdRef.current = created.id;
+                pendingAnchorMemoryRef.current = created.id;
+                pendingKindRef.current = persistedKind;
+                setPendingBlankAutoFocus(pendingCreateFocusRef.current);
+                resetPendingDraft("");
+                setPendingBlankRow(nextRow);
+                if (pendingCreateFocusRef.current) {
+                  requestAnimationFrame(() => {
+                    editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                  });
+                }
+              };
+
+              const handleCreateFailure = () => {
+                if (pendingCreateGenerationRef.current !== createGeneration) return;
+                // Keep the text in the editor-only row when persistence
+                // fails; no blank/partial node is left behind.
+                pendingCreateIdRef.current = null;
+                pendingKindRef.current = insertion.kind;
+                setPendingBlankRow(insertion);
+                resetPendingDraft(title);
+                const activeElement = document.activeElement;
+                pendingRollbackFocusRef.current = pendingExternalFocusRef.current
+                  ?? (activeElement instanceof HTMLElement && activeElement !== document.body ? activeElement : null);
+                setPendingRollbackFocusRevision((current) => current + 1);
+                setPendingBlankAutoFocus(false);
+              };
+
+              const finishCreate = () => {
+                pendingBlankCommitRef.current = false;
+                setPendingBlankCommit(false);
+                if (pendingCreateGenerationRef.current !== createGeneration) return;
+                const activeElement = document.activeElement;
+                const shouldFocus = pendingCreateFocusRef.current
+                  && (!activeElement || activeElement.closest("[data-docs-blank-row]"));
+                pendingCreateFocusRef.current = false;
+                if (shouldFocus) {
+                  requestAnimationFrame(() => {
+                    editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
+                  });
+                }
+              };
+
+              let createdOrPromise: DocsNode | Promise<DocsNode>;
+              try {
+                createdOrPromise = onCreateNode({
                   parentId: insertion.parentId,
                   afterNodeId: insertion.afterNodeId,
                   title: persistedTitle,
@@ -3333,7 +3595,7 @@ export function OutlineBlockEditor({
                   focusOnCreate: false,
                   onPersistenceError: (nodeId) => {
                     // The callback is delivered by the workspace after the
-                    // optimistic node's id is known.  Ignore failures from an
+                    // optimistic node's id is known. Ignore failures from an
                     // older row once the user has already moved on.
                     if (pendingCreateGenerationRef.current !== createGeneration) return;
                     if (pendingCreateIdRef.current && pendingCreateIdRef.current !== nodeId) return;
@@ -3370,58 +3632,26 @@ export function OutlineBlockEditor({
                       });
                     }
                   },
-                }))
-                .then((created) => {
-                  if (pendingCreateGenerationRef.current !== createGeneration) return;
-                  // Keep the editor-only row model: successful entry commits
-                  // exactly once, then immediately exposes the next sibling
-                  // row rather than leaving focus on the saved node.
-                  const nextRow: PendingBlankRow = {
-                    parentId: created.parent_id,
-                    afterNodeId: created.id,
-                    kind: persistedKind,
-                    depth: insertion.depth,
-                  };
-                  pendingCreateIdRef.current = created.id;
-                  pendingAnchorMemoryRef.current = created.id;
-                  pendingKindRef.current = persistedKind;
-                  setPendingBlankAutoFocus(pendingCreateFocusRef.current);
-                  resetPendingDraft("");
-                  setPendingBlankRow(nextRow);
-                  if (pendingCreateFocusRef.current) {
-                    requestAnimationFrame(() => {
-                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
-                    });
-                  }
-                })
-                .catch(() => {
-                  if (pendingCreateGenerationRef.current !== createGeneration) return;
-                  // Keep the text in the editor-only row when persistence
-                  // fails; no blank/partial node is left behind.
-                  pendingCreateIdRef.current = null;
-                  pendingKindRef.current = insertion.kind;
-                  setPendingBlankRow(insertion);
-                  resetPendingDraft(title);
-                  const activeElement = document.activeElement;
-                  pendingRollbackFocusRef.current = pendingExternalFocusRef.current
-                    ?? (activeElement instanceof HTMLElement && activeElement !== document.body ? activeElement : null);
-                  setPendingRollbackFocusRevision((current) => current + 1);
-                  setPendingBlankAutoFocus(false);
-                })
-                .finally(() => {
-                  pendingBlankCommitRef.current = false;
-                  setPendingBlankCommit(false);
-                  if (pendingCreateGenerationRef.current !== createGeneration) return;
-                  const activeElement = document.activeElement;
-                  const shouldFocus = pendingCreateFocusRef.current
-                    && (!activeElement || activeElement.closest("[data-docs-blank-row]"));
-                  pendingCreateFocusRef.current = false;
-                  if (shouldFocus) {
-                    requestAnimationFrame(() => {
-                      editorRootRef.current?.querySelector<HTMLInputElement>("[data-docs-blank-row-input]")?.focus();
-                    });
-                  }
                 });
+              } catch {
+                handleCreateFailure();
+                finishCreate();
+                return;
+              }
+
+              // Workspace creates an optimistic node synchronously. Complete
+              // that path before the key event returns so fast follow-up typing
+              // lands in the next pending row instead of a transient disabled
+              // input. Async adapters retain the existing guarded wait path.
+              if (createdOrPromise instanceof Promise) {
+                void createdOrPromise
+                  .then(handleCreateSuccess)
+                  .catch(handleCreateFailure)
+                  .finally(finishCreate);
+              } else {
+                handleCreateSuccess(createdOrPromise);
+                finishCreate();
+              }
             }}
           />
         </div>
@@ -3549,7 +3779,7 @@ export function OutlineBlockEditor({
             {visibleFields.length > 0 ? (
               <div className="space-y-1" data-testid="docs-document-fields">
                 {visibleFields.map(({ field, value }, fieldIndex) => (
-                  <div key={field.id} className="grid max-w-2xl grid-cols-[minmax(8rem,11rem)_minmax(12rem,32rem)] items-start gap-2 text-xs">
+                  <div key={field.id} className="grid min-w-0 max-w-2xl grid-cols-[minmax(8rem,11rem)_minmax(12rem,32rem)] items-start gap-2 text-xs">
                     <label
                       htmlFor={`${fieldControlIdPrefix}-docs-document-field-${documentRow.node.id}-${field.id}`}
                       className="cursor-text truncate px-1 py-2 text-muted-foreground"
@@ -3719,6 +3949,34 @@ export function OutlineBlockEditor({
             ? renderBelowRow(row, index, { searchExpanded })
             : null;
           const menuAtPointer = contextMenuPosition?.nodeId === row.node.id ? contextMenuPosition : null;
+          const rowCanArchive = canMutateNodeForAction(row.node, "archive");
+          const rowCanDuplicate = canMutateNodeForAction(row.node, "content")
+            && !isDocsProjectCanonicalNode(row.node);
+          const pointedProject = projects.find((project) => project.knowledge_node_id === row.node.id);
+          const rowProjectId = row.node.project_id
+            ?? docsProjectIdFromSystemKey(row.node.system_key)
+            ?? pointedProject?.id;
+          const rowProject = projects.find((project) => project.id === rowProjectId);
+          const rowCanCleanup = Boolean(
+            onCleanupNode
+            && (canCleanupNode?.(row.node) ?? isDocsProjectCanonicalNode(row.node))
+            && rowProject
+            && (
+              isDocsStaleProjectNode(row.node)
+              || rowProject.is_completed === true
+              || Boolean(rowProject.deleted_at)
+              || (
+                row.node.system_key?.startsWith("project_information:duplicate:") === true
+                && rowProject.knowledge_node_id !== row.node.id
+              )
+            ),
+          );
+          const rowCanMove = canMutateNodeForAction(row.node, "move");
+          const rowCanTaskify = canMutateNodeForAction(row.node, "taskify");
+          const rowCanTag = canMutateNodeForAction(row.node, "tag");
+          const rowProtectedMessage = !rowCanArchive || !rowCanMove || !rowCanTaskify || !rowCanTag
+            ? docsNodeProtectionMessage(row.node)
+            : null;
           const rowMenu = menuNodeId === row.node.id ? (
             <DocsNodeContextMenu
               node={row.node}
@@ -3730,14 +3988,28 @@ export function OutlineBlockEditor({
               }}
               onCopyNodeId={copyNodeId}
               onDuplicateNode={(node) => onDuplicateNode(node)}
+              onCleanupNode={onCleanupNode}
               onArchiveNode={(node) => onArchiveNode(node)}
               onMoveNode={() => openMoveDialog(row)}
-              onTaskifyNode={(node) => onCommitTitle(node, node.title, {
-                body_json: { ...node.body_json, ...blockJsonForKind("checkbox") },
-                display_props: { ...node.display_props, show_checkbox: true },
-              })}
-              onApplyTag={(node, tag) => onApplyTag(node, tag)}
+              onTaskifyNode={(node) => {
+                if (!rowCanTaskify) return;
+                return onCommitTitle(node, node.title, {
+                  body_json: { ...node.body_json, ...blockJsonForKind("checkbox") },
+                  display_props: { ...node.display_props, show_checkbox: true },
+                });
+              }}
+              onApplyTag={(node, tag) => {
+                if (!rowCanTag) return;
+                return onApplyTag(node, tag);
+              }}
               onOpenNode={(node) => onOpenNode(node.id)}
+              canArchive={rowCanArchive}
+              canDuplicate={rowCanDuplicate}
+              canCleanup={rowCanCleanup}
+              canMove={rowCanMove}
+              canTaskify={rowCanTaskify}
+              canTag={rowCanTag}
+              protectedMessage={rowProtectedMessage}
             />
           ) : null;
           // key は node.id だけにする。親や sort_order を混ぜると Tab / Shift-Tab / D&D の移動で
@@ -3811,7 +4083,8 @@ export function OutlineBlockEditor({
                 event.preventDefault();
                 const intent = dropTarget?.nodeId === row.node.id ? dropTarget.intent : outlineDropIntentFromPointer(event);
                 const move = dragNodeId ? outlineDropMove(rowsRef.current, dragNodeId, row.node.id, intent) : null;
-                if (move) void onMoveNode(move);
+                const dragged = move ? rowsRef.current.find((candidate) => candidate.node.id === move.nodeId) : null;
+                if (move && dragged && !rejectProtectedAction(dragged.node, "move")) void onMoveNode(move);
                 setDragNodeId(null);
                 setDropTarget(null);
               }}
@@ -3830,6 +4103,11 @@ export function OutlineBlockEditor({
                     aria-label={`${row.node.title}をドラッグして移動`}
                     onClick={(event) => event.stopPropagation()}
                     onDragStart={(event) => {
+                      if (rejectProtectedAction(row.node, "move")) {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        return;
+                      }
                       event.stopPropagation();
                       event.dataTransfer.effectAllowed = "move";
                       event.dataTransfer.setData("text/plain", row.node.id);
@@ -3981,7 +4259,7 @@ export function OutlineBlockEditor({
                         const suggestion = aiFieldSuggestions.find((item) => item.field.id === field.id);
                         const currentValue = fieldValueToDraft(fieldValuesById.get(field.id));
                         return (
-                          <div key={field.id} className="grid min-h-7 min-w-0 grid-cols-[minmax(7rem,auto)_minmax(10rem,1fr)] items-center gap-2 py-0">
+                          <div key={field.id} className="grid min-h-7 min-w-0 grid-cols-[minmax(7rem,auto)_minmax(10rem,1fr)] items-start gap-2 py-0">
                             <span className="inline-flex h-7 items-center gap-1 text-xs leading-7 text-muted-foreground">
                               <span aria-hidden="true">&gt;</span>
                               <span>{field.name}</span>
@@ -3991,9 +4269,14 @@ export function OutlineBlockEditor({
                               value={currentValue}
                               nodes={nodes}
                               projects={projects}
-                               currentNodeId={row.node.id}
-                               disabled={row.node.permission === "read"}
-                               onChange={() => {}}
+                              currentNodeId={row.node.id}
+                              disabled={row.node.permission === "read"}
+                              // A long_text field is part of the document
+                              // body.  Render it as a wrapping textarea so a
+                              // Project Information value never collapses
+                              // into a one-line horizontal scroller.
+                              longTextLayout={docsFieldType(field) === "long_text" ? "document" : "compact"}
+                              onChange={() => {}}
                                onCommit={(value) => void onSaveField(row.node, field, value)}
                                onNavigatePrevious={() => {
                                  const fields = fieldControlsForNode(row.node.id);

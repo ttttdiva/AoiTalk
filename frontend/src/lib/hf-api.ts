@@ -6,6 +6,148 @@
 // ─── Types ───
 export type RepoType = "model" | "dataset";
 
+/** Secret-free structured errors returned by the Hydrus proxy. */
+export type HydrusApiErrorCode =
+  | "csrf_rejected"
+  | "authentication_required"
+  | "hydrus_legacy_claim_confirmation_required"
+  | "hydrus_legacy_unavailable"
+  | "hydrus_not_configured"
+  | "hydrus_legacy_claim_conflict"
+  | "hydrus_legacy_owner_conflict"
+  | "hydrus_legacy_owner_ambiguous"
+  | "hydrus_legacy_claim_unavailable"
+  | "hydrus_legacy_import_unavailable"
+  | "hydrus_endpoint_policy_rejected"
+  | "hydrus_endpoint_resolution_failed"
+  | "hydrus_auth_failed"
+  | "hydrus_unreachable"
+  | "hydrus_upstream_error"
+  | "hydrus_credential_unreadable"
+  | "hydrus_credential_store_unavailable"
+  | "python_proxy_unreachable"
+  | (string & {});
+
+export interface HydrusApiErrorDetail {
+  category: string;
+  code: HydrusApiErrorCode;
+  message: string;
+  trace_id?: string;
+  retryable?: boolean;
+}
+
+const HYDRUS_RETRYABLE_CODES = new Set<string>([
+  "hydrus_endpoint_resolution_failed",
+  "hydrus_unreachable",
+  "hydrus_upstream_error",
+  "hydrus_credential_store_unavailable",
+  "store_unavailable",
+  "python_proxy_unreachable",
+]);
+
+/** Codes accepted from the server's secret-free Hydrus error boundary. */
+const SAFE_HYDRUS_ERROR_CODES = new Set<string>([
+  "csrf_rejected",
+  "authentication_required",
+  "hydrus_legacy_claim_confirmation_required",
+  "hydrus_legacy_unavailable",
+  "hydrus_legacy_claim_conflict",
+  "hydrus_legacy_owner_conflict",
+  "hydrus_legacy_owner_ambiguous",
+  "hydrus_legacy_claim_unavailable",
+  "hydrus_legacy_import_unavailable",
+  "hydrus_endpoint_policy_rejected",
+  "hydrus_endpoint_resolution_failed",
+  "hydrus_not_configured",
+  "hydrus_auth_failed",
+  "hydrus_unreachable",
+  "hydrus_upstream_error",
+  "hydrus_credential_unreadable",
+  "hydrus_credential_store_unavailable",
+  "python_proxy_unreachable",
+]);
+
+/** A safe, typed Hydrus error; raw upstream response text is never retained. */
+export class HydrusApiError extends Error {
+  readonly status: number;
+  readonly category: string;
+  readonly code: HydrusApiErrorCode;
+  readonly traceId?: string;
+  readonly trace_id?: string;
+  readonly retryable: boolean;
+
+  constructor(detail: HydrusApiErrorDetail, status = 0) {
+    const message =
+      typeof detail.message === "string" && detail.message.trim()
+        ? detail.message.trim()
+        : "Hydrusへの接続に失敗しました";
+    super(message);
+    this.name = "HydrusApiError";
+    this.status = status;
+    this.category = detail.category;
+    this.code = detail.code;
+    this.traceId =
+      typeof detail.trace_id === "string" && detail.trace_id.trim()
+        ? detail.trace_id.trim()
+        : undefined;
+    this.trace_id = this.traceId;
+    this.retryable =
+      typeof detail.retryable === "boolean"
+        ? detail.retryable
+        : HYDRUS_RETRYABLE_CODES.has(String(detail.code));
+  }
+}
+
+/** Human-readable, secret-free guidance for a Hydrus error code. */
+export function hydrusErrorMessage(
+  error: unknown,
+  fallback = "Hydrusへの接続に失敗しました。設定と接続を確認して再試行してください。",
+): string {
+  if (!(error instanceof HydrusApiError)) return fallback;
+  switch (String(error.code)) {
+    case "hydrus_not_configured":
+      return "Hydrusが設定されていません。設定画面で接続先とAccess Keyを登録してください。";
+    case "authentication_required":
+      return "認証が必要です。ログイン状態を確認して再試行してください。";
+    case "csrf_rejected":
+      return "安全のため同じ画面からの操作だけが許可されます。ページを再読み込みして再試行してください。";
+    case "hydrus_legacy_claim_confirmation_required":
+      return "既存のHydrus設定を取り込むには確認が必要です。";
+    case "hydrus_legacy_unavailable":
+      return "移行できる既存のHydrus設定がありません。Access Keyを設定画面から登録してください。";
+    case "hydrus_endpoint_policy_rejected":
+      return "このHydrus接続先は安全ポリシーで拒否されました。ローカル接続はloopback（localhost / 127.0.0.1 / ::1）を使用してください。";
+    case "hydrus_endpoint_resolution_failed":
+      return "Hydrusの接続先を安全に解決できませんでした。URLを確認して再試行してください。";
+    case "hydrus_unreachable":
+      return "Hydrus Clientに到達できません。Clientが起動しているか、URLとポートを確認してください。";
+    case "hydrus_auth_failed":
+      return "Hydrus APIの認証または権限に失敗しました。Access KeyとHydrus API権限を確認してください。";
+    case "hydrus_upstream_error":
+      return "Hydrus Clientでエラーが発生しました。しばらくしてから再試行してください。";
+    case "hydrus_credential_unreadable":
+      return "Hydrusの保存済み認証情報を読み取れません。設定画面で再設定してください。";
+    case "hydrus_credential_store_unavailable":
+    case "store_unavailable":
+      return "Hydrus設定を読み込めません。サーバーの状態を確認して再試行してください。";
+    case "hydrus_legacy_claim_conflict":
+    case "hydrus_legacy_owner_conflict":
+      return "既存のHydrus設定は別のユーザーが取り込み済みです。現在のユーザーで設定を登録してください。";
+    case "hydrus_legacy_owner_ambiguous":
+      return "既存のHydrus設定の所有者を安全に特定できません。Access Keyを設定画面から登録してください。";
+    case "hydrus_legacy_claim_unavailable":
+    case "hydrus_legacy_import_unavailable":
+      return "既存のHydrus設定を取り込めません。Access Keyを設定画面から登録してください。";
+    case "python_proxy_unreachable":
+      return "AoiTalkのHydrusプロキシに接続できません。サーバーが起動しているか確認して再試行してください。";
+    default:
+      // Unknown machine codes are intentionally not rendered.  The server
+      // allowlist may gain codes later, but an arbitrary message must never
+      // become a browser-side secret/error reflection channel.
+      return fallback;
+  }
+}
+
 export interface HfUploadFailure {
   name: string;
   relativePath?: string;
@@ -86,7 +228,66 @@ export type HfReferenceAddResponse =
     };
 
 // ─── Helpers ───
-async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/** Parse only the safe structured Hydrus detail object. */
+export function parseHydrusApiErrorDetail(
+  body: unknown,
+): HydrusApiErrorDetail | null {
+  if (!isRecord(body)) return null;
+  const candidate =
+    (isRecord(body.detail) && body.detail) ||
+    (isRecord(body.error) && body.error) ||
+    ("category" in body && "code" in body && "message" in body ? body : null);
+  if (!candidate || !isRecord(candidate)) return null;
+  if (
+    typeof candidate.category !== "string" ||
+    typeof candidate.code !== "string" ||
+    typeof candidate.message !== "string"
+  ) {
+    return null;
+  }
+  const category = candidate.category.trim();
+  const code = candidate.code.trim();
+  const message = candidate.message.trim().replace(/[\u0000-\u001f\u007f]/g, " ");
+  if (!category || !code || !message) return null;
+  // Hydrus proxy errors are namespaced; do not reinterpret another
+  // integration's arbitrary JSON payload as a Hydrus error.
+  if (
+    category !== "hydrus" &&
+    category !== "python_proxy" &&
+    !code.startsWith("hydrus_") &&
+    !code.startsWith("python_proxy_")
+  ) {
+    return null;
+  }
+  if (!SAFE_HYDRUS_ERROR_CODES.has(code)) return null;
+  const traceId =
+    typeof candidate.trace_id === "string" && candidate.trace_id.trim()
+      ? candidate.trace_id.trim().replace(/[\u0000-\u001f\u007f]/g, "")
+      : undefined;
+  return {
+    category,
+    code: code as HydrusApiErrorCode,
+    message: message.slice(0, 400),
+    ...(traceId ? { trace_id: traceId.slice(0, 160) } : {}),
+    ...(typeof candidate.retryable === "boolean"
+      ? { retryable: candidate.retryable }
+      : {}),
+  };
+}
+
+interface JsonFetchOptions {
+  hydrusErrors?: boolean;
+}
+
+async function jsonFetch<T>(
+  url: string,
+  init?: RequestInit,
+  options: JsonFetchOptions = {},
+): Promise<T> {
   // Integration responses are principal-scoped and may contain private repo
   // metadata.  Opt out of browser/Next shared caching by default.
   const res = await fetch(url, { cache: "no-store", credentials: "include", ...init });
@@ -94,11 +295,28 @@ async function jsonFetch<T>(url: string, init?: RequestInit): Promise<T> {
     const t = await res.text().catch(() => "");
     let detail = res.statusText || `HTTP ${res.status}`;
     try {
-      const body = JSON.parse(t) as { detail?: unknown; error?: unknown };
-      const message = body.detail ?? body.error;
-      if (typeof message === "string" && message.trim()) detail = message;
+      const body = JSON.parse(t) as unknown;
+      if (options.hydrusErrors) {
+        const structured = parseHydrusApiErrorDetail(body);
+        if (structured) throw new HydrusApiError(structured, res.status);
+      }
+      // Hydrus responses are allowed to expose only the structured,
+      // allow-listed detail above.  Never copy a raw string detail/error from
+      // a proxy or upstream body into a browser-visible Error.
+      if (!options.hydrusErrors) {
+        const message =
+          isRecord(body) ? (body.detail ?? body.error) : undefined;
+        if (typeof message === "string" && message.trim()) detail = message;
+      }
     } catch {
-      // use raw response
+      if (options.hydrusErrors) {
+        try {
+          const structured = parseHydrusApiErrorDetail(JSON.parse(t));
+          if (structured) throw new HydrusApiError(structured, res.status);
+        } catch (error) {
+          if (error instanceof HydrusApiError) throw error;
+        }
+      }
     }
     throw new Error(detail || `HTTP ${res.status}`);
   }
@@ -340,7 +558,7 @@ export interface HydrusTagSearchResponse {
 
 /** Python proxy 経由で Hydrus バックエンドを叩く */
 async function hydrusFetch<T>(path: string, init?: RequestInit): Promise<T> {
-  return jsonFetch(`/api/python-proxy${path}`, init);
+  return jsonFetch(`/api/python-proxy${path}`, init, { hydrusErrors: true });
 }
 
 export async function hydrusHealth(): Promise<{ ok: boolean; error?: string }> {
@@ -351,11 +569,13 @@ export interface HydrusUserSettingsResponse {
   configured: boolean;
   apiUrl: string | null;
   displayName?: string | null;
+  /** A legacy HYDRUS_* configuration can be explicitly claimed by this user. */
+  legacyAvailable?: boolean;
 }
 
 /** Hydrus接続設定（access keyはAPIレスポンスへ含めない）。 */
 export async function hydrusGetSettings(): Promise<HydrusUserSettingsResponse> {
-  return jsonFetch("/api/hydrus/settings");
+  return jsonFetch("/api/hydrus/settings", undefined, { hydrusErrors: true });
 }
 
 export async function hydrusSaveSettings(params: {
@@ -363,15 +583,44 @@ export async function hydrusSaveSettings(params: {
   accessKey: string;
   displayName?: string;
 }): Promise<{ success: boolean }> {
-  return jsonFetch("/api/hydrus/settings", {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(params),
-  });
+  return jsonFetch(
+    "/api/hydrus/settings",
+    {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(params),
+    },
+    { hydrusErrors: true },
+  );
 }
 
 export async function hydrusDeleteSettings(): Promise<{ success: boolean }> {
-  return jsonFetch("/api/hydrus/settings", { method: "DELETE" });
+  return jsonFetch(
+    "/api/hydrus/settings",
+    { method: "DELETE" },
+    { hydrusErrors: true },
+  );
+}
+
+export interface HydrusLegacyMigrationResponse {
+  success: boolean;
+  configured: boolean;
+  migrated?: boolean;
+  alreadyMigrated?: boolean;
+  apiUrl: string | null;
+}
+
+/** Explicitly claim an existing desktop/local HYDRUS_* configuration. */
+export async function hydrusMigrateLegacySettings(): Promise<HydrusLegacyMigrationResponse> {
+  return jsonFetch(
+    "/api/hydrus/settings/migrate-legacy",
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: "claim-existing-local-hydrus" }),
+    },
+    { hydrusErrors: true },
+  );
 }
 
 export async function hydrusGetServices(): Promise<HydrusServicesResponse> {

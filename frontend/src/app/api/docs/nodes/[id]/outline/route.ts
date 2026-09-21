@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { and, asc, eq, inArray, isNull, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNull, or, sql } from "drizzle-orm";
 import { db } from "@/db";
 import {
   knowledgeFieldValues,
@@ -15,6 +15,7 @@ import {
   getUserProjects,
   getWorkspaceViews,
   getDocsNodeAccess,
+  docsNodeVisibleOrBridge,
   requireDocsNode,
   serializeField,
   serializeFieldValue,
@@ -27,8 +28,31 @@ import {
 } from "@/lib/server/knowledge-docs-utils";
 import { listDocsTaskSyntheticFieldValues } from "@/lib/server/docs-task-binding";
 
+type OutlineCursor = { sortOrder: number; itemId: string };
+
+function decodeOutlineCursor(raw: string | null): OutlineCursor | null {
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(raw, "base64url").toString("utf8")) as Partial<OutlineCursor>;
+    if (
+      typeof parsed.sortOrder !== "number"
+      || !Number.isFinite(parsed.sortOrder)
+      || typeof parsed.itemId !== "string"
+      || parsed.itemId.length === 0
+      || parsed.itemId.length > 200
+    ) return null;
+    return { sortOrder: parsed.sortOrder, itemId: parsed.itemId };
+  } catch {
+    return null;
+  }
+}
+
+function encodeOutlineCursor(cursor: OutlineCursor) {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
 export async function GET(
-  _request: NextRequest,
+  request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
   const user = await getSession();
@@ -43,23 +67,36 @@ export async function GET(
   }
 
   const rootPageId = access.node.rootPageId ?? access.node.id;
-  const rawNodes = await db
+  // The outline endpoint is a compatibility projection and historically
+  // loaded an entire root subtree.  Bound each response so a large library
+  // cannot turn a single focused request into an unbounded metadata query.
+  // Clients may request a smaller page; the server cap remains finite.
+  const requestedLimit = Number.parseInt(request.nextUrl.searchParams.get("limit") ?? "500", 10);
+  const pageLimit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(requestedLimit, 1), 2000)
+    : 500;
+  const rawCursor = request.nextUrl.searchParams.get("cursor");
+  const cursor = decodeOutlineCursor(rawCursor);
+  if (rawCursor && !cursor) {
+    return NextResponse.json({ detail: "cursorが不正です" }, { status: 400 });
+  }
+  const cursorCondition = cursor
+    ? or(
+        gt(knowledgeNodes.sortOrder, cursor.sortOrder),
+        and(
+          eq(knowledgeNodes.sortOrder, cursor.sortOrder),
+          gt(knowledgeNodes.id, cursor.itemId),
+        ),
+      )
+    : undefined;
+  const queriedNodes = await db
     .select()
     .from(knowledgeNodes)
     .where(
       and(
         eq(knowledgeNodes.docsLibraryId, access.workspace.id),
         isNull(knowledgeNodes.archivedAt),
-        sql<boolean>`(
-          regexp_replace(trim(${knowledgeNodes.title}), '[[:space:]]+', '', 'g') <> ''
-          OR EXISTS (
-            SELECT 1 FROM knowledge_nodes AS blank_child_descendant
-            WHERE blank_child_descendant.parent_id = ${knowledgeNodes.id}
-              AND blank_child_descendant.docs_library_id = ${access.workspace.id}
-              AND blank_child_descendant.archived_at IS NULL
-              AND regexp_replace(trim(blank_child_descendant.title), '[[:space:]]+', '', 'g') <> ''
-          )
-        )`,
+        docsNodeVisibleOrBridge(access.workspace.id),
         sql<boolean>`NOT (
           ${knowledgeNodes.title} = '（空行）'
           AND EXISTS (
@@ -83,9 +120,17 @@ export async function GET(
           )
         )`,
         or(eq(knowledgeNodes.id, rootPageId), eq(knowledgeNodes.rootPageId, rootPageId)),
+        cursorCondition,
       ),
     )
-    .orderBy(asc(knowledgeNodes.sortOrder));
+    .orderBy(asc(knowledgeNodes.sortOrder), asc(knowledgeNodes.id))
+    .limit(pageLimit + 1);
+  const hasMore = queriedNodes.length > pageLimit;
+  const rawNodes = hasMore ? queriedNodes.slice(0, pageLimit) : queriedNodes;
+  const tail = rawNodes.at(-1);
+  const nextCursor = hasMore && tail
+    ? encodeOutlineCursor({ sortOrder: tail.sortOrder ?? 0, itemId: tail.id })
+    : null;
   const accessRows = await Promise.all(
     rawNodes.map((node) => requireDocsNode(node.id, user, "read")),
   );
@@ -173,8 +218,30 @@ export async function GET(
     getWorkspaceViews(access.workspace.id),
     getUserProjects(user.id),
   ]);
+  // A shared/read Project node must not expose unrelated Personal-library
+  // definitions.  The owner keeps the complete library projection; other
+  // readers receive only tags/fields actually attached to the visible nodes
+  // (and views scoped to those tags).
+  const ownerLibrary = access.workspace.ownerUserId === user.id;
+  const visibleSupertagIds = new Set(nodeSupertags.map((relation) => relation.supertagId));
+  const exposedSupertags = ownerLibrary
+    ? supertags
+    : supertags.filter((tag) => visibleSupertagIds.has(tag.id));
+  const exposedSupertagFields = ownerLibrary
+    ? supertagFields
+    : supertagFields.filter((relation) => visibleSupertagIds.has(relation.supertagId));
+  const attachedFieldIds = new Set(exposedSupertagFields.map((relation) => relation.fieldId));
+  const exposedFieldIds = ownerLibrary
+    ? new Set(fields.map((field) => field.id))
+    : attachedFieldIds;
+  const exposedFields = ownerLibrary
+    ? fields
+    : fields.filter((field) => exposedFieldIds.has(field.id));
+  const exposedViews = ownerLibrary
+    ? views
+    : views.filter((view) => Boolean(view.supertagId && visibleSupertagIds.has(view.supertagId)));
   const taskFieldValues = nodeIds.length
-    ? await listDocsTaskSyntheticFieldValues({ nodeIds, fields, user })
+    ? await listDocsTaskSyntheticFieldValues({ nodeIds, fields: exposedFields, user })
     : [];
   const targetIds = Array.from(new Set(
     storedFieldValues
@@ -191,21 +258,30 @@ export async function GET(
       .map((item) => [item.node.id, item]),
   );
   const visibleStoredFieldValues = storedFieldValues.filter(
-    (value) => !value.targetNodeId || targetAccessById.has(value.targetNodeId),
+    (value) => exposedFieldIds.has(value.fieldId)
+      && (!value.targetNodeId || targetAccessById.has(value.targetNodeId)),
   );
   const fieldValues = [...visibleStoredFieldValues, ...taskFieldValues];
+  const visibleNodeIdSet = new Set(nodeIds);
+  const visiblePlacements = placements.filter(
+    (placement) => visibleNodeIdSet.has(placement.nodeId)
+      && visibleNodeIdSet.has(placement.parentNodeId),
+  );
 
   return NextResponse.json({
     focus_node_id: access.node.id,
     root_page_id: rootPageId,
+    has_more: hasMore,
+    limit: pageLimit,
+    next_cursor: nextCursor,
     nodes: nodes.map(serializeNode),
-    supertags: supertags.map(serializeSupertag),
-    supertag_fields: supertagFields.map(serializeSupertagField),
-    placements: placements.map(serializeNodePlacement),
-    fields: fields.map(serializeField),
+    supertags: exposedSupertags.map(serializeSupertag),
+    supertag_fields: exposedSupertagFields.map(serializeSupertagField),
+    placements: visiblePlacements.map(serializeNodePlacement),
+    fields: exposedFields.map(serializeField),
     node_supertags: nodeSupertags.map(serializeNodeSupertag),
     field_values: fieldValues.map(serializeFieldValue),
-    views: views.map(serializeView),
+    views: exposedViews.map(serializeView),
     projects,
   });
 }

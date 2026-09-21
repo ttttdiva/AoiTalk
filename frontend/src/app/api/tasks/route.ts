@@ -9,31 +9,30 @@ import {
   timeEntries,
   taskRecurrenceRules,
   taskOccurrences,
+  taskRecurrenceScheduleSegments,
   projects,
 } from "@/db/schema";
-import {
-  eq,
-  and,
-  isNull,
-  isNotNull,
-  inArray,
-  min,
-  sql,
-  lte,
-} from "drizzle-orm";
+import { eq, and, isNull, isNotNull, inArray, min, sql } from "drizzle-orm";
 import { getSession } from "@/lib/auth";
 import { isClosedTaskStatus, normalizeTaskStatus } from "@/lib/task-status";
 import { enqueueAutoSyncGoogleCalendarForTask } from "@/lib/server/google-calendar-auto-sync";
-import { computeOccurrencesInRange } from "@/lib/recurrence-preview";
+import { computeOccurrenceCandidatesInRange } from "@/lib/recurrence-preview";
 import {
   applyOccurrenceDuration,
   getOccurrenceDurationMs,
 } from "@/lib/recurrence-schedule";
 import {
-  correctLikelyTimerStartedAt,
+  applyRecurrenceScheduleSegment,
+  getRecurrenceSegmentEnvelopeMs,
+  type RecurrenceScheduleSegment,
+} from "@/lib/recurrence-schedule-segments";
+import {
+  calculateTimerDurationSeconds,
   dbTimestampToLocalDate,
   localDateToDbTimestampDate,
   serializeDbTimestamp,
+  serializeTimerTimestamp,
+  timerDurationSecondsSql,
   toDbLocalTimestamp,
   type DbTimestampValue,
 } from "@/lib/server/db-time";
@@ -41,13 +40,14 @@ import {
   canWriteProjectId,
   canReadProjectId,
   extractProjectColor,
-  getReadableProjectIds,
   getParticipatingProjectIds,
   normalizeOptionalUuid,
   isDateOnlyTaskInput,
   parseTaskWallClockDate,
   normalizeTaskTitle,
   resolveProjectTagIds,
+  resolveReadScope,
+  TaskBrowseScopeError,
   stripGoogleCalendarMetadata,
   taskToSnake,
 } from "@/lib/server/task-route-utils";
@@ -55,6 +55,7 @@ import {
 import { getTaskNotificationsDefaultEnabled } from "@/lib/user-settings";
 import { estimateOccurrenceCount, parseRrule } from "@/lib/recurrence-rrule";
 import {
+  isRecurrenceOverrideSourceKind,
   isRecurrenceSkipSourceKind,
   resolveOccurrenceOriginalStartAt,
 } from "@/lib/recurrence-exceptions";
@@ -65,6 +66,17 @@ import {
 } from "@/lib/task-list-effective-occurrence";
 import { jsonWithConditional } from "@/lib/server/http-cache";
 import { lockTaskProjectIds } from "@/lib/server/project-move-dependency-invariant";
+import {
+  enqueueKnowledgeCaptureForCompletion,
+  recordTaskActivity,
+} from "@/lib/server/knowledge-capture-enqueue";
+import {
+  assertTaskDocsNodeLinkAllowed,
+  assertTaskProjectAccessInTransaction,
+  assertTaskDocsNodeLinkAllowedInTransaction,
+  TaskDocsNodeInvariantError,
+  TaskProjectAccessInvariantError,
+} from "@/lib/server/task-docs-node-invariant";
 
 const TASK_LIST_OCCURRENCE_LOOKAHEAD_DAYS = 366;
 
@@ -144,15 +156,81 @@ async function resolveTaskListEffectiveOccurrences(
       : await db
           .select()
           .from(taskOccurrences)
+          .where(inArray(taskOccurrences.taskId, recurrenceTaskIds));
+
+  const segmentRows =
+    recurrenceTaskIds.length === 0
+      ? []
+      : await db
+          .select({
+            taskId: taskRecurrenceScheduleSegments.taskId,
+            effectiveFrom: taskRecurrenceScheduleSegments.effectiveFrom,
+            startOffsetSeconds:
+              taskRecurrenceScheduleSegments.startOffsetSeconds,
+            endOffsetSeconds: taskRecurrenceScheduleSegments.endOffsetSeconds,
+            allDay: taskRecurrenceScheduleSegments.allDay,
+          })
+          .from(taskRecurrenceScheduleSegments)
           .where(
-            and(
-              inArray(taskOccurrences.taskId, recurrenceTaskIds),
-              lte(taskOccurrences.startAt, toDbLocalTimestamp(rangeEnd)),
-            ),
+            inArray(taskRecurrenceScheduleSegments.taskId, recurrenceTaskIds),
           );
+  const segmentsByTask = new Map<string, RecurrenceScheduleSegment[]>();
+  for (const row of segmentRows) {
+    const segments = segmentsByTask.get(row.taskId) ?? [];
+    segments.push({
+      effectiveFrom: row.effectiveFrom,
+      startOffsetSeconds: row.startOffsetSeconds ?? 0,
+      endOffsetSeconds: row.endOffsetSeconds ?? 0,
+      allDay: row.allDay ?? false,
+    });
+    segmentsByTask.set(row.taskId, segments);
+  }
+  const legacyCanonicalByTask = new Map<string, Map<number, Date>>();
+  for (const [taskId, rule] of recurrenceByTask) {
+    const task = taskById.get(taskId);
+    const taskStart = task
+      ? dbTimestampToLocalDate(task.startAt ?? task.endAt)
+      : null;
+    if (!task || !taskStart) continue;
+    const durationMs =
+      task.startAt && task.endAt
+        ? (getOccurrenceDurationMs(task.startAt, task.endAt) ?? 0)
+        : 0;
+    const paddingMs = getRecurrenceSegmentEnvelopeMs(
+      segmentsByTask.get(taskId) ?? [],
+    );
+    const parsed = parseRrule(rule.rrule);
+    const candidates = computeOccurrenceCandidatesInRange(
+      taskStart,
+      {
+        freq: parsed.freq,
+        interval: parsed.interval,
+        byDay: parsed.byDay,
+        skipWeekend: rule.skipWeekend ?? false,
+        skipHoliday: rule.skipHoliday ?? false,
+        skipMode: rule.skipMode ?? "shift_forward",
+        endCount: rule.endCount ?? null,
+        endDate: rule.endDate ? serializeDbTimestamp(rule.endDate) : null,
+      },
+      new Date(rangeStart.getTime() - durationMs - paddingMs - 14 * 86400000),
+      new Date(rangeEnd.getTime() + durationMs + paddingMs + 14 * 86400000),
+      20000,
+    );
+    const byActual = new Map<number, Date>();
+    for (const candidate of candidates) {
+      if (!byActual.has(candidate.occurrenceStart.getTime())) {
+        byActual.set(
+          candidate.occurrenceStart.getTime(),
+          candidate.canonicalStart,
+        );
+      }
+    }
+    legacyCanonicalByTask.set(taskId, byActual);
+  }
 
   const occurrenceMaps = new Map<string, Map<string, EffectiveOccurrence>>();
   const hiddenOccurrences = new Set<string>();
+  const explicitCanonicalOccurrences = new Set<string>();
 
   const setOccurrence = (
     taskId: string,
@@ -165,6 +243,18 @@ async function resolveTaskListEffectiveOccurrences(
       occurrenceMaps.set(taskId, map);
     }
   };
+  const removeCanonicalOccurrences = (taskId: string, canonicalKey: string) => {
+    const map = occurrenceMaps.get(taskId);
+    if (!map) return;
+    for (const [key, occurrence] of map) {
+      if (
+        occurrence.originalStartAt &&
+        occurrenceKey(taskId, occurrence.originalStartAt) === canonicalKey
+      ) {
+        map.delete(key);
+      }
+    }
+  };
 
   for (const row of storedRows) {
     const task = taskById.get(row.taskId);
@@ -173,26 +263,80 @@ async function resolveTaskListEffectiveOccurrences(
     const rowEndAt = dbTimestampToLocalDate(row.endAt);
     if (!rowStartAt) continue;
 
-    const originalStartAt = resolveOccurrenceOriginalStartAt(
-      row.sourceKind,
-      rowStartAt,
-    );
+    let originalStartAt = row.originalStartAt
+      ? dbTimestampToLocalDate(row.originalStartAt)
+      : dbTimestampToLocalDate(
+          resolveOccurrenceOriginalStartAt(row.sourceKind, rowStartAt),
+        );
+    if (
+      row.originalStartAt === null &&
+      !isRecurrenceOverrideSourceKind(row.sourceKind) &&
+      !isRecurrenceSkipSourceKind(row.sourceKind)
+    ) {
+      originalStartAt =
+        legacyCanonicalByTask.get(row.taskId)?.get(rowStartAt.getTime()) ??
+        originalStartAt;
+    }
     const originalKey = originalStartAt
       ? occurrenceKey(row.taskId, originalStartAt)
       : null;
 
     if (originalKey && isRecurrenceSkipSourceKind(row.sourceKind)) {
+      if (explicitCanonicalOccurrences.has(originalKey)) continue;
       hiddenOccurrences.add(originalKey);
+      removeCanonicalOccurrences(row.taskId, originalKey);
       continue;
+    }
+    if (originalKey && isRecurrenceOverrideSourceKind(row.sourceKind)) {
+      explicitCanonicalOccurrences.add(originalKey);
+      hiddenOccurrences.delete(originalKey);
+      removeCanonicalOccurrences(row.taskId, originalKey);
     }
     if (originalKey && isClosedTaskStatus(row.status)) {
       hiddenOccurrences.add(originalKey);
     }
 
+    const isExplicitException =
+      isRecurrenceOverrideSourceKind(row.sourceKind) ||
+      isRecurrenceSkipSourceKind(row.sourceKind);
+    const hasCanonicalIdentity = row.originalStartAt !== null;
+    const segmentResult =
+      !isExplicitException && !hasCanonicalIdentity && originalStartAt
+        ? applyRecurrenceScheduleSegment({
+            canonicalStart: originalStartAt,
+            canonicalEnd: (() => {
+              const durationMs =
+                task.startAt && task.endAt
+                  ? getOccurrenceDurationMs(task.startAt, task.endAt)
+                  : null;
+              return durationMs !== null
+                ? new Date(originalStartAt.getTime() + durationMs)
+                : rowEndAt;
+            })(),
+            baseAllDay: row.allDay ?? task.allDay ?? false,
+            segments: segmentsByTask.get(row.taskId) ?? [],
+          })
+        : null;
+    const rowAlreadyApplied =
+      segmentResult !== null &&
+      rowStartAt.getTime() === segmentResult.startAt.getTime() &&
+      (row.allDay ?? false) === segmentResult.allDay &&
+      (!segmentResult.endAt ||
+        rowEndAt?.getTime() === segmentResult.endAt.getTime());
+    const actualStartAt = rowAlreadyApplied
+      ? rowStartAt
+      : (segmentResult?.startAt ?? rowStartAt);
+    const actualEndAt = rowAlreadyApplied
+      ? rowEndAt
+      : (segmentResult?.endAt ?? rowEndAt);
+    const actualAllDay = rowAlreadyApplied
+      ? (row.allDay ?? task.allDay ?? false)
+      : (segmentResult?.allDay ?? row.allDay ?? task.allDay ?? false);
+
     if (
       !shouldIncludeTaskScheduleOccurrence({
-        start: rowStartAt,
-        end: rowEndAt,
+        start: actualStartAt,
+        end: actualEndAt,
         status: row.status,
         rangeStart,
         rangeEnd,
@@ -201,16 +345,15 @@ async function resolveTaskListEffectiveOccurrences(
       continue;
     }
 
-    setOccurrence(row.taskId, occurrenceKey(row.taskId, row.startAt), {
+    const actualKey = occurrenceKey(row.taskId, actualStartAt);
+    setOccurrence(row.taskId, originalKey ?? actualKey, {
       id: row.id,
-      startAt: row.startAt,
-      endAt: row.endAt,
-      allDay: row.allDay ?? task.allDay ?? false,
+      startAt: actualStartAt,
+      endAt: actualEndAt,
+      allDay: actualAllDay,
       status: row.status ?? task.status ?? null,
       sourceKind: row.sourceKind ?? null,
-      originalStartAt: originalStartAt
-        ? (serializeDbTimestamp(originalStartAt) ?? originalStartAt)
-        : null,
+      originalStartAt: serializeDbTimestamp(originalStartAt),
     });
   }
 
@@ -225,27 +368,45 @@ async function resolveTaskListEffectiveOccurrences(
     const baseStartLocal = dbTimestampToLocalDate(baseStart);
     const baseEndLocal = dbTimestampToLocalDate(baseEnd);
     if (!baseStartLocal) continue;
+    const segments = segmentsByTask.get(task.id) ?? [];
+    const segmentEnvelopeMs = getRecurrenceSegmentEnvelopeMs(segments);
+    const generationRangeStart = new Date(
+      rangeStart.getTime() - segmentEnvelopeMs,
+    );
+    const generationRangeEnd = new Date(rangeEnd.getTime() + segmentEnvelopeMs);
+    const baseApplied = applyRecurrenceScheduleSegment({
+      canonicalStart: baseStartLocal,
+      canonicalEnd: baseEndLocal,
+      baseAllDay: task.allDay ?? false,
+      segments,
+    });
 
     if (
       shouldIncludeTaskScheduleOccurrence({
-        start: baseStartLocal,
-        end: baseEndLocal,
+        start: baseApplied.startAt,
+        end: baseApplied.endAt,
         status: task.status,
         rangeStart,
         rangeEnd,
-        blocked: hiddenOccurrences.has(occurrenceKey(task.id, baseStart)),
+        blocked:
+          hiddenOccurrences.has(occurrenceKey(task.id, baseStart)) ||
+          explicitCanonicalOccurrences.has(occurrenceKey(task.id, baseStart)),
       })
     ) {
-      const key = occurrenceKey(task.id, baseStart);
-      if (!hiddenOccurrences.has(key)) {
+      const canonicalKey = occurrenceKey(task.id, baseStart);
+      const key = canonicalKey;
+      if (
+        !hiddenOccurrences.has(canonicalKey) &&
+        !explicitCanonicalOccurrences.has(canonicalKey)
+      ) {
         setOccurrence(task.id, key, {
           id: null,
-          startAt: baseStart,
-          endAt: baseEnd,
-          allDay: task.allDay ?? false,
+          startAt: baseApplied.startAt,
+          endAt: baseApplied.endAt,
+          allDay: baseApplied.allDay,
           status: task.status ?? null,
           sourceKind: "task_schedule",
-          originalStartAt: serializeDbTimestamp(baseStart),
+          originalStartAt: serializeDbTimestamp(baseApplied.originalStartAt),
         });
       }
     }
@@ -270,37 +431,68 @@ async function resolveTaskListEffectiveOccurrences(
       : null;
     const occurrenceRangeStart =
       durationMs !== null && durationMs > 0
-        ? new Date(rangeStart.getTime() - durationMs)
-        : rangeStart;
-    const count = estimateOccurrenceCount(baseStartLocal, rangeEnd, config);
-    const upcomingStarts = computeOccurrencesInRange(
+        ? new Date(generationRangeStart.getTime() - durationMs)
+        : generationRangeStart;
+    const count = estimateOccurrenceCount(
+      baseStartLocal,
+      generationRangeEnd,
+      config,
+    );
+    const upcomingOccurrences = computeOccurrenceCandidatesInRange(
       baseStartLocal,
       config,
       occurrenceRangeStart,
-      rangeEnd,
+      generationRangeEnd,
       count,
     );
 
-    for (const nextStart of upcomingStarts) {
-      const nextEnd = applyOccurrenceDuration(nextStart, durationMs);
-      if (!occurrenceOverlapsRange(nextStart, nextEnd, rangeStart, rangeEnd))
+    for (const {
+      canonicalStart: nextStart,
+      occurrenceStart: shiftedStart,
+    } of upcomingOccurrences) {
+      const canonicalEnd = applyOccurrenceDuration(nextStart, durationMs);
+      const shiftedEnd = applyOccurrenceDuration(shiftedStart, durationMs);
+      const applied = applyRecurrenceScheduleSegment({
+        canonicalStart: nextStart,
+        canonicalEnd,
+        baseStartAt: shiftedStart,
+        baseEndAt: shiftedEnd,
+        baseAllDay: task.allDay ?? false,
+        segments,
+      });
+      if (
+        !occurrenceOverlapsRange(
+          applied.startAt,
+          applied.endAt,
+          rangeStart,
+          rangeEnd,
+        )
+      )
         continue;
 
-      const nextStartDb = localDateToDbTimestampDate(nextStart) ?? nextStart;
-      const nextEndDb = nextEnd
-        ? (localDateToDbTimestampDate(nextEnd) ?? nextEnd)
+      const canonicalStartDb =
+        localDateToDbTimestampDate(nextStart) ?? nextStart;
+      const actualStartDb =
+        localDateToDbTimestampDate(applied.startAt) ?? applied.startAt;
+      const actualEndDb = applied.endAt
+        ? (localDateToDbTimestampDate(applied.endAt) ?? applied.endAt)
         : null;
-      const key = occurrenceKey(task.id, nextStartDb);
-      if (hiddenOccurrences.has(key)) continue;
+      const canonicalKey = occurrenceKey(task.id, canonicalStartDb);
+      const key = canonicalKey;
+      if (
+        hiddenOccurrences.has(canonicalKey) ||
+        explicitCanonicalOccurrences.has(canonicalKey)
+      )
+        continue;
 
       setOccurrence(task.id, key, {
         id: null,
-        startAt: nextStartDb,
-        endAt: nextEndDb,
-        allDay: task.allDay ?? false,
+        startAt: actualStartDb,
+        endAt: actualEndDb,
+        allDay: applied.allDay,
         status: normalizeTaskStatus(rule.resetStatusTo || "open") || "open",
         sourceKind: "rrule",
-        originalStartAt: serializeDbTimestamp(nextStartDb),
+        originalStartAt: serializeDbTimestamp(canonicalStartDb),
       });
     }
   }
@@ -324,13 +516,18 @@ export async function GET(request: NextRequest) {
   }
 
   const { searchParams } = new URL(request.url);
-  const projectId = searchParams.get("project_id");
-  const spaceId = searchParams.get("space_id");
-
-  const readableProjectIds = await getParticipatingProjectIds(user.id, {
-    projectId,
-    spaceId: projectId ? null : spaceId,
-  });
+  let readableProjectIds: string[];
+  try {
+    readableProjectIds = (await resolveReadScope(user, searchParams)).projectIds;
+  } catch (error) {
+    if (error instanceof TaskBrowseScopeError) {
+      return NextResponse.json(
+        { detail: error.message },
+        { status: error.status },
+      );
+    }
+    throw error;
+  }
   if (readableProjectIds.length === 0) {
     return jsonWithConditional(request, []);
   }
@@ -366,7 +563,7 @@ export async function GET(request: NextRequest) {
       projectMetadata: projects.projectMetadata,
     })
     .from(projects)
-    .where(inArray(projects.id, projectIds));
+    .where(and(inArray(projects.id, projectIds), isNull(projects.deletedAt)));
 
   const assigneeRowsQuery = db
     .select({
@@ -413,7 +610,10 @@ export async function GET(request: NextRequest) {
   const totalTimeRowsQuery = db
     .select({
       taskId: timeEntries.taskId,
-      totalSeconds: sql<number>`coalesce(sum(greatest(extract(epoch from (${timeEntries.endedAt} - ${timeEntries.startedAt})), 0))::int, 0)`,
+      totalSeconds: timerDurationSecondsSql(
+        timeEntries.startedAt,
+        timeEntries.endedAt,
+      ),
     })
     .from(timeEntries)
     .where(
@@ -478,27 +678,15 @@ export async function GET(request: NextRequest) {
 
   const activeByTask = new Map<string, unknown>();
   for (const e of activeEntries) {
-    const startedAt = correctLikelyTimerStartedAt(
-      e.startedAt,
-      e.createdAt,
-      e.source,
-    );
     activeByTask.set(e.taskId, {
       id: e.id,
       task_id: e.taskId,
       user_id: e.userId,
-      started_at: serializeDbTimestamp(startedAt),
-      ended_at: serializeDbTimestamp(e.endedAt),
+      started_at: serializeTimerTimestamp(e.startedAt),
+      ended_at: serializeTimerTimestamp(e.endedAt),
       duration_seconds:
         e.startedAt && e.endedAt
-          ? Math.max(
-              0,
-              Math.floor(
-                ((dbTimestampToLocalDate(e.endedAt)?.getTime() ?? 0) -
-                  (dbTimestampToLocalDate(startedAt)?.getTime() ?? 0)) /
-                  1000,
-              ),
-            )
+          ? calculateTimerDurationSeconds(e.startedAt, e.endedAt)
           : null,
       source: e.source,
       note: e.note,
@@ -607,6 +795,22 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ detail: "権限がありません" }, { status: 403 });
   }
 
+  const normalizedKnowledgeNodeId = normalizeOptionalUuid(knowledge_node_id);
+  if (normalizedKnowledgeNodeId) {
+    try {
+      await assertTaskDocsNodeLinkAllowed(
+        normalizedKnowledgeNodeId,
+        String(project_id),
+        user,
+      );
+    } catch (error) {
+      if (error instanceof TaskDocsNodeInvariantError) {
+        return NextResponse.json({ detail: error.message }, { status: error.status });
+      }
+      throw error;
+    }
+  }
+
   const { tagIds: normalizedTagIds, invalidTagIds } =
     await resolveProjectTagIds(project_id, tag_ids);
   if (invalidTagIds.length > 0) {
@@ -667,7 +871,7 @@ export async function POST(request: NextRequest) {
 
     const taskInsertValues = {
       projectId: project_id,
-      knowledgeNodeId: normalizeOptionalUuid(knowledge_node_id),
+      knowledgeNodeId: normalizedKnowledgeNodeId,
       title: normalizedTitle,
       description: description || null,
       status: normalizedStatus,
@@ -684,8 +888,7 @@ export async function POST(request: NextRequest) {
           : !!notifications_enabled,
       createdBy: user.id,
       taskMetadata,
-      estimatedHours:
-        estimated_hours != null ? Number(estimated_hours) : null,
+      estimatedHours: estimated_hours != null ? Number(estimated_hours) : null,
       sortOrder: newSortOrder,
       parentTaskId: normalizedParentTaskId,
       completedAt:
@@ -699,6 +902,17 @@ export async function POST(request: NextRequest) {
           // locks. Revalidate the parent row while it is locked, then insert
           // the child before releasing the transaction lock.
           await lockTaskProjectIds(tx, [project_id]);
+          await assertTaskProjectAccessInTransaction(tx, [project_id], user, {
+            requireRead: true,
+          });
+          if (normalizedKnowledgeNodeId) {
+            await assertTaskDocsNodeLinkAllowedInTransaction(
+              tx,
+              normalizedKnowledgeNodeId,
+              String(project_id),
+              user,
+            );
+          }
           const [parent] = await tx
             .select({ id: tasks.id, projectId: tasks.projectId })
             .from(tasks)
@@ -726,35 +940,96 @@ export async function POST(request: NextRequest) {
             .insert(tasks)
             .values(taskInsertValues)
             .returning();
-          return inserted;
+          if (normalizedTagIds.length > 0) {
+            await tx.insert(taskTags).values(
+              normalizedTagIds.map((tagId: string) => ({
+                taskId: inserted.id,
+                tagId,
+              })),
+            );
+          }
+           if (normalizedAssigneeIds.length > 0) {
+             await tx.insert(taskAssignees).values(
+              normalizedAssigneeIds.map((userId: string, i: number) => ({
+                taskId: inserted.id,
+                userId,
+                isPrimary: i === 0,
+               })),
+             );
+           }
+           const activity = await recordTaskActivity(tx, {
+             taskId: inserted.id,
+             userId: user.id,
+             activityType: "task_created",
+             payload: {
+               project_id: String(project_id),
+               status: normalizedStatus,
+             },
+           });
+           if (normalizedStatus === "closed") {
+             await enqueueKnowledgeCaptureForCompletion(tx, {
+               taskId: inserted.id,
+               projectId: project_id,
+               status: normalizedStatus,
+               completedAt: inserted.completedAt,
+               activity,
+               triggerUserId: user.id,
+             });
+           }
+           return inserted;
         })
-      : (
-          await db
-            .insert(tasks)
-            .values(taskInsertValues)
-            .returning()
-        )[0];
-
-    // タグ関連付け
-    if (normalizedTagIds.length > 0) {
-      await db.insert(taskTags).values(
-        normalizedTagIds.map((tagId: string) => ({
-          taskId: task.id,
-          tagId,
-        })),
-      );
-    }
-
-    // アサイン
-    if (normalizedAssigneeIds.length > 0) {
-      await db.insert(taskAssignees).values(
-        normalizedAssigneeIds.map((userId: string, i: number) => ({
-          taskId: task.id,
-          userId,
-          isPrimary: i === 0,
-        })),
-      );
-    }
+      : await db.transaction(async (tx) => {
+          await lockTaskProjectIds(tx, [project_id]);
+          await assertTaskProjectAccessInTransaction(tx, [project_id], user, {
+            requireRead: true,
+          });
+          if (normalizedKnowledgeNodeId) {
+            await assertTaskDocsNodeLinkAllowedInTransaction(
+              tx,
+              normalizedKnowledgeNodeId,
+              String(project_id),
+              user,
+            );
+          }
+          const [inserted] = await tx.insert(tasks).values(taskInsertValues).returning();
+          if (normalizedTagIds.length > 0) {
+            await tx.insert(taskTags).values(
+              normalizedTagIds.map((tagId: string) => ({
+                taskId: inserted.id,
+                tagId,
+              })),
+            );
+          }
+           if (normalizedAssigneeIds.length > 0) {
+             await tx.insert(taskAssignees).values(
+              normalizedAssigneeIds.map((userId: string, i: number) => ({
+                taskId: inserted.id,
+                userId,
+                isPrimary: i === 0,
+               })),
+             );
+           }
+           const activity = await recordTaskActivity(tx, {
+             taskId: inserted.id,
+             userId: user.id,
+             activityType: "task_created",
+             payload: {
+               project_id: String(project_id),
+               status: normalizedStatus,
+             },
+           });
+           if (normalizedStatus === "closed") {
+             await enqueueKnowledgeCaptureForCompletion(tx, {
+               taskId: inserted.id,
+               projectId: project_id,
+               status: normalizedStatus,
+               completedAt: inserted.completedAt,
+               activity,
+               triggerUserId: user.id,
+             });
+           }
+           return inserted;
+        });
 
     const result = serializeAutoCloseOnDue(
       task,
@@ -799,10 +1074,13 @@ export async function POST(request: NextRequest) {
     return NextResponse.json(result);
   } catch (err) {
     if (err instanceof TaskParentProjectInvariantError) {
-      return NextResponse.json(
-        { detail: err.message },
-        { status: err.status },
-      );
+      return NextResponse.json({ detail: err.message }, { status: err.status });
+    }
+    if (err instanceof TaskDocsNodeInvariantError) {
+      return NextResponse.json({ detail: err.message }, { status: err.status });
+    }
+    if (err instanceof TaskProjectAccessInvariantError) {
+      return NextResponse.json({ detail: err.message }, { status: err.status });
     }
     console.error("Task creation error:", err);
     return NextResponse.json({ detail: String(err) }, { status: 500 });

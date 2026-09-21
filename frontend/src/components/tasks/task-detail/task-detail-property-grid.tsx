@@ -34,7 +34,12 @@ import {
   DropdownMenuContent,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import type { RecurrenceRule, Tag, Task } from "@/lib/task-api";
+import type {
+  RecurrenceRule,
+  RecurringOccurrenceContext,
+  Tag,
+  Task,
+} from "@/lib/task-api";
 import { toLocalDateTimeInputValue } from "@/lib/date-time";
 import { cn } from "@/lib/utils";
 import { formatTimerClock } from "@/lib/task-time";
@@ -81,6 +86,7 @@ export function TaskDetailPropertyGrid({
   applyLocalDraftUpdate,
   buildDateTaskUpdate,
   moveOccurrenceDateRange,
+  onRecurringDateRangeChange,
   resolveTagUpdates,
   handleRenameTag,
   handleChangeTagColor,
@@ -127,7 +133,7 @@ export function TaskDetailPropertyGrid({
   displayTaskTags: Tag[];
   displayStartAt: string | null | undefined;
   displayEndAt: string | null | undefined;
-  activeOccurrenceContext: { start_at?: string | null } | null;
+  activeOccurrenceContext: RecurringOccurrenceContext | null;
   editEstHours: string;
   setEditEstHours: (value: string) => void;
   estHoursSaving: boolean;
@@ -147,6 +153,15 @@ export function TaskDetailPropertyGrid({
     startAt: string | null;
     endAt: string | null;
   }) => Promise<void>;
+  /**
+   * 繰り返し発生回の日時変更を適用範囲選択へ渡す入口。
+   * 未指定時は既存の moveOccurrenceDateRange を使うため、呼び出し側の
+   * 互換性を保ったまま pending/dialog フローへ切り替えられる。
+   */
+  onRecurringDateRangeChange?: (values: {
+    startAt: string | null;
+    endAt: string | null;
+  }) => void;
   resolveTagUpdates: (
     tagNames: string[],
     targetProjectId?: string | null,
@@ -187,6 +202,8 @@ export function TaskDetailPropertyGrid({
   handleDeleteRecurrence: () => void;
   readOnly?: boolean;
 }) {
+  const effectiveAllDay = activeOccurrenceContext?.all_day ?? task.all_day;
+
   return (
     <div
       className="grid grid-cols-1 divide-y border-y md:grid-cols-2 md:gap-x-6 md:divide-y-0 md:[&>div:nth-child(even)]:border-l md:[&>div:nth-child(even)]:pl-6 md:[&>div:nth-child(n+3)]:border-t [&>div]:min-h-10 [&>div]:py-2"
@@ -292,12 +309,12 @@ export function TaskDetailPropertyGrid({
           {readOnly ? (
             <span className="text-xs text-muted-foreground">
               {formatTaskDateLabel(displayStartAt ?? null, {
-                allDay: task.all_day,
+                allDay: effectiveAllDay,
                 absoluteStyle: "long",
               })}
               {displayEndAt
-                ? ` → ${formatTaskDateLabel(displayEndAt, {
-                    allDay: task.all_day,
+                  ? ` → ${formatTaskDateLabel(displayEndAt, {
+                    allDay: effectiveAllDay,
                     absoluteStyle: "long",
                   })}`
                 : ""}
@@ -305,16 +322,16 @@ export function TaskDetailPropertyGrid({
           ) : (
             <TaskDatePicker
               startAt={toLocalDateTimeInputValue(displayStartAt, {
-                allDay: task.all_day,
+                allDay: effectiveAllDay,
               })}
               endAt={toLocalDateTimeInputValue(displayEndAt, {
-                allDay: task.all_day,
+                allDay: effectiveAllDay,
               })}
-              allDay={task.all_day}
+              allDay={effectiveAllDay}
               deferCommitUntilClose={!!activeOccurrenceContext?.start_at}
               onRangeChange={
                 activeOccurrenceContext?.start_at
-                  ? moveOccurrenceDateRange
+                  ? (onRecurringDateRangeChange ?? moveOccurrenceDateRange)
                   : ({ startAt, endAt }) =>
                       immediateUpdate(
                         buildDateTaskUpdate({

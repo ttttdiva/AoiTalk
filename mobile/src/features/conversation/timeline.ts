@@ -1,3 +1,4 @@
+import { conversationMessageIdentity } from "./conversation-submissions";
 import type { ConversationMessage } from "../../types/api";
 import type {
   ConversationEvent,
@@ -226,7 +227,7 @@ export function buildDurableTimeline(args: {
   activityMessage: string | null;
 }): TimelineItem[] {
   const items: TimelineItem[] = args.messages.map((message) => ({
-    id: message.id,
+    id: conversationMessageIdentity(message),
     type: "message",
     message,
   }));

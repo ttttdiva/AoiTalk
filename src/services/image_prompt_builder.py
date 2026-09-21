@@ -15,6 +15,7 @@ from typing import List, Tuple
 
 from ..llm.conversation_context import persist_usage_sync
 from .outbound_privacy_service import (
+    EgressDescriptor,
     OutboundPrivacyGateway,
     PrivacyError,
     get_privacy_policy_context,
@@ -399,14 +400,22 @@ async def _call_gemini_async(
         project_metadata=project_metadata if isinstance(project_metadata, Mapping) else None,
     )
 
-    def _sync_call():
-        protected = gateway.protect_sync(
-            {"prompt": prompt},
-            provider="gemini",
-            source_kind="image_prompt",
-        )
+    descriptor = EgressDescriptor(
+        action="image_prompt.scene_tags",
+        transport="google.generativeai",
+        destination="https://generativelanguage.googleapis.com",
+        provider="gemini",
+        tool="image_prompt_builder",
+        model=model_name,
+    )
+
+    def _send_scene_tags(protected_payload: object) -> str:
+        """Send only the gateway-approved prompt to Gemini."""
+
+        if not isinstance(protected_payload, Mapping):
+            raise PrivacyError("image prompt egress payload is malformed")
         response = model.generate_content(
-            str((protected.payload or {}).get("prompt") or "")
+            str(protected_payload.get("prompt") or "")
         )
         _record_gemini_usage(
             response,
@@ -414,7 +423,21 @@ async def _call_gemini_async(
             started=started,
             usage_context=usage_context,
         )
-        return gateway.restore(str(response.text or ""))
+        return str(getattr(response, "text", "") or "")
+
+    def _sync_call():
+        response_text = gateway.execute_sync(
+            {"prompt": prompt},
+            provider="gemini",
+            descriptor=descriptor,
+            sender=_send_scene_tags,
+            base_url="https://generativelanguage.googleapis.com",
+            source_kind="image_prompt",
+            model=model_name,
+        )
+        # Restore aliases that may appear in generated tags, while keeping
+        # the raw request entirely inside the gateway's in-memory boundary.
+        return gateway.restore(str(response_text or ""))
 
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, _sync_call)

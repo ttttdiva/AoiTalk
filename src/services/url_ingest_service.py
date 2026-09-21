@@ -27,7 +27,13 @@ import httpx
 from bs4 import BeautifulSoup
 
 from .deep_research_service import DeepResearchSearchClient, DeepResearchSource
-from .outbound_privacy_service import ExternalProviderBlocked, OutboundPrivacyGateway, PrivacyError
+from .outbound_privacy_service import (
+    EgressDescriptor,
+    ExternalProviderBlocked,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
 from .yahoo_realtime_search_service import canonicalize_x_url, x_status_id
 from .x_cookie_service import (
     XCookieResolution,
@@ -126,6 +132,53 @@ class UrlIngestService:
             "Accept-Language": "ja,en;q=0.8",
         }
 
+    async def _privacy_get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        headers: Mapping[str, str] | None = None,
+        cookies: Mapping[str, str] | None = None,
+        action: str = "url.fetch",
+        source_kind: str = "url_fetch",
+    ) -> httpx.Response:
+        """Perform one URL-ingest GET through the privacy gateway.
+
+        URL destinations and provider credentials are control-plane values;
+        query parameters (notably oEmbed URLs and X/GitHub identifiers) are
+        user-derived and therefore the payload protected by the gateway.
+        ``sender`` owns the actual httpx call so a failed review cannot fall
+        through to an unprotected request.
+        """
+
+        async def sender(protected_payload: Any) -> httpx.Response:
+            if not isinstance(protected_payload, Mapping) or "params" not in protected_payload:
+                raise PrivacyError("URL ingest reviewed payload is malformed")
+            protected_params = protected_payload.get("params")
+            if not isinstance(protected_params, Mapping):
+                raise PrivacyError("URL ingest reviewed params are malformed")
+            return await client.get(
+                url,
+                params=dict(protected_params),
+                headers=dict(headers) if headers is not None else None,
+                cookies=dict(cookies) if cookies is not None else None,
+            )
+
+        return await self._privacy_gateway.execute(
+            {"params": dict(params or {})},
+            provider="url_ingest",
+            descriptor=EgressDescriptor(
+                action=action,
+                transport="httpx",
+                destination=url,
+                provider="url_ingest",
+            ),
+            sender=sender,
+            base_url=url,
+            source_kind=source_kind,
+        )
+
     async def fetch_all(
         self,
         urls: list[str],
@@ -133,8 +186,28 @@ class UrlIngestService:
         user_id: UUID | None = None,
         session: Any = None,
     ) -> list[UrlFetchResult]:
+        # URL ingestion is often launched from a background clip worker, but
+        # interactive requests do provide a user id.  Bind that identity to
+        # the shared gateway so review-required content cannot silently use an
+        # anonymous scope; the background path intentionally remains
+        # fail-closed when no interactive session is present.
+        if user_id is not None and not getattr(self._privacy_gateway, "user_id", ""):
+            context = get_privacy_policy_context()
+            session_context = context.session_context or self.session_context or {}
+            session_id = str(
+                session_context.get("session_id")
+                or session_context.get("id")
+                or ""
+            )
+            self._privacy_gateway = OutboundPrivacyGateway(
+                self.config,
+                user_id=str(user_id),
+                session_id=session_id,
+                session_context=context.session_context or self.session_context,
+                project_metadata=context.project_metadata or self.project_metadata,
+            )
         async with httpx.AsyncClient(
-            timeout=self.timeout, follow_redirects=True, headers=self.headers
+            timeout=self.timeout, follow_redirects=False, headers=self.headers
         ) as client:
             if user_id is None and session is None:
                 # Preserve the simple call shape used by direct callers and
@@ -204,6 +277,15 @@ class UrlIngestService:
                 final_url=url,
                 error=self._status_message(status),
                 acquisition_status=status,
+            )
+        except (ExternalProviderBlocked, PrivacyError):
+            # Privacy/local-only denials are terminal for this URL.  Never
+            # fall through to an alternate provider or direct HTML fetch.
+            return UrlFetchResult(
+                requested_url=url,
+                final_url=url,
+                error="外部送信がプライバシーポリシーで拒否されました",
+                acquisition_status="privacy_blocked",
             )
         except Exception:  # URL単位で隔離し、全件の状態を必ず返す
             return UrlFetchResult(
@@ -282,13 +364,22 @@ class UrlIngestService:
         if len(parts) < 2:
             return await self._fetch_html(client, url)
         owner, repo = parts[0], parts[1].removesuffix(".git")
-        api = await client.get(f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}")
+        api_url = f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}"
+        api = await self._privacy_get(
+            client,
+            api_url,
+            action="github.repository.get",
+            source_kind="github_api",
+        )
         api.raise_for_status()
         meta = api.json()
         readme_text = ""
-        readme = await client.get(
+        readme = await self._privacy_get(
+            client,
             f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/readme",
             headers={**self.headers, "Accept": "application/vnd.github.raw+json"},
+            action="github.repository.readme",
+            source_kind="github_api",
         )
         if readme.is_success:
             readme_text = readme.text[: self.max_body_chars]
@@ -332,12 +423,20 @@ class UrlIngestService:
             return UrlFetchResult(requested_url=url)
         repo_id = f"{owner}/{repo}"
         encoded_id = f"{quote(owner, safe='')}/{quote(repo, safe='')}"
-        api = await client.get(f"https://huggingface.co/api/models/{encoded_id}")
+        api = await self._privacy_get(
+            client,
+            f"https://huggingface.co/api/models/{encoded_id}",
+            action="huggingface.model.get",
+            source_kind="huggingface_api",
+        )
         api.raise_for_status()
         meta = api.json()
         readme_text = ""
-        readme = await client.get(
-            f"https://huggingface.co/{encoded_id}/resolve/main/README.md"
+        readme = await self._privacy_get(
+            client,
+            f"https://huggingface.co/{encoded_id}/resolve/main/README.md",
+            action="huggingface.model.readme",
+            source_kind="huggingface_api",
         )
         if readme.is_success:
             readme_text = readme.text[: self.max_body_chars]
@@ -395,7 +494,12 @@ class UrlIngestService:
         model: dict[str, Any] | None = None
         version: dict[str, Any] | None = None
         if ref.model_id is not None:
-            response = await client.get(f"{_CIVITAI_API_ORIGIN}/api/v1/models/{ref.model_id}")
+            response = await self._privacy_get(
+                client,
+                f"{_CIVITAI_API_ORIGIN}/api/v1/models/{ref.model_id}",
+                action="civitai.model.get",
+                source_kind="civitai_api",
+            )
             response.raise_for_status()
             payload = response.json()
             if not isinstance(payload, dict):
@@ -405,8 +509,11 @@ class UrlIngestService:
             model is None or not self._civitai_version_in_model(model, ref.version_id)
         ):
             try:
-                response = await client.get(
-                    f"{_CIVITAI_API_ORIGIN}/api/v1/model-versions/{ref.version_id}"
+                response = await self._privacy_get(
+                    client,
+                    f"{_CIVITAI_API_ORIGIN}/api/v1/model-versions/{ref.version_id}",
+                    action="civitai.model_version.get",
+                    source_kind="civitai_api",
                 )
                 response.raise_for_status()
                 payload = response.json()
@@ -420,8 +527,11 @@ class UrlIngestService:
                     model_id = payload.get("modelId")
                     if not isinstance(model_id, int):
                         raise ValueError("Civitaiモデル情報を取得できませんでした")
-                    response = await client.get(
-                        f"{_CIVITAI_API_ORIGIN}/api/v1/models/{model_id}"
+                    response = await self._privacy_get(
+                        client,
+                        f"{_CIVITAI_API_ORIGIN}/api/v1/models/{model_id}",
+                        action="civitai.model.get",
+                        source_kind="civitai_api",
                     )
                     response.raise_for_status()
                     model_payload = response.json()
@@ -728,11 +838,35 @@ class UrlIngestService:
             connection.close()
 
     async def _safe_get(self, client: httpx.AsyncClient, url: str) -> httpx.Response:
-        """各redirect先を接続前に検証し、SSRFを防ぐ。"""
+        """各redirect先を接続前に検証し、SSRFを防ぐ。
+
+        The low-level pinned request is still a real external egress, so each
+        hop is its own gateway transaction.  Redirects are never delegated to
+        httpx (which is configured with ``follow_redirects=False``); every hop
+        is revalidated and reviewed independently.
+        """
         current = url
         for _ in range(8):
             parts, address = await self._resolve_public_url(current)
-            response = await asyncio.to_thread(self._pinned_request, parts, address)
+            async def sender(_protected_payload: Any) -> httpx.Response:
+                return await asyncio.to_thread(self._pinned_request, parts, address)
+
+            try:
+                response = await self._privacy_gateway.execute(
+                    {},
+                    provider="url_ingest",
+                    descriptor=EgressDescriptor(
+                        action="url.http.get",
+                        transport="http.client",
+                        destination=current,
+                        provider="url_ingest",
+                    ),
+                    sender=sender,
+                    base_url=current,
+                    source_kind="url_http_fetch",
+                )
+            except (ExternalProviderBlocked, PrivacyError):
+                raise
             if response.is_redirect:
                 location = response.headers.get("location")
                 if not location:
@@ -878,9 +1012,12 @@ class UrlIngestService:
             observed_statuses.append(self._status_from_exception(exc))
         # 公開syndicationは本文・投稿者・日時・引用・mediaを構造化して返す。
         try:
-            response = await client.get(
+            response = await self._privacy_get(
+                client,
                 "https://cdn.syndication.twimg.com/tweet-result",
                 params={"id": tweet_id, "lang": "ja"},
+                action="x.syndication.get",
+                source_kind="x_syndication",
             )
             response.raise_for_status()
             data = response.json()
@@ -907,8 +1044,12 @@ class UrlIngestService:
             observed_statuses.append(self._status_from_exception(exc))
         # oEmbedは認証不要の別経路。本文を含むblockquoteだけを成功とする。
         try:
-            response = await client.get(
-                "https://publish.twitter.com/oembed", params={"url": url, "omit_script": "true"}
+            response = await self._privacy_get(
+                client,
+                "https://publish.twitter.com/oembed",
+                params={"url": url, "omit_script": "true"},
+                action="x.oembed.get",
+                source_kind="x_oembed",
             )
             response.raise_for_status()
             data = response.json()
@@ -929,7 +1070,8 @@ class UrlIngestService:
         bearer = os.getenv("X_BEARER_TOKEN") or os.getenv("TWITTER_BEARER_TOKEN")
         if bearer:
             try:
-                response = await client.get(
+                response = await self._privacy_get(
+                    client,
                     f"https://api.x.com/2/tweets/{tweet_id}",
                     params={
                         "tweet.fields": "created_at,author_id,conversation_id,in_reply_to_user_id,entities,attachments,referenced_tweets",
@@ -938,9 +1080,8 @@ class UrlIngestService:
                         "media.fields": "alt_text,type,url,preview_image_url",
                     },
                     headers={**self.headers, "Authorization": f"Bearer {bearer}"},
-                    # Authorization is also a secret header; do not allow a
-                    # redirect to replay it to an unexpected origin.
-                    follow_redirects=False,
+                    action="x.api.tweet.get",
+                    source_kind="x_api",
                 )
                 if bool(getattr(response, "is_redirect", False)) or int(
                     getattr(response, "status_code", 200) or 200
@@ -977,21 +1118,18 @@ class UrlIngestService:
             cookies, csrf_token = self._load_x_cookie_secret()
         if cookies:
             try:
-                response = await client.get(
+                response = await self._privacy_get(
+                    client,
                     url,
                     cookies=cookies,
-                    # Never let httpx follow a redirect while secret Cookie
-                    # headers are attached.  A redirect target may be a
-                    # different origin; rejecting the hop avoids leaking the
-                    # x-csrf-token header even when the Cookie jar itself is
-                    # filtered by httpx.
-                    follow_redirects=False,
                     headers={
                         **self.headers,
                         "x-csrf-token": csrf_token,
                         "x-twitter-auth-type": "OAuth2Session",
                         "x-twitter-active-user": "yes",
                     },
+                    action="x.authenticated_html.get",
+                    source_kind="x_authenticated_html",
                 )
                 if bool(getattr(response, "is_redirect", False)) or int(
                     getattr(response, "status_code", 200) or 200
@@ -1040,7 +1178,8 @@ class UrlIngestService:
         username = str(author.get("username") or "")
         if conversation_id and username:
             try:
-                thread_response = await client.get(
+                thread_response = await self._privacy_get(
+                    client,
                     "https://api.x.com/2/tweets/search/recent",
                     params={
                         "query": f"conversation_id:{conversation_id} from:{username}",
@@ -1048,7 +1187,8 @@ class UrlIngestService:
                         "tweet.fields": "created_at,referenced_tweets",
                     },
                     headers={**self.headers, "Authorization": f"Bearer {bearer}"},
-                    follow_redirects=False,
+                    action="x.api.thread.search",
+                    source_kind="x_api",
                 )
                 if not bool(getattr(thread_response, "is_redirect", False)) and int(
                     getattr(thread_response, "status_code", 200) or 200

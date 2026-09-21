@@ -14,18 +14,12 @@ from sqlalchemy import select
 
 from ..memory.database import get_db_session
 from ..memory.models import ConversationSession, Task
-from .context_memory_service import ContextMemoryService
-from .scoped_memory_flags import (
-    legacy_agent_memory_read_enabled,
-    scoped_memory_v2_enabled,
-)
 from .scoped_memory_service import ScopedMemoryService
 from .project_context import (
     ProjectContextResolver,
     format_minimal_project_context_for_chat_prompt,
     format_project_context_for_chat_prompt,
 )
-from .project_context_pack_service import ProjectContextPackService
 from .docs_acl import can_read_node, docs_readable_node_predicate
 from .docs_workspace import get_project_docs_library
 from .turn_context import get_turn_context
@@ -60,13 +54,11 @@ _WEAK_DETAIL_RE = re.compile(
 )
 
 _PROJECT_INFORMATION_EXCLUDED_PREFIXES = (
-    "agent_memory",
     "project_inbox",
     "project_mail",
     "workspace_file_reference:",
 )
 _PROJECT_INFORMATION_EXCLUDED_DOMAINS = {
-    "legacy_agent_memory",
     "project_inbox",
     "project_mail",
     "workspace_file_reference",
@@ -222,6 +214,60 @@ def _render_accessible_knowledge_index(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_work_intelligence(value: Any) -> str:
+    """Render the compiler's transient sidecar, never arbitrary payloads.
+
+    Work Intelligence is a structured *data* block.  The compiler has already
+    applied ACL, liveness, ranking, and prompt-injection filtering; this helper
+    intentionally accepts only its rendered block (or the matching mapping
+    key), and never serializes raw object/dict values into the prompt.
+    """
+
+    if value is None:
+        return ""
+    block = getattr(value, "rendered_block", None)
+    if not block:
+        block = getattr(value, "block", None)
+    if not block and isinstance(value, dict):
+        block = value.get("block") or value.get("rendered_block")
+    if not isinstance(block, str):
+        return ""
+    return block.strip()
+
+
+def _work_intelligence_provenance(value: Any) -> list[dict[str, Any]]:
+    """Return transient selected-item provenance for render trace consumers."""
+
+    trace = getattr(value, "trace", None)
+    if trace is None and isinstance(value, dict):
+        trace = value.get("trace")
+    if not isinstance(trace, list):
+        return []
+    result: list[dict[str, Any]] = []
+    for item in trace:
+        if not isinstance(item, dict):
+            continue
+        # The compiler emits hashed references for trace rows.  Keep only the
+        # structural fields here; raw IDs/titles are never copied into debug.
+        row = {
+            key: item[key]
+            for key in (
+                "kind",
+                "ref_hash",
+                "selected",
+                "score",
+                "evidence_count",
+                "uncertain",
+                "advisory_conflict",
+            )
+            if key in item
+        }
+        if row.get("selected") is False:
+            continue
+        result.append(row)
+    return result
+
+
 def _project_information_node_allowed(
     node: Any,
     *,
@@ -244,6 +290,177 @@ def _project_information_node_allowed(
     return any(tag.get("base_type") == "project_information" for tag in tags)
 
 
+def _context_manifest_index_provenance(
+    project_id: Any,
+    value: Any,
+    *,
+    groups: tuple[str, ...],
+) -> dict[str, Any]:
+    """Hash manifest-only provenance for an already-authorized index."""
+
+    from ..llm.context_snapshot import observation_ref_hash
+
+    project_ref_hash = observation_ref_hash("project", project_id)
+    if not project_ref_hash or not isinstance(value, dict):
+        return {}
+
+    node_ref_hashes: dict[str, list[str]] = {}
+    for group in groups:
+        hashes: set[str] = set()
+        rows = value.get(group)
+        if isinstance(rows, list):
+            for row in rows[:64]:
+                if not isinstance(row, dict):
+                    continue
+                node_id = row.get("id") or row.get("node_id")
+                digest = observation_ref_hash("knowledge_node", node_id)
+                if digest:
+                    hashes.add(digest)
+        node_ref_hashes[group] = sorted(hashes)
+
+    return {
+        "project_ref_hash": project_ref_hash,
+        "node_ref_hashes": node_ref_hashes,
+    }
+
+
+def _context_manifest_memory_lineage(
+    memories: Any,
+) -> list[dict[str, Any]]:
+    """Return bounded persistence-safe lineage without Memory title/body.
+
+    This is an observation of rows already selected by ScopedMemoryService.
+    It does not classify, mutate, touch last_used_at, or create a second
+    memory source of truth.
+    """
+
+    from ..llm.context_snapshot import observation_ref_hash
+
+    def read_field(memory: Any, key: str) -> Any:
+        if isinstance(memory, dict):
+            return memory.get(key)
+        return getattr(memory, key, None)
+
+    def safe_timestamp(value: Any) -> str | None:
+        if value is None:
+            return None
+        if hasattr(value, "isoformat"):
+            value = value.isoformat()
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text if re.fullmatch(r"[0-9TZ:+.\-]{1,64}", text) else None
+
+    result: list[dict[str, Any]] = []
+    for memory in list(memories or [])[:8]:
+        scope_type = str(
+            read_field(memory, "scope_type") or ""
+        ).strip().casefold()
+        if scope_type not in {
+            "global",
+            "user",
+            "project",
+            "task",
+            "session",
+        }:
+            continue
+
+        memory_ref_hash = observation_ref_hash(
+            "scoped_memory",
+            read_field(memory, "id"),
+        )
+        if not memory_ref_hash:
+            continue
+
+        scope_value = {
+            "user": read_field(memory, "user_id"),
+            "project": read_field(memory, "project_id"),
+            "task": read_field(memory, "task_id"),
+            "session": read_field(memory, "session_id"),
+        }.get(scope_type)
+        if scope_type != "global" and not scope_value:
+            scope_value = read_field(memory, "scope_id")
+
+        raw_evidence = read_field(memory, "evidence_refs")
+        if not isinstance(raw_evidence, (list, tuple)):
+            raw_evidence = ()
+        evidence_hashes = [
+            digest
+            for raw in list(raw_evidence)[:16]
+            if (
+                digest := observation_ref_hash(
+                    "scoped_memory_evidence",
+                    raw,
+                )
+            )
+        ]
+
+        version = read_field(memory, "version")
+        try:
+            version = (
+                int(version)
+                if version is not None and not isinstance(version, bool)
+                else None
+            )
+        except (TypeError, ValueError):
+            version = None
+
+        result.append(
+            {
+                "memory_ref_hash": memory_ref_hash,
+                "scope_type": scope_type,
+                "scope_ref_hash": (
+                    observation_ref_hash(scope_type, scope_value)
+                    if scope_type != "global" and scope_value
+                    else None
+                ),
+                "source_type": str(
+                    read_field(memory, "source_type") or ""
+                ).strip(),
+                "source_ref_hash": observation_ref_hash(
+                    "scoped_memory_source",
+                    read_field(memory, "source_ref"),
+                ),
+                "version": version,
+                "supersedes_ref_hash": observation_ref_hash(
+                    "scoped_memory",
+                    read_field(memory, "supersedes_id"),
+                ),
+                "evidence_ref_hashes": evidence_hashes,
+                "created_at": safe_timestamp(
+                    read_field(memory, "created_at")
+                ),
+                "updated_at": safe_timestamp(
+                    read_field(memory, "updated_at")
+                ),
+            }
+        )
+    return result
+
+
+def _record_context_manifest_observation(
+    debug: dict[str, Any],
+    key: str,
+    producer: Any,
+    *,
+    enabled: bool,
+) -> None:
+    """Record optional Manifest-only debug without affecting legacy context."""
+
+    if not enabled:
+        return
+    try:
+        value = producer()
+    except Exception:
+        logger.warning(
+            "[ContextBuilder] ContextManifest observation failed: %s",
+            key,
+        )
+        return
+    if value:
+        debug[key] = value
+
+
 @dataclass
 class ContextBundle:
     memory_context_block: str = ""
@@ -251,12 +468,25 @@ class ContextBundle:
     project_information_block: str = ""
     project_knowledge_index: Optional[Dict[str, Any]] = None
     accessible_knowledge_index: Optional[Dict[str, Any]] = None
-    agent_memory_block: str = ""
-    project_pack_block: str = ""
     task_context_block: str = ""
     session_context_block: str = ""
+    # Typed provider-neutral projection produced by WorkIntelligenceCompiler.
+    # ``work_intelligence_block`` is the only value rendered into a prompt;
+    # ``work_intelligence`` is a transient sidecar for trace/Manifest builders.
+    work_intelligence_block: str = ""
+    work_intelligence: Any = None
     debug: Dict[str, Any] = field(default_factory=dict)
     max_chars: int = 12000
+
+    @property
+    def work_intelligence_sidecar(self) -> Any:
+        """Compatibility alias for inspector/Manifest consumers."""
+
+        return self.work_intelligence
+
+    @property
+    def structured_work_intelligence(self) -> Any:
+        return self.work_intelligence
 
     def render_with_trace(self, max_chars: Optional[int] = None) -> tuple[str, list[dict[str, Any]]]:
         limit = max_chars or self.max_chars
@@ -266,16 +496,21 @@ class ContextBundle:
         accessible_knowledge_index_block = _render_accessible_knowledge_index(
             self.accessible_knowledge_index
         )
+        work_intelligence_block = self.work_intelligence_block or _render_work_intelligence(
+            self.work_intelligence
+        )
         blocks = [
-            ("project_context", "Project context", "ContextBundle.project_context_block", self.project_context_block, 85),
-            ("session_summary", "Session summary", "ContextBundle.session_context_block", self.session_context_block, 90),
-            ("context_memory", "Context memory", "ContextBundle.memory_context_block", self.memory_context_block, 100),
-            ("project_knowledge_index", "Active Project Knowledge", "ContextBundle.project_knowledge_index", project_knowledge_index_block, 84),
-            ("accessible_knowledge_index", "Accessible Knowledge", "ContextBundle.accessible_knowledge_index", accessible_knowledge_index_block, 82),
-            ("project_information", "Project information / Docs", "ContextBundle.project_information_block", self.project_information_block, 80),
-            ("agent_memory", "Agent Memory", "ContextBundle.agent_memory_block", self.agent_memory_block, 70),
-            ("project_context_pack", "Project context pack", "ContextBundle.project_pack_block", self.project_pack_block, 60),
-            ("active_task_context", "Active task context", "ContextBundle.task_context_block", self.task_context_block, 95),
+            ("project_context", "Project context", "ContextBundle.project_context_block", self.project_context_block, 100),
+            ("session_summary", "Session summary", "ContextBundle.session_context_block", self.session_context_block, 95),
+            ("context_memory", "Context memory", "ContextBundle.memory_context_block", self.memory_context_block, 90),
+            # Live authoritative work state outranks advisory memory under a
+            # tight shared budget, while the selected Project identity remains
+            # the highest-priority scope anchor.
+            ("work_intelligence", "Work Intelligence", "ContextBundle.work_intelligence_block", work_intelligence_block, 98),
+            ("project_knowledge_index", "Active Project Knowledge", "ContextBundle.project_knowledge_index", project_knowledge_index_block, 85),
+            ("accessible_knowledge_index", "Accessible Knowledge", "ContextBundle.accessible_knowledge_index", accessible_knowledge_index_block, 80),
+            ("project_information", "Project information / Docs", "ContextBundle.project_information_block", self.project_information_block, 75),
+            ("active_task_context", "Active task context", "ContextBundle.task_context_block", self.task_context_block, 70),
         ]
         seen: set[str] = set()
         candidates: list[tuple[int, str, str, str, str, int]] = []
@@ -345,7 +580,59 @@ class ContextBundle:
             rendered.append(chosen)
             clipped = len(chosen) < len(block)
             trace.append({"category": category, "label": label, "source": source, "text": chosen, "status": "active", "preview": "上限に合わせて切り詰めて送信" if clipped else "モデルへ送信済み", "selection_reason": layer.get("selection_reason", "selected_with_budget_truncation" if clipped else "selected_for_current_turn"), "duration_ms": layer.get("duration_ms"), "retrieved_chars": layer.get("retrieved_chars", len(block)), "selected_chars": len(chosen)})
-        return "\n\n".join(rendered), trace
+        output = "\n\n".join(rendered)
+
+        # Add structured offsets after outer budget clipping and stable block
+        # joining.  This keeps provenance tied to the *actual* text sent to the
+        # provider rather than to the pre-budget candidate strings.
+        cursor = 0
+        trace_by_category = {item.get("category"): item for item in trace}
+        for index, chosen in enumerate(rendered):
+            category = None
+            # Rendered blocks follow the historical category order; look up the
+            # first active trace whose text is exactly this chosen value.
+            for item in trace:
+                if item.get("status") == "active" and item.get("text") == chosen:
+                    category = item.get("category")
+                    break
+            if category is None:
+                cursor += len(chosen) + (2 if index < len(rendered) - 1 else 0)
+                continue
+            item = trace_by_category.get(category)
+            if item is not None:
+                item["offset_start"] = cursor
+                item["offset_end"] = cursor + len(chosen)
+                if category == "work_intelligence":
+                    provenance = _work_intelligence_provenance(self.work_intelligence)
+                    if provenance:
+                        # The compiler's trace is item-level but intentionally
+                        # does not carry arbitrary source text.  Compute line
+                        # spans from the selected data block and retain only
+                        # spans that survive clipping.
+                        spans: list[dict[str, Any]] = []
+                        lines = chosen.splitlines(keepends=True)
+                        line_cursor = 0
+                        item_index = 0
+                        for line in lines:
+                            if line.lstrip().startswith("- ") and item_index < len(provenance):
+                                end = line_cursor + len(line.rstrip("\r\n"))
+                                if line_cursor < len(chosen):
+                                    row = dict(provenance[item_index])
+                                    row.update(
+                                        {
+                                            "offset_start": cursor + line_cursor,
+                                            "offset_end": cursor + min(end, len(chosen)),
+                                        }
+                                    )
+                                    spans.append(row)
+                                item_index += 1
+                            line_cursor += len(line)
+                            if line_cursor >= len(chosen):
+                                break
+                        item["item_provenance"] = spans
+                        item["provenance"] = spans
+            cursor += len(chosen) + (2 if index < len(rendered) - 1 else 0)
+        return output, trace
 
     def render_for_prompt(self, max_chars: Optional[int] = None) -> str:
         return self.render_with_trace(max_chars)[0]
@@ -358,18 +645,77 @@ class ContextBuilder:
         self,
         *,
         context_memory_service: Optional[Any] = None,
-        project_context_pack_service: Optional[ProjectContextPackService] = None,
         project_context_resolver: Optional[ProjectContextResolver] = None,
+        work_intelligence_compiler: Optional[Any] = None,
+        manifest_config: Any = None,
     ):
-        self.context_memory_service = context_memory_service or (
-            ScopedMemoryService()
-            if scoped_memory_v2_enabled()
-            else ContextMemoryService()
-        )
-        self.project_context_pack_service = (
-            project_context_pack_service or ProjectContextPackService()
-        )
+        self.context_memory_service = context_memory_service or ScopedMemoryService()
         self.project_context_resolver = project_context_resolver or ProjectContextResolver()
+        # Import lazily so callers that only need legacy ContextBundle
+        # rendering do not pay for the optional projection's model imports.
+        if work_intelligence_compiler is None:
+            try:
+                from .work_intelligence import WorkIntelligenceCompiler
+
+                compiler_kwargs: dict[str, Any] = {
+                    "project_context_resolver": self.project_context_resolver,
+                }
+                if manifest_config is not None:
+                    # Config values are optional tuning only; malformed
+                    # values are ignored by the compiler's own safe clamps.
+                    getter = getattr(manifest_config, "get", None)
+
+                    def config_value(key: str) -> Any:
+                        if isinstance(manifest_config, dict):
+                            current: Any = manifest_config
+                            for part in key.split("."):
+                                if not isinstance(current, dict) or part not in current:
+                                    return None
+                                current = current[part]
+                            return current
+                        try:
+                            return getter(key, None) if callable(getter) else None
+                        except Exception:
+                            return None
+
+                    for key, target in (
+                        ("work_intelligence.compiler.max_items", "max_items"),
+                        ("work_intelligence.compiler.max_people", "max_people"),
+                        ("work_intelligence.compiler.max_evidence", "max_evidence"),
+                        ("work_intelligence.compiler.max_chars", "max_chars"),
+                    ):
+                        value = config_value(key)
+                        if isinstance(value, int) and not isinstance(value, bool):
+                            compiler_kwargs[target] = value
+                work_intelligence_compiler = WorkIntelligenceCompiler(**compiler_kwargs)
+            except Exception:
+                work_intelligence_compiler = None
+        self.work_intelligence_compiler = work_intelligence_compiler
+        self._work_intelligence_gate: Optional[bool] = None
+        try:
+            from .work_intelligence import work_intelligence_enabled
+
+            # ``manifest_config`` is the provider's existing config seam.  A
+            # missing seam keeps direct/test ContextBuilder use useful, while
+            # an explicit malformed/false rollout value fails closed.
+            if manifest_config is not None:
+                self._work_intelligence_gate = work_intelligence_enabled(
+                    manifest_config
+                )
+        except Exception:
+            self._work_intelligence_gate = False if manifest_config is not None else None
+        self._context_manifest_observation_enabled = False
+        if manifest_config is not None:
+            try:
+                from ..llm.context_snapshot import (
+                    context_manifest_persistence_enabled,
+                )
+
+                self._context_manifest_observation_enabled = (
+                    context_manifest_persistence_enabled(manifest_config)
+                )
+            except Exception:
+                self._context_manifest_observation_enabled = False
 
     async def build_context(
         self,
@@ -383,8 +729,6 @@ class ContextBuilder:
         project_context: Optional[dict[str, Any]] = None,
         include_project_context: bool = True,
         include_project_information: Optional[bool] = None,
-        include_agent_memory: Optional[bool] = None,
-        include_project_pack: Optional[bool] = None,
         include_task_context: Optional[bool] = None,
         project_context_mode: str = "auto",
     ) -> ContextBundle:
@@ -402,11 +746,24 @@ class ContextBuilder:
             "user_id": user_id,
             "project_id": project_id,
             "task_id": task_id,
+            "task_project_id": None,
             "session_id": session_id,
             "errors": {},
             "layers": {},
         }
         bundle = ContextBundle(max_chars=max_chars, debug=debug)
+        debug["work_intelligence_gate"] = self._work_intelligence_gate
+
+        # Project Steward and actorless Heartbeat execution supply their
+        # complete bounded input explicitly. Do not re-introduce user/global
+        # Memory, Personal Docs, session summaries, or other normal-chat
+        # context behind that controller's scope boundary.
+        if get_turn_context().suppress_automatic_context:
+            debug["automatic_context_suppressed"] = True
+            debug["automatic_context_reason"] = (
+                "trusted_background_execution"
+            )
+            return bundle
 
         def record_layer(
             category: str,
@@ -419,26 +776,13 @@ class ContextBuilder:
                 "project_knowledge_index": "project_knowledge",
                 "accessible_knowledge_index": "accessible_knowledge",
                 "project_information": "project_information",
-                "project_context_pack": "project_context_pack",
-                "agent_memory": "agent_memory",
                 "active_task_context": "task_context",
                 "session_summary": "session_context",
                 "context_memory": "context_memories",
+                "work_intelligence": "work_intelligence",
             }
             error_key = error_keys.get(category)
-            # ``project_pack`` is a lifecycle warning (stale/failed) while
-            # ``project_context_pack`` is the historical retrieval error key.
-            # Both must keep the layer trace honest without changing the
-            # externally visible warning contract.
-            lifecycle_error = debug["errors"].get("project_pack")
-            failed = bool(
-                error_key in debug["errors"]
-                or (
-                    category == "project_context_pack"
-                    and lifecycle_error
-                    and lifecycle_error != "stale_context_pack"
-                )
-            )
+            failed = bool(error_key in debug["errors"])
             debug["layers"][category] = {
                 "selection_reason": (
                     "retrieval_failed" if failed else selection_reason
@@ -450,8 +794,6 @@ class ContextBuilder:
                 "retrieved_chars": len(str(block or "")),
             }
         detailed_context_needed = _needs_detailed_project_context(message)
-        if include_project_pack is None:
-            include_project_pack = detailed_context_needed
         if include_task_context is None:
             include_task_context = bool(task_id) or detailed_context_needed
         resolved_project_context_mode = (
@@ -463,21 +805,9 @@ class ContextBuilder:
         )
         if include_project_information is None:
             include_project_information = detailed_context_needed
-        if include_agent_memory is None:
-            include_agent_memory = detailed_context_needed
         debug["project_information_selection"] = (
             "explicit_or_current_message_requires_details"
             if include_project_information
-            else "deferred_until_relevant_turn"
-        )
-        debug["agent_memory_selection"] = (
-            "explicit_or_current_message_requires_details"
-            if include_agent_memory
-            else "deferred_until_relevant_turn"
-        )
-        debug["project_pack_selection"] = (
-            "explicit_or_current_message_requires_details"
-            if include_project_pack
             else "deferred_until_relevant_turn"
         )
         debug["task_context_selection"] = (
@@ -510,6 +840,7 @@ class ContextBuilder:
             except Exception as exc:
                 logger.warning("[ContextBuilder] task scope lookup failed: %s", exc)
                 task_project_id = None
+            debug["task_project_id"] = task_project_id
             if task_project_id is None or (
                 project_id is not None and str(project_id) != str(task_project_id)
             ):
@@ -581,6 +912,16 @@ class ContextBuilder:
                     project_id=project_id,
                     actor_user_id=user_id,
                 )
+                _record_context_manifest_observation(
+                    debug,
+                    "project_knowledge_manifest_provenance",
+                    lambda: _context_manifest_index_provenance(
+                        project_id,
+                        bundle.project_knowledge_index,
+                        groups=("canonical_nodes", "related_nodes"),
+                    ),
+                    enabled=self._context_manifest_observation_enabled,
+                )
             except Exception as exc:
                 logger.warning("[ContextBuilder] project knowledge index failed: %s", exc)
                 debug["errors"]["project_knowledge"] = str(exc)
@@ -607,6 +948,16 @@ class ContextBuilder:
                         timeout=accessible_knowledge_timeout,
                     )
                 )
+                _record_context_manifest_observation(
+                    debug,
+                    "accessible_knowledge_manifest_provenance",
+                    lambda: _context_manifest_index_provenance(
+                        project_id,
+                        bundle.accessible_knowledge_index,
+                        groups=("project", "personal"),
+                    ),
+                    enabled=self._context_manifest_observation_enabled,
+                )
             except asyncio.TimeoutError:
                 # This layer is optional.  Keep canonical Project Knowledge
                 # and normal chat generation alive even when Personal Docs
@@ -619,8 +970,8 @@ class ContextBuilder:
                 debug["errors"]["accessible_knowledge"] = error
             except Exception as exc:
                 # Personal Docs are an additive index layer.  A scope/DB
-                # failure must not suppress the canonical Project Knowledge,
-                # Project Information, or Project Context Pack layers.
+                # failure must not suppress canonical Project Knowledge or
+                # Project Information.
                 logger.warning(
                     "[ContextBuilder] accessible knowledge index failed: %s",
                     exc,
@@ -655,149 +1006,12 @@ class ContextBuilder:
                 debug["project_information_selection"],
             )
 
-            project_pack_started = time.perf_counter()
-            if include_project_pack:
-                try:
-                    project_pack_status = None
-                    actor_renderer = getattr(
-                        self.project_context_pack_service,
-                        "render_project_context_pack_for_actor",
-                        None,
-                    )
-                    if callable(actor_renderer):
-                        lifecycle_result = await actor_renderer(
-                            project_id,
-                            actor_user_id=user_id,
-                        )
-                        if isinstance(lifecycle_result, tuple):
-                            (
-                                bundle.project_pack_block,
-                                project_pack_status,
-                            ) = lifecycle_result
-                        elif isinstance(lifecycle_result, dict):
-                            bundle.project_pack_block = str(
-                                lifecycle_result.get("rendered")
-                                or lifecycle_result.get("block")
-                                or ""
-                            )
-                            project_pack_status = lifecycle_result.get("status")
-                        else:
-                            bundle.project_pack_block = str(lifecycle_result or "")
-                            project_pack_status = None
-                    else:
-                        # Keep lifecycle-aware test doubles and older
-                        # integrations compatible while actor-scoped readers
-                        # roll out.
-                        render_with_status = getattr(
-                            self.project_context_pack_service,
-                            "render_project_context_pack_for_prompt_with_status",
-                            None,
-                        )
-                        if callable(render_with_status):
-                            lifecycle_result = await render_with_status(project_id)
-                            if isinstance(lifecycle_result, tuple):
-                                (
-                                    bundle.project_pack_block,
-                                    project_pack_status,
-                                ) = lifecycle_result
-                            elif isinstance(lifecycle_result, dict):
-                                bundle.project_pack_block = str(
-                                    lifecycle_result.get("rendered")
-                                    or lifecycle_result.get("block")
-                                    or ""
-                                )
-                                project_pack_status = lifecycle_result.get("status")
-                            else:
-                                bundle.project_pack_block = str(lifecycle_result or "")
-                                project_pack_status = None
-                        else:
-                            # Keep lightweight test doubles and older
-                            # integrations compatible while the lifecycle-aware
-                            # reader rolls out.
-                            legacy_pack_reader = getattr(
-                                self.project_context_pack_service,
-                                "get_project_context_pack",
-                                None,
-                            )
-                            legacy_pack = (
-                                await legacy_pack_reader(project_id)
-                                if callable(legacy_pack_reader)
-                                else None
-                            )
-                            legacy_status = str(
-                                (legacy_pack or {}).get("status") or "fresh"
-                            ).casefold()
-                            if legacy_status == "stale":
-                                debug["errors"]["project_pack"] = (
-                                    "stale_context_pack"
-                                )
-                                bundle.project_pack_block = (
-                                    await self.project_context_pack_service.render_project_context_pack_for_prompt(
-                                        project_id
-                                    )
-                                )
-                            elif legacy_status == "failed":
-                                debug["errors"]["project_pack"] = (
-                                    "failed_context_pack"
-                                )
-                                bundle.project_pack_block = ""
-                            else:
-                                bundle.project_pack_block = (
-                                    await self.project_context_pack_service.render_project_context_pack_for_prompt(
-                                        project_id
-                                    )
-                                )
-
-                    project_pack_status = str(
-                        project_pack_status or ""
-                    ).casefold()
-                    if project_pack_status == "stale":
-                        debug["errors"]["project_pack"] = (
-                            "stale_context_pack"
-                        )
-                    elif project_pack_status == "failed":
-                        debug["errors"]["project_pack"] = (
-                            "failed_context_pack"
-                        )
-                        bundle.project_pack_block = ""
-                except Exception as exc:
-                    logger.warning("[ContextBuilder] project context pack failed: %s", exc)
-                    debug["errors"]["project_context_pack"] = str(exc)
-            record_layer(
-                "project_context_pack",
-                project_pack_started,
-                bundle.project_pack_block,
-                debug["project_pack_selection"],
-            )
-
-        agent_memory_started = time.perf_counter()
-        # Project Context OFF must not turn the retained Selected Project ID
-        # into an implicit Agent Memory scope.  The ID remains available to
-        # runtime authorization/get_project_context(), while rich project
-        # memory is strictly model-visible Project Context.
-        if include_agent_memory and include_project_context and project_id:
-            try:
-                bundle.agent_memory_block = await self._build_agent_memory_block(
-                    project_id=project_id,
-                    user_id=user_id,
-                )
-                debug["agent_memory_context"] = bool(bundle.agent_memory_block)
-            except Exception as exc:
-                logger.warning("[ContextBuilder] agent memory failed: %s", exc)
-                debug["errors"]["agent_memory"] = str(exc)
-        record_layer(
-            "agent_memory",
-            agent_memory_started,
-            bundle.agent_memory_block,
-            debug["agent_memory_selection"],
-        )
-
         task_context_started = time.perf_counter()
         if include_task_context:
             try:
                 bundle.task_context_block = await self._build_task_context_block(
                     project_id=project_id if include_project_context else None,
-                    task_id=task_id,
+                    task_id=task_id if include_project_context else None,
                 )
             except Exception as exc:
                 logger.warning("[ContextBuilder] task context failed: %s", exc)
@@ -828,32 +1042,28 @@ class ContextBuilder:
 
         context_memory_started = time.perf_counter()
         try:
-            if hasattr(self.context_memory_service, "retrieve_for_context"):
-                memories, retrieval_trace = (
-                    await self.context_memory_service.retrieve_for_context(
-                        actor_id=user_id,
-                        project_id=project_id if include_project_context else None,
-                        task_id=task_id,
-                        session_id=session_id,
-                        query=message,
-                        limit=8,
-                        max_chars=5000,
-                    )
-                )
-                debug["context_memory_retrieval_trace"] = retrieval_trace
-            else:
-                memories = await self.context_memory_service.get_memories_for_context(
-                    user_id=user_id,
+            memories, retrieval_trace = (
+                await self.context_memory_service.retrieve_for_context(
+                    actor_id=user_id,
                     project_id=project_id if include_project_context else None,
-                    task_id=task_id,
+                    task_id=task_id if include_project_context else None,
                     session_id=session_id,
-                    message=message,
+                    query=message,
                     limit=8,
+                    max_chars=5000,
                 )
+            )
+            debug["context_memory_retrieval_trace"] = retrieval_trace
             bundle.memory_context_block = (
                 self.context_memory_service.render_memories_for_prompt(memories)
             )
             debug["context_memory_count"] = len(memories)
+            _record_context_manifest_observation(
+                debug,
+                "context_memory_manifest_lineage",
+                lambda: _context_manifest_memory_lineage(memories),
+                enabled=self._context_manifest_observation_enabled,
+            )
         except Exception as exc:
             logger.warning("[ContextBuilder] context memories failed: %s", exc)
             debug["errors"]["context_memories"] = str(exc)
@@ -862,6 +1072,85 @@ class ContextBuilder:
             context_memory_started,
             bundle.memory_context_block,
             "scoped_relevance_search",
+        )
+
+        # Work Intelligence is additive to the established ContextBuilder
+        # path.  Compile only after all normal scope re-authorization and
+        # scoped-memory retrieval have completed, then pass memory rows as
+        # advisory input so authoritative Task/Docs state wins conflicts.
+        work_intelligence_started = time.perf_counter()
+        wi_enabled = self._work_intelligence_gate is not False
+        if wi_enabled and include_project_context and project_id and self.work_intelligence_compiler is not None:
+            try:
+                compiler = self.work_intelligence_compiler
+                compile_method = getattr(compiler, "compile", None)
+                if not callable(compile_method):
+                    compile_method = getattr(compiler, "compile_context", None)
+                if callable(compile_method):
+                    advisory_memory = locals().get("memories", ())
+                    conflict_probe = getattr(
+                        self.context_memory_service,
+                        "retrieve_advisory_conflict_candidates",
+                        None,
+                    )
+                    if callable(conflict_probe):
+                        try:
+                            advisory_memory = await conflict_probe(
+                                actor_id=user_id,
+                                project_id=project_id,
+                                task_id=task_id,
+                                session_id=session_id,
+                                limit=64,
+                            )
+                        except Exception as exc:
+                            # Conflict detection is advisory only.  Preserve
+                            # the established top-8 prompt retrieval as the
+                            # compiler fallback and expose neither raw error
+                            # text nor candidate content through the bundle.
+                            logger.warning(
+                                "[ContextBuilder] Work Intelligence advisory "
+                                "conflict probe failed: %s",
+                                type(exc).__name__,
+                            )
+                    result = await compile_method(
+                        user_id=user_id,
+                        query=message,
+                        project_id=project_id,
+                        task_id=task_id,
+                        session_id=session_id,
+                        project_context=resolved_project_context,
+                        advisory_memory=advisory_memory,
+                        include_project_context=include_project_context,
+                        strict_project_scope=get_turn_context().strict_project_scope,
+                    )
+                    bundle.work_intelligence = result
+                    rendered = _render_work_intelligence(result)
+                    bundle.work_intelligence_block = rendered
+                    if result is not None and hasattr(result, "omissions"):
+                        debug["work_intelligence_omissions"] = dict(
+                            getattr(result, "omissions", {}) or {}
+                        )
+                    debug["work_intelligence_compiled"] = bool(rendered)
+            except Exception as exc:
+                # This is an additive observation layer; a compiler failure
+                # must never remove the legacy context or fail a successful
+                # turn.  Exception text stays out of model-facing fields.
+                logger.warning(
+                    "[ContextBuilder] work intelligence failed: %s",
+                    type(exc).__name__,
+                )
+                debug["errors"]["work_intelligence"] = type(exc).__name__
+        elif not wi_enabled:
+            debug["work_intelligence_selection"] = "rollout_gate_disabled"
+        elif not include_project_context:
+            debug["work_intelligence_selection"] = "project_context_disabled"
+        else:
+            debug["work_intelligence_selection"] = "project_scope_unavailable"
+        record_layer(
+            "work_intelligence",
+            work_intelligence_started,
+            bundle.work_intelligence_block,
+            debug.get("work_intelligence_selection", "selected_live_work_projection"),
         )
 
         return bundle
@@ -897,6 +1186,7 @@ class ContextBuilder:
                 project_id=project_uuid,
                 mode=DocsScopeMode.PROJECT_PLUS_PERSONAL,
                 max_personal_nodes=limit,
+                expand_project_subtrees=False,
             )
 
             # Fail closed if the scope resolver did not authorize this
@@ -1072,181 +1362,6 @@ class ContextBuilder:
             if task.description:
                 lines.append(f"  {task.description.strip()[:500]}")
         return "\n".join(lines)
-
-    async def _build_agent_memory_block(
-        self,
-        *,
-        project_id: str,
-        user_id: str | None = None,
-        agent_memory_chars: int = 4000,
-    ) -> str:
-        """プロジェクト毎のエージェントメモリ索引ノードのアウトラインを注入する。
-
-        索引ノード（system_key="agent_memory:<project_id>"）を ensure し、
-        その直下の子ノード群（1エントリ=1子ノード）を浅いアウトラインで描画する。
-        DB接続やensureに失敗してもチャットを壊さず空ブロックへ落とす。
-        """
-        project_uuid = _coerce_uuid(project_id)
-        user_uuid = _coerce_uuid(user_id)
-        if not project_uuid or not legacy_agent_memory_read_enabled():
-            return ""
-
-        from .agent_memory_docs import (
-            AGENT_MEMORY_AI_INSTRUCTIONS,
-            get_agent_memory_doc,
-        )
-
-        async with await get_db_session() as session:
-            node = (
-                await get_agent_memory_doc(session, project_uuid, user_uuid)
-                if user_uuid is not None
-                else await get_agent_memory_doc(session, project_uuid)
-            )
-            if node is None:
-                return ""
-
-            node_id = node.id
-            node_title = (node.title or "(untitled)").strip()
-            # 索引ノードは project_id を持つため DocsGraphService.outline_lines は
-            # scope が project_id 一致となり、案件情報等プロジェクト全ノード(LIMIT 500)を
-            # 引いてしまう。500超のプロジェクトではメモリの子が取得対象から漏れて静かに
-            # 消え得るため、索引ノードの子孫だけを parent_id で辿って直接構築する。
-            outline_lines = (
-                await self._agent_memory_outline_lines(
-                    session, node, depth=2, user_id=user_uuid
-                )
-                if user_uuid is not None
-                else await self._agent_memory_outline_lines(session, node, depth=2)
-            )
-
-        outline_text = "\n".join(outline_lines).strip()
-        truncated = False
-        if len(outline_text) > max(1, agent_memory_chars):
-            outline_text = _clip_text(outline_text, max(1, agent_memory_chars)).rstrip()
-            truncated = True
-
-        lines = [
-            "## Agent Memory (project-scoped, agent-maintained)",
-            (
-                "プロジェクト毎の恒久メモリ（Claude CodeのMEMORY.md相当）。"
-                "訂正・導出不能な知見・作業上の嗜好のみをここへ保存する。"
-            ),
-            f"- Memory Index Node: {node_title} (ref=@docs:{node_id})",
-            (
-                "- 書込単位: 索引ノード直下に「1エントリ=1子ノード」を docs_create_nodes で追加し、"
-                "既存エントリの修正は docs_update_node で行う"
-                "（索引ノード本文はタイトルミラー固定のため本文へは書き込まない）。"
-            ),
-            "- 詳細は各エントリの子ノードにある。必要なら docs_read で該当ノードを読む。",
-            "- 上限接近時は古い項目を統合・圧縮する。秘密情報（パスワード/トークン）は保存禁止。",
-        ]
-        if AGENT_MEMORY_AI_INSTRUCTIONS.strip():
-            lines.append(
-                "- 保存基準: " + _clip_text(AGENT_MEMORY_AI_INSTRUCTIONS.strip(), 420)
-            )
-        lines.append("### Memory Entries Outline")
-        if outline_text:
-            lines.append(outline_text)
-            if truncated:
-                lines.append("...(truncated; 全量は docs_read で索引ノードを読む)")
-        else:
-            lines.append("(まだ記憶はありません)")
-
-        return "\n".join(lines)
-
-    async def _agent_memory_outline_lines(
-        self,
-        session: Any,
-        root: Any,
-        *,
-        depth: int = 2,
-        user_id: uuid.UUID | None = None,
-    ) -> list[str]:
-        """索引ノードのサブツリーだけを浅いアウトラインとして構築する。
-
-        ``DocsGraphService.outline_lines`` はプロジェクト全ノードを引くため、
-        ここでは ``parent_id`` を階層ごとに辿って索引ノードの子孫だけを取得し、
-        同一フォーマット（``短縮ID タイトル #タグ`` + タブインデント、短縮IDは
-        UUID 先頭8hex）で組み立てる。``docs_update_node`` / ``docs_read`` の
-        ``resolve_node`` が 8-12hex プレフィックスで解決できる表記を保つ。
-        """
-        from ..memory.models import (
-            DocsLibrary,
-            KnowledgeNode,
-            KnowledgeNodeSupertag,
-            KnowledgeSupertag,
-        )
-
-        max_depth = max(0, min(int(depth or 2), 8))
-        visibility = None
-        if user_id is not None:
-            library = await session.get(DocsLibrary, root.docs_library_id)
-            visibility = docs_readable_node_predicate(
-                KnowledgeNode,
-                docs_library_id=root.docs_library_id,
-                user_id=user_id,
-                library_owner_id=getattr(library, "owner_user_id", None),
-            )
-            root_visible = await session.scalar(
-                select(KnowledgeNode.id).where(
-                    KnowledgeNode.id == root.id,
-                    visibility,
-                )
-            )
-            if root_visible is None:
-                return []
-        nodes: list[Any] = [root]
-        children_map: dict[Any, list[Any]] = {}
-        frontier: list[Any] = [root.id]
-        current_depth = 0
-        while current_depth < max_depth and frontier:
-            level_result = await session.execute(
-                select(KnowledgeNode)
-                .where(
-                    KnowledgeNode.docs_library_id == root.docs_library_id,
-                    KnowledgeNode.parent_id.in_(frontier),
-                    KnowledgeNode.archived_at.is_(None),
-                    visibility if visibility is not None else True,
-                )
-                .order_by(KnowledgeNode.sort_order, KnowledgeNode.created_at)
-                .limit(500)
-            )
-            level_nodes = list(level_result.scalars().unique().all())
-            for child in level_nodes:
-                children_map.setdefault(child.parent_id, []).append(child)
-            nodes.extend(level_nodes)
-            frontier = [child.id for child in level_nodes]
-            current_depth += 1
-
-        tags_by_node: dict[Any, list[str]] = {}
-        if nodes:
-            tag_rows = await session.execute(
-                select(KnowledgeNodeSupertag.node_id, KnowledgeSupertag.name)
-                .join(
-                    KnowledgeSupertag,
-                    KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id,
-                )
-                .where(
-                    KnowledgeNodeSupertag.node_id.in_([node.id for node in nodes])
-                )
-            )
-            for node_id, tag_name in tag_rows.all():
-                tags_by_node.setdefault(node_id, []).append(tag_name)
-
-        lines: list[str] = []
-
-        def visit(node: Any, node_depth: int) -> None:
-            if node_depth > max_depth:
-                return
-            tags = " ".join(f"#{name}" for name in tags_by_node.get(node.id, []))
-            suffix = f" {tags}" if tags else ""
-            indent = "\t" * node_depth
-            lines.append(f"{indent}{str(node.id)[:8]} {node.title}{suffix}")
-            for child in children_map.get(node.id, []):
-                visit(child, node_depth + 1)
-
-        visit(root, 0)
-        return lines
 
     async def _build_project_information_block(
         self,

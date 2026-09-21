@@ -1,11 +1,11 @@
+import { ScopeSwitcher } from "./scope-switcher";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
-import { ScrollView, StyleSheet, View } from "react-native";
+import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import { format } from "date-fns";
 import {
   ActivityIndicator,
   Button,
-  Chip,
   Dialog,
   Divider,
   Portal,
@@ -13,8 +13,7 @@ import {
 } from "react-native-paper";
 import { tasksRepo, timeEntriesRepo } from "../repositories";
 import { useProject } from "../contexts/ProjectContext";
-import { taskApi } from "../lib/task-api";
-import type { Space, Task, TimeEntry } from "../types/api";
+import type { Task, TimeEntry } from "../types/api";
 
 function formatDuration(seconds: number): string {
   const safeSeconds = Math.max(0, seconds);
@@ -61,12 +60,10 @@ export function TaskQuickViewDialog({
   const router = useRouter();
   const { projects } = useProject();
   const [task, setTask] = useState<Task | null>(null);
-  const [spaces, setSpaces] = useState<Space[]>([]);
   const [activeEntry, setActiveEntry] = useState<TimeEntry | null>(null);
   const [loading, setLoading] = useState(false);
   const [timerSaving, setTimerSaving] = useState(false);
   const [projectSaving, setProjectSaving] = useState(false);
-  const [projectPickerVisible, setProjectPickerVisible] = useState(false);
   const [timerElapsed, setTimerElapsed] = useState(0);
 
   const loadTask = useCallback(async () => {
@@ -94,25 +91,6 @@ export function TaskQuickViewDialog({
   }, [loadTask, visible]);
 
   useEffect(() => {
-    if (!visible) {
-      setProjectPickerVisible(false);
-      return;
-    }
-    let active = true;
-    void taskApi
-      .listSpaces()
-      .then((list) => {
-        if (active) setSpaces(list);
-      })
-      .catch(() => {
-        if (active) setSpaces([]);
-      });
-    return () => {
-      active = false;
-    };
-  }, [visible]);
-
-  useEffect(() => {
     if (!activeEntry?.started_at) {
       setTimerElapsed(0);
       return;
@@ -137,47 +115,6 @@ export function TaskQuickViewDialog({
     task?.total_time_seconds,
     timerElapsed,
   ]);
-
-  const currentProject = useMemo(
-    () =>
-      task?.project_id
-        ? (projects.find((project) => project.id === task.project_id) ?? null)
-        : null,
-    [projects, task?.project_id],
-  );
-
-  const currentSpaceName = useMemo(() => {
-    if (!currentProject?.space_id) return null;
-    return (
-      spaces.find((space) => space.id === currentProject.space_id)?.name ?? null
-    );
-  }, [currentProject?.space_id, spaces]);
-
-  const projectGroups = useMemo(() => {
-    const groups = spaces
-      .map((space) => ({
-        key: space.id,
-        label: space.name,
-        projects: projects.filter((project) => project.space_id === space.id),
-      }))
-      .filter((group) => group.projects.length > 0);
-    const ungrouped = projects.filter((project) => !project.space_id);
-    if (ungrouped.length > 0) {
-      groups.push({
-        key: "no-space",
-        label: "No Space",
-        projects: ungrouped,
-      });
-    }
-    if (groups.length === 0 && projects.length > 0) {
-      groups.push({
-        key: "all-projects",
-        label: "Projects",
-        projects,
-      });
-    }
-    return groups;
-  }, [projects, spaces]);
 
   const handleTimerToggle = useCallback(async () => {
     if (!taskId) return;
@@ -206,7 +143,6 @@ export function TaskQuickViewDialog({
   const handleMoveTask = useCallback(
     async (projectId: string) => {
       if (!taskId || !task || !projectId || projectId === task.project_id) {
-        setProjectPickerVisible(false);
         return;
       }
       setProjectSaving(true);
@@ -215,7 +151,6 @@ export function TaskQuickViewDialog({
           project_id: projectId,
         });
         setTask(updatedTask);
-        setProjectPickerVisible(false);
         await loadTask();
         onTaskChanged?.();
       } finally {
@@ -236,32 +171,8 @@ export function TaskQuickViewDialog({
             </View>
           ) : task ? (
             <View style={styles.content}>
-              <View style={styles.scopeRow}>
-                {currentSpaceName ? (
-                  <Chip
-                    compact
-                    icon="folder-multiple-outline"
-                    onPress={() => setProjectPickerVisible(true)}
-                    style={styles.scopeChip}
-                    textStyle={styles.scopeChipText}
-                    disabled={projectSaving || projects.length <= 1}
-                  >
-                    {currentSpaceName}
-                  </Chip>
-                ) : null}
-                {task.project_name ? (
-                  <Chip
-                    compact
-                    icon="folder-outline"
-                    onPress={() => setProjectPickerVisible(true)}
-                    style={styles.scopeChip}
-                    textStyle={styles.scopeChipText}
-                    disabled={projectSaving || projects.length <= 1}
-                  >
-                    {task.project_name}
-                  </Chip>
-                ) : null}
-              </View>
+              <ScopeSwitcher variant="chip" projects={projects} projectId={task.project_id} allowAll={false}
+                disabled={projectSaving} onSelectProject={async (id) => { if (id) await handleMoveTask(id); }} />
               <Text style={styles.titleText}>
                 {task.title || "Untitled task"}
               </Text>
@@ -326,48 +237,6 @@ export function TaskQuickViewDialog({
           </Button>
         </Dialog.Actions>
       </Dialog>
-
-      <Dialog
-        visible={projectPickerVisible}
-        onDismiss={() => setProjectPickerVisible(false)}
-        style={styles.dialog}
-      >
-        <Dialog.Title style={styles.dialogTitle}>Move Task</Dialog.Title>
-        <Dialog.Content>
-          <ScrollView style={styles.projectPickerScroll}>
-            {projectGroups.map((group) => (
-              <View key={group.key} style={styles.projectGroup}>
-                <Text style={styles.sectionLabel}>{group.label}</Text>
-                {group.projects.map((project) => {
-                  const selected = project.id === task?.project_id;
-                  return (
-                    <Button
-                      key={project.id}
-                      mode={selected ? "contained-tonal" : "text"}
-                      onPress={() => void handleMoveTask(project.id)}
-                      disabled={projectSaving}
-                      loading={projectSaving && selected}
-                      contentStyle={styles.projectButtonContent}
-                      style={styles.projectButton}
-                      textColor={selected ? "#cdd6f4" : "#89b4fa"}
-                    >
-                      {project.name}
-                    </Button>
-                  );
-                })}
-              </View>
-            ))}
-          </ScrollView>
-        </Dialog.Content>
-        <Dialog.Actions>
-          <Button
-            onPress={() => setProjectPickerVisible(false)}
-            textColor="#a6adc8"
-          >
-            Close
-          </Button>
-        </Dialog.Actions>
-      </Dialog>
     </Portal>
   );
 }
@@ -377,9 +246,6 @@ const styles = StyleSheet.create({
   dialogTitle: { color: "#cdd6f4" },
   loadingWrap: { paddingVertical: 20, alignItems: "center" },
   content: { gap: 6 },
-  scopeRow: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
-  scopeChip: { backgroundColor: "#313244" },
-  scopeChipText: { color: "#cdd6f4" },
   projectText: { color: "#89b4fa", fontSize: 12 },
   titleText: { color: "#cdd6f4", fontSize: 18, fontWeight: "700" },
   metaText: { color: "#a6adc8", fontSize: 13 },
@@ -392,8 +258,4 @@ const styles = StyleSheet.create({
   entryMetaText: { color: "#bac2de", fontSize: 13 },
   noteText: { color: "#cdd6f4", fontSize: 13 },
   divider: { backgroundColor: "#313244", marginVertical: 10 },
-  projectPickerScroll: { maxHeight: 320 },
-  projectGroup: { marginBottom: 12 },
-  projectButton: { alignItems: "flex-start" },
-  projectButtonContent: { justifyContent: "flex-start" },
 });

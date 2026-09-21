@@ -1,14 +1,24 @@
 import * as SecureStore from "expo-secure-store";
 import { CHAT_TIMEOUT, STORAGE_KEYS } from "../constants/config";
+import {
+  descriptorForUrl,
+  executeMobileEgress,
+  fetchWithTimeout,
+  type MobileEgressReviewCallback,
+  type MobilePrivacyMode,
+  type MobileReviewPolicy,
+} from "../privacy/outbound-gateway";
 import type {
   CharacterProfileSnapshot,
   ConversationMessage,
 } from "../types/api";
 import {
   CLOUD_PROVIDER_DEFINITIONS,
+  FORBIDDEN_MODEL_ID,
   getAdapterKind,
   getDefaultBaseUrlForProvider,
   getDefaultModelForProvider,
+  isForbiddenModelId,
   isDirectMobileLlmProvider,
   type CloudAdapterKind,
   type DirectMobileLlmProvider,
@@ -58,6 +68,21 @@ export interface MobileLlmSettings {
   baseUrl: string;
   maxTokens?: number;
   reasoningEffort?: string;
+  /** Direct is the backwards-compatible default; local_only always blocks cloud URLs. */
+  privacyMode?: MobilePrivacyMode;
+  reviewPolicy?: MobileReviewPolicy;
+  trustedLocalHosts?: readonly string[];
+  redactionTerms?: readonly string[];
+}
+
+export interface MobileLlmEgressOptions {
+  signal?: AbortSignal;
+  /** Optional transaction-scoped approval callback for protected/always routes. */
+  review?: MobileEgressReviewCallback;
+  privacyMode?: MobilePrivacyMode;
+  reviewPolicy?: MobileReviewPolicy;
+  trustedLocalHosts?: readonly string[];
+  redactionTerms?: readonly string[];
 }
 
 export interface DirectMobileLlmSelection {
@@ -89,10 +114,34 @@ function normalizeMainProvider(value: string | null): MobileLlmProvider {
 
 function normalizeDirectProvider(
   value: string | null,
-): DirectMobileLlmProvider {
+): DirectMobileLlmProvider | null {
+  if (!value) return "openai";
   if (value === "openai_compatible") return "custom";
   if (value && isDirectMobileLlmProvider(value)) return value;
-  return "openai";
+  return null;
+}
+
+const FORBIDDEN_MODEL_MESSAGE =
+  `${FORBIDDEN_MODEL_ID} は廃止されたため、選択・保存・実行できません。`;
+
+function normalizeStoredModel(value: string | null | undefined): string {
+  const normalized = String(value ?? "").trim();
+  return isForbiddenModelId(normalized) ? "" : normalized;
+}
+
+async function readSafeStoredModel(key: string): Promise<string> {
+  const raw = await SecureStore.getItemAsync(key);
+  const normalized = normalizeStoredModel(raw);
+  if (raw !== null && normalized !== raw) {
+    await SecureStore.setItemAsync(key, normalized);
+  }
+  return normalized;
+}
+
+function assertAllowedModel(model: string): void {
+  if (isForbiddenModelId(model)) {
+    throw new Error(FORBIDDEN_MODEL_MESSAGE);
+  }
 }
 
 /* -------------------------------------------------------------------------- */
@@ -186,11 +235,11 @@ export async function getMainSlot(): Promise<MobileLlmSlotSelection> {
   await ensureMobileLlmMigrated();
   const [providerRaw, modelRaw, effortRaw] = await Promise.all([
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_PROVIDER),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL),
+    readSafeStoredModel(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MAIN_EFFORT),
   ]);
   const provider = normalizeMainProvider(providerRaw);
-  const model = (modelRaw ?? "").trim();
+  const model = normalizeStoredModel(modelRaw);
   const reasoningEffort = normalizeDirectReasoningEffort(
     provider,
     model,
@@ -209,6 +258,7 @@ export async function saveMainSlot(
   reasoningEffort?: string,
 ): Promise<void> {
   const trimmedModel = model.trim();
+  assertAllowedModel(trimmedModel);
   if (isDirectProvider(provider) && !trimmedModel) {
     throw new Error("モデルIDを指定してください。");
   }
@@ -232,18 +282,19 @@ export async function getFallbackConfig(): Promise<MobileLlmFallbackConfig> {
   const [enabledRaw, providerRaw, modelRaw, effortRaw] = await Promise.all([
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL),
+    readSafeStoredModel(STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_EFFORT),
   ]);
-  const provider = normalizeDirectProvider(providerRaw);
-  const model = (modelRaw ?? "").trim();
+  const normalizedProvider = normalizeDirectProvider(providerRaw);
+  const provider = normalizedProvider ?? "openai";
+  const model = normalizeStoredModel(modelRaw);
   const reasoningEffort = normalizeDirectReasoningEffort(
     provider,
     model,
     effortRaw,
   );
   return {
-    enabled: enabledRaw === "1",
+    enabled: enabledRaw === "1" && normalizedProvider !== null,
     provider,
     model,
     ...(reasoningEffort ? { reasoningEffort } : {}),
@@ -254,6 +305,7 @@ export async function saveFallbackConfig(
   config: MobileLlmFallbackConfig,
 ): Promise<void> {
   const trimmedModel = config.model.trim();
+  assertAllowedModel(trimmedModel);
   if (config.enabled && !trimmedModel) {
     throw new Error("フォールバックのモデルIDを指定してください。");
   }
@@ -291,13 +343,14 @@ export async function getClipIngestConfig(): Promise<MobileLlmClipIngestConfig> 
   const [enabledRaw, providerRaw, modelRaw, effortRaw] = await Promise.all([
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_ENABLED),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_PROVIDER),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_MODEL),
+    readSafeStoredModel(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_MODEL),
     SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_EFFORT),
   ]);
+  const normalizedProvider = normalizeDirectProvider(providerRaw);
   return {
-    enabled: enabledRaw === "1",
-    provider: normalizeDirectProvider(providerRaw),
-    model: (modelRaw ?? "").trim(),
+    enabled: enabledRaw === "1" && normalizedProvider !== null,
+    provider: normalizedProvider ?? "openai",
+    model: normalizeStoredModel(modelRaw),
     reasoningEffort: (effortRaw ?? "").trim(),
   };
 }
@@ -306,6 +359,7 @@ export async function saveClipIngestConfig(
   config: MobileLlmClipIngestConfig,
 ): Promise<void> {
   const trimmedModel = config.model.trim();
+  assertAllowedModel(trimmedModel);
   if (config.enabled && !trimmedModel) {
     throw new Error("クリップ取り込みのモデルIDを指定してください。");
   }
@@ -358,7 +412,10 @@ async function resolveDirectSettings(
   reasoningEffort?: string,
 ): Promise<MobileLlmSettings> {
   const profile = await getProviderProfile(provider);
-  const resolvedModel = model.trim() || getDefaultModelForProvider(provider);
+  const trimmedModel = model.trim();
+  assertAllowedModel(trimmedModel);
+  const resolvedModel = trimmedModel || getDefaultModelForProvider(provider);
+  assertAllowedModel(resolvedModel);
   const resolvedEffort = normalizeDirectReasoningEffort(
     provider,
     resolvedModel,
@@ -529,6 +586,7 @@ export function isMobileLlmConfigured(settings: MobileLlmSettings): boolean {
   if (!isDirectProvider(settings.provider)) return false;
   if (!settings.apiKey.trim()) return false;
   if (!settings.model.trim()) return false;
+  if (isForbiddenModelId(settings.model)) return false;
   const definition = CLOUD_PROVIDER_DEFINITIONS[settings.provider];
   if (definition.baseUrlRequired && !settings.baseUrl.trim()) return false;
   return true;
@@ -552,103 +610,132 @@ async function runMigration(): Promise<void> {
   const done = await SecureStore.getItemAsync(
     STORAGE_KEYS.CHAT_LLM_SLOT_MIGRATED,
   );
-  if (done === "1") return;
+  if (done !== "1") {
+    const [
+      providerRaw,
+      fallbackRaw,
+      legacyApiKey,
+      legacyModel,
+      legacyBaseUrl,
+      openaiModel,
+      geminiModel,
+      ocApiKey,
+      ocModel,
+      ocBaseUrl,
+    ] = await Promise.all([
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_PROVIDER),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_API_KEY),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MODEL),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_BASE_URL),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_MODEL),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_GEMINI_MODEL),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_API_KEY),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_MODEL),
+      SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_BASE_URL),
+    ]);
 
-  const [
-    providerRaw,
-    fallbackRaw,
-    legacyApiKey,
-    legacyModel,
-    legacyBaseUrl,
-    openaiModel,
-    geminiModel,
-    ocApiKey,
-    ocModel,
-    ocBaseUrl,
-  ] = await Promise.all([
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_PROVIDER),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_API_KEY),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_MODEL),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_BASE_URL),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_MODEL),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_GEMINI_MODEL),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_API_KEY),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_MODEL),
-    SecureStore.getItemAsync(STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_BASE_URL),
-  ]);
+    // 1. 旧共通キー（provider 分割以前）→ openai プロファイルへ。
+    await setIfEmpty(STORAGE_KEYS.CHAT_LLM_OPENAI_API_KEY, legacyApiKey);
+    await setIfEmpty(STORAGE_KEYS.CHAT_LLM_OPENAI_BASE_URL, legacyBaseUrl);
 
-  // 1. 旧共通キー（provider 分割以前）→ openai プロファイルへ。
-  await setIfEmpty(STORAGE_KEYS.CHAT_LLM_OPENAI_API_KEY, legacyApiKey);
-  await setIfEmpty(STORAGE_KEYS.CHAT_LLM_OPENAI_BASE_URL, legacyBaseUrl);
+    // 2. 旧 openai_compatible プロファイル → custom プロファイルへ。
+    await setIfEmpty(STORAGE_KEYS.CHAT_LLM_CUSTOM_API_KEY, ocApiKey);
+    await setIfEmpty(STORAGE_KEYS.CHAT_LLM_CUSTOM_BASE_URL, ocBaseUrl);
 
-  // 2. 旧 openai_compatible プロファイル → custom プロファイルへ。
-  await setIfEmpty(STORAGE_KEYS.CHAT_LLM_CUSTOM_API_KEY, ocApiKey);
-  await setIfEmpty(STORAGE_KEYS.CHAT_LLM_CUSTOM_BASE_URL, ocBaseUrl);
-
-  // 3. メインプロバイダーの写像（openai_compatible → custom）。
-  const newMainProvider = normalizeMainProvider(providerRaw);
-  if (providerRaw && providerRaw !== newMainProvider) {
-    await SecureStore.setItemAsync(
-      STORAGE_KEYS.CHAT_LLM_PROVIDER,
-      newMainProvider,
-    );
-  }
-
-  // 4. メインスロットモデル：旧プロバイダー単位モデルから引き当てる。
-  const oldModelByProvider = (
-    provider: MobileLlmProvider,
-  ): string | null => {
-    if (provider === "openai") return openaiModel;
-    if (provider === "gemini") return geminiModel;
-    if (provider === "custom") return ocModel;
-    return null;
-  };
-  const mainModel = oldModelByProvider(newMainProvider) || legacyModel;
-  await setIfEmpty(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL, mainModel);
-
-  // 5. フォールバック設定の再構築。
-  const migratedEnabled = await SecureStore.getItemAsync(
-    STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
-  );
-  if (migratedEnabled === null) {
-    const fallbackActive =
-      fallbackRaw !== null && fallbackRaw !== "" && fallbackRaw !== "off";
-    if (fallbackActive) {
-      const fbProvider = normalizeDirectProvider(fallbackRaw);
-      const fbModel =
-        oldModelByProvider(fbProvider) || getDefaultModelForProvider(fbProvider);
+    // 3. メインプロバイダーの写像（openai_compatible → custom）。
+    const newMainProvider = normalizeMainProvider(providerRaw);
+    if (providerRaw && providerRaw !== newMainProvider) {
       await SecureStore.setItemAsync(
-        STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
-        fbProvider,
-      );
-      await setIfEmpty(STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL, fbModel);
-      await SecureStore.setItemAsync(
-        STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
-        "1",
-      );
-    } else {
-      // 旧値が "off"/未設定なら無効。プロバイダー文字列が "off" のままだと
-      // normalize で openai になるため、既定 provider を書いておく。
-      if (fallbackRaw === "off" || fallbackRaw === null || fallbackRaw === "") {
-        await SecureStore.setItemAsync(
-          STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
-          "openai",
-        );
-      } else {
-        await SecureStore.setItemAsync(
-          STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
-          normalizeDirectProvider(fallbackRaw),
-        );
-      }
-      await SecureStore.setItemAsync(
-        STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
-        "0",
+        STORAGE_KEYS.CHAT_LLM_PROVIDER,
+        newMainProvider,
       );
     }
+
+    // 4. メインスロットモデル：旧プロバイダー単位モデルから引き当てる。
+    const oldModelByProvider = (
+      provider: MobileLlmProvider,
+    ): string | null => {
+      if (provider === "openai") return openaiModel;
+      if (provider === "gemini") return geminiModel;
+      if (provider === "custom") return ocModel;
+      return null;
+    };
+    const mainModel = oldModelByProvider(newMainProvider) || legacyModel;
+    await setIfEmpty(STORAGE_KEYS.CHAT_LLM_MAIN_MODEL, mainModel);
+
+    // 5. フォールバック設定の再構築。
+    const migratedEnabled = await SecureStore.getItemAsync(
+      STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
+    );
+    if (migratedEnabled === null) {
+      const fallbackActive =
+        fallbackRaw !== null && fallbackRaw !== "" && fallbackRaw !== "off";
+      if (fallbackActive) {
+        const fbProvider = normalizeDirectProvider(fallbackRaw);
+        if (!fbProvider) {
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
+            "openai",
+          );
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
+            "0",
+          );
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL,
+            "",
+          );
+        } else {
+          const fbModel =
+            oldModelByProvider(fbProvider) || getDefaultModelForProvider(fbProvider);
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
+            fbProvider,
+          );
+          await setIfEmpty(STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL, fbModel);
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
+            "1",
+          );
+        }
+      } else {
+        // 旧値が "off"/未設定なら無効。プロバイダー文字列が "off" のままだと
+        // normalize で openai になるため、既定 provider を書いておく。
+        if (fallbackRaw === "off" || fallbackRaw === null || fallbackRaw === "") {
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
+            "openai",
+          );
+        } else {
+          await SecureStore.setItemAsync(
+            STORAGE_KEYS.CHAT_LLM_FALLBACK_PROVIDER,
+            normalizeDirectProvider(fallbackRaw) ?? "openai",
+          );
+        }
+        await SecureStore.setItemAsync(
+          STORAGE_KEYS.CHAT_LLM_FALLBACK_ENABLED,
+          "0",
+        );
+      }
+    }
+
+    await SecureStore.setItemAsync(STORAGE_KEYS.CHAT_LLM_SLOT_MIGRATED, "1");
   }
 
-  await SecureStore.setItemAsync(STORAGE_KEYS.CHAT_LLM_SLOT_MIGRATED, "1");
+  // 移行済み端末にも残る古いモデル値を毎回浄化する。migration flagだけを
+  // 信頼すると、過去のmini選択がそのままrequest payloadへ戻り得る。
+  await Promise.all(
+    [
+      STORAGE_KEYS.CHAT_LLM_MAIN_MODEL,
+      STORAGE_KEYS.CHAT_LLM_FALLBACK_MODEL,
+      STORAGE_KEYS.CHAT_LLM_CLIP_INGEST_MODEL,
+      STORAGE_KEYS.CHAT_LLM_MODEL,
+      STORAGE_KEYS.CHAT_LLM_OPENAI_MODEL,
+      STORAGE_KEYS.CHAT_LLM_GEMINI_MODEL,
+      STORAGE_KEYS.CHAT_LLM_OPENAI_COMPATIBLE_MODEL,
+    ].map((key) => readSafeStoredModel(key)),
+  );
 }
 
 export async function ensureMobileLlmMigrated(): Promise<void> {
@@ -681,6 +768,22 @@ interface LlmAdapter {
   ): { url: string; init: RequestInit };
   extractReply(data: unknown): MobileLlmReply | null;
   extractError(data: unknown, status: number): string;
+}
+
+function usesOpenAIResponses(provider: DirectMobileLlmProvider, model: string): boolean {
+  return provider === "openai" && gpt5MinorVersion(normalizeModelIdForEffort(model)) === 6;
+}
+
+function transportForProvider(provider: DirectMobileLlmProvider, model: string): string {
+  if (usesOpenAIResponses(provider, model)) return "openai.responses";
+  switch (getAdapterKind(provider)) {
+    case "gemini":
+      return "gemini.generate_content";
+    case "anthropic":
+      return "anthropic.messages";
+    default:
+      return "openai.chat.completions";
+  }
 }
 
 function trimBaseUrl(baseUrl: string, fallback: string): string {
@@ -750,6 +853,39 @@ const openAiChatAdapter: LlmAdapter = {
     const content = message?.content;
     if (typeof content !== "string" || !content) return null;
     return { content, assistantPayload: message };
+  },
+  extractError: readError,
+};
+
+/** GPT-5.6のmaxはResponses APIへ送る。Chat Completionsの旧enumへ渡さない。 */
+const openAiResponsesAdapter: LlmAdapter = {
+  buildRequest(settings, context) {
+    const baseUrl = trimBaseUrl(settings.baseUrl, getDefaultBaseUrlForProvider("openai"));
+    const instructions = context.filter((message) => message.role === "system").map((message) => message.content).join("\n\n");
+    const body: Record<string, unknown> = {
+      model: settings.model.trim(),
+      input: context.filter((message) => message.role !== "system").map(({ role, content }) => ({ role, content })),
+      store: false,
+      ...(instructions ? { instructions } : {}),
+      ...(settings.reasoningEffort ? { reasoning: { effort: settings.reasoningEffort } } : {}),
+      ...(settings.maxTokens && settings.maxTokens > 0 ? { max_output_tokens: Math.floor(settings.maxTokens) } : {}),
+    };
+    return {
+      url: `${baseUrl}/responses`,
+      init: { method: "POST", headers: { Authorization: `Bearer ${settings.apiKey.trim()}`, "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    };
+  },
+  extractReply(data) {
+    const record = data as { status?: string; output?: Array<{ type?: string; content?: Array<{ type?: string; text?: string; refusal?: string }> }> } | null;
+    if (record?.status && record.status !== "completed") {
+      throw new Error("LLMの応答が未完了です。出力上限や接続を確認して再試行してください。");
+    }
+    const content = (record?.output ?? [])
+      .filter((item) => item.type === "message")
+      .flatMap((item) => item.content ?? [])
+      .map((part) => part.type === "output_text" ? part.text ?? "" : part.type === "refusal" ? part.refusal ?? "" : "")
+      .filter(Boolean).join("\n");
+    return content ? { content } : null;
   },
   extractError: readError,
 };
@@ -858,7 +994,8 @@ const ADAPTERS: Record<CloudAdapterKind, LlmAdapter> = {
   anthropic: anthropicAdapter,
 };
 
-function getAdapter(provider: DirectMobileLlmProvider): LlmAdapter {
+function getAdapter(provider: DirectMobileLlmProvider, model: string): LlmAdapter {
+  if (usesOpenAIResponses(provider, model)) return openAiResponsesAdapter;
   return ADAPTERS[getAdapterKind(provider)];
 }
 
@@ -913,6 +1050,7 @@ export function buildContext(
   messages: ConversationMessage[],
   nextUserText: string,
   characterProfile?: CharacterProfileSnapshot | null,
+  localTaskContext?: string,
 ): ContextMessage[] {
   const recent: ContextMessage[] = messages
     .filter(
@@ -936,32 +1074,47 @@ export function buildContext(
     });
   }
   recent.push({ role: "user", content: nextUserText });
+  if (localTaskContext) recent.splice(characterProfile ? 1 : 0, 0, { role: "system", content: localTaskContext });
   return recent;
-}
-
-async function fetchWithTimeout(
-  url: string,
-  init: RequestInit,
-): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), CHAT_TIMEOUT);
-  try {
-    return await fetch(url, { ...init, signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 async function runAdapter(
   settings: MobileLlmSettings,
   context: ContextMessage[],
+  egressOptions: MobileLlmEgressOptions = {},
 ): Promise<MobileLlmReply> {
   if (!isDirectProvider(settings.provider)) {
     throw new Error("Mobile LLM is not configured.");
   }
-  const adapter = getAdapter(settings.provider);
+  const adapter = getAdapter(settings.provider, settings.model);
   const { url, init } = adapter.buildRequest(settings, context);
-  const response = await fetchWithTimeout(url, init);
+  const response = await executeMobileEgress(
+    { url, init },
+    {
+      descriptor: descriptorForUrl(
+        {
+          action: "model.generate",
+          transport: transportForProvider(settings.provider, settings.model),
+          destination: settings.baseUrl,
+          provider: settings.provider,
+          tool: "mobile_llm",
+          model: settings.model,
+        },
+        url,
+      ),
+      mode: egressOptions.privacyMode ?? settings.privacyMode ?? "direct",
+      reviewPolicy:
+        egressOptions.reviewPolicy ?? settings.reviewPolicy ?? "high_risk",
+      trustedLocalHosts:
+        egressOptions.trustedLocalHosts ?? settings.trustedLocalHosts ?? [],
+      redactionTerms:
+        egressOptions.redactionTerms ?? settings.redactionTerms ?? [],
+      review: egressOptions.review,
+    },
+    (request) => fetchWithTimeout(request.url, {
+      ...request.init, signal: egressOptions.signal,
+    }, CHAT_TIMEOUT),
+  );
   const data = await response.json().catch(() => null);
   if (!response.ok) {
     throw new Error(adapter.extractError(data, response.status));
@@ -981,13 +1134,16 @@ export async function generateMobileLlmReply(
   messages: ConversationMessage[],
   nextUserText: string,
   characterProfile?: CharacterProfileSnapshot | null,
+  egressOptions?: MobileLlmEgressOptions,
+  localTaskContext?: string,
 ): Promise<MobileLlmReply> {
   if (!isMobileLlmConfigured(settings)) {
     throw new Error("Mobile LLM is not configured.");
   }
   return runAdapter(
     settings,
-    buildContext(settings, messages, nextUserText, characterProfile),
+    buildContext(settings, messages, nextUserText, characterProfile, localTaskContext),
+    egressOptions,
   );
 }
 
@@ -999,14 +1155,17 @@ export interface MobileLlmConnectionResult {
 /** 短い1メッセージを送って疎通を確認する。 */
 export async function testMobileLlmConnection(
   settings: MobileLlmSettings,
+  egressOptions?: MobileLlmEgressOptions,
 ): Promise<MobileLlmConnectionResult> {
   if (!isMobileLlmConfigured(settings)) {
     return { ok: false, message: "APIキーとモデルIDを設定してください。" };
   }
   try {
-    const reply = await runAdapter(settings, [
-      { role: "user", content: "ping" },
-    ]);
+    const reply = await runAdapter(
+      settings,
+      [{ role: "user", content: "ping" }],
+      egressOptions,
+    );
     return { ok: Boolean(reply.content), message: "接続に成功しました。" };
   } catch (error) {
     return {

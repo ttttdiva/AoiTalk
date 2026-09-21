@@ -17,6 +17,14 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
+from .outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    PrivacyReviewDenied,
+    get_privacy_policy_context,
+)
+
 logger = logging.getLogger(__name__)
 
 try:  # requests is already a project dependency (and pywebpush requires it).
@@ -258,16 +266,67 @@ async def send_web_push(
     payload: Mapping[str, Any],
     *,
     content_encoding: str = "aes128gcm",
+    config: Any | None = None,
+    privacy_gateway: OutboundPrivacyGateway | None = None,
+    user_id: str | None = None,
+    session_id: str | None = None,
 ) -> WebPushResult:
     """Deliver one JSON notification without blocking the event loop."""
 
-    config = get_web_push_config()
-    if not config.configured:
+    push_config = get_web_push_config()
+    if not push_config.configured:
         return WebPushResult(False, "vapid_not_configured")
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    return await asyncio.to_thread(
-        _send_sync, subscription_info, data, config, content_encoding
-    )
+
+    if privacy_gateway is None:
+        context = get_privacy_policy_context()
+        session_context = context.session_context or {}
+        effective_session_id = str(
+            session_id
+            or session_context.get("session_id")
+            or session_context.get("id")
+            or ""
+        )
+        privacy_gateway = OutboundPrivacyGateway(
+            config,
+            user_id=str(user_id or ""),
+            session_id=effective_session_id,
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    endpoint = str(subscription_info.get("endpoint") or "")
+
+    def sender(protected_payload: Any) -> WebPushResult:
+        # Keep subscription endpoint/keys and VAPID material out of the
+        # privacy payload: they are control-plane credentials.  The exact
+        # protected notification body is serialized only inside this sender,
+        # immediately before pywebpush performs the one wire call.
+        if not isinstance(protected_payload, Mapping):
+            raise PrivacyError("web push reviewed payload is malformed")
+        wire_payload = dict(protected_payload)
+        data = json.dumps(wire_payload, ensure_ascii=False, separators=(",", ":"))
+        return _send_sync(subscription_info, data, push_config, content_encoding)
+
+    try:
+        return await asyncio.to_thread(
+            privacy_gateway.execute_sync,
+            dict(payload),
+            provider="web_push",
+            descriptor=EgressDescriptor(
+                action="web_push.send",
+                transport="requests",
+                destination=endpoint,
+                provider="web_push",
+            ),
+            sender=sender,
+            base_url=endpoint,
+            source_kind="web_push_notification",
+        )
+    except (PrivacyError, PrivacyReviewDenied):
+        # Notification workers are background execution.  A review-required
+        # payload with no interactive scope must fail closed without turning
+        # the whole scheduler transaction into an exception.
+        return WebPushResult(False, "privacy_blocked")
 
 
 def is_expired_subscription_error(result: WebPushResult) -> bool:

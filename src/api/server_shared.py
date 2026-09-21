@@ -35,6 +35,15 @@ from .connection_manager import ConnectionManager
 from .routes.api_token_routes import register_api_token_routes
 from .routes.auth_routes import register_auth_routes
 from .routes.agent_run_routes import register_agent_run_routes
+# WS01 generic Agent identity/authority routes are kept in a separate module
+# so existing conversation/Operations route contracts remain unchanged.
+try:
+    from .agent_identity_routes import create_agent_identity_router
+
+    AGENT_IDENTITY_ROUTES_AVAILABLE = True
+except ImportError:
+    create_agent_identity_router = None
+    AGENT_IDENTITY_ROUTES_AVAILABLE = False
 from .routes.live_voice_routes import register_live_voice_routes
 from .routes.voice_session_routes import register_voice_session_routes
 from .routes.voice_session_routes import register_voice_session_routes
@@ -63,6 +72,7 @@ from .routes.payloads import (
 )
 from .routes.system_routes import register_system_routes
 from .routes.user_admin_routes import register_user_admin_routes
+from .routes.verification_data_routes import register_verification_data_routes
 from .routes.websocket_routes import register_websocket_routes
 from ..services.conversation_title_llm import generate_title_with_llm_client
 from ..services.llm_model_catalog import build_llm_mode_state, model_supports_vision
@@ -188,6 +198,15 @@ except ImportError:
     PROJECT_ROUTES_AVAILABLE = False
     create_project_router = None
 
+# Import Project Overview routes.
+try:
+    from .routes.project_overview_routes import create_project_overview_router
+
+    PROJECT_OVERVIEW_ROUTES_AVAILABLE = True
+except ImportError:
+    PROJECT_OVERVIEW_ROUTES_AVAILABLE = False
+    create_project_overview_router = None
+
 # Import Project Docs candidate review routes.  Keep this boundary separate
 # from the generic memory decision router so approval always goes through the
 # canonical Project Information Docs writer.
@@ -199,16 +218,118 @@ except ImportError:
     PROJECT_DOCS_CANDIDATE_ROUTES_AVAILABLE = False
     create_project_docs_candidate_router = None
 
-# Import ProjectContextPack status/rebuild routes.  This boundary remains
-# separate from the generic Project and Docs candidate routers so projection
-# jobs cannot mutate canonical content directly.
+# Resolution Knowledge Capture is an additive rollout surface.  Keep its
+# import independently optional so a legacy checkout can still boot while the
+# candidate-domain migration/services are being deployed.
 try:
-    from .project_context_pack_routes import create_project_context_pack_router
+    from .knowledge_capture_routes import create_knowledge_capture_router
 
-    PROJECT_CONTEXT_PACK_ROUTES_AVAILABLE = True
+    KNOWLEDGE_CAPTURE_ROUTES_AVAILABLE = True
 except ImportError:
-    PROJECT_CONTEXT_PACK_ROUTES_AVAILABLE = False
-    create_project_context_pack_router = None
+    KNOWLEDGE_CAPTURE_ROUTES_AVAILABLE = False
+    create_knowledge_capture_router = None
+
+# Import the authenticated Engagement Operations kernel routes.  Keep this
+# optional at composition time so a source-tree checkout without the optional
+# operations migration can still boot and expose the remaining API surface.
+try:
+    from .operations_routes import create_operations_router
+
+    OPERATIONS_ROUTES_AVAILABLE = True
+except ImportError:
+    OPERATIONS_ROUTES_AVAILABLE = False
+    create_operations_router = None
+
+# Media Operations is a separate typed vertical. Keep it independently
+# optional at composition time so EngagementOps availability and semantics are
+# unaffected by a rolling deploy of the MediaOps migration/code.
+try:
+    from .media_operations_routes import create_media_operations_router
+
+    MEDIA_OPERATIONS_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_ROUTES_AVAILABLE = False
+    create_media_operations_router = None
+
+try:
+    from .media_operations_setup_routes import (
+        create_media_operations_setup_router,
+    )
+
+    MEDIA_OPERATIONS_SETUP_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_SETUP_ROUTES_AVAILABLE = False
+    create_media_operations_setup_router = None
+
+try:
+    from .media_operations_research_routes import (
+        create_media_operations_research_router,
+    )
+
+    MEDIA_OPERATIONS_RESEARCH_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_RESEARCH_ROUTES_AVAILABLE = False
+    create_media_operations_research_router = None
+
+try:
+    from .media_operations_generation_routes import (
+        create_media_operations_generation_router,
+    )
+
+    MEDIA_OPERATIONS_GENERATION_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_GENERATION_ROUTES_AVAILABLE = False
+    create_media_operations_generation_router = None
+
+try:
+    from .media_operations_automation_routes import (
+        create_media_operations_automation_router,
+    )
+
+    MEDIA_OPERATIONS_AUTOMATION_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_AUTOMATION_ROUTES_AVAILABLE = False
+    create_media_operations_automation_router = None
+
+try:
+    from .media_operations_content_routes import (
+        create_media_operations_content_router,
+    )
+
+    MEDIA_OPERATIONS_CONTENT_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_CONTENT_ROUTES_AVAILABLE = False
+    create_media_operations_content_router = None
+
+try:
+    from .media_operations_metrics_routes import (
+        create_media_operations_metrics_router,
+    )
+
+    MEDIA_OPERATIONS_METRICS_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_METRICS_ROUTES_AVAILABLE = False
+    create_media_operations_metrics_router = None
+
+try:
+    from .media_operations_learning_routes import (
+        create_media_operations_learning_router,
+    )
+
+    MEDIA_OPERATIONS_LEARNING_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_LEARNING_ROUTES_AVAILABLE = False
+    create_media_operations_learning_router = None
+
+try:
+    from .media_operations_overview_routes import (
+        create_media_operations_overview_router,
+    )
+
+    MEDIA_OPERATIONS_OVERVIEW_ROUTES_AVAILABLE = True
+except ImportError:
+    MEDIA_OPERATIONS_OVERVIEW_ROUTES_AVAILABLE = False
+    create_media_operations_overview_router = None
 
 # Import Knowledge routes
 try:
@@ -300,6 +421,17 @@ except ImportError:
     DOCS_ROUTES_AVAILABLE = False
     create_docs_router = None
 
+# Import Meeting Processing API routes.  Keep this optional at composition
+# time so source-tree checkouts that have not applied the meeting-processing
+# model/storage migration can still boot the remaining API surface.
+try:
+    from .meeting_processing_routes import create_meeting_processing_router
+
+    MEETING_PROCESSING_ROUTES_AVAILABLE = True
+except ImportError:
+    MEETING_PROCESSING_ROUTES_AVAILABLE = False
+    create_meeting_processing_router = None
+
 # Import authenticated per-user X Cookie routes
 try:
     from .x_cookie_routes import create_x_cookie_router
@@ -318,6 +450,17 @@ except ImportError:
     TASK_NOTIFICATION_WORKER_AVAILABLE = False
     TaskNotificationWorker = None
 
+# The Knowledge Capture worker is optional during rolling deployment.  The
+# route surface remains importable, but composition must not make legacy
+# startup depend on the new candidate/research stack.
+try:
+    from ..services.knowledge_capture_worker import KnowledgeCaptureWorker
+
+    KNOWLEDGE_CAPTURE_WORKER_AVAILABLE = True
+except ImportError:
+    KNOWLEDGE_CAPTURE_WORKER_AVAILABLE = False
+    KnowledgeCaptureWorker = None
+
 # Import heartbeat routes
 try:
     from .heartbeat_routes import create_heartbeat_router
@@ -335,6 +478,16 @@ try:
 except ImportError:
     AGENT_HARNESS_ROUTES_AVAILABLE = False
     create_agent_harness_router = None
+
+# Common durable AgentWork read/maintenance routes.  Keep optional during
+# rolling migrations so the core API can still boot before WS02 is applied.
+try:
+    from .agent_work_routes import create_agent_work_router
+
+    AGENT_WORK_ROUTES_AVAILABLE = True
+except ImportError:
+    create_agent_work_router = None
+    AGENT_WORK_ROUTES_AVAILABLE = False
 
 # Import persistent Apps routes
 try:
@@ -456,8 +609,10 @@ else:
         COMFYUI_ROUTES_AVAILABLE = False
         create_comfyui_router = None
 
-# Logging configuration
-logging.basicConfig(level=logging.INFO)
+# Logging is configured by the application entry point (``main.py``).  Avoid
+# mutating the process-wide root handlers at import time: server_shared is
+# imported by many routes before startup logging has selected its independent
+# console/file thresholds.
 logger = logging.getLogger(__name__)
 
 # Suppress noisy websockets library errors for expected disconnections

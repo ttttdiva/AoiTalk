@@ -429,6 +429,10 @@ async def apply_daily_intake(
                     created_by=user_id,
                     updated_by=user_id,
                     created_by_agent=True,
+                    # Daily-intake extraction is inferred background
+                    # organization; keep it in the review queue and make its
+                    # provenance explicit for safe historical cleanup.
+                    origin="legacy_auto",
                 )
             )
             inquiries_created += 1
@@ -488,19 +492,6 @@ async def apply_daily_intake(
             record_rows_created += 1
 
     await session.commit()
-    # Daily intake mutates the canonical Project Information Docs in the
-    # transaction above.  Rebuild scheduling happens only after that commit;
-    # a queue outage must not turn a successful intake into an API failure.
-    from .project_context_pack_job_service import enqueue_project_context_pack_rebuild
-
-    try:
-        await enqueue_project_context_pack_rebuild(
-            project_id,
-            user_id,
-            "daily_intake_applied",
-        )
-    except Exception:
-        logger.exception("Failed to enqueue ProjectContextPack rebuild after daily intake")
     for task_payload in task_payloads:
         await task_service._broadcast("task_created", task_payload)
 

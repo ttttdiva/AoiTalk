@@ -4,6 +4,7 @@ import copy
 import os
 import logging
 import re
+import threading
 from typing import Optional, List, Dict, Any, Union, Callable, Awaitable, TYPE_CHECKING
 
 from ..config import Config
@@ -17,6 +18,7 @@ from .native_runtime import (
     AgentTurnRunner,
     NativeModelSettings as ModelSettings,
     Reasoning,
+    cloud_advisor_parent_scope,
     create_async_openai_client,
 )
 from .provider_capabilities import ProviderCapabilities
@@ -33,7 +35,10 @@ from .generation_policy import DEFAULT_GENERATION_POLICY
 from .planning_policy import DEFAULT_PLANNING_POLICY
 from .conversation_context import conversation_state_mode
 from .deployment_resolver import (
+    KNOWN_PROVIDER_IDS,
+    canonical_model_for_provider,
     effective_config_overrides,
+    is_retired_model,
     preflight_deployment,
     resolve_llm_deployment,
 )
@@ -44,6 +49,7 @@ from .manager_parts import (
     MemoryIntegrationMixin,
     TurnExecutionMixin,
 )
+from ..utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 if TYPE_CHECKING:
     # 戻り値型注釈（文字列フォワードリファレンス）用。実行時importは循環回避のため行わない。
@@ -120,7 +126,7 @@ class AgentLLMClient(
     def __init__(
         self,
         api_key: str,
-        model: str = "gpt-4o",
+        model: str = "gpt-5.6-luna",
         config: Optional[Config] = None,
         *,
         provider_label: str = "openai",
@@ -137,9 +143,28 @@ class AgentLLMClient(
             config: Application configuration (required)
         """
         self.config = config
-        self.model_name = model
+        self._lightweight_ephemeral_client = _config_bool(
+            config, "runtime.lightweight_ephemeral_client", False
+        )
+        normalized_model = str(model or "").strip()
+        if is_retired_model(normalized_model):
+            normalized_model = canonical_model_for_provider(
+                config, provider_label, selected_model=None
+            )
+        if not normalized_model:
+            normalized_model = canonical_model_for_provider(
+                config, provider_label, selected_model=None
+            )
+        if not normalized_model or is_retired_model(normalized_model):
+            raise ValueError(
+                f"No safe model is configured for provider '{provider_label}'"
+            )
+        self.model_name = normalized_model
         self.provider_label = provider_label
-        self._native_tools_enabled = bool(supports_tools)
+        self._native_tools_enabled = (
+            bool(supports_tools)
+            and not self._lightweight_ephemeral_client
+        )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
             supports_tools=self._native_tools_enabled,
@@ -159,7 +184,9 @@ class AgentLLMClient(
             config=config,
         )
         # Handle both Config object and dict
-        if hasattr(config, "default_character"):
+        if self._lightweight_ephemeral_client:
+            self.character_name = "Assistant"
+        elif hasattr(config, "default_character"):
             self.character_name = config.default_character
         elif isinstance(config, dict):
             self.character_name = config.get("default_character", "Assistant")
@@ -199,6 +226,11 @@ class AgentLLMClient(
         self._history_active_model_transcript: list[dict[str, Any]] = []
         self._provider_state_mode = conversation_state_mode(config, provider_label)
         self._provider_state = {"previous_response_id": None, "fingerprint": None}
+        # Native OpenAI turns publish a run-keyed completed ledger so
+        # AgentRun fallback can still prove a committed mutation when the
+        # final provider text request fails after the tool loop.
+        self._native_completed_agent_run_states: dict[str, dict[str, Any]] = {}
+        self._native_completed_agent_run_states_lock = threading.Lock()
 
         # Initialize memory manager
         self.memory_manager = None
@@ -212,7 +244,25 @@ class AgentLLMClient(
             else:
                 return default
 
-        self._memory_enabled = get_config_value("memory", {}).get("enabled", True)
+        if self._lightweight_ephemeral_client:
+            # Lightweight target clients are intentionally side-effect free:
+            # no memory manager or cross-session persistence is allowed even
+            # when a caller constructs one without the usual ephemeral flag.
+            self._memory_enabled = False
+        else:
+            explicit_memory_enabled = get_config_value(
+                "memory.enabled",
+                None,
+            )
+            if explicit_memory_enabled is None:
+                self._memory_enabled = get_config_value(
+                    "memory",
+                    {},
+                ).get("enabled", True)
+            else:
+                self._memory_enabled = _config_bool(
+                    config, "memory.enabled", True
+                )
         if self._memory_enabled:
             memory_config = MemoryConfig()
             if config:
@@ -223,12 +273,6 @@ class AgentLLMClient(
                     "llm_model", memory_config.llm_model
                 )
                 memory_settings = get_config_value("memory", {})
-                memory_config.embedding_model = memory_settings.get(
-                    "embedding_model", memory_config.embedding_model
-                )
-                memory_config.preload_embedding_model = memory_settings.get(
-                    "preload_embedding_model", memory_config.preload_embedding_model
-                )
                 memory_config.enable_search = memory_settings.get(
                     "enable_search", memory_config.enable_search
                 )
@@ -237,42 +281,98 @@ class AgentLLMClient(
             )
 
         self._cleanup_registered = False  # Track if cleanup is registered
-        self._tool_registry = build_runtime_tool_registry_for_client(
-            build_runtime_tool_registry,
-            config,
-            client=self,
-        )
-        ensure_load_tool_pack_tool(self._tool_registry, self)
+        if self._lightweight_ephemeral_client:
+            from ..tools.registry import ToolRegistry
+
+            self._tool_registry = ToolRegistry()
+        else:
+            self._tool_registry = build_runtime_tool_registry_for_client(
+                build_runtime_tool_registry,
+                config,
+                client=self,
+            )
+            ensure_load_tool_pack_tool(self._tool_registry, self)
 
         # Initialize reasoning manager
         self.reasoning_manager = None
-        if self.config:
+        if self.config and not self._lightweight_ephemeral_client:
             reasoning_config = get_config_value("reasoning", {})
             if reasoning_config.get("enabled", False):
                 self.reasoning_manager = ReasoningManager(self, reasoning_config)
-                print(
-                    f"[AgentLLMClient] Reasoning enabled (threshold: {reasoning_config.get('complexity_threshold', 0.6)})"
+                logger.info(
+                    "Agent reasoning enabled (threshold: %s)",
+                    reasoning_config.get("complexity_threshold", 0.6),
                 )
 
-        self.agent = self._create_character_agent()
-        print(f"[AgentLLMClient] Character agent initialized: {self.character_name}")
+        if self._lightweight_ephemeral_client:
+            self.agent = None
+        else:
+            self.agent = self._create_character_agent()
+            logger.info(
+                "Character agent initialized: %s",
+                self.character_name,
+            )
 
         # Initialize Spotify
         spotify_enabled = get_config_value("spotify", {}).get("enabled", True)
-        if self.config and spotify_enabled:
+        if (
+            not self._lightweight_ephemeral_client
+            and self.config
+            and spotify_enabled
+        ):
             spotify_success = init_spotify_manager()
             if spotify_success:
-                print("[AgentLLMClient] Spotify initialized successfully")
-            else:
-                print(
-                    "[AgentLLMClient] Spotify initialization failed; continuing without Spotify"
+                logger.info(
+                    "Spotify integration initialized",
                 )
-        elif not spotify_enabled:
-            print("[AgentLLMClient] Spotify feature is disabled")
+            else:
+                logger.warning(
+                    "Spotify integration unavailable; continuing without Spotify",
+                    extra=FILE_ONLY_LOG_EXTRA,
+                )
+        elif (
+            not self._lightweight_ephemeral_client
+            and not spotify_enabled
+        ):
+            logger.info(
+                "Spotify integration disabled by configuration",
+            )
 
         # 常駐clientだけprocess終了hookを持つ。短命clientは所有者がcleanupする。
         if _config_bool(config, "runtime.register_process_cleanup", True):
             self._register_cleanup()
+
+    def cloud_advisor_scope(
+        self,
+        *,
+        origin: Any | None = None,
+        assessment: Any | None = None,
+    ):
+        """Return a context manager for one trusted parent Cloud Advisor turn.
+
+        Request/controller code can use this narrow seam around an async
+        generation call to distinguish an explicit user request from an
+        automatic, semantically assessed escalation::
+
+            async with ...  # use ``cloud_advisor_parent_scope`` for sync
+            with client.cloud_advisor_scope(origin=..., assessment=...):
+                await client.generate_response_async(...)
+
+        ``origin`` and ``assessment`` are validated by the native bridge and
+        the Cloud Advisor service.  Untrusted mappings, regex/length hints, or
+        model-provided booleans are ignored rather than promoted to authority.
+        Existing callers should omit this context manager and retain the
+        historical Main-agent/no-assessment behavior.
+        """
+
+        return cloud_advisor_parent_scope(
+            origin=origin,
+            assessment=assessment,
+        )
+
+    # More explicit alias for controllers that want to document that this is
+    # a parent-owned scope rather than a general provider setting.
+    cloud_advisor_parent_scope = cloud_advisor_scope
 
 
 class TargetConfig:
@@ -302,6 +402,25 @@ class TargetConfig:
 
     def set(self, key: str, value: Any) -> None:
         self._overrides[key] = value
+
+    def get_character_config(self, character_name: str) -> Dict[str, Any]:
+        """Delegate Character resolution, with a mapping-only compatibility fallback.
+
+        Real application Config objects keep their canonical Character
+        resolver. Lightweight/legacy mapping snapshots used for request-local
+        target construction have never carried that method; they receive a
+        generic assistant Character rather than turning a normal non-lightweight
+        session reroute into an AttributeError.
+        """
+
+        resolver = getattr(self._base, "get_character_config", None)
+        if callable(resolver):
+            return resolver(character_name)
+        name = str(character_name or "Assistant").strip() or "Assistant"
+        return {
+            "name": name,
+            "personality": {},
+        }
 
     def save_to_file(self, key: str, value: Any) -> bool:
         # ターン専用設定は永続化しない。
@@ -334,6 +453,7 @@ TARGET_CLIENT_PROVIDERS = {
 }
 
 _LLAMA_CPP_TARGET_RUNTIME_KEYS = (
+    "profile_id",
     "model_path",
     "model_alias",
     "context_size",
@@ -349,28 +469,108 @@ _LLAMA_CPP_TARGET_RUNTIME_KEYS = (
     "mtp_reason",
     "mtp_artifact_path",
     "mtp_resolved_model_path",
+    "mtp_variant_model_path",
     "mtp_mode",
 )
+
+_FREETOKEN_TARGET_RUNTIME_KEYS = (
+    "host",
+    "port",
+    "auto_start",
+    "readiness_timeout",
+    "extra_args",
+)
+
+_LLAMA_CPP_FREETOKEN_MASK_KEYS = (
+    "executable",
+    "profile_id",
+    "model_path",
+    "model_root",
+    "model_alias",
+    "host",
+    "port",
+    "context_size",
+    "extra_args",
+    "gpu_layers",
+    "auto_start",
+    "readiness_timeout",
+    "reasoning_effort",
+    "mtp_enabled",
+    "mtp_model_path",
+    "mtp_supported",
+    "mtp_available",
+    "mtp_status",
+    "mtp_reason",
+    "mtp_artifact_path",
+    "mtp_resolved_model_path",
+    "mtp_variant_model_path",
+    "mtp_mode",
+)
+
+
+def _target_enable_tools_option(
+    options: Optional[Dict[str, Any]],
+) -> Optional[bool]:
+    """Return a validated per-target tool flag when one was supplied."""
+
+    if not options or "enable_tools" not in options:
+        return None
+    value = options["enable_tools"]
+    if not isinstance(value, bool):
+        raise ValueError("provider_options.enable_tools must be a boolean")
+    return value
 
 
 def _overlay_openai_compatible_local_target_runtime(
     config: Any,
     overrides: Dict[str, Any],
     model: str,
+    *,
+    options: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Copy persist local settings and overlay resolved llama.cpp runtime.
+    """Copy persisted local settings and overlay the selected local runtime.
 
     The persist dict is never mutated.  ``local-model`` stays an external
-    endpoint and does not receive managed launch settings.
+    endpoint and managed runtime settings remain request-scoped.
     """
 
+    options = options or {}
+    enable_tools = _target_enable_tools_option(options)
     base_local = _config_get(config, "openai_compatible_local", {})
     if not isinstance(base_local, dict):
         base_local = {}
     local_copy = copy.deepcopy(base_local)
     target_model = str(model or "").strip()
     local_copy["model"] = target_model
-    if target_model.casefold() != "local-model":
+    if enable_tools is not None:
+        local_copy["enable_tools"] = enable_tools
+
+    from .openai_compatible_local_profiles import managed_local_runtime_for_model
+
+    managed_runtime = managed_local_runtime_for_model(
+        config,
+        target_model,
+    )
+    if managed_runtime == "freetoken":
+        from src.service_manager._local_llm_servers import _freetoken_settings
+
+        resolved = _freetoken_settings(
+            config,
+            model=target_model,
+        )
+        local_copy["freetoken"] = {
+            key: copy.deepcopy(resolved[key])
+            for key in _FREETOKEN_TARGET_RUNTIME_KEYS
+            if key in resolved
+        }
+        local_copy["llama_cpp"] = {}
+        local_copy.pop("reasoning_effort", None)
+        overrides.pop("runtime.target_reasoning_effort", None)
+        for key in _LLAMA_CPP_FREETOKEN_MASK_KEYS:
+            overrides[
+                f"openai_compatible_local.llama_cpp.{key}"
+            ] = None
+    elif target_model.casefold() != "local-model":
         from src.service_manager._local_llm_servers import _llama_cpp_settings
         from .openai_compatible_local_profiles import llama_cpp_reasoning_effort_metadata
 
@@ -408,6 +608,7 @@ def _overlay_openai_compatible_local_target_runtime(
         if isinstance(llama_cpp, dict):
             llama_cpp = dict(llama_cpp)
             for key in (
+                "profile_id",
                 "mtp_enabled",
                 "mtp_model_path",
                 "mtp_supported",
@@ -416,6 +617,7 @@ def _overlay_openai_compatible_local_target_runtime(
                 "mtp_reason",
                 "mtp_artifact_path",
                 "mtp_resolved_model_path",
+                "mtp_variant_model_path",
                 "mtp_mode",
             ):
                 # Explicit ``None`` prevents TargetConfig dotted reads from
@@ -459,6 +661,12 @@ def create_llm_client_for_target(
 
         model = enforce_enterprise_sglang_model(config, provider, model)
     options = dict(provider_options or {})
+    enable_tools = _target_enable_tools_option(options)
+    lightweight_client = options.get("lightweight_client", False)
+    if not isinstance(lightweight_client, bool):
+        raise ValueError(
+            "provider_options.lightweight_client must be a boolean"
+        )
     resolved_key = api_key or str(
         getattr(credential_profile, "api_key", "") or ""
     )
@@ -481,6 +689,13 @@ def create_llm_client_for_target(
     if options.get("ephemeral_session_client"):
         overrides["runtime.ephemeral_session_client"] = True
         overrides["memory.enabled"] = False
+    if enable_tools is not None:
+        overrides["runtime.target_enable_tools"] = enable_tools
+    if "lightweight_client" in options:
+        # Explicit False is significant: Project Steward must be able to mask
+        # a stale/base lightweight flag while creating its tool-enabled,
+        # read-only request client.
+        overrides["runtime.lightweight_ephemeral_client"] = lightweight_client
     if resolved_key:
         overrides["runtime.target_api_key"] = resolved_key
     if resolved_base_url:
@@ -489,6 +704,12 @@ def create_llm_client_for_target(
         overrides["runtime.defer_server_start"] = True
     if options.get("disable_server_auto_start"):
         overrides["runtime.disable_server_auto_start"] = True
+    # Target-scoped tool enablement must reach every provider adapter. Some
+    # engines consume provider-specific flags, while registry-backed engines
+    # use `use_tools`; keep both projections request-scoped and consistent.
+    if enable_tools is not None:
+        overrides["use_tools"] = enable_tools
+
     if provider == "openai":
         if resolved_key:
             overrides["openai_api_key"] = resolved_key
@@ -553,9 +774,17 @@ def create_llm_client_for_target(
     elif provider == "claude-cli" and effort:
         overrides["claude_cli.reasoning_effort"] = effort
     elif provider == "openai_compatible_local":
-        from .openai_compatible_local_profiles import llama_cpp_reasoning_effort_metadata
+        from .openai_compatible_local_profiles import (
+            llama_cpp_reasoning_effort_metadata,
+            managed_local_runtime_for_model,
+        )
 
-        local_metadata = llama_cpp_reasoning_effort_metadata(model)
+        local_runtime = managed_local_runtime_for_model(config, model)
+        local_metadata = (
+            None
+            if local_runtime == "freetoken"
+            else llama_cpp_reasoning_effort_metadata(model)
+        )
         if effort and local_metadata:
             normalized_effort = str(effort).strip().lower()
             if normalized_effort not in local_metadata["options"]:
@@ -564,7 +793,18 @@ def create_llm_client_for_target(
                     f"{effort!r}; expected one of {local_metadata['options']}"
                 )
             overrides["runtime.target_reasoning_effort"] = normalized_effort
-        _overlay_openai_compatible_local_target_runtime(config, overrides, model)
+        _overlay_openai_compatible_local_target_runtime(
+            config,
+            overrides,
+            model,
+            options=options,
+        )
+    elif provider == "ollama":
+        overrides["ollama.model"] = model
+        if resolved_base_url:
+            overrides["ollama.base_url"] = resolved_base_url
+        if enable_tools is not None:
+            overrides["ollama.enable_tools"] = enable_tools
     elif provider == "routing-profile":
         clean_model = str(model or "").strip()
         if clean_model != "free-team":
@@ -601,7 +841,26 @@ def create_llm_client(
         if overrides:
             config = TargetConfig(config, overrides)
 
-    llm_provider = str(config.get("llm_provider", "openai") or "openai").lower()
+    llm_provider = str(config.get("llm_provider", "openai") or "openai").strip().lower()
+    if llm_provider not in KNOWN_PROVIDER_IDS:
+        raise RuntimeError(
+            f"Unsupported LLM provider '{llm_provider}'; refusing to fall back "
+            "to the official OpenAI transport"
+        )
+
+    # Project a safe effective model onto this turn-scoped config.  This keeps
+    # provider engines that do not call the native factory (Gemini/CLI/local)
+    # from forwarding a retired persisted model.  Explicit non-retired model
+    # selections remain untouched.
+    if llm_provider != "routing-profile":
+        safe_model = canonical_model_for_provider(config, llm_provider)
+        if not safe_model or is_retired_model(safe_model):
+            raise RuntimeError(
+                f"No safe model is configured for provider '{llm_provider}'"
+            )
+        current_model = str(config.get("llm_model", "") or "").strip()
+        if current_model != safe_model:
+            config = TargetConfig(config, {"llm_model": safe_model})
 
     if llm_provider == "routing-profile":
         model = str(config.get("llm_model", "") or "")
@@ -612,25 +871,27 @@ def create_llm_client(
         return FreeTeamRoutingClient(config)
 
     if llm_provider == "gemini":
-        print(f"[LLM Factory] Geminiクライアントを作成")
+        logger.info("Creating Gemini LLM client")
         from .gemini_engine import create_gemini_client
 
         return create_gemini_client(config)
 
     elif llm_provider == "sglang":
-        print(f"[LLM Factory] SGLangクライアントを作成")
+        logger.info("Creating SGLang LLM client")
         from .sglang_engine import create_sglang_client
 
         return create_sglang_client(config)
 
     elif llm_provider == "ollama":
-        print("[LLM Factory] Ollamaクライアントを作成")
+        logger.info("Creating Ollama LLM client")
         from .ollama_engine import create_ollama_client
 
         return create_ollama_client(config)
 
     elif llm_provider == "openai_compatible_local":
-        print(f"[LLM Factory] OpenAI互換ローカルクライアントを作成")
+        logger.info(
+            "Creating OpenAI-compatible local LLM client",
+        )
         from .openai_compatible_local_engine import (
             create_openai_compatible_local_client,
         )
@@ -639,7 +900,10 @@ def create_llm_client(
 
     elif llm_provider in ["antigravity-cli", "claude-cli", "codex-cli", "grok-cli"]:
         # CLI-based providers
-        print(f"[LLM Factory] {llm_provider.upper()} Backendを作成")
+        logger.info(
+            "Creating %s CLI LLM backend",
+            llm_provider.upper(),
+        )
 
         # Select appropriate CLI backend
         if llm_provider == "antigravity-cli":
@@ -670,7 +934,7 @@ def create_llm_client(
         return CLILLMClient(config=config, cli_backend=cli_backend)
 
     elif llm_provider == "openrouter":
-        print(f"[LLM Factory] OpenRouter Agentクライアントを作成")
+        logger.info("Creating OpenRouter LLM client")
         api_key = config.get("openrouter_api_key") or os.getenv("OPENROUTER_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -703,20 +967,20 @@ def create_llm_client(
 
         return AgentLLMClient(
             api_key=api_key,
-            model=config.get(
-                "llm_model",
-                config.get("openrouter.model", "openai/gpt-4o-mini"),
-            ),
+            model=canonical_model_for_provider(config, "openrouter"),
             config=config,
             provider_label="openrouter",
             base_url=base_url,
             default_headers=headers,
             force_chat_completions=True,
-            supports_tools=_config_bool(config, "openrouter.enable_tools", False),
+            supports_tools=(
+                _config_bool(config, "openrouter.enable_tools", False)
+                and _config_bool(config, "runtime.target_enable_tools", True)
+            ),
         )
 
     elif llm_provider == "deepseek":
-        print("[LLM Factory] DeepSeek APIクライアントを作成")
+        logger.info("Creating DeepSeek LLM client")
         api_key = config.get("deepseek_api_key") or os.getenv("DEEPSEEK_API_KEY")
         if not api_key:
             raise RuntimeError(
@@ -739,11 +1003,13 @@ def create_llm_client(
             provider_label="deepseek",
             base_url=base_url,
             force_chat_completions=True,
-            supports_tools=True,
+            supports_tools=_config_bool(
+                config, "runtime.target_enable_tools", True
+            ),
         )
 
     elif llm_provider == "deepinfra":
-        print("[LLM Factory] DeepInfra APIクライアントを作成")
+        logger.info("Creating DeepInfra LLM client")
         api_key = config.get("deepinfra_api_key") or os.getenv("DEEPINFRA_TOKEN")
         if not api_key:
             raise RuntimeError(
@@ -766,11 +1032,13 @@ def create_llm_client(
             provider_label="deepinfra",
             base_url=base_url,
             force_chat_completions=True,
-            supports_tools=True,
+            supports_tools=_config_bool(
+                config, "runtime.target_enable_tools", True
+            ),
         )
 
     elif llm_provider == "kimi":
-        print("[LLM Factory] Kimi APIクライアントを作成")
+        logger.info("Creating Kimi LLM client")
         api_key = config.get("kimi_api_key") or os.getenv("MOONSHOT_API_KEY")
         if not api_key:
             raise RuntimeError("Kimiを使用するには MOONSHOT_API_KEY を設定してください")
@@ -787,13 +1055,27 @@ def create_llm_client(
             provider_label="kimi",
             base_url=base_url,
             force_chat_completions=True,
-            supports_tools=True,
+            supports_tools=_config_bool(
+                config, "runtime.target_enable_tools", True
+            ),
         )
 
     else:  # openai or default
-        print(f"[LLM Factory] OpenAI Agentクライアントを作成")
+        logger.info("Creating OpenAI LLM client")
+        base_url = (
+            config.get("openai.base_url")
+            or config.get("openai_base_url")
+            or os.getenv("OPENAI_BASE_URL")
+            or None
+        )
         return AgentLLMClient(
             api_key=config.get("openai_api_key"),
-            model=config.get("llm_model", "gpt-4o"),
+            model=canonical_model_for_provider(config, "openai"),
             config=config,
+            base_url=base_url,
+            supports_tools=_config_bool(
+                config,
+                "runtime.target_enable_tools",
+                True,
+            ),
         )

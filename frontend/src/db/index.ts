@@ -6,6 +6,8 @@ import {
 import postgres from "postgres";
 import * as schema from "./schema";
 
+const POSTGRES_SCHEMA_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 function getConnectionString(): string {
   if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
 
@@ -18,11 +20,26 @@ function getConnectionString(): string {
   return `postgres://${user}:${password}@${host}:${port}/${dbName}`;
 }
 
+function getConnectionOptions() {
+  const configuredSchema = process.env.POSTGRES_SCHEMA?.trim() || "";
+  if (!configuredSchema || configuredSchema.toLowerCase() === "public") {
+    return undefined;
+  }
+  if (!POSTGRES_SCHEMA_RE.test(configuredSchema)) {
+    throw new Error(
+      "POSTGRES_SCHEMA must be a simple PostgreSQL identifier",
+    );
+  }
+  return { options: `-c search_path=${configuredSchema}` };
+}
+
 function createClient() {
+  const connection = getConnectionOptions();
   return postgres(getConnectionString(), {
     // 1プロセスあたりの上限を明示する（postgres の既定も10だが、
     // PostgreSQL 側の max_connections を食い潰さないよう意図を残す）。
     max: 10,
+    ...(connection ? { connection } : {}),
     types: {
       wallClockTimestamp: {
         to: 1114,

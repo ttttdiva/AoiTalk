@@ -10,7 +10,6 @@ AoiTalk は大規模な logging framework を使わず、Caddy / Python logging 
 | `logs/web/` | HTTP 境界: Next.js frontend、Caddy access / runtime |
 | `logs/models/` | ローカル LLM: llama.cpp、exo、mlx_lm、sglang |
 | `logs/startup/` | 起動計測 `startup_timing_<run_id>.jsonl` |
-| `logs/desktop/` | Tauri デスクトップから起動した backend |
 | `logs/ops/` | DDNS watchdog など運用系 |
 | `logs/discord/` | Discord bot（従来どおり） |
 
@@ -81,10 +80,6 @@ AoiTalk が管理する llama-server は、起動中の親コンソールにも 
 - **アクティブ**: 起動ごとの `bot_YYYYMMDD_HHMMSS.log`
 - **latest**: `latest.log` ポインタ（discord 専用、削除しない）
 - **保持**: 最大 20 ファイル（latest ポインタ除く）
-
-### Desktop (`logs/desktop/desktop-tauri-backend.log`)
-
-Tauri から起動した `main.py` の stdout/stderr。10MiB 超で rotate（housekeeping が世代整理）。
 
 ### DDNS (`logs/ops/ddns_update.log`)
 

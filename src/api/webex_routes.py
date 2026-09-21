@@ -28,9 +28,10 @@ def create_webex_router(
     get_db_manager,
     get_user_from_request,
     require_auth_dependency,
+    config: Any | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/webex", tags=["webex"])
-    service = WebexService()
+    service = WebexService(config=config)
 
     async def _current_user(request: Request) -> dict[str, Any]:
         user_info = await get_user_from_request(request)

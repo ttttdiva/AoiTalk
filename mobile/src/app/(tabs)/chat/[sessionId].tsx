@@ -7,7 +7,6 @@ import React, {
 } from "react";
 import {
   Alert,
-  Animated,
   FlatList,
   Keyboard,
   ScrollView,
@@ -15,11 +14,10 @@ import {
   View,
 } from "react-native";
 import * as Clipboard from "expo-clipboard";
-import { useLocalSearchParams, useNavigation, useRouter } from "expo-router";
+import { useLocalSearchParams, useRouter } from "expo-router";
 import {
   Button,
   Dialog,
-  IconButton,
   Surface,
   Text,
   TextInput,
@@ -40,14 +38,7 @@ import { ChatDialogHost } from "../../../features/conversation/components/ChatDi
 import { ChatScreenShell } from "../../../features/conversation/components/ChatScreenShell";
 import { useReducedMotion } from "../../../features/ui/use-reduced-motion";
 import type { ConversationMessage } from "../../../types/api";
-import { chatApi, type ChatAppContext, type ContextRequestSnapshot } from "../../../lib/chat-api";
-import { characterApi } from "../../../lib/character-api";
-import { appsRepo } from "../../../repositories/apps";
-import type { ProjectAppBinding } from "../../../lib/apps-api";
-import { conversationsRepo } from "../../../repositories";
-import {
-  applyRemoteConversationSessions,
-} from "../../../repositories/conversations";
+import type { ChatAppContext, ContextRequestSnapshot } from "../../../lib/chat-api";
 import {
   getFallbackConfig,
   getMainSlot,
@@ -87,7 +78,6 @@ export default function ChatScreen() {
     : rawAppTargetId;
   const routeProjectId = Array.isArray(rawProjectId) ? rawProjectId[0] : rawProjectId;
   const routeTaskId = Array.isArray(rawTaskId) ? rawTaskId[0] : rawTaskId;
-  const navigation = useNavigation();
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const { user, isAuthenticated } = useAuth();
@@ -95,13 +85,11 @@ export default function ChatScreen() {
     projects,
     selectedProjectId,
     setSelectedProjectId,
-    refreshProjects,
   } = useProject();
   const flatListRef = useRef<FlatList<TimelineItem>>(null);
   const scrollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const promotedSessionTargetRef = useRef<string | null>(null);
   const reduceMotion = useReducedMotion();
-  const screenOpacity = useRef(new Animated.Value(0)).current;
   const [editTarget, setEditTarget] = useState<ConversationMessage | null>(
     null,
   );
@@ -133,31 +121,16 @@ export default function ChatScreen() {
   const [contextLoading, setContextLoading] = useState(false);
   const [contextMain, setContextMain] = useState<ContextRequestSnapshot | null>(null);
   const [contextError, setContextError] = useState<string | null>(null);
-  const [appPickerVisible, setAppPickerVisible] = useState(false);
-  const [appPickerLoading, setAppPickerLoading] = useState(false);
-  const [appPickerError, setAppPickerError] = useState<string | null>(null);
-  const [appPickerApps, setAppPickerApps] = useState<ProjectAppBinding[]>([]);
-  const [appPickerTargetId, setAppPickerTargetId] = useState<string | null>(null);
-  const [groupPickerVisible, setGroupPickerVisible] = useState(false);
-  const [groupPickerLoading, setGroupPickerLoading] = useState(false);
-  const [groupPickerError, setGroupPickerError] = useState<string | null>(null);
-  const [groupCharacters, setGroupCharacters] = useState<string[]>([]);
-  const [groupSelectedCharacters, setGroupSelectedCharacters] = useState<string[]>([]);
-  const [groupCreating, setGroupCreating] = useState(false);
-  const groupCreatingRef = useRef(false);
 
   const handleSessionPromoted = useCallback(
     (remoteSessionId: string) => {
       promotedSessionTargetRef.current = remoteSessionId;
-      router.replace({
-        pathname: "/(tabs)/chat/[sessionId]",
-        params: {
+      router.setParams({
           sessionId: remoteSessionId,
           ...(routeAppId ? { appId: routeAppId } : {}),
           ...(routeAppTargetId ? { appTargetId: routeAppTargetId } : {}),
           ...(routeProjectId ? { projectId: routeProjectId } : {}),
           ...(routeTaskId ? { taskId: routeTaskId } : {}),
-        },
       });
     },
     [routeAppId, routeAppTargetId, routeProjectId, routeTaskId, router],
@@ -218,163 +191,6 @@ export default function ChatScreen() {
       .finally(() => setContextLoading(false));
   }, [controller.getContextSnapshot]);
 
-  const openAppPicker = useCallback(() => {
-    setAppPickerVisible(true);
-    setAppPickerLoading(true);
-    setAppPickerError(null);
-    const request = currentProjectId
-      ? appsRepo.listProjectApps(currentProjectId)
-      : appsRepo.list().then((apps) =>
-          apps.map((app) => ({
-            project_id: "",
-            app_id: app.id,
-            binding_mode: "development" as const,
-            enabled: true,
-            pinned: false,
-            app,
-            targets: app.targets ?? [],
-          })),
-        );
-    void request
-      .then((bindings) => {
-        const enabled = bindings.filter((binding) => binding.enabled);
-        setAppPickerApps(enabled);
-        const current = enabled.find(
-          (binding) => binding.app_id === controller.session?.app_id,
-        );
-        setAppPickerTargetId(
-          current?.targets?.[0]?.id ?? current?.app.targets?.[0]?.id ?? null,
-        );
-      })
-      .catch((error) =>
-        setAppPickerError(
-          error instanceof Error ? error.message : "App一覧を取得できませんでした。",
-        ),
-      )
-      .finally(() => setAppPickerLoading(false));
-  }, [controller.session?.app_id, currentProjectId]);
-
-  const applyAppContext = useCallback(
-    async (binding: ProjectAppBinding | null, targetId = appPickerTargetId) => {
-      try {
-        await controller.bindAppContext(
-          binding
-            ? {
-                appId: binding.app_id,
-                appTargetId: targetId,
-                projectId: currentProjectId,
-              }
-            : null,
-        );
-        setAppPickerVisible(false);
-      } catch (error) {
-        setAppPickerError(
-          error instanceof Error ? error.message : "App contextの変更に失敗しました。",
-        );
-      }
-    }, [appPickerTargetId, controller.bindAppContext, currentProjectId],
-  );
-
-  const openGroupPicker = useCallback(() => {
-    setGroupPickerVisible(true);
-    setGroupPickerLoading(true);
-    setGroupPickerError(null);
-    void characterApi
-      .list()
-      .catch(() => characterApi.getOfflineList(false))
-      .then((characters) => {
-        const slugs = characters
-          .filter((character) => character.is_enabled !== false)
-          .map((character) => character.slug)
-          .filter((slug): slug is string => Boolean(slug));
-        setGroupCharacters(slugs);
-        setGroupSelectedCharacters(slugs.slice(0, 2));
-      })
-      .catch((error) =>
-        setGroupPickerError(
-          error instanceof Error
-            ? error.message
-            : "キャラクター一覧を取得できませんでした。",
-        ),
-      )
-      .finally(() => setGroupPickerLoading(false));
-  }, []);
-
-  const createGroupChat = useCallback(async () => {
-    if (groupCreatingRef.current) return;
-    if (controller.session?.is_group_chat) return;
-    const selectedCharacters = Array.from(
-      new Set(groupSelectedCharacters.map((character) => character.trim()).filter(Boolean)),
-    );
-    if (!isAuthenticated) {
-      setGroupPickerError("グループチャットにはログインが必要です。");
-      return;
-    }
-    if (selectedCharacters.length < 2) {
-      setGroupPickerError("グループチャットには2人以上のキャラクターを選択してください。");
-      return;
-    }
-
-    groupCreatingRef.current = true;
-    setGroupCreating(true);
-    setGroupPickerError(null);
-    const shouldCleanupRegularSession =
-      !controller.session?.is_group_chat && controller.messages.length === 0;
-    try {
-      const result = await chatApi.createGroupSession(
-        selectedCharacters,
-        currentProjectId ?? null,
-      );
-      await applyRemoteConversationSessions([result.session]);
-      setGroupPickerVisible(false);
-      router.replace({
-        pathname: "/(tabs)/chat/[sessionId]",
-        params: {
-          sessionId: result.session.id,
-          ...(currentProjectId ? { projectId: currentProjectId } : {}),
-        },
-      });
-      if (shouldCleanupRegularSession) {
-        try {
-          await conversationsRepo.deleteSession(sessionId);
-        } catch (cleanupError) {
-          console.warn("[chat] unused regular session cleanup failed", cleanupError);
-        }
-      }
-    } catch (error) {
-      setGroupPickerError(
-        error instanceof Error ? error.message : "グループチャットの作成に失敗しました。",
-      );
-    } finally {
-      groupCreatingRef.current = false;
-      setGroupCreating(false);
-    }
-  }, [
-    controller.messages.length,
-    controller.session?.is_group_chat,
-    currentProjectId,
-    groupSelectedCharacters,
-    isAuthenticated,
-    router,
-    sessionId,
-  ]);
-
-  useEffect(() => {
-    if (controller.loading) return;
-    if (reduceMotion) {
-      screenOpacity.setValue(1);
-      return;
-    }
-    screenOpacity.setValue(0);
-    const animation = Animated.timing(screenOpacity, {
-      toValue: 1,
-      duration: 180,
-      useNativeDriver: true,
-    });
-    animation.start();
-    return () => animation.stop();
-  }, [controller.loading, reduceMotion, screenOpacity]);
-
   const durableTimeline = useMemo(
     () =>
       buildDurableTimeline({
@@ -402,30 +218,18 @@ export default function ChatScreen() {
         (message) =>
           message.role === "user" &&
           Boolean(message.metadata?.local_only) &&
-          Boolean(message.metadata?.pending),
+          (Boolean(message.metadata?.pending) || message.metadata?.message_state === "direct-failed"),
       ),
     [controller.messages],
   );
   const directEffortOptions = directResponse
     ? getDirectReasoningEffortOptions(directResponse.provider, directResponse.model)
     : [];
-  const effectiveDirect =
-    controller.effectiveGeneration?.kind === "direct"
-      ? controller.effectiveGeneration
-      : null;
-  const effectiveDirectEffortOptions = effectiveDirect
-    ? getDirectReasoningEffortOptions(
-        effectiveDirect.provider as DirectMobileLlmProvider,
-        effectiveDirect.model,
-      )
-    : [];
-  const currentLlmModeLabel = effectiveDirect?.reasoningEffort
-    ? effectiveDirect.reasoningEffort
-    : directResponse
+  const currentLlmModeLabel = directResponse
     ? directResponse.reasoningEffort || directEffortOptions[0] || "標準"
     : controller.llmMode
       ? controller.llmModeLabels[controller.llmMode] ?? controller.llmMode
-      : "サーバー既定";
+      : "自動";
   const llmSyncLabel =
     controller.llmModeSyncStatus === "pending"
       ? "Effortをバックグラウンド同期予定"
@@ -433,13 +237,6 @@ export default function ChatScreen() {
         ? "Effortをバックグラウンド同期中"
         : null;
   const currentResponseModelLabel = useMemo(() => {
-    const effective = controller.effectiveGeneration;
-    if (effective?.kind === "direct") {
-      return `${getProviderLabel(effective.provider as DirectMobileLlmProvider)} / ${effective.model}`;
-    }
-    if (effective?.kind === "server" && effective.model) {
-      return `${effective.provider ? `${effective.provider} / ` : ""}${effective.model}`;
-    }
     if (directResponse) {
       return `${getProviderLabel(directResponse.provider)} / ${directResponse.model}`;
     }
@@ -450,8 +247,8 @@ export default function ChatScreen() {
             item.model === responseModel.model,
         )
       : controller.responseModelOptions.find((item) => item.isCurrent);
-    return option?.modelLabel ?? responseModel?.model ?? "サーバー既定";
-  }, [controller.effectiveGeneration, controller.responseModelOptions, directResponse, responseModel]);
+    return option?.modelLabel ?? responseModel?.model ?? "サーバー自動";
+  }, [controller.responseModelOptions, directResponse, responseModel]);
 
   // 「次の応答モデル」: Direct + Server をプロバイダー単位で 2段階化する。
   const visibleDirectModelOptions = directModelOptions;
@@ -591,25 +388,6 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, []);
-  useEffect(() => {
-    navigation.setOptions({
-      title: controller.session?.title || "チャット",
-      headerRight: () => (
-        <IconButton
-          icon="pencil-outline"
-          iconColor="#cdd6f4"
-          size={21}
-          accessibilityLabel="セッションタイトルを変更"
-          onPress={() => {
-            setTitleDraft(controller.session?.title || "");
-            setTitleError(null);
-            setTitleDialogVisible(true);
-          }}
-        />
-      ),
-    });
-  }, [controller.session?.title, navigation]);
-
   const saveSessionTitle = useCallback(async () => {
     const normalized = titleDraft.trim();
     if (!normalized) {
@@ -667,11 +445,9 @@ export default function ChatScreen() {
 
   const sendComposerMessage = useCallback(
     (submission: ChatComposerSubmission) => {
-      if (controller.session?.is_group_chat) {
-        return controller.groupRespond(submission.content);
-      }
       return controller.sendConversationCommand({
           message: submission.content,
+          submissionId: submission.submissionId,
           projectId: currentProjectId,
           appId: controller.session?.app_id ?? routeAppId ?? null,
           appTargetId: controller.session?.app_target_id ?? routeAppTargetId ?? null,
@@ -682,8 +458,8 @@ export default function ChatScreen() {
         });
     },
     [
-      controller.groupRespond,
-      controller.session?.is_group_chat,
+      controller.session?.app_id,
+      controller.session?.app_target_id,
       controller.responseTarget,
       controller.sendConversationCommand,
       currentProjectId,
@@ -700,9 +476,12 @@ export default function ChatScreen() {
 
   const submitEdit = useCallback(() => {
     if (!editTarget || !editContent.trim()) return;
-    void controller.editMessage(editTarget, editContent.trim());
-    setEditTarget(null);
-    setEditContent("");
+    void controller.editMessage(editTarget, editContent.trim()).then(() => {
+      setEditTarget(null);
+      setEditContent("");
+    }).catch((error: unknown) => {
+      Alert.alert("編集したメッセージの送信に失敗しました", error instanceof Error ? error.message : "入力と履歴を保持しました。再試行できます。");
+    });
   }, [controller, editContent, editTarget]);
 
   const copyMessage = useCallback(async (message: ConversationMessage) => {
@@ -730,27 +509,34 @@ export default function ChatScreen() {
   const openResponseModel = useCallback(() => {
     setModelPickerFilter("");
     setResponseModelVisible(true);
-  }, []);
+    void controller.refreshResponseModelOptions();
+  }, [controller.refreshResponseModelOptions]);
   const openLlmMode = useCallback(() => setLlmModeVisible(true), []);
 
   return (
     <ChatScreenShell
       loading={controller.loading && !hasConversationContent}
       error={controller.error}
-      opacity={screenOpacity}
       onReload={() => void controller.load()}
-    >
-      <ChatHeaderStatus
+      header={
+        <ChatHeaderStatus
         diagnostics={controller.diagnostics}
         session={controller.session}
         projects={projects}
         currentProjectId={currentProjectId ?? null}
         pendingCount={pendingMessages.length}
-        onRefreshProjects={refreshProjects}
         onChangeProject={changeChatProject}
         onChangeCharacter={controller.changeCharacter}
         onOpenPendingQueue={openPendingQueue}
+        onBack={() => router.back()}
+        onRenameTitle={() => {
+          setTitleDraft(controller.session?.title || "");
+          setTitleError(null);
+          setTitleDialogVisible(true);
+        }}
       />
+      }
+    >
       <ChatTimeline
         listRef={flatListRef}
         items={durableTimeline}
@@ -765,43 +551,16 @@ export default function ChatScreen() {
         onRespondPermission={controller.respondPermission}
       />
 
-      <Surface style={styles.appContextRail} elevation={0}>
-        <View style={styles.appContextRailText}>
-          <Text style={styles.appContextTitle} numberOfLines={1}>
-            App context: {controller.session?.app_id ?? routeAppId ?? "なし"}
-          </Text>
-          <Text style={styles.appContextMeta} numberOfLines={1}>
-            Project {currentProjectId ?? "全体"} · Task {routeTaskId ?? "—"} · Target {controller.session?.app_target_id ?? routeAppTargetId ?? "default"} · {controller.session?.development_status ?? (appContextSelected ? "working" : "通常Chat")}
-          </Text>
-        </View>
-        <Button compact mode="text" textColor="#89b4fa" onPress={openContextSnapshot}>
-          Context
-        </Button>
-        <Button compact mode="text" textColor="#89b4fa" onPress={openAppPicker} disabled={!isAuthenticated}>
-          App
-        </Button>
-        <Button
-          compact
-          mode="text"
-          textColor="#89b4fa"
-          onPress={openGroupPicker}
-          disabled={!isAuthenticated || Boolean(controller.session?.is_group_chat)}
-        >
-          Group
-        </Button>
-      </Surface>
-
       <ChatComposer
         bottomInset={insets.bottom}
         keyboardVisible={keyboardVisible}
         sendEnabled={Boolean(sendEnabled)}
-        serverGenerationActive={controller.serverGenerationActive}
         directResponseActive={Boolean(directResponse)}
         currentResponseModelLabel={currentResponseModelLabel}
         currentLlmModeLabel={currentLlmModeLabel}
         effortEnabled={
-          directResponse || effectiveDirect
-            ? (directResponse ? directEffortOptions : effectiveDirectEffortOptions).length > 0
+          directResponse
+            ? directEffortOptions.length > 0
             : controller.llmModeOptions.length > 0
         }
         llmSelectionMessage={controller.llmSelectionMessage}
@@ -810,166 +569,22 @@ export default function ChatScreen() {
         isAuthenticated={isAuthenticated}
         pendingCount={pendingMessages.length}
         onSend={sendComposerMessage}
-        onStopGeneration={controller.stopGeneration}
         onOpenResponseModel={openResponseModel}
         onOpenLlmMode={openLlmMode}
+        onOpenContextDiagnostics={openContextSnapshot}
         onOpenPendingQueue={openPendingQueue}
         onStartDeepResearch={controller.startDeepResearch}
-        onSteerGeneration={controller.steerGeneration}
       />
 
       <ChatDialogHost>
-        <Dialog
-          visible={groupPickerVisible}
-          onDismiss={() => {
-            if (!groupPickerLoading && !groupCreating) setGroupPickerVisible(false);
-          }}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>Group Chat</Dialog.Title>
-          <Dialog.ScrollArea style={styles.dialogScrollArea}>
-            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              <Text style={styles.diagnosticsText}>
-                参加するキャラクターを2人以上選択してください。
-              </Text>
-              {groupPickerLoading ? (
-                <Text style={styles.diagnosticsText}>読み込み中…</Text>
-              ) : null}
-              {groupPickerError ? (
-                <Text style={styles.dialogError}>{groupPickerError}</Text>
-              ) : null}
-              {!groupPickerLoading && groupCharacters.length === 0 ? (
-                <Text style={styles.diagnosticsText}>
-                  利用可能なキャラクターがありません。
-                </Text>
-              ) : null}
-              {!groupPickerLoading
-                ? groupCharacters.map((slug) => {
-                    const selected = groupSelectedCharacters.includes(slug);
-                    return (
-                      <Button
-                        key={slug}
-                        mode={selected ? "contained" : "outlined"}
-                        buttonColor={selected ? "#7c3aed" : undefined}
-                        textColor="#cdd6f4"
-                        style={styles.modeButton}
-                        onPress={() =>
-                          setGroupSelectedCharacters((current) =>
-                            selected
-                              ? current.filter((item) => item !== slug)
-                              : [...current, slug],
-                          )
-                        }
-                        disabled={groupCreating}
-                      >
-                        {slug}
-                      </Button>
-                    );
-                  })
-                : null}
-            </ScrollView>
-          </Dialog.ScrollArea>
-          <Dialog.Actions>
-            <Button
-              textColor="#a6adc8"
-              onPress={() => setGroupPickerVisible(false)}
-              disabled={groupPickerLoading || groupCreating}
-            >
-              閉じる
-            </Button>
-            <Button
-              textColor="#7c3aed"
-              onPress={() => void createGroupChat()}
-              loading={groupCreating}
-              disabled={
-                groupPickerLoading ||
-                groupCreating ||
-                groupSelectedCharacters.length < 2
-              }
-            >
-              作成
-            </Button>
-          </Dialog.Actions>
-        </Dialog>
-        <Dialog
-          visible={appPickerVisible}
-          onDismiss={() => {
-            if (!appPickerLoading) setAppPickerVisible(false);
-          }}
-          style={styles.dialog}
-        >
-          <Dialog.Title style={styles.dialogTitle}>App context</Dialog.Title>
-          <Dialog.ScrollArea style={styles.dialogScrollArea}>
-            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
-              {appPickerLoading ? <Text style={styles.diagnosticsText}>読み込み中…</Text> : null}
-              {appPickerError ? <Text style={styles.dialogError}>{appPickerError}</Text> : null}
-              {!appPickerLoading ? (
-                <>
-                  <Button
-                    mode={!controller.session?.app_id ? "contained" : "outlined"}
-                    buttonColor={!controller.session?.app_id ? "#7c3aed" : undefined}
-                    textColor="#cdd6f4"
-                    style={styles.modeButton}
-                    onPress={() => void applyAppContext(null)}
-                  >
-                    App contextを解除
-                  </Button>
-                  {appPickerApps.map((binding) => {
-                    const selected = binding.app_id === controller.session?.app_id;
-                    const targets = binding.targets ?? binding.app.targets ?? [];
-                    return (
-                      <View key={binding.app_id}>
-                        <Button
-                          mode={selected ? "contained" : "outlined"}
-                          buttonColor={selected ? "#7c3aed" : undefined}
-                          textColor="#cdd6f4"
-                          style={styles.modeButton}
-                          onPress={() => {
-                            const targetId = targets[0]?.id ?? null;
-                            setAppPickerTargetId(targetId);
-                            void applyAppContext(binding, targetId);
-                          }}
-                        >
-                          {binding.display_alias || binding.app.name}
-                        </Button>
-                        {selected
-                          ? targets.map((target) => (
-                              <Button
-                                key={target.id}
-                                compact
-                                mode={target.id === controller.session?.app_target_id ? "contained" : "outlined"}
-                                textColor="#89b4fa"
-                                style={styles.targetButton}
-                                onPress={() => {
-                                  setAppPickerTargetId(target.id);
-                                  void applyAppContext(binding, target.id);
-                                }}
-                              >
-                                Target: {target.display_name || target.target_key}
-                              </Button>
-                            ))
-                          : null}
-                      </View>
-                    );
-                  })}
-                  {appPickerApps.length === 0 ? (
-                    <Text style={styles.diagnosticsText}>このProjectで利用可能なAppはありません。</Text>
-                  ) : null}
-                </>
-              ) : null}
-            </ScrollView>
-          </Dialog.ScrollArea>
-          <Dialog.Actions>
-            <Button textColor="#a6adc8" onPress={() => setAppPickerVisible(false)} disabled={appPickerLoading}>閉じる</Button>
-          </Dialog.Actions>
-        </Dialog>
         <Dialog
           visible={contextVisible}
           onDismiss={() => setContextVisible(false)}
           style={styles.dialog}
         >
           <Dialog.Title style={styles.dialogTitle}>Context snapshot</Dialog.Title>
-          <Dialog.Content>
+          <Dialog.ScrollArea style={styles.dialogScrollArea}>
+            <ScrollView contentContainerStyle={styles.dialogScrollContent}>
             {contextLoading ? <Text style={styles.diagnosticsText}>読み込み中…</Text> : null}
             {contextError ? <Text style={styles.dialogError}>{contextError}</Text> : null}
             {!contextLoading && !contextError && contextMain ? (
@@ -993,7 +608,8 @@ export default function ChatScreen() {
             {!contextLoading && !contextError && !contextMain ? (
               <Text style={styles.diagnosticsText}>利用可能なスナップショットはありません。</Text>
             ) : null}
-          </Dialog.Content>
+            </ScrollView>
+          </Dialog.ScrollArea>
           <Dialog.Actions>
             <Button textColor="#a6adc8" onPress={() => setContextVisible(false)}>閉じる</Button>
           </Dialog.Actions>
@@ -1058,9 +674,11 @@ export default function ChatScreen() {
                       {message.content || "未送信メッセージ"}
                     </Text>
                     <Text style={styles.pendingMeta} numberOfLines={2}>
-                      {String(message.metadata?.error || "再送待ち")}
+                      {String(message.metadata?.direct_error || message.metadata?.delivery_error || message.metadata?.error || "再送待ち")}
                     </Text>
                   </View>
+                  <View>
+                  {isAuthenticated && message.metadata?.delivery_route !== "direct" ? (
                   <Button
                     compact
                     icon="refresh"
@@ -1072,9 +690,23 @@ export default function ChatScreen() {
                     }}
                   >
                     {controller.retryingMessageIds.includes(message.id)
-                      ? "Retrying…"
-                      : "Retry"}
+                      ? "再試行中…"
+                      : "サーバーへ再送"}
                   </Button>
+                  ) : null}
+                  <Button
+                    compact
+                    icon="cloud-outline"
+                    textColor="#89b4fa"
+                    disabled={controller.retryingMessageIds.includes(message.id)}
+                    onPress={() => {
+                      setPendingQueueVisible(false);
+                      void controller.retryPendingMessage(message, "direct");
+                    }}
+                  >
+                    Directで再試行
+                  </Button>
+                  </View>
                 </Surface>
               ))}
               {pendingMessages.length === 0 ? (
@@ -1167,7 +799,7 @@ export default function ChatScreen() {
                       closeResponseModelDialog();
                     }}
                   >
-                    サーバー既定（自動）
+                    サーバー自動
                   </Button>
                   {responseModelGroups.map((group) => {
                     const selected =
@@ -1202,9 +834,14 @@ export default function ChatScreen() {
                       </Button>
                     );
                   })}
-                  {responseModelGroups.length === 0 ? (
+                  {!isAuthenticated ? (
                     <Text style={styles.diagnosticsText}>
-                      利用可能なモデルがありません。
+                      サーバーモデルを使用するにはログインが必要です。
+                    </Text>
+                  ) : !controller.responseModelOptionsLoading &&
+                    controller.responseModelOptions.length === 0 ? (
+                    <Text style={styles.diagnosticsText}>
+                      現在利用可能なサーバーモデルがありません。ローカルLLMを使用する場合はサーバー側runtimeを確認して更新してください。
                     </Text>
                   ) : null}
                 </>
@@ -1212,8 +849,17 @@ export default function ChatScreen() {
             </ScrollView>
           </Dialog.ScrollArea>
           <Dialog.Actions>
+            <Button
+              icon="refresh"
+              textColor="#89b4fa"
+              onPress={() => void controller.refreshResponseModelOptions()}
+              loading={controller.responseModelOptionsLoading}
+              disabled={!isAuthenticated || controller.responseModelOptionsLoading}
+            >
+              更新
+            </Button>
             <Button textColor="#a6adc8" onPress={closeResponseModelDialog}>
-              Cancel
+              閉じる
             </Button>
           </Dialog.Actions>
         </Dialog>
@@ -1529,19 +1175,6 @@ export default function ChatScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#11111b" },
-  appContextRail: {
-    minHeight: 48,
-    flexDirection: "row",
-    alignItems: "center",
-    paddingHorizontal: 14,
-    paddingVertical: 6,
-    backgroundColor: "#202033",
-    borderBottomColor: "#45475a",
-    borderBottomWidth: StyleSheet.hairlineWidth,
-  },
-  appContextRailText: { flex: 1, minWidth: 0 },
-  appContextTitle: { color: "#cdd6f4", fontSize: 12, fontWeight: "700" },
-  appContextMeta: { color: "#a6adc8", fontSize: 11, marginTop: 2 },
   contextMetric: { color: "#cdd6f4", fontSize: 13, marginTop: 8 },
   contextCategory: { color: "#a6adc8", fontSize: 12, marginTop: 4 },
   loadingContainer: {

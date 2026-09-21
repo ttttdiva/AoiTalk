@@ -6,6 +6,7 @@ import { FolderOpen, Layers, ListChecks, MoreHorizontal } from "lucide-react";
 import type { Project, Space } from "@/lib/task-api";
 import { cn } from "@/lib/utils";
 import type { TaskViewMode } from "@/components/tasks/hooks/use-task-view-preferences";
+import type { TaskBrowseScope } from "@/lib/task-browse-scope";
 import { TaskViewSwitcher } from "@/components/tasks/task-view-switcher";
 import {
   Popover,
@@ -143,6 +144,8 @@ export function TasksWorkspaceNavigation({
   onProjectChange,
   onSpaceColorChange,
   onProjectColorChange,
+  browseScope,
+  onResetBrowse,
 }: {
   viewMode: TaskViewMode;
   onViewModeChange: (mode: TaskViewMode) => void;
@@ -159,6 +162,8 @@ export function TasksWorkspaceNavigation({
   onProjectChange: (projectId: string, spaceId?: string | null) => void;
   onSpaceColorChange?: ColorUpdate;
   onProjectColorChange?: ColorUpdate;
+  browseScope?: TaskBrowseScope | null;
+  onResetBrowse?: () => void;
 }) {
   const treeProjects = (projects ?? activeProjects ?? []).filter(
     (project) => !project.is_completed,
@@ -182,6 +187,33 @@ export function TasksWorkspaceNavigation({
           </p>
         </div>
       </div>
+
+      {browseScope ? (
+        <div
+          className="rounded border border-amber-500/40 bg-amber-500/10 px-2.5 py-2 text-[11px] text-sidebar-foreground"
+          data-testid="tasks-browse-navigation-state"
+        >
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium">参照専用</span>
+            {onResetBrowse ? (
+              <button
+                type="button"
+                className="shrink-0 rounded px-1.5 py-0.5 text-[10px] text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-foreground"
+                onClick={onResetBrowse}
+              >
+                通常スコープへ戻る
+              </button>
+            ) : null}
+          </div>
+          <p className="mt-1 truncate text-sidebar-foreground/70">
+            {browseScope.kind === "project"
+              ? treeProjects.find((project) => project.id === browseScope.id)
+                  ?.name ?? "プロジェクト"
+              : spaces.find((space) => space.id === browseScope.id)?.name ??
+                "スペース"}
+          </p>
+        </div>
+      ) : null}
 
       <section className="space-y-2" aria-labelledby="tasks-view-heading">
         <h2
@@ -209,9 +241,13 @@ export function TasksWorkspaceNavigation({
             const spaceProjects = treeProjects.filter(
               (project) => project.space_id === space.id,
             );
-            const selected = selectedSpaceId === space.id && projectTab === "all";
+            const selected = browseScope
+              ? browseScope.kind === "space" && browseScope.id === space.id
+              : selectedSpaceId === space.id && projectTab === "all";
             const canEdit =
-              space.source !== "remote" && space.can_write === true;
+              !browseScope &&
+              space.source !== "remote" &&
+              space.can_write === true;
 
             return (
               <div key={space.id} className="group min-w-0">
@@ -254,9 +290,13 @@ export function TasksWorkspaceNavigation({
                 {spaceProjects.length > 0 ? (
                   <div className="ml-4 space-y-0.5 border-l border-sidebar-border/60 pl-2">
                     {spaceProjects.map((project) => {
-                      const projectSelected = projectTab === project.id;
+                      const projectSelected = browseScope
+                        ? browseScope.kind === "project" &&
+                          browseScope.id === project.id
+                        : projectTab === project.id;
                       const count = projectTaskCounts.get(project.id);
                       const projectCanEdit =
+                        !browseScope &&
                         project.source !== "remote" &&
                         project.can_manage_settings === true;
 

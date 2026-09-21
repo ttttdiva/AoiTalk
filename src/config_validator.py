@@ -49,7 +49,6 @@ class MemoryConfig(BaseModel):
     max_context_tokens: int = Field(8000, gt=0)
     history_batch_size: int = Field(100, gt=0)
     similarity_threshold: float = Field(0.3, ge=0.0, le=1.0)
-    preload_embedding_model: bool = False
 
 
 class ReasoningConfig(BaseModel):

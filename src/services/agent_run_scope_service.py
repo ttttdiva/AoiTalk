@@ -16,12 +16,18 @@ from typing import Any, Mapping
 
 from ..security.agent_run_scope import AgentRunScope
 from ..security.git_publication_gate import RunSnapshot
+from ..security.harness_execution_scope import (
+    HarnessExecutionScope,
+    NetworkCapability,
+    ResourceLimits,
+)
 
 
 TRUSTED_PARENT_CONTEXT_KEY = "_trusted_agent_run_context"
 TRUSTED_PARENT_CAPABILITY_KEY = "_trusted_agent_run_capability"
 RUN_SCOPE_CONTEXT_KEY = "run_scope"
 REQUIRE_RUN_SCOPE_KEY = "require_run_scope"
+HARNESS_EXECUTION_SCOPE_CONTEXT_KEY = "_trusted_harness_execution_scope"
 
 
 class AgentRunScopeServiceError(RuntimeError):
@@ -78,6 +84,7 @@ class TrustedParentRunContext:
     scope: AgentRunScope
     snapshot: RunSnapshot
     capability: ParentRunScopeCapability
+    execution_scope: HarnessExecutionScope | None = None
     # A Director parent may temporarily bind its immutable context while an
     # Operator/Agent-Team child run is active.  Child IDs are issued by that
     # parent (never by model/project text) and are therefore the only
@@ -99,6 +106,37 @@ class TrustedParentRunContext:
             raise TypeError("snapshot must be a RunSnapshot")
         if not isinstance(self.capability, ParentRunScopeCapability):
             raise TypeError("capability must be a ParentRunScopeCapability")
+        if self.execution_scope is not None:
+            if not isinstance(self.execution_scope, HarnessExecutionScope):
+                raise TypeError("execution_scope must be a HarnessExecutionScope")
+            expected = self.execution_scope.to_agent_run_scope()
+            roots_match = all(
+                {
+                    os.path.normcase(str(Path(item)))
+                    for item in getattr(expected, name, ()) or ()
+                }
+                == {
+                    os.path.normcase(str(Path(item)))
+                    for item in getattr(self.scope, name, ()) or ()
+                }
+                for name in (
+                    "read_roots",
+                    "write_roots",
+                    "delete_roots",
+                    "command_roots",
+                    "scratch_roots",
+                )
+            )
+            if (
+                expected.run_id != self.scope.run_id
+                or expected.repo_identity != self.scope.repo_identity
+                or expected.canonical_root != self.scope.canonical_root
+                or expected.workspace_access_level != self.scope.workspace_access_level
+                or not roots_match
+            ):
+                raise ParentRunScopeMismatchError(
+                    "HarnessExecutionScope does not match the parent AgentRunScope"
+                )
         if self.capability._token is not _CAPABILITY_TOKEN:
             raise UntrustedParentScopeError("invalid parent scope capability")
         if self.scope.run_id != parent_run_id:
@@ -185,6 +223,7 @@ class TrustedParentRunContext:
             scope=self.scope,
             snapshot=self.snapshot,
             capability=self.capability,
+            execution_scope=self.execution_scope,
             _bound_child_run_ids=self._bound_child_run_ids | {clean_child_id},
         )
 
@@ -227,6 +266,8 @@ class TrustedParentRunContext:
         context[TRUSTED_PARENT_CONTEXT_KEY] = self
         context[TRUSTED_PARENT_CAPABILITY_KEY] = self.capability
         context[RUN_SCOPE_CONTEXT_KEY] = self.scope
+        if self.execution_scope is not None:
+            context[HARNESS_EXECUTION_SCOPE_CONTEXT_KEY] = self.execution_scope
         context[REQUIRE_RUN_SCOPE_KEY] = True
         metadata = context.get("metadata")
         safe_metadata = dict(metadata) if isinstance(metadata, Mapping) else {}
@@ -313,11 +354,43 @@ def create_trusted_parent_run_context(
         canonical_root=scope.canonical_root,
         _token=_CAPABILITY_TOKEN,
     )
+    execution_scope = None
+    try:
+        from ..features import Features
+
+        enterprise = bool(Features.is_enterprise())
+    except Exception:
+        enterprise = True
+    if enterprise:
+        # This is an autonomous repository controller, not a chat principal.
+        # Preserve the parent-issued lower scope exactly while adding the
+        # finite Enterprise authority layer required by every process lane.
+        execution_scope = HarnessExecutionScope._issue(
+            user_id="agent-parent-system",
+            organization_id=None,
+            project_ids=(),
+            app_ids=(),
+            read_roots=scope.read_roots,
+            write_roots=scope.write_roots,
+            delete_roots=scope.delete_roots,
+            command_roots=scope.command_roots,
+            scratch_roots=scope.scratch_roots,
+            external_read_grants=(),
+            network_capability=NetworkCapability.NONE,
+            network_allowlist=(),
+            environment_capability_ids=(),
+            secret_capability_ids=(),
+            resource_limits=ResourceLimits(),
+            run_id=clean_parent_id,
+            audit_id=f"agent-parent:{clean_parent_id}",
+            root_identity=scope.repo_identity,
+        )
     return TrustedParentRunContext(
         parent_run_id=clean_parent_id,
         scope=scope,
         snapshot=snapshot,
         capability=capability,
+        execution_scope=execution_scope,
     )
 
 
@@ -474,6 +547,7 @@ __all__ = [
     "ParentRunScopeMismatchError",
     "RUN_SCOPE_CONTEXT_KEY",
     "REQUIRE_RUN_SCOPE_KEY",
+    "HARNESS_EXECUTION_SCOPE_CONTEXT_KEY",
     "TRUSTED_PARENT_CAPABILITY_KEY",
     "TRUSTED_PARENT_CONTEXT_KEY",
     "TrustedParentRunContext",

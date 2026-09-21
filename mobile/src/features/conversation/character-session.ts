@@ -5,7 +5,8 @@ import type {
   ConversationSession,
 } from "../../types/api";
 import { characterApi } from "../../lib/character-api";
-import { getApiUrl, getToken, getTokenAuthScope } from "../../lib/auth";
+import { getToken, getTokenAuthScope } from "../../lib/auth";
+import { getConfiguredApiServerFingerprint } from "../../lib/api-client";
 import { normalizeApiUrl } from "../../lib/api-url";
 import {
   generateMobileLlmReply,
@@ -92,7 +93,7 @@ export class CharacterProfileUnavailableError extends Error {
   readonly slug: string;
 
   constructor(slug: string) {
-    super(`キャラクター「${slug}」の情報を取得できないため、Direct応答を開始できません。`);
+    super(`キャラクター「${slug}」のプロフィールが端末で利用できません。サーバー接続後にキャラクター一覧を更新してからDirect送信を再試行してください。入力と履歴は保持されています。`);
     this.name = "CharacterProfileUnavailableError";
     this.slug = slug;
   }
@@ -129,7 +130,7 @@ async function resolveCharacterSnapshotScope(
   options: CharacterSnapshotResolverOptions,
 ): Promise<string> {
   const server = normalizeApiUrl(
-    options.serverIdentity || (await getApiUrl()) || "",
+    options.serverIdentity || (await getConfiguredApiServerFingerprint()) || "",
   ) || "server-unknown";
   const authScope =
     String(options.authScope ?? "").trim() ||
@@ -140,7 +141,7 @@ async function resolveCharacterSnapshotScope(
 
 export function createCharacterProfileSnapshotResolver(
   characterSlug: string | null | undefined,
-  lookup: CharacterLookup = (slug) => characterApi.getBySlug(slug),
+  lookup: CharacterLookup = (slug) => characterApi.getDirectProfile(slug),
   options: CharacterSnapshotResolverOptions = {},
 ): () => Promise<CharacterProfileSnapshot | null> {
   const slugAtSendStart = String(characterSlug ?? "").trim();
@@ -150,7 +151,10 @@ export function createCharacterProfileSnapshotResolver(
   return () => {
     if (!snapshotPromise) {
       snapshotPromise = (async () => {
-        if (!slugAtSendStart) return null;
+        if (!slugAtSendStart) {
+          if (strict) throw new CharacterProfileUnavailableError("未選択");
+          return null;
+        }
         const cacheable = Boolean(String(options.sessionId ?? "").trim());
         let cacheKey = [
           String(options.serverIdentity ?? "server-unknown"),
@@ -170,6 +174,10 @@ export function createCharacterProfileSnapshotResolver(
           if (cacheable) characterSnapshotCache.set(cacheKey, resolved);
           return resolved;
         } catch (error) {
+          if (error instanceof CharacterProfileUnavailableError) {
+            if (strict) throw error;
+            return null;
+          }
           const cached = cacheable ? characterSnapshotCache.get(cacheKey) : null;
           if (cached) return cached;
           if (strict) {
@@ -188,10 +196,11 @@ export function buildDirectReplyPersistedMetadata(
   metadata: Record<string, unknown> = {},
 ): Record<string, unknown> {
   return {
+    ...metadata,
     pending: false,
     message_state: "persisted",
     direct_cloud: true,
-    ...metadata,
+    delivery_route: "direct",
   };
 }
 

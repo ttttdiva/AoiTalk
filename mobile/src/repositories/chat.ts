@@ -10,7 +10,8 @@ import {
   type ConversationSearchResult,
   type ContextRequestSnapshot,
 } from "../lib/chat-api";
-import { conversationsRepo, uploadLocalSession } from "./conversations";
+import { conversationsRepo, excludeUserDeletedSessions, uploadLocalSession } from "./conversations";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getDb, schema } from "../db/client";
 import type { ConversationMessage, ConversationSession } from "../types/api";
 
@@ -84,7 +85,7 @@ export async function bindChatAppContext(
   // uploadLocalSession already applies the new remote row, but applying again
   // makes this helper safe for a server-backed session and test doubles.
   await import("./conversations").then(({ applyRemoteConversationSessions }) =>
-    applyRemoteConversationSessions([updated]),
+    runForegroundSqliteWrite(() => applyRemoteConversationSessions([updated])),
   );
   return updated;
 }
@@ -96,7 +97,7 @@ export async function forkChatSession(
 ): Promise<ConversationSession> {
   const result = await chatApi.forkSession(sessionId, fromMessageId, title);
   await import("./conversations").then(({ applyRemoteConversationSessions }) =>
-    applyRemoteConversationSessions([result.session]),
+    runForegroundSqliteWrite(() => applyRemoteConversationSessions([result.session])),
   );
   return result.session;
 }
@@ -129,7 +130,7 @@ export async function searchChatLocal(
       results.push(sessionResult(session, normalized));
     }
   }
-  return results.slice(0, max);
+  return excludeUserDeletedSessions(results.slice(0, max), (item) => item.session_id);
 }
 
 /** Online search with an offline/local fallback. */
@@ -142,7 +143,7 @@ export async function searchChat(
   if (!normalized) return [];
   try {
     const result = await chatApi.searchConversations(normalized, projectId, limit);
-    return result.results.slice(0, 50);
+    return await excludeUserDeletedSessions(result.results.slice(0, 50), (item) => item.session_id);
   } catch {
     return searchChatLocal(normalized, projectId, limit);
   }
@@ -182,7 +183,7 @@ export async function getChatContextSnapshot(
     const result = await chatApi.getContextSnapshot(sessionId);
     const snapshot = result.snapshot ?? null;
     const now = new Date().toISOString();
-    await db
+    await runForegroundSqliteWrite(() => db
       .insert(schema.conversationContextSnapshots)
       .values({
         authScope,
@@ -219,7 +220,8 @@ export async function getChatContextSnapshot(
           cachedAt: now,
           updatedAt: now,
         },
-      });
+      }));
+
     return {
       snapshot,
       main: resolveMainContextSnapshot(snapshot),

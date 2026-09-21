@@ -12,7 +12,6 @@
 | --- | --- |
 | [setup_guide.md](setup_guide.md) | Windows/Linux/macOS セットアップ。`setup.bat`, `setup.sh`, `run.bat`, `run.sh`, `pyproject.toml`, `frontend/package.json` |
 | [DISCORD_BOT_SETUP.md](DISCORD_BOT_SETUP.md) | Discord。`src/bot/handlers/command_handler.py` と bot/service 設定 |
-| [desktop_tauri.md](desktop_tauri.md) | Tauri desktop。`desktop/` |
 | [live_voice_backend.md](live_voice_backend.md) | Live Voice。`src/services/live_voice_service.py`, live voice routes/defaults |
 | [llama_cpp_muse_glimmer_setup.md](llama_cpp_muse_glimmer_setup.md) | managed llama.cpp / GGUF。model profile registry と local provider 実装 |
 | [irodori_tts.md](irodori_tts.md) | Irodori-TTS runtime/setup。`pyproject.toml`, setup scripts, vendored runtime |
@@ -49,6 +48,9 @@
 
 ## 3. 設計・再構築・履歴文書
 
+- [pc_bridge.md](pc_bridge.md) — ポータブルexe、接続先PCの選択、既存EdgeとWindows Computer Use
+- [jev_browser_agent.md](jev_browser_agent.md) — 既存Microsoft Edgeのログイン済みタブを操作する拡張機能。Jev/LLM切り替え、インストール、設定、実動作検証
+
 これらは重要な設計根拠ですが、**現在の runtime 仕様そのものではありません**。過去時点の DB 件数、未実装項目、ファイル行数、API の有無を現行仕様として引用しないでください。
 
 - [scenario_studio_rebuild_plan.md](scenario_studio_rebuild_plan.md) — Scenario Studio 再構築時点の調査・設計。2026-08-02 の実データ計測など時点情報を含む
@@ -69,9 +71,10 @@
 ## 5. リポジトリ直下の文書
 
 - `README.md` — 日本語の現行概要 / public publish でも利用
-- `docs_i18n/README_en.md` — 英語の現行概要 / public publish でも利用
+- `README.en.md` — 英語の現行概要 / public publish でも利用
+- `README.zh-CN.md` — 中国語の現行概要
 - `README.enterprise.md` — Enterprise handoff の唯一の人間向け runbook
-- `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` — AI agent / repository workflow。製品仕様書ではない
+- [AGENTS.md](../AGENTS.md) — AI agent / repository workflow。製品仕様書ではない
 
 ## 文書更新ルール
 

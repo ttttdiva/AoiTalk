@@ -988,6 +988,7 @@ class SkillRecordingService:
     ) -> dict[str, Any]:
         from uuid import UUID
         from ..services.project_workspace_cleanup import get_project_workspace_path
+        from ..services.skill_target_io import publish_skill_text
         from ..skills.loader import load_project_skills
 
         try:
@@ -1010,16 +1011,14 @@ class SkillRecordingService:
 
         skill_dir.mkdir(parents=True, exist_ok=True)
         skill_md_path = skill_dir / "SKILL.md"
-        skill_md_path.write_text(
-            build_skill_markdown(
-                name=name,
-                description=description,
-                trigger_mode=trigger_mode,
-                bound_tools=bound_tools,
-                body=body,
-            ),
-            encoding="utf-8",
+        skill_text = build_skill_markdown(
+            name=name,
+            description=description,
+            trigger_mode=trigger_mode,
+            bound_tools=bound_tools,
+            body=body,
         )
+        publish_skill_text(skill_md_path, skill_text)
         # レジストリへ反映。
         load_project_skills(str(project_id))
         return {

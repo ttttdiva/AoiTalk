@@ -12,6 +12,45 @@ class GenerationCancelled(RuntimeError):
     """Raised inside a synchronous generation worker after a stop request."""
 
 
+class GenerationMutationBlocked(GenerationCancelled):
+    """Raised when a late worker reaches a mutation fence after its parent stopped.
+
+    This is a cancellation-derived safety result rather than provider
+    generation control flow.  Tool boundaries may convert it into their
+    machine-readable failure envelope after rolling back the staged write.
+    """
+
+
+class PlanningInteractionTerminated(RuntimeError):
+    """End the active generation after plan approval can no longer continue.
+
+    This is a control-flow signal, not a model-visible tool failure.  It keeps
+    the terminal AgentRun state and the safe user-facing reply together while
+    deliberately carrying no plan text.
+    """
+
+    def __init__(
+        self,
+        reason: str,
+        agent_run_status: str,
+        user_message: str,
+    ) -> None:
+        normalized_reason = (
+            str(reason or "planning_interaction_terminated").strip()
+            or "planning_interaction_terminated"
+        )
+        normalized_status = (
+            "cancelled"
+            if str(agent_run_status).strip().lower() == "cancelled"
+            else "failed"
+        )
+        normalized_message = str(user_message or "").strip()
+        self.reason = normalized_reason
+        self.agent_run_status = normalized_status
+        self.user_message = normalized_message
+        super().__init__(normalized_reason)
+
+
 @dataclass
 class GenerationMutationGate:
     """Per-delegation fence for writes that outlive an async task cancel.
@@ -322,7 +361,7 @@ def raise_if_generation_mutation_blocked() -> None:
     """Fail closed before a write when an old attempt was interrupted."""
 
     if generation_mutation_blocked():
-        raise GenerationCancelled(
+        raise GenerationMutationBlocked(
             "generation mutation blocked after parent interruption"
         )
 

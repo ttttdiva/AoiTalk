@@ -66,6 +66,7 @@ export function SubtaskRow({
   showAssigneeColumn = false,
   showTimeColumn = true,
   onStatusChange,
+  statusFocusEpochRef,
   rowRef,
   tabIndex = -1,
   onFocus,
@@ -102,6 +103,7 @@ export function SubtaskRow({
   showAssigneeColumn?: boolean;
   showTimeColumn?: boolean;
   onStatusChange?: (task: Task, status: TaskStatusOption) => Promise<void>;
+  statusFocusEpochRef?: React.RefObject<number>;
   rowRef?: React.Ref<HTMLTableRowElement>;
   tabIndex?: number;
   onFocus?: () => void;
@@ -109,6 +111,71 @@ export function SubtaskRow({
   focused?: boolean;
 }) {
   const status = getTaskDisplayStatus(sub);
+  const [statusMenuOpen, setStatusMenuOpen] = useState(false);
+  const statusFocusSessionRef = useRef<{
+    epoch: number;
+    phase: "pending" | "canceled" | "consumed";
+  } | null>(null);
+  const statusTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const statusMenuOpenRef = useRef(false);
+
+  const invalidateStatusFocusSession = useCallback(() => {
+    const session = statusFocusSessionRef.current;
+    if (session?.phase === "pending") session.phase = "canceled";
+  }, []);
+
+  const handleRowFocus = useCallback(() => {
+    invalidateStatusFocusSession();
+    onFocus?.();
+  }, [invalidateStatusFocusSession, onFocus]);
+
+  const focusOwningRow = useCallback(() => {
+    focusRow?.();
+    const row = statusTriggerRef.current?.closest("tr") as
+      | HTMLTableRowElement
+      | null;
+    row?.focus();
+  }, [focusRow]);
+
+  const resolveStatusMenuFinalFocus = useCallback(() => {
+    // A stale popup cleanup must not restore focus while a newer instance of
+    // this menu is already open.
+    if (statusMenuOpenRef.current) return false;
+    const session = statusFocusSessionRef.current;
+    if (!session) return true;
+    const shouldReturnFocus =
+      session.phase === "pending" &&
+      session.epoch === (statusFocusEpochRef?.current ?? session.epoch);
+    session.phase = "consumed";
+    const row = statusTriggerRef.current?.closest("tr") as
+      | HTMLTableRowElement
+      | null;
+    return shouldReturnFocus ? row ?? false : false;
+  }, [statusFocusEpochRef]);
+
+  const handleStatusMenuOpenChange = useCallback(
+    (open: boolean, eventDetails: { reason: string }) => {
+      statusMenuOpenRef.current = open;
+      if (open) {
+        invalidateStatusFocusSession();
+        // A new popup must not inherit a previous canceled/consumed return
+        // focus request. Escape below creates a fresh session for this close.
+        statusFocusSessionRef.current = null;
+      } else if (eventDetails.reason === "escape-key") {
+        focusOwningRow();
+        statusFocusSessionRef.current = {
+          epoch: statusFocusEpochRef?.current ?? 0,
+          phase: "pending",
+        };
+      }
+      setStatusMenuOpen(open);
+    },
+    [
+      focusOwningRow,
+      invalidateStatusFocusSession,
+      statusFocusEpochRef,
+    ],
+  );
 
   return (
     <tr
@@ -123,7 +190,7 @@ export function SubtaskRow({
       onDrop={(e) => onDrop(e, sub.id)}
       onDragEnd={onDragEnd}
       onMouseEnter={() => setHoveredGroupId(parentTask.id)}
-      onFocus={onFocus}
+      onFocus={handleRowFocus}
       onClick={() => {
         focusRow?.();
         openTask(sub);
@@ -165,8 +232,22 @@ export function SubtaskRow({
               title={STATUS_LABELS[status]}
             />
           ) : (
-            <DropdownMenu>
+            <DropdownMenu
+              open={statusMenuOpen}
+              onOpenChange={handleStatusMenuOpenChange}
+            >
               <DropdownMenuTrigger
+                ref={statusTriggerRef}
+                // Wait for click so a press-and-drag can still move the row.
+                onPointerDown={(event) => event.preventBaseUIHandler()}
+                onMouseDown={(event) => event.preventBaseUIHandler()}
+                onClick={(event) => event.stopPropagation()}
+                onKeyDown={(event) => {
+                  if (event.key !== "Escape") return;
+                  event.preventDefault();
+                  event.stopPropagation();
+                  focusOwningRow();
+                }}
                 className={cn(
                   "size-4 shrink-0 rounded-full border-2 transition-colors hover:ring-2 hover:ring-primary/30",
                   STATUS_DOT_COLORS[status] || STATUS_DOT_COLORS.open,
@@ -174,7 +255,11 @@ export function SubtaskRow({
                 title={STATUS_LABELS[status]}
                 aria-label={`${sub.title}のステータスを変更`}
               />
-              <DropdownMenuContent align="start" className="min-w-36">
+              <DropdownMenuContent
+                align="start"
+                className="min-w-36"
+                finalFocus={resolveStatusMenuFinalFocus}
+              >
                 <TaskStatusMenuItems
                   currentStatus={status}
                   onSelect={(nextStatus, event) => {

@@ -11,6 +11,7 @@ import { StyleSheet, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { IconButton, Surface, Text } from "react-native-paper";
+import { useAppSidebar } from "./app-sidebar-context";
 
 const TEXT = "#cdd6f4";
 const MUTED = "#a6adc8";
@@ -25,6 +26,8 @@ export type ScreenHeaderProps = {
   onSettings?: () => void;
   /** 指定時は左端に戻る矢印を表示（Stack の戻る用）。 */
   onBack?: () => void;
+  /** Root画面ではSidebarを開く明示ボタンを表示する。 */
+  showMenu?: boolean;
   /** Settings root itself can hide the self-referential settings action. */
   showSettings?: boolean;
 };
@@ -35,10 +38,12 @@ export function ScreenHeader({
   right,
   onSettings,
   onBack,
+  showMenu = true,
   showSettings = true,
 }: ScreenHeaderProps) {
   const router = useRouter();
   const insets = useSafeAreaInsets();
+  const sidebar = useAppSidebar();
 
   const handleSettings = () => {
     if (onSettings) {
@@ -70,6 +75,15 @@ export function ScreenHeader({
             style={styles.backButton}
             onPress={onBack}
             accessibilityLabel="戻る"
+          />
+        ) : showMenu && sidebar ? (
+          <IconButton
+            icon="menu"
+            size={22}
+            iconColor={TEXT}
+            style={styles.backButton}
+            onPress={sidebar.openSidebar}
+            accessibilityLabel="メニューを開く"
           />
         ) : null}
         <View style={styles.copy}>

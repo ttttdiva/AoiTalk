@@ -30,6 +30,11 @@ def runtime_feature_response() -> Dict[str, Any]:
     """Return runtime feature flags with live Discord bot service state."""
     status = runtime_feature_manager.status()
     status["discord_bot_service"] = discord_bot_service.status()
+    # Application capability flags are distinct from the low-level runtime
+    # adapter flags above.  Include the effective profile values so clients
+    # can hide company/autonomous panels without treating missing keys as an
+    # implicit allow.
+    status["application_features"] = Features.get_all()
     return status
 
 

@@ -39,12 +39,22 @@ function collectBrowserEvidence(page: Page) {
 
   page.on("console", (message) => {
     if (message.type() !== "error") return;
+    const text = message.text();
     // The shared fixture intentionally reports Python health as unavailable;
     // retain that console observation separately from unexpected UI errors.
-    if (message.text().includes("status of 503 (Service Unavailable)")) {
-      evidence.expectedConsoleErrors.push(message.text());
+    const isExpectedMockedWebSocketHandshake =
+      text.includes("WebSocket connection to") &&
+      text.includes(
+        "ws://127.0.0.1:3000/ws?session_id=session-e2e",
+      ) &&
+      text.includes("Unexpected response code: 403");
+    if (
+      text.includes("status of 503 (Service Unavailable)") ||
+      isExpectedMockedWebSocketHandshake
+    ) {
+      evidence.expectedConsoleErrors.push(text);
     } else {
-      evidence.consoleErrors.push(message.text());
+      evidence.consoleErrors.push(text);
     }
   });
   page.on("pageerror", (error) => {
@@ -58,7 +68,11 @@ function collectBrowserEvidence(page: Page) {
     if (url.startsWith("ws:") || url.startsWith("wss:")) return;
     // Next App Router cancels speculative RSC prefetches during the sidebar
     // navigation. They are expected browser events, not failed API calls.
-    if (request.failure()?.errorText === "net::ERR_ABORTED" && !url.includes("/api/")) {
+    if (
+      request.failure()?.errorText === "net::ERR_ABORTED" &&
+      (!url.includes("/api/") ||
+        new URL(url).pathname === "/api/python-proxy/health")
+    ) {
       evidence.expectedRequestFailures.push(`${request.method()} ${url}: net::ERR_ABORTED`);
       return;
     }
@@ -215,9 +229,9 @@ test.describe("chat composer fenced editing", () => {
     await expect(input).toHaveValue(BASE_FENCED_MESSAGE);
 
     await input.press("Control+Home");
-    expect(await input.evaluate((element) => [element.selectionStart, element.selectionEnd])).toEqual([0, 0]);
+    expect(await input.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([0, 0]);
     await input.press("Control+End");
-    expect(await input.evaluate((element) => [element.selectionStart, element.selectionEnd])).toEqual([
+    expect(await input.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([
       BASE_FENCED_MESSAGE.length,
       BASE_FENCED_MESSAGE.length,
     ]);
@@ -231,7 +245,7 @@ test.describe("chat composer fenced editing", () => {
     await expect(input).toHaveValue(textareaValueBeforeArrows);
 
     await input.press("Control+A");
-    expect(await input.evaluate((element) => [element.selectionStart, element.selectionEnd])).toEqual([
+    expect(await input.evaluate((element: HTMLTextAreaElement) => [element.selectionStart, element.selectionEnd])).toEqual([
       0,
       BASE_FENCED_MESSAGE.length,
     ]);
@@ -317,9 +331,135 @@ test.describe("chat composer fenced editing", () => {
         response.request().method() === "POST",
     );
     await input.press("Enter");
-    await dispatchResponse;
+    await expect(input).toHaveValue("");
     await expect(
       page.getByTestId("chat-message-list").getByText(sentContent, { exact: true }),
     ).toBeVisible();
+    await dispatchResponse;
+  });
+
+  test("clears the composer before a controlled dispatch response and preserves a newer draft", async ({ page }) => {
+    const input = await openNewComposer(page);
+    let signalRequestStarted: () => void = () => {};
+    const requestStarted = new Promise<void>((resolve) => {
+      signalRequestStarted = resolve;
+    });
+    let releaseDispatch: () => void = () => {};
+    const dispatchReleased = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+
+    await page.route(
+      "**/api/python-proxy/conversations/session-e2e/dispatch",
+      async (route) => {
+        if (route.request().method() !== "POST") {
+          await route.continue();
+          return;
+        }
+        signalRequestStarted();
+        await dispatchReleased;
+        await route.fulfill({
+          json: { success: true, queued: false, session_id: "session-e2e" },
+        });
+      },
+    );
+
+    const sentContent = "E2E controlled unresolved immediate clear";
+    const secondDraft = "E2E second draft survives settlement";
+    await input.fill(sentContent);
+    await expect(page.getByTitle("送信")).toBeEnabled();
+    const dispatchResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/python-proxy/conversations/session-e2e/dispatch") &&
+        response.request().method() === "POST",
+    );
+
+    await input.press("Enter");
+    await requestStarted;
+    await expect(input).toHaveValue("");
+    await expect(
+      page.getByTestId("chat-message-list").getByText(sentContent, { exact: true }),
+    ).toBeVisible();
+
+    await input.fill(secondDraft);
+    releaseDispatch();
+    await dispatchResponse;
+    await expect(input).toHaveValue(secondDraft);
+  });
+
+  test("does not resurrect the submitted draft across new-session promotion", async ({ page }) => {
+    collectBrowserEvidence(page);
+    await addAuthCookie(page);
+    await mockAuthenticatedApis(page);
+    await installComposerFixtures(page);
+    await page.route("**/api/python-proxy/characters", async (route) => {
+      if (route.request().method() === "GET") {
+        await route.fulfill({
+          json: { characters: ["aoi"], current: "aoi" },
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    const settingsResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/users/me/settings") &&
+        response.request().method() === "GET",
+    );
+    await page.goto("/chat");
+    await settingsResponse;
+    await expect(page).toHaveURL(/\/chat$/);
+    const input = page.getByRole("textbox", { name: "メッセージ入力" });
+    await expect(input).toBeVisible();
+    await expect(page.locator('[data-chat-composer-editor="true"] textarea')).toHaveCount(1);
+
+    let signalRequestStarted: () => void = () => {};
+    const requestStarted = new Promise<void>((resolve) => {
+      signalRequestStarted = resolve;
+    });
+    let releaseDispatch: () => void = () => {};
+    const dispatchReleased = new Promise<void>((resolve) => {
+      releaseDispatch = resolve;
+    });
+    await page.route(
+      "**/api/python-proxy/conversations/session-e2e/dispatch",
+      async (route) => {
+        if (route.request().method() !== "POST") {
+          await route.continue();
+          return;
+        }
+        signalRequestStarted();
+        await dispatchReleased;
+        await route.fulfill({
+          json: { success: true, queued: false, session_id: "session-e2e" },
+        });
+      },
+    );
+
+    const firstMessage = "NEW_SESSION_PROMOTION_BROWSER";
+    const secondDraft = "NEW_SESSION_SECOND_DRAFT";
+    await input.fill(firstMessage);
+    const dispatchResponse = page.waitForResponse(
+      (response) =>
+        response.url().includes("/api/python-proxy/conversations/session-e2e/dispatch") &&
+        response.request().method() === "POST",
+    );
+    await input.press("Enter");
+    await requestStarted;
+    await expect(input).toHaveValue("");
+    await expect(
+      page.getByTestId("chat-message-list").getByText(firstMessage, { exact: true }),
+    ).toBeVisible();
+    await expect(page).toHaveURL(/\/chat\?s=session-e2e$/);
+
+    await input.fill(secondDraft);
+    releaseDispatch();
+    await dispatchResponse;
+    await expect(input).toHaveValue(secondDraft);
+
+    await page.reload();
+    await expect(input).toBeVisible();
+    await expect(input).not.toHaveValue(new RegExp(firstMessage));
   });
 });

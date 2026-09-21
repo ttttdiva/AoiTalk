@@ -17,6 +17,7 @@ import html as _html
 import logging
 import re
 import unicodedata
+from types import SimpleNamespace
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
@@ -29,6 +30,11 @@ from .outbound_privacy_service import (
     ExternalProviderBlocked,
     OutboundPrivacyGateway,
     PrivacyError,
+)
+from .search_egress_policy import (
+    SearchEgressPreconditionError,
+    assert_public_search_egress_approved,
+    search_egress_error_message,
 )
 
 logger = logging.getLogger(__name__)
@@ -631,6 +637,31 @@ def _normalize_yahoo_endpoint(value: Any) -> str:
     return urlunsplit((parts.scheme.casefold(), parts.netloc, path, "", ""))
 
 
+def _yahoo_egress_descriptor(destination: str):
+    """Build the stable descriptor for one Yahoo transport transaction."""
+
+    try:
+        from .outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="yahoo_realtime_search",
+            transport="httpx.AsyncClient.get",
+            destination=destination,
+            provider="yahoo_realtime",
+            tool="x_search",
+            model="",
+        )
+    except ImportError:  # pragma: no cover - old stripped embeds
+        return SimpleNamespace(
+            action="yahoo_realtime_search",
+            transport="httpx.AsyncClient.get",
+            destination=destination,
+            provider="yahoo_realtime",
+            tool="x_search",
+            model="",
+        )
+
+
 async def _client_get(client: Any, params: dict[str, Any], *, url: str) -> Any:
     """Call a real/fake AsyncClient without ever following redirects."""
 
@@ -715,6 +746,25 @@ async def search_yahoo_realtime(
 
     logger.debug("X search route: yahoo_realtime")
 
+    # The Enterprise egress precondition deliberately runs before privacy
+    # gateway construction and before creating/using an HTTP client.  A
+    # missing approved route therefore fails quickly without displaying or
+    # transporting the query, while Personal/Yahoo compatibility remains
+    # unchanged.
+    policy_config = config
+    if policy_config is None:
+        policy_config = getattr(privacy_gateway, "config", None)
+    try:
+        assert_public_search_egress_approved(
+            policy_config,
+            engine="yahoo_realtime",
+            endpoint=request_url,
+        )
+    except SearchEgressPreconditionError as exc:
+        result.status = exc.code
+        result.error = search_egress_error_message(exc)
+        return result
+
     gateway = privacy_gateway
     if gateway is None:
         try:
@@ -729,53 +779,64 @@ async def search_yahoo_realtime(
             result.status = "privacy_blocked"
             result.error = "リアルタイム検索のプライバシー設定を解決できません"
             return result
+
+    # Resolve the provider policy before creating an HTTP client.  This is a
+    # cheap, payload-independent check and is important for local_only (and
+    # other fail-closed profiles): a blocked route must not even initialise a
+    # transport that could perform a request as a side effect.
     try:
-        if gateway is not None:
-            gateway.ensure_provider_allowed("yahoo_realtime", base_url=request_url)
-            # A supplied gateway owns redaction/review.  In direct mode this
-            # is a no-op; in protected/local-only mode it fails closed rather
-            # than sending a raw query behind the caller's back.
-            protected = await gateway.protect(
-                {"query": normalized},
-                provider="yahoo_realtime",
-                base_url=request_url,
-                source_kind="yahoo_realtime_search",
-            )
-            payload = protected.payload
-            if isinstance(payload, Mapping):
-                normalized = _normalized_query(payload.get("query"))
-                # Keep the result metadata on the same redacted side of the
-                # egress boundary.  A caller with the gateway can explicitly
-                # restore aliases for local display; this service never
-                # rehydrates raw terms on its own.
-                result.query = normalized
-        
+        gateway.ensure_provider_allowed("yahoo_realtime", base_url=request_url)
     except ExternalProviderBlocked:
         result.status = "blocked"
-        result.error = "外部リアルタイム検索はプライバシーポリシーにより停止しました"
+        result.error = "Yahooリアルタイム検索はプライバシーポリシーにより停止しました"
         return result
     except PrivacyError:
         result.status = "privacy_blocked"
-        result.error = "リアルタイム検索はプライバシーポリシーにより停止しました"
-        return result
-    except Exception:
-        # The query itself is intentionally absent from this log.
-        logger.warning("Yahoo realtime privacy boundary failed")
-        result.status = "privacy_blocked"
-        result.error = "リアルタイム検索のプライバシー処理に失敗しました"
+        result.error = "Yahooリアルタイム検索のプライバシー保護に失敗しました"
         return result
 
     owned_client = False
     active_client = client
     if active_client is None:
-        active_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
+        active_client = httpx.AsyncClient(
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            follow_redirects=False,
+        )
         owned_client = True
     try:
-        response = await _client_get(
-            active_client,
-            {"p": normalized, "n": safe_limit},
-            url=request_url,
+        execute = getattr(gateway, "execute", None)
+        if not callable(execute):
+            raise PrivacyError("outbound privacy gateway does not support execution")
+
+        wire_query = normalized
+
+        async def send(final_payload):
+            nonlocal wire_query
+            if not isinstance(final_payload, Mapping):
+                raise PrivacyError(
+                    "Yahoo realtime privacy boundary returned no protected query"
+                )
+            candidate = final_payload.get("query")
+            if not isinstance(candidate, str) or not candidate.strip():
+                raise PrivacyError(
+                    "Yahoo realtime privacy boundary returned no protected query"
+                )
+            wire_query = _normalized_query(candidate)
+            return await _client_get(
+                active_client,
+                {"p": wire_query, "n": safe_limit},
+                url=request_url,
+            )
+
+        response = await execute(
+            {"query": normalized},
+            provider="yahoo_realtime",
+            descriptor=_yahoo_egress_descriptor(request_url),
+            sender=send,
+            base_url=request_url,
+            source_kind="yahoo_realtime_search",
         )
+        result.query = wire_query
         status_code = getattr(response, "status_code", None)
         try:
             status_code = int(status_code) if status_code is not None else None
@@ -817,9 +878,24 @@ async def search_yahoo_realtime(
         if not result.posts:
             logger.debug("X search no-result/fallback")
         return result
-    except (httpx.HTTPError, OSError, TimeoutError):
+    except (httpx.TimeoutException, TimeoutError):
+        result.status = "timeout"
+        result.error = "Yahooリアルタイム検索が制限時間を超えました"
+        return result
+    except (httpx.HTTPError, OSError):
         result.status = "network_error"
         result.error = "Yahooリアルタイム検索への接続に失敗しました"
+        return result
+    except ExternalProviderBlocked:
+        # ``local_only`` (or an equivalent provider policy) is an explicit
+        # denial, not a provider/parser failure.  Preserve the stable blocked
+        # status and never expose the exception text to callers.
+        result.status = "blocked"
+        result.error = "Yahooリアルタイム検索はプライバシーポリシーにより停止しました"
+        return result
+    except PrivacyError:
+        result.status = "privacy_blocked"
+        result.error = "Yahooリアルタイム検索のプライバシー保護に失敗しました"
         return result
     except Exception:
         # Keep provider details and query text out of logs/results.

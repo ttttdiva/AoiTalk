@@ -17,10 +17,27 @@ from .security.field_crypto import (
     decrypt_json_secret_leaves,
     encrypt_json_secret_leaves,
 )
+from .utils.logging_config import FILE_ONLY_LOG_EXTRA
 
 
 logger = logging.getLogger(__name__)
 GLOBAL_CONFIG_KEY = "global"
+
+
+class AppConfigSnapshotUnavailable(RuntimeError):
+    """The read-only effective configuration snapshot could not be loaded.
+
+    This sentinel intentionally carries no database, decryption, endpoint, or
+    provider details.  Overview workers use it to fail closed instead of
+    silently routing a request through stale startup configuration.
+    """
+
+    code = "config_unavailable"
+
+    def __init__(self) -> None:
+        super().__init__(self.code)
+
+
 OBSOLETE_AGENT_TEAM_MEMBER_KEYS = {
     "search",
     "filesystem",
@@ -39,6 +56,15 @@ OBSOLETE_AGENT_TOGGLE_KEYS = {
     "skills",
     "utility",
     "media",
+}
+
+# Legacy memory settings for the removed SentenceTransformer embedding path.
+# Semantic conversation search is owned by CrossSessionMemoryService/src.rag
+# (BGE-M3 + Qdrant), so these keys have no runtime consumer and must not be
+# retained in the persisted application configuration.
+OBSOLETE_MEMORY_CONFIG_KEYS = {
+    "embedding_model",
+    "preload_embedding_model",
 }
 
 _WRITING_MODEL_ROUTING_DEFAULT: Dict[str, Any] = {
@@ -179,6 +205,11 @@ def _prune_obsolete_app_config(value: Dict[str, Any]) -> Dict[str, Any]:
         for agent_key in OBSOLETE_AGENT_TOGGLE_KEYS:
             agents.pop(agent_key, None)
 
+    memory = cleaned.get("memory")
+    if isinstance(memory, dict):
+        for memory_key in OBSOLETE_MEMORY_CONFIG_KEYS:
+            memory.pop(memory_key, None)
+
     tts_settings = cleaned.get("tts_settings")
     if isinstance(tts_settings, dict):
         for engine_key in ("irodori_tts", "miotts"):
@@ -258,6 +289,160 @@ _LEGACY_AUTOFILLED_DEFAULTS: tuple[tuple[tuple[str, ...], Any], ...] = (
     (("voice_sessions", "allowed_modes"), ["realtime_native"]),
 )
 
+# The retired compact OpenAI model identifier must not survive in the persisted
+# application configuration.  Keep the legacy token assembled here rather than
+# sprinkling it through the runtime; this helper is migration-only and never
+# chooses the legacy model for a request.
+_LEGACY_COMPACT_MODEL = "gpt-4o-" + "mini"
+
+# Provider-specific model keys are the existing config authority.  Migration
+# reads the current seed through these paths rather than inventing a second
+# catalog or silently forcing every provider onto the OpenAI model.
+_PROVIDER_MODEL_CONFIG_PATHS: dict[str, tuple[str, ...]] = {
+    "openai": ("openai", "model"),
+    "openrouter": ("openrouter", "model"),
+    "gemini": ("gemini", "model"),
+    "deepseek": ("deepseek", "model"),
+    "deepinfra": ("deepinfra", "model"),
+    "kimi": ("kimi", "model"),
+    "ollama": ("ollama", "model"),
+    "sglang": ("sglang", "model"),
+    "openai_compatible_local": ("openai_compatible_local", "model"),
+    "codex-cli": ("codex_cli", "model"),
+    "claude-cli": ("claude_cli", "model"),
+    "grok-cli": ("grok_cli", "model"),
+    "antigravity-cli": ("antigravity_cli", "model"),
+}
+
+
+def _dotted_config_value(value: Any, path: tuple[str, ...]) -> Any:
+    current = value
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _normalise_provider_id(provider: Any) -> str:
+    return str(provider or "").strip().lower().replace("_", "-")
+
+
+def _canonical_model_for_provider(provider: Any, seed: Dict[str, Any]) -> str:
+    """Resolve a migration replacement from the provider's existing seed."""
+
+    if not isinstance(seed, dict):
+        seed = {}
+    provider_id = _normalise_provider_id(provider)
+    # ``openai_compatible_local`` normalises to a dashed spelling above, while
+    # the seed uses the underscored config key.
+    if provider_id == "openai-compatible-local":
+        provider_id = "openai_compatible_local"
+    path = _PROVIDER_MODEL_CONFIG_PATHS.get(provider_id)
+    candidate = _dotted_config_value(seed, path) if path else None
+    if candidate is None or not str(candidate).strip():
+        if provider_id == "openai":
+            candidate = seed.get("llm_model")
+    candidate_text = str(candidate or "").strip()
+    if _is_legacy_compact_model(candidate_text):
+        # A caller may pass an old external seed as ``seed_override``.  Never
+        # use that old value as the migration replacement.
+        return ""
+    return candidate_text
+
+
+def _is_legacy_compact_model(value: Any) -> bool:
+    text = str(value or "").strip()
+    model_id = text.rsplit("/", 1)[-1].lower()
+    if model_id == _LEGACY_COMPACT_MODEL:
+        return True
+    # Also retire dated/realtime snapshots such as ``...-2024-07-18``.  The
+    # runtime resolver rejects the whole retired family, so persisted config
+    # must not reintroduce one through a voice or specialist route.
+    return model_id.startswith(_LEGACY_COMPACT_MODEL + "-")
+
+
+def _migrate_legacy_compact_models(
+    value: Dict[str, Any], seed: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Replace retired compact-model values in persisted config.
+
+    This walks only model-bearing keys, preserving arbitrary strings elsewhere.
+    The provider on each route wins; otherwise the surrounding provider branch,
+    then the top-level provider, determines the replacement.  Unknown provider
+    values fail closed to an empty model instead of falling through to OpenAI.
+    """
+
+    migrated = copy.deepcopy(value)
+    seed = seed if isinstance(seed, dict) else {}
+    root_provider = migrated.get("llm_provider") or seed.get("llm_provider")
+    model_keys = {
+        "model",
+        "llm_model",
+        "openai_model",
+        "openrouter_model",
+        "gemini_model",
+        "deepseek_model",
+        "deepinfra_model",
+        "kimi_model",
+        "ollama_model",
+        "sglang_model",
+        "openai_compatible_local_model",
+        "codex_model",
+        "claude_model",
+        "grok_model",
+        "antigravity_cli_model",
+    }
+    provider_key_aliases = {
+        "openai_model": "openai",
+        "openrouter_model": "openrouter",
+        "gemini_model": "gemini",
+        "deepseek_model": "deepseek",
+        "deepinfra_model": "deepinfra",
+        "kimi_model": "kimi",
+        "ollama_model": "ollama",
+        "sglang_model": "sglang",
+        "openai_compatible_local_model": "openai_compatible_local",
+        "codex_model": "codex-cli",
+        "claude_model": "claude-cli",
+        "grok_model": "grok-cli",
+        "antigravity_cli_model": "antigravity-cli",
+    }
+
+    def visit(node: Any, inherited_provider: Any, branch_name: str = "") -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item, inherited_provider, branch_name)
+            return
+        if not isinstance(node, dict):
+            return
+
+        local_provider = node.get("provider") or inherited_provider
+        branch_provider = (
+            branch_name
+            if branch_name in _PROVIDER_MODEL_CONFIG_PATHS
+            else local_provider
+        )
+        for key, child in list(node.items()):
+            provider_for_key = provider_key_aliases.get(key, branch_provider)
+            if key in model_keys and _is_legacy_compact_model(child):
+                replacement = _canonical_model_for_provider(provider_for_key, seed)
+                # A top-level model with no provider is an invalid route.  Use
+                # the canonical OpenAI seed only when the provider is actually
+                # OpenAI; all other unresolved routes remain fail-closed.
+                node[key] = replacement
+                logger.warning(
+                    "Migrated retired compact model at %s to %s",
+                    key,
+                    replacement or "<empty/fail-closed>",
+                )
+                continue
+            child_branch = key if key in _PROVIDER_MODEL_CONFIG_PATHS else branch_name
+            visit(child, provider_for_key, child_branch)
+
+    visit(migrated, root_provider)
+    return migrated
+
 VOICE_SESSION_ALLOWED_MODES_SOURCE_KEY = "allowed_modes_source"
 VOICE_SESSION_ALLOWED_MODES_USER_PROVENANCE = "user"
 
@@ -301,7 +486,7 @@ def _migrate_legacy_autofilled_defaults(
     value: Dict[str, Any], seed: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Replace untouched legacy auto-fill values with the current defaults."""
-    migrated = copy.deepcopy(value)
+    migrated = _migrate_legacy_compact_models(value, seed)
 
     for path, legacy_value in _LEGACY_AUTOFILLED_DEFAULTS:
         stored_parent: Any = migrated
@@ -448,6 +633,7 @@ def load_app_config_sync(
 ) -> Dict[str, Any]:
     """Load the global app config from DB, seeding it on first use."""
 
+    canonical_seed = load_default_config()
     seed = (
         copy.deepcopy(seed_override)
         if seed_override is not None
@@ -456,7 +642,7 @@ def load_app_config_sync(
             if legacy_config_path is not None
             else None
         )
-    ) or load_default_config()
+    ) or copy.deepcopy(canonical_seed)
     seed = _migrate_agent_team_v2_config(
         _migrate_writing_model_routing(
             _migrate_shared_integrations(
@@ -464,6 +650,9 @@ def load_app_config_sync(
             )
         )
     )
+    # Legacy YAML/seed overrides can carry the retired compact model too.  Do
+    # this before a first-use DB insert so a fresh row is never seeded with it.
+    seed = _migrate_legacy_compact_models(seed, canonical_seed)
 
     try:
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
@@ -518,7 +707,16 @@ def load_app_config_sync(
                 session.commit()
             return copy.deepcopy(merged)
     except Exception as exc:
-        logger.error("Failed to load app configuration from DB: %s", exc)
+        # Personal installs intentionally fall back to the seed config when
+        # the optional settings database is unavailable. Retain the exact
+        # exception in the application log without turning this expected
+        # fallback into an operator-facing error flood; the caller emits a
+        # concise actionable warning/error when the database is required.
+        logger.error(
+            "Failed to load app configuration from DB: %s",
+            exc,
+            extra=FILE_ONLY_LOG_EXTRA,
+        )
         require_database = os.getenv("AOITALK_REQUIRE_DATABASE", "").lower() in {
             "1", "true", "yes", "on"
         } or Features.is_enterprise()
@@ -527,6 +725,98 @@ def load_app_config_sync(
                 "Enterprise app configuration could not be loaded from PostgreSQL"
             ) from exc
         return copy.deepcopy(seed)
+
+
+def load_app_config_snapshot_sync(
+    *,
+    bootstrap_config: Any | None = None,
+    legacy_config_path: Optional[Path] = None,
+    seed_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Read the effective global config without migration/default writeback.
+
+    Long-lived workers must observe DB-backed settings changed after process
+    startup, but a job-time read must not seed rows, migrate encrypted values,
+    or persist defaults. The optional bootstrap config supplies deployment
+    environment overrides and the seed used only when a healthy DB has no
+    global row; persisted DB values remain authoritative for keys that are
+    present. Database, schema, decryption, and environment-merge failures
+    raise :class:`AppConfigSnapshotUnavailable` so callers cannot silently
+    route through stale startup configuration.
+    """
+
+    bootstrap_value = getattr(bootstrap_config, "config", bootstrap_config)
+    fallback = (
+        copy.deepcopy(bootstrap_value)
+        if isinstance(bootstrap_value, dict)
+        else load_default_config()
+    )
+    canonical_seed = load_default_config()
+    seed = (
+        copy.deepcopy(seed_override)
+        if seed_override is not None
+        else (
+            _load_legacy_yaml(legacy_config_path)
+            if legacy_config_path is not None
+            else fallback
+        )
+    ) or copy.deepcopy(canonical_seed)
+    seed = _migrate_agent_team_v2_config(
+        _migrate_writing_model_routing(
+            _migrate_shared_integrations(
+                _migrate_external_model_privacy(_prune_obsolete_app_config(seed))
+            )
+        )
+    )
+    seed = _migrate_legacy_compact_models(seed, canonical_seed)
+
+    try:
+        _, get_database_manager, AppConfigSetting = _db_deps()
+        _ensure_table()
+        db_manager = get_database_manager()
+        with db_manager.get_sync_session() as session:
+            row = session.get(AppConfigSetting, GLOBAL_CONFIG_KEY)
+            if row is None:
+                result = copy.deepcopy(seed)
+            else:
+                stored_value = row.value if isinstance(row.value, dict) else {}
+                decrypted = decrypt_json_secret_leaves(
+                    stored_value,
+                    aad_prefix="app_config_settings.value",
+                )
+                value = _migrate_agent_team_v2_config(
+                    _migrate_writing_model_routing(
+                        _migrate_shared_integrations(
+                            _migrate_external_model_privacy(
+                                _prune_obsolete_app_config(decrypted)
+                            )
+                        )
+                    )
+                )
+                result = _fill_missing_defaults(value, seed)
+
+        # Match Config's deployment-environment credential/path precedence
+        # without constructing Config (which would recursively read/write DB).
+        try:
+            from .config import Config
+
+            env_merger = Config.__new__(Config)
+            env_merger._merge_env_variables(result)
+        except Exception as exc:
+            logger.warning(
+                "App config snapshot environment merge unavailable: exception_type=%s",
+                type(exc).__name__,
+            )
+            raise AppConfigSnapshotUnavailable() from exc
+        return copy.deepcopy(result)
+    except Exception as exc:
+        logger.warning(
+            "Failed to read app configuration snapshot: exception_type=%s",
+            type(exc).__name__,
+        )
+        if isinstance(exc, AppConfigSnapshotUnavailable):
+            raise
+        raise AppConfigSnapshotUnavailable() from exc
 
 
 def save_app_config_sync(config: Dict[str, Any]) -> bool:
@@ -557,6 +847,7 @@ def save_app_config_sync(config: Dict[str, Any]) -> bool:
                 )
             )
         )
+        config = _migrate_legacy_compact_models(config, load_default_config())
         SQLAlchemyError, get_database_manager, AppConfigSetting = _db_deps()
         _ensure_table()
         db_manager = get_database_manager()
@@ -697,6 +988,12 @@ def update_app_config_keys_sync(
                         )
                         config["app_config_schema_version"] = APP_CONFIG_SCHEMA_VERSION
 
+                # A patch is an explicit operator action, but the retired
+                # compact model is no longer accepted even when supplied by a
+                # stale client.  Normalize after applying the whole patch so a
+                # simultaneous provider+model update resolves consistently.
+                config = _prune_obsolete_app_config(config)
+                config = _migrate_legacy_compact_models(config, load_default_config())
                 encrypted = encrypt_json_secret_leaves(
                     copy.deepcopy(config),
                     aad_prefix="app_config_settings.value",

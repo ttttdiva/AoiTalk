@@ -35,7 +35,21 @@ class User(Base):
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     username = Column(String(100), unique=True, nullable=False, index=True)
     email = Column(String(255), unique=True, nullable=True, index=True)
-    password_hash = Column(String(255), nullable=False)
+    # ``None`` is intentional for externally authenticated accounts.  AD is
+    # the credential authority and AoiTalk must never persist a local bcrypt
+    # shadow hash for those users.
+    password_hash = Column(String(255), nullable=True)
+
+    # Authentication source is explicit so a request can never silently fall
+    # back from AD to local bcrypt (or the other way around).  Existing rows
+    # are migrated as ``local`` and retain their hashes unchanged.
+    auth_source = Column(
+        String(16),
+        nullable=False,
+        default="local",
+        server_default="local",
+        index=True,
+    )
 
     # Profile
     display_name = Column(String(100))
@@ -67,10 +81,31 @@ class User(Base):
     # Settings (JSON for flexibility)
     user_settings = Column(JSON, default=dict)
 
+    # No delete cascade: an AD identity binding is durable ownership history,
+    # and a hard delete must fail closed rather than silently orphaning it.
+    external_identity_bindings = relationship(
+        "ExternalIdentityBinding",
+        back_populates="user",
+        passive_deletes=True,
+    )
+
     __table_args__ = (
         CheckConstraint(
             "role IN ('admin', 'user')",
             name="ck_users_role_admin_user",
+        ),
+        CheckConstraint(
+            "auth_source IN ('local', 'ad')",
+            name="ck_users_auth_source",
+        ),
+        CheckConstraint(
+            "(auth_source = 'local' AND password_hash IS NOT NULL) "
+            "OR (auth_source = 'ad' AND password_hash IS NULL)",
+            name="ck_users_auth_source_password_hash",
+        ),
+        CheckConstraint(
+            "auth_source = 'local' OR is_password_reset_required IS FALSE",
+            name="ck_users_ad_password_reset_disabled",
         ),
     )
 
@@ -88,6 +123,7 @@ class User(Base):
             "preferred_character": self.preferred_character,
             "avatar_url": self._avatar_url(),
             "role": self.role,
+            "auth_source": self.auth_source or "local",
             "is_active": self.is_active,
             "is_password_reset_required": self.is_password_reset_required,
             "session_version": self.session_version or 1,
@@ -117,6 +153,80 @@ class User(Base):
         ):
             return None
         return f"/api/users/{quote(str(self.id), safe='')}/avatar?v={quote(file_name, safe='')}"
+
+
+class ExternalIdentityBinding(Base):
+    """Immutable binding between a local user and an external identity.
+
+    ``external_id`` stores the AD ``objectGUID`` as a UUID.  ``authority``
+    identifies the configured AD authority/forest so the same object GUID in
+    another authority cannot be mistaken for this account.  Passwords and
+    DNs are deliberately absent; this table is an ownership/identity map,
+    not a credential or directory cache.
+    """
+
+    __tablename__ = "external_identity_bindings"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    source = Column(String(16), nullable=False, default="ad", server_default="ad")
+    authority = Column(String(255), nullable=False)
+    # AD objectGUID represented canonically as UUID; never a mutable username,
+    # email, DN, or password-derived identifier.
+    external_id = Column(UUID(as_uuid=True), nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+    user = relationship("User", back_populates="external_identity_bindings")
+
+    __table_args__ = (
+        CheckConstraint(
+            "source = 'ad'",
+            name="ck_external_identity_bindings_source_ad",
+        ),
+        CheckConstraint(
+            "length(authority) BETWEEN 1 AND 255",
+            name="ck_external_identity_bindings_authority_length",
+        ),
+        UniqueConstraint(
+            "source",
+            "authority",
+            "external_id",
+            name="uq_external_identity_bindings_source_authority_external",
+        ),
+        UniqueConstraint(
+            "user_id",
+            "source",
+            name="uq_external_identity_bindings_user_source",
+        ),
+        Index(
+            "ix_external_identity_bindings_source_authority_external",
+            "source",
+            "authority",
+            "external_id",
+        ),
+    )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Return only safe linkage metadata.
+
+        The immutable objectGUID and authority are persistence keys, not
+        ordinary account metadata.  Callers that need to inspect bindings
+        (for example, a migration or audit tool) should query this model
+        directly under an explicitly privileged boundary; they must not be
+        serialized into ordinary API/UI responses.
+        """
+
+        return {
+            "id": str(self.id),
+            "user_id": str(self.user_id),
+            "source": self.source,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
 
 
 class ScopedMemoryPrincipal(Base):

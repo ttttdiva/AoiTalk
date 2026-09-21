@@ -83,6 +83,9 @@ function toSnake(row: Record<string, unknown>): Record<string, unknown> {
     isCompleted: "is_completed",
     spaceId: "space_id",
     knowledgeNodeId: "knowledge_node_id",
+    knowledgeNodeIdRaw: "knowledge_node_id_raw",
+    knowledgeNodeIdValid: "knowledge_node_id_valid",
+    knowledgeNodeIdValidated: "knowledge_node_id_validated",
     createdAt: "created_at",
     updatedAt: "updated_at",
     deletedAt: "deleted_at",
@@ -210,6 +213,16 @@ export async function GET() {
         {
           ...(row as unknown as Record<string, unknown>),
           knowledgeNodeId: canonicalNodeId,
+          // Keep an owner/admin-only diagnostic pointer for malformed
+          // hierarchy cleanup.  It is never used as a navigation link; the
+          // UI only uses it to fail closed and offer the dedicated repair
+          // path instead of a misleading generic Docs delete.
+          knowledgeNodeIdRaw:
+            user.role === "admin" || row.ownerId === user.id
+              ? row.knowledgeNodeId
+              : null,
+          knowledgeNodeIdValid: Boolean(canonicalNodeId),
+          knowledgeNodeIdValidated: true,
         },
         user.role === "admin" ||
           row.ownerId === user.id ||
@@ -274,35 +287,38 @@ export async function POST(request: NextRequest) {
     color: typeof color === "string" && color.trim() ? color.trim() : null,
   };
 
-  const [project] = await db
-    .insert(projects)
-    .values({
-      name,
-      description: description || null,
-      slug: finalSlug,
-      ownerId: user.id,
-      estimatedHours: estimated_hours != null ? Number(estimated_hours) : null,
-      spaceId: space_id || null,
-      storageQuotaMb: 1000,
-      storageUsedMb: 0,
-      projectMetadata: mergedMetadata,
-    })
-    .returning();
-
-  await db.insert(projectMembers).values({
-    projectId: project.id,
-    userId: user.id,
-    role: "owner",
-    permissions: getDefaultProjectPermissions("owner"),
-  });
-
   // Project information is a real child of the owner's Personal Docs
-  // Library's 案件情報 hub.  Bootstrap it during project creation so
-  // `projects.knowledge_node_id` is authoritative from the first response;
-  // the hierarchy helper is idempotent under concurrent retries.
-  const informationNode = await ensureProjectInformationHierarchyNode({
-    userId: user.id,
-    project,
+  // Library's 案件情報 hub.  Create the Project/member rows and bootstrap the
+  // canonical node in one transaction so a failed hierarchy write cannot
+  // leave a visible Project without its identity pointer.
+  const { project, informationNode } = await db.transaction(async (tx) => {
+    const [createdProject] = await tx
+      .insert(projects)
+      .values({
+        name,
+        description: description || null,
+        slug: finalSlug,
+        ownerId: user.id,
+        estimatedHours: estimated_hours != null ? Number(estimated_hours) : null,
+        spaceId: space_id || null,
+        storageQuotaMb: 1000,
+        storageUsedMb: 0,
+        projectMetadata: mergedMetadata,
+      })
+      .returning();
+
+    await tx.insert(projectMembers).values({
+      projectId: createdProject.id,
+      userId: user.id,
+      role: "owner",
+      permissions: getDefaultProjectPermissions("owner"),
+    });
+    const canonicalNode = await ensureProjectInformationHierarchyNode({
+      userId: user.id,
+      project: createdProject,
+      client: tx,
+    });
+    return { project: createdProject, informationNode: canonicalNode };
   });
   const library = await getPersonalDocsLibrary(user.id);
 

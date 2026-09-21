@@ -13,6 +13,10 @@ export default defineConfig({
     include: [
       "src/**/__tests__/**/*.test.ts",
       "src/**/__tests__/**/*.test.tsx",
+      // Keep focused feature tests next to their implementation while also
+      // retaining the historical __tests__ convention.
+      "src/**/*.test.ts",
+      "src/**/*.test.tsx",
     ],
   },
   resolve: {

@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..memory.models import (
@@ -30,6 +31,249 @@ DOCS_LIBRARY_SETTINGS: dict[str, Any] = {
 DOCS_WORKSPACE_NAME = DOCS_LIBRARY_NAME
 DOCS_WORKSPACE_DESCRIPTION = DOCS_LIBRARY_DESCRIPTION
 DOCS_WORKSPACE_SETTINGS = DOCS_LIBRARY_SETTINGS
+
+
+async def _ensure_aoitalk_guide_for_library(
+    session: AsyncSession,
+    library: DocsLibrary,
+    owner_user_id: UUID | None,
+) -> None:
+    """Materialize the canonical product guide for a real DB-backed library.
+
+    A few dependency-free compatibility tests pass lightweight session doubles
+    to this module.  They intentionally do not model the knowledge tables, so
+    skip the lifecycle hook for those doubles; production ``AsyncSession``
+    callers always receive the visible, system-managed guide.
+    """
+
+    if owner_user_id is None or not isinstance(session, AsyncSession):
+        return
+    from .aoitalk_guide import ensure_aoitalk_guide_hierarchy
+
+    await ensure_aoitalk_guide_hierarchy(
+        session,
+        owner_user_id,
+        library=library,
+    )
+
+
+async def get_canonical_project_information_node(
+    session: AsyncSession,
+    *,
+    project_id: UUID | str,
+    actor_user_id: UUID | str | None = None,
+) -> KnowledgeNode | None:
+    """Resolve a Project's canonical Project Information node, fail closed.
+
+    ``Project.knowledge_node_id`` is denormalized metadata and must never be
+    trusted on its own.  A valid pointer is the live, project-bound child in
+    the owning user's Personal Docs Library, under the canonical hub, with
+    the canonical ``project_info`` supertag.  The helper intentionally has no
+    repair side effects; callers that need to bootstrap/repair use
+    :func:`ensure_project_information_doc` instead.
+
+    ``actor_user_id`` is optional so write/bootstrap callers can validate the
+    pointer after their own permission check.  When supplied, a current
+    Project ``read`` ACL is required.  All failures return ``None`` so callers
+    can map the result to a uniform not-found response without leaking whether
+    a stale pointer happened to exist.
+
+    A handful of dependency-free service tests use ``SimpleNamespace`` rows
+    that predate the canonical metadata columns.  Real ORM rows always expose
+    every field; when those fields are absent we retain the legacy shape only
+    for compatibility, while any explicitly persisted malformed value is
+    rejected.
+    """
+
+    try:
+        normalized_project_id = UUID(str(project_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+    try:
+        project = await session.get(Project, normalized_project_id)
+    except Exception:
+        return None
+    if project is None or getattr(project, "deleted_at", None) is not None:
+        return None
+
+    if actor_user_id is not None:
+        try:
+            actor = UUID(str(actor_user_id))
+            allowed = await ProjectRepository.has_permission(
+                session,
+                project_id=normalized_project_id,
+                user_id=actor,
+                permission="read",
+            )
+        except Exception:
+            allowed = False
+        if not allowed:
+            return None
+
+    pointer_id = getattr(project, "knowledge_node_id", None)
+    if pointer_id is None:
+        return None
+    try:
+        pointer_uuid = UUID(str(pointer_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    try:
+        node = await session.get(KnowledgeNode, pointer_uuid)
+    except Exception:
+        return None
+    if node is None:
+        return None
+
+    # Explicitly persisted values are authoritative.  Missing attributes are
+    # tolerated only for lightweight legacy test doubles (see docstring).
+    sentinel = object()
+    node_project_id = getattr(node, "project_id", sentinel)
+    if node_project_id is not sentinel:
+        try:
+            if UUID(str(node_project_id)) != normalized_project_id:
+                return None
+        except (TypeError, ValueError, AttributeError):
+            return None
+    archived_at = getattr(node, "archived_at", sentinel)
+    if archived_at is not sentinel and archived_at is not None:
+        return None
+    # A canonical Project-information pointer is identity-bearing content,
+    # never an explicit user blank.  Treat a stale marker as corruption so
+    # callers cannot expose/operate on a blank-corrupted canonical root.
+    if getattr(node, "is_explicit_blank", sentinel) is True:
+        return None
+    node_type = getattr(node, "node_type", sentinel)
+    if node_type is not sentinel and str(node_type or "") != "node":
+        return None
+
+    library_id = getattr(node, "docs_library_id", sentinel)
+    if library_id is sentinel:
+        library_id = getattr(node, "workspace_id", sentinel)
+    if library_id is sentinel or library_id is None:
+        return None
+    try:
+        library_uuid = UUID(str(library_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    try:
+        library = await session.get(DocsLibrary, library_uuid)
+    except Exception:
+        return None
+    if library is None:
+        # Dependency-free legacy doubles may not model DocsLibrary lookup at
+        # all.  Real ORM rows always carry the strict pointer metadata below;
+        # only an otherwise-unadorned compatibility row may pass through.
+        if not all(
+            hasattr(node, field)
+            for field in ("system_key", "parent_id", "root_page_id")
+        ):
+            return node
+        return None
+
+    library_type = getattr(library, "library_type", sentinel)
+    if (
+        library_type is not sentinel
+        and str(library_type or "personal").strip().casefold() != "personal"
+    ):
+        return None
+    owner_id = getattr(project, "owner_id", sentinel)
+    library_owner_id = getattr(library, "owner_user_id", sentinel)
+    if owner_id is not sentinel and library_owner_id is not sentinel:
+        if owner_id is None or library_owner_id is None:
+            return None
+        if str(owner_id) != str(library_owner_id):
+            return None
+    elif library_owner_id is not sentinel and library_owner_id is None:
+        return None
+
+    expected_system_key = f"project_information:{normalized_project_id}"
+    node_system_key = getattr(node, "system_key", sentinel)
+    if node_system_key is not sentinel and str(node_system_key or "").strip() != expected_system_key:
+        return None
+
+    # A strict ORM row must carry the full parent/root contract.  Legacy test
+    # doubles lacking those columns are accepted above; once any parent field
+    # is present, malformed values are denied rather than partially inferred.
+    strict_parent_fields = all(
+        hasattr(node, field)
+        for field in ("parent_id", "root_page_id", "system_key")
+    )
+    if strict_parent_fields:
+        parent_id = getattr(node, "parent_id", None)
+        if parent_id is None:
+            return None
+        try:
+            parent_uuid = UUID(str(parent_id))
+        except (TypeError, ValueError, AttributeError):
+            return None
+        try:
+            hub = await session.get(KnowledgeNode, parent_uuid)
+        except Exception:
+            return None
+        if hub is None:
+            return None
+        hub_library_id = getattr(hub, "docs_library_id", sentinel)
+        if hub_library_id is not sentinel:
+            try:
+                if UUID(str(hub_library_id)) != library_uuid:
+                    return None
+            except (TypeError, ValueError, AttributeError):
+                return None
+        hub_archived_at = getattr(hub, "archived_at", sentinel)
+        if hub_archived_at is not sentinel and hub_archived_at is not None:
+            return None
+        hub_system_key = getattr(hub, "system_key", sentinel)
+        if hub_system_key is not sentinel and str(hub_system_key or "").strip() != "project_information_root":
+            return None
+        hub_parent_id = getattr(hub, "parent_id", sentinel)
+        if hub_parent_id is not sentinel and hub_parent_id is not None:
+            return None
+        hub_project_id = getattr(hub, "project_id", sentinel)
+        if hub_project_id is not sentinel and hub_project_id is not None:
+            return None
+        hub_root_page_id = getattr(hub, "root_page_id", sentinel)
+        if hub_root_page_id is not sentinel and hub_root_page_id not in (None, hub.id):
+            return None
+        hub_title = getattr(hub, "title", sentinel)
+        if hub_title is not sentinel and str(hub_title or "").strip() != "案件情報":
+            return None
+        hub_node_type = getattr(hub, "node_type", sentinel)
+        if hub_node_type is not sentinel and str(hub_node_type or "") != "node":
+            return None
+        hub_blank = getattr(hub, "is_explicit_blank", sentinel)
+        if hub_blank is True:
+            return None
+        node_root_page_id = getattr(node, "root_page_id", sentinel)
+        if node_root_page_id is not sentinel:
+            try:
+                if UUID(str(node_root_page_id)) != parent_uuid:
+                    return None
+            except (TypeError, ValueError, AttributeError):
+                return None
+
+        # The canonical Project Information supertag is part of the pointer
+        # identity.  A node with an arbitrary/renamed tag is not canonical.
+        try:
+            tag_result = await session.execute(
+                select(KnowledgeNodeSupertag.node_id)
+                .join(
+                    KnowledgeSupertag,
+                    KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                )
+                .where(
+                    KnowledgeNodeSupertag.node_id == pointer_uuid,
+                    KnowledgeSupertag.docs_library_id == library_uuid,
+                    func.btrim(KnowledgeSupertag.system_key) == "project_info",
+                )
+                .limit(1)
+            )
+            if tag_result.scalar_one_or_none() is None:
+                return None
+        except Exception:
+            return None
+
+    return node
 
 DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
     {
@@ -64,6 +308,17 @@ DEFAULT_DOCS_SUPERTAGS: list[dict[str, Any]] = [
             {"name": "案件", "field_type": "reference", "options_json": {"default": "ancestor_project"}},
         ],
         "ai_instructions": "会議メモは議題、決定、宿題、未確認事項を分ける。",
+    },
+    {
+        "name": "Meeting Minutes",
+        "system_key": "meeting_minutes",
+        "base_type": "meeting_minutes",
+        "description": "取り込んだ議事録・議事メモ",
+        "icon": "notebook-tabs",
+        "color": "#7c3aed",
+        "pinned_field_names": [],
+        "fields": [],
+        "ai_instructions": "取り込み済みの議事録本文を原文のまま保持する。",
     },
     {
         "name": "Person",
@@ -385,10 +640,40 @@ async def ensure_docs_library(
             "settings_json": DOCS_LIBRARY_SETTINGS,
         }
         kwargs["library_type"] = "personal"
-        library = DocsLibrary(**kwargs)
-        session.add(library)
-        await session.flush()
+        # Two first-use requests can both observe the missing owner row.  The
+        # partial unique index is the database authority, so isolate the
+        # insert in a savepoint and recover the winner instead of poisoning
+        # the caller's transaction with an IntegrityError.  Lightweight
+        # compatibility session doubles do not implement begin_nested(); keep
+        # their historical simple path unchanged.
+        if isinstance(session, AsyncSession):
+            try:
+                async with session.begin_nested():
+                    candidate = DocsLibrary(**kwargs)
+                    session.add(candidate)
+                    await session.flush()
+                library = candidate
+            except IntegrityError:
+                winner_result = await session.execute(
+                    select(DocsLibrary)
+                    .where(DocsLibrary.owner_user_id == owner_user_id)
+                    .order_by(
+                        (DocsLibrary.name == DOCS_LIBRARY_NAME).desc(),
+                        DocsLibrary.created_at,
+                    )
+                    .limit(1)
+                )
+                library = winner_result.scalar_one_or_none()
+                if library is None:
+                    raise
+        else:
+            library = DocsLibrary(**kwargs)
+            session.add(library)
+            await session.flush()
+        if library is None:  # pragma: no cover - defensive for session doubles
+            raise RuntimeError("Personal Docs Library could not be created")
         await seed_default_docs_supertags(session, library)
+        await _ensure_aoitalk_guide_for_library(session, library, owner_user_id)
         return library
 
     changed = False
@@ -411,6 +696,7 @@ async def ensure_docs_library(
     if changed:
         await session.flush()
     await seed_default_docs_supertags(session, library)
+    await _ensure_aoitalk_guide_for_library(session, library, owner_user_id)
     return library
 
 
@@ -455,58 +741,17 @@ async def get_project_docs_library(
     # the pointer node and return its owner's Personal Docs Library only when
     # the pointer is already a valid project root. Read paths never create or
     # repair a missing pointer; the write/bootstrap helper below does that.
-    pointer_id = getattr(project, "knowledge_node_id", None)
-    if pointer_id is None:
-        return None
-    node = await session.get(KnowledgeNode, pointer_id)
-    if node is None or node.project_id != normalized_project_id:
-        return None
     # Runtime reads must validate the complete canonical pointer contract;
     # accepting an arbitrary project-tagged node would let a stale pointer
     # expose unrelated Personal metadata.  Do not repair anything here.
+    node = await get_canonical_project_information_node(
+        session,
+        project_id=normalized_project_id,
+    )
+    if node is None:
+        return None
     library = await session.get(DocsLibrary, node.docs_library_id)
     if library is None:
-        return None
-    if (
-        str(getattr(library, "library_type", "personal") or "personal").lower()
-        != "personal"
-        or getattr(library, "owner_user_id", None) != project.owner_id
-        or getattr(node, "archived_at", None) is not None
-        or str(getattr(node, "system_key", "") or "")
-        != f"project_information:{normalized_project_id}"
-        or getattr(node, "parent_id", None) is None
-    ):
-        return None
-
-    hub = await session.get(KnowledgeNode, node.parent_id)
-    if (
-        hub is None
-        or hub.id != node.parent_id
-        or hub.docs_library_id != library.id
-        or getattr(hub, "archived_at", None) is not None
-        or str(getattr(hub, "system_key", "") or "")
-        != "project_information_root"
-        or getattr(hub, "parent_id", None) is not None
-        or getattr(hub, "project_id", None) is not None
-        or getattr(hub, "root_page_id", None) not in (None, hub.id)
-        or getattr(node, "root_page_id", None) != hub.id
-    ):
-        return None
-
-    # The canonical Project Information supertag is part of the pointer
-    # identity.  A node merely carrying an arbitrary tag must not be adopted
-    # as the project root.
-    tag_result = await session.execute(
-        select(KnowledgeNodeSupertag.node_id)
-        .join(KnowledgeSupertag, KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id)
-        .where(
-            KnowledgeNodeSupertag.node_id == node.id,
-            KnowledgeSupertag.docs_library_id == library.id,
-            KnowledgeSupertag.system_key == "project_info",
-        )
-        .limit(1)
-    )
-    if tag_result.scalar_one_or_none() is None:
         return None
     return library
 

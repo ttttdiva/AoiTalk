@@ -6,28 +6,41 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
+import threading
 import time
 import uuid
+from collections.abc import Mapping
 from contextvars import ContextVar, Token
 from datetime import datetime, timedelta
+from dataclasses import dataclass
 from typing import Any, Dict
 
 from sqlalchemy import and_, case, delete, desc, func, or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ..memory.database import get_database_manager
 from ..memory.models import (
+    Agent,
+    AgentRevision,
     AgentRun,
     AgentRunEdge,
     AgentRunEvent,
     AgentRunToolCall,
+    AgentWorkItem,
     ConversationDispatchOutbox,
     ConversationMessage,
     ConversationSession,
+    Task,
 )
-from .agent_team_v3 import AGENT_TEAM_SUBAGENT_CATALOG
+from ..memory.models.operations import _normalized_security_key, sanitize_source_url
+from .agent_team_v3 import (
+    AGENT_TEAM_CAPABILITY_CATALOG,
+    AGENT_TEAM_DEFAULT_TEAMS,
+    AGENT_TEAM_SUBAGENT_CATALOG,
+)
 from .agent_resource_mutations import (
     DOCS_MUTATION_OPERATIONS,
     TASK_MUTATION_OPERATIONS,
@@ -45,6 +58,12 @@ _current_agent_run_id: ContextVar[str | None] = ContextVar(
 _DISPATCH_PROCESS_ID = str(uuid.uuid4())
 MAX_CLIENT_MESSAGE_ID_LENGTH = 512
 DISPATCH_OUTBOX_RETENTION_SECONDS = 7 * 24 * 60 * 60
+# Dispatch attempts are intentionally bounded.  Existing callers may still
+# release a lease for an immediate retry; once this ceiling is reached the
+# row is dead-lettered and the AgentRun is terminalized instead of looping
+# forever after a restart.
+DISPATCH_MAX_ATTEMPTS = 5
+DISPATCH_DEADLETTER_STATUS = "deadletter"
 _AGENT_RUN_USAGE_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -54,6 +73,25 @@ _AGENT_RUN_USAGE_FIELDS = (
 _RESOURCE_MUTATION_TOOL_NAMES = frozenset(
     (*TASK_MUTATION_OPERATIONS, *DOCS_MUTATION_OPERATIONS)
 )
+
+
+@dataclass
+class PreparedApprovedMutationReceipt:
+    """Transaction-local fence for one approved resource mutation.
+
+    ``owned`` is true only for the caller that successfully inserted the
+    unique ``(run_id, tool_call_id)`` row and may therefore perform the
+    resource write.  A false value represents an already committed winner;
+    callers must return ``receipt``'s prior result without touching the
+    resource.
+    """
+
+    run_id: uuid.UUID
+    tool_name: str
+    tool_call_id: str
+    receipt: AgentRunToolCall
+    owned: bool
+    metadata: dict[str, Any]
 
 
 def _monotonic_activity(value):
@@ -185,6 +223,423 @@ SENSITIVE_TOOL_RESULT_NAMES = {
 SENSITIVE_TOOL_RESULT_MARKER = (
     "[Webexメッセージ本文は一時利用のため実行履歴へ保存しません]"
 )
+AUDIT_REDACTED_MARKER = "[REDACTED]"
+AUDIT_REDACTION_FAILED_MARKER = "[REDACTED_UNAVAILABLE]"
+# Cloud Advisor is a read-only advisory capability.  Its response is useful
+# to the live parent, but the durable AgentRun/audit surfaces must retain only
+# routing and outcome metadata.  Keep the run-type check narrow so ordinary
+# chat/director history remains backwards compatible.
+CLOUD_ADVISOR_RUN_TYPES = frozenset(
+    {
+        "cloud_advisor",
+        "cloud_advisor_consultation",
+        "cloud_advisor_consult",
+    }
+)
+_STATUS_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+_STATUS_LOCKS_GUARD = threading.Lock()
+
+
+def _status_lock(run_id: uuid.UUID) -> asyncio.Lock:
+    """Serialize same-run status transitions in one event loop."""
+
+    loop_id = id(asyncio.get_running_loop())
+    key = (loop_id, str(run_id))
+    with _STATUS_LOCKS_GUARD:
+        lock = _STATUS_LOCKS.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            _STATUS_LOCKS[key] = lock
+        return lock
+
+
+def _release_status_lock(run_id: uuid.UUID, lock: asyncio.Lock) -> None:
+    """Release and prune an idle per-run lock cache entry."""
+
+    lock.release()
+    key = (id(asyncio.get_running_loop()), str(run_id))
+    waiters = getattr(lock, "_waiters", None)
+    with _STATUS_LOCKS_GUARD:
+        if (
+            _STATUS_LOCKS.get(key) is lock
+            and not lock.locked()
+            and not waiters
+        ):
+            _STATUS_LOCKS.pop(key, None)
+
+
+def _validate_typed_agent_actor(
+    *,
+    user_id: str | None,
+    agent_id: uuid.UUID | None,
+    agent_revision: Any | None,
+    acting_subagent_id: str | None,
+    agent_row: Any | None = None,
+    config: Any | None = None,
+) -> None:
+    """Enforce the no-Agent-as-user and pinned subagent boundary.
+
+    This helper is called for both ordinary AgentRun creation and the
+    conversation dispatch transaction.  A UUID that belongs to an Agent may
+    never be copied into the legacy ``user_id`` column, even when the caller
+    omitted ``agent_id``.  Subagent IDs are executable declarations only when
+    they are present in the exact pinned revision and that revision's Team.
+    """
+
+    if user_id and agent_row is not None:
+        candidate = parse_uuid(user_id)
+        if candidate is not None and getattr(agent_row, "id", None) == candidate:
+            raise ValueError("Agent IDs must not be stored in user_id")
+    if not acting_subagent_id:
+        return
+    normalized = str(acting_subagent_id).strip()
+    known_subagent_ids = set(AGENT_TEAM_SUBAGENT_CATALOG)
+    if config is not None:
+        try:
+            from .agent_team_v3 import agent_team_v3_subagents
+
+            known_subagent_ids.update(
+                str(item.get("subagent_id"))
+                for item in agent_team_v3_subagents(config)
+                if isinstance(item, Mapping) and item.get("subagent_id")
+            )
+        except Exception:
+            pass
+    if normalized not in known_subagent_ids:
+        raise ValueError("unknown acting_subagent_id")
+    # Historical human/chat runs may carry a specialist marker without a
+    # typed AgentRevision.  Preserve that compatibility path; the strict
+    # revision/team binding applies whenever an autonomous Agent identity is
+    # present.
+    if agent_id is None:
+        return
+    if agent_revision is None:
+        raise ValueError("acting_subagent_id requires an exact AgentRevision")
+    allowed = {
+        str(item).strip()
+        for item in (getattr(agent_revision, "allowed_subagent_ids", None) or [])
+        if str(item).strip()
+    }
+    team_id = str(getattr(agent_revision, "agent_team_id", "") or "")
+    team = AGENT_TEAM_DEFAULT_TEAMS.get(team_id) or {}
+    if config is not None:
+        try:
+            from .agent_team_v3 import agent_team_v3_teams
+
+            configured_teams = {
+                str(item.get("team_id")): item
+                for item in agent_team_v3_teams(config)
+                if isinstance(item, Mapping) and item.get("team_id")
+            }
+            team = configured_teams.get(team_id) or team
+        except Exception:
+            # An unavailable/malformed optional config must not broaden the
+            # default Team membership.
+            pass
+    team_members = {
+        str(item).strip() for item in (team.get("subagent_ids") or []) if str(item).strip()
+    }
+    if normalized not in allowed or normalized not in team_members:
+        raise ValueError("acting_subagent_id is not allowed by the pinned AgentRevision")
+
+
+def _validate_manifest_bindings(
+    manifest: Dict[str, Any] | None,
+    *,
+    agent_id: uuid.UUID | None,
+    revision_id: uuid.UUID | None,
+    task_id: uuid.UUID | None,
+    project_id: uuid.UUID | None,
+    work_item_id: uuid.UUID | None = None,
+) -> None:
+    """Ensure a metadata manifest cannot claim a different typed target."""
+
+    if not isinstance(manifest, dict):
+        return
+    for key, expected in (
+        ("agent_id", agent_id),
+        ("agent_revision_id", revision_id),
+        ("task_id", task_id),
+        ("work_item_id", work_item_id),
+        ("project_id", project_id),
+    ):
+        raw = manifest.get(key)
+        if raw in (None, ""):
+            continue
+        parsed = parse_uuid(raw)
+        if parsed is None or expected is None or parsed != expected:
+            raise ValueError(f"execution manifest {key} does not match typed run binding")
+
+
+async def _lookup_agent_for_legacy_user(session: Any, user_uuid: uuid.UUID) -> Any | None:
+    """Look up an Agent without breaking pre-WS01 rolling schemas.
+
+    Before migration ``agents`` does not exist in a few lightweight legacy
+    fixtures.  A human-only run remains valid in that window; any other DB
+    error is propagated so production does not silently bypass an unavailable
+    identity authority.
+    """
+
+    try:
+        return await session.get(Agent, user_uuid)
+    except OperationalError as exc:
+        detail = str(exc).casefold()
+        if "no such table" in detail and "agent" in detail:
+            return None
+        if "undefinedtable" in detail and "agent" in detail:
+            return None
+        raise
+CLOUD_ADVISOR_TOOL_NAME = "consult_cloud_advisor"
+CLOUD_ADVISOR_CONTENT_REDACTED_MARKER = "[Cloud Advisor content withheld]"
+_CLOUD_ADVISOR_CONTENT_KEYS = frozenset(
+    {
+        "advisory_text",
+        "assistant_response",
+        "answer",
+        "body",
+        "candidate_payload",
+        "content",
+        "context",
+        "context_snapshot",
+        "final_payload",
+        "input",
+        "instructions",
+        "message",
+        "messages",
+        "model_transcript",
+        "original_payload",
+        "output",
+        "output_text",
+        "prompt",
+        "query",
+        "raw_context",
+        "raw_prompt",
+        "raw_reply",
+        "raw_response",
+        "reply",
+        "response",
+        "response_text",
+        "text",
+        "transcript",
+    }
+)
+_CLOUD_ADVISOR_CONTENT_KEYS_COMPACT = frozenset(
+    key.replace("_", "") for key in _CLOUD_ADVISOR_CONTENT_KEYS
+)
+_CLOUD_ADVISOR_SAFE_EVENT_MESSAGES = frozenset(
+    {
+        "Agent run queued",
+        "Agent run started",
+        "Agent run completed",
+        "Agent run cancelled",
+        "Agent run failed",
+    }
+)
+_TOOL_AUDIT_ARGUMENT_KEYS = frozenset({"tool_args", "arguments", "args"})
+_TOOL_AUDIT_RESULT_KEYS = frozenset({"tool_result", "result", "output", "stderr", "error"})
+_TOOL_AUDIT_CORRELATION_KEYS = frozenset(
+    {
+        "tool",
+        "tool_name",
+        "name",
+        "operation_id",
+        "tool_call_id",
+        "call_id",
+        "id",
+        "status",
+        "state",
+        "success",
+        "successful",
+        "ok",
+        "succeeded",
+    }
+)
+_TOOL_AUDIT_ID_KEYS = frozenset(
+    {"operation_id", "tool_call_id", "call_id", "id"}
+)
+
+# Operations tool calls can carry untrusted external source snapshots and
+# application bodies.  These values may be needed transiently by the tool,
+# but must not be written to AgentRun arguments/events/transcripts.  Matching
+# is deliberately scoped to ``operations_*`` tool names so unrelated tools'
+# ordinary ``text``/``body`` fields remain untouched.
+OPERATIONS_TOOL_NAME_PREFIX = "operations_"
+OPERATIONS_REDACTED_VALUE = "[Operations protected body redacted]"
+_OPERATIONS_PROTECTED_FIELD_NAMES = frozenset(
+    {
+        "source_text",
+        "raw_source",
+        "source_body",
+        "external_body",
+        "application_message",
+        "message",
+        "raw_body",
+        "response_body",
+        "credential",
+        "credential_ref",
+        "credentials",
+        "password",
+        "passphrase",
+        "secret",
+        "token",
+        "access_token",
+        "auth_token",
+        "session_token",
+        "refresh_token",
+        "api_key",
+        "saml_response",
+        "relay_state",
+        "authorization",
+        "cookie",
+        "cookies",
+        "browser_data",
+        "browser_state",
+        "browser_context",
+    }
+)
+_OPERATIONS_PROTECTED_FIELD_NAMES_COMPACT = frozenset(
+    name.replace("_", "") for name in _OPERATIONS_PROTECTED_FIELD_NAMES
+)
+_OPERATIONS_URL_FIELD_NAMES = frozenset({"source_url", "remote_url", "url"})
+_OPERATIONS_URL_FIELD_NAMES_COMPACT = frozenset(
+    name.replace("_", "") for name in _OPERATIONS_URL_FIELD_NAMES
+)
+
+
+def _is_operations_tool_name(value: Any) -> bool:
+    """Return whether a name belongs to the direct Operations tool family."""
+
+    normalized = str(value or "").strip().rsplit(".", 1)[-1].casefold()
+    return normalized.startswith(OPERATIONS_TOOL_NAME_PREFIX)
+
+
+def _operations_protected_field(key: Any) -> bool:
+    normalized, compact = _normalized_security_key(key)
+    if (
+        normalized in _OPERATIONS_PROTECTED_FIELD_NAMES
+        or compact in _OPERATIONS_PROTECTED_FIELD_NAMES_COMPACT
+    ):
+        return True
+    # Provider payloads occasionally use a qualified key (for example
+    # ``provider_access_token``).  Keep this matching narrow and avoid broad
+    # words such as ``status`` or ``summary`` that are safe audit metadata.
+    return any(
+        marker in normalized
+        for marker in (
+            "credential",
+            "access_token",
+            "refresh_token",
+            "api_key",
+            "password",
+            "passphrase",
+            "secret",
+            "cookie",
+            "browser_",
+            "raw_source",
+            "source_text",
+            "source_body",
+            "external_body",
+            "application_message",
+            "response_body",
+        )
+    )
+
+
+def _operations_url_field(key: Any) -> bool:
+    """Return whether a field is an Operations URL boundary."""
+
+    normalized, compact = _normalized_security_key(key)
+    return (
+        normalized in _OPERATIONS_URL_FIELD_NAMES
+        or compact in _OPERATIONS_URL_FIELD_NAMES_COMPACT
+    )
+
+
+def _durable_operations_url(value: Any) -> Any:
+    """Canonicalize a durable Operations URL or replace it with a marker."""
+
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return OPERATIONS_REDACTED_VALUE
+    normalized = sanitize_source_url(value)
+    return normalized if normalized is not None else OPERATIONS_REDACTED_VALUE
+
+
+def _operations_tool_name_from_mapping(value: dict[str, Any]) -> str:
+    for key in ("tool", "tool_name", "name"):
+        candidate = value.get(key)
+        if _is_operations_tool_name(candidate):
+            return _clean_tool_name(candidate)
+    for nested_key in ("tool_result", "tool_call", "call", "function"):
+        nested = value.get(nested_key)
+        if isinstance(nested, dict):
+            candidate = _operations_tool_name_from_mapping(nested)
+            if candidate:
+                return candidate
+    return ""
+
+
+def _redact_operations_value(value: Any, *, tool_name: str) -> Any:
+    """Recursively redact protected Operations fields in a JSON value."""
+
+    if isinstance(value, list):
+        return [
+            _redact_operations_value(item, tool_name=tool_name)
+            for item in value
+        ]
+    if isinstance(value, str):
+        # Event/tool adapters sometimes serialize a result object one level
+        # earlier than the durable boundary.  Decode only JSON objects/arrays;
+        # ordinary status/summary strings remain unchanged.
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return value
+        if isinstance(parsed, (dict, list)):
+            return _redact_operations_value(parsed, tool_name=tool_name)
+        return value
+    if not isinstance(value, dict):
+        return value
+    return {
+        str(key): (
+            OPERATIONS_REDACTED_VALUE
+            if _operations_protected_field(key)
+            else _durable_operations_url(item)
+            if _operations_url_field(key)
+            else _redact_operations_value(item, tool_name=tool_name)
+        )
+        for key, item in value.items()
+    }
+
+
+def _redact_operations_json_arguments(value: Any, *, tool_name: str) -> Any:
+    """Redact an Operations function argument object or JSON string."""
+
+    if isinstance(value, (dict, list)):
+        safe_value, ok = _safe_audit_redact(value)
+        if not ok:
+            return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+        return _redact_operations_value(safe_value, tool_name=tool_name)
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        # Even an unstructured Operations string may contain a labelled or
+        # bearer credential, so apply the generic value redactor before
+        # returning it.  Structural field projection is only possible for
+        # decoded object/array arguments.
+        safe_value, ok = _safe_audit_redact(value)
+        return safe_value if ok else AUDIT_REDACTION_FAILED_MARKER
+    safe_value, ok = _safe_audit_redact(parsed)
+    if not ok:
+        return AUDIT_REDACTION_FAILED_MARKER
+    redacted = _redact_operations_value(safe_value, tool_name=tool_name)
+    try:
+        return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return OPERATIONS_REDACTED_VALUE
 
 
 def set_current_agent_run_id(run_id: str | None) -> Token:
@@ -208,6 +663,200 @@ def _jsonable(value: Any) -> Any:
         return {"value": str(value)}
 
 
+def _validated_context_manifest_ref(value: Any) -> dict[str, Any] | None:
+    """Return hash-only validated ContextManifest metadata.
+
+    AgentRun records must remain useful for reproducibility without becoming a
+    second authority or persisting prompt/context bodies.  The existing
+    ContextManifest validator is the only authority for shape/version/hash
+    validation; this projection retains only hashes and bounded counters.
+    """
+
+    if not isinstance(value, dict):
+        return None
+    try:
+        from ..llm.context_snapshot import validate_context_manifest_metadata
+
+        manifest = validate_context_manifest_metadata(value)
+    except Exception:
+        manifest = None
+    if not isinstance(manifest, dict):
+        # Accept an already projected ref (for idempotent retries) but never
+        # treat arbitrary provider metadata as a valid manifest.
+        manifest_hash = str(value.get("manifest_hash") or "").strip()
+        reproducibility = value.get("reproducibility_hashes")
+        evidence_hashes = value.get("evidence_hashes")
+
+        def valid_hash(item: Any) -> bool:
+            text = str(item or "").strip()
+            return (
+                len(text) == 71
+                and text.startswith("sha256:")
+                and all(character in "0123456789abcdef" for character in text[7:].lower())
+            )
+
+        if (
+            not valid_hash(manifest_hash)
+            or not isinstance(reproducibility, dict)
+            or not isinstance(evidence_hashes, (list, tuple))
+        ):
+            return None
+        clean_reproducibility = {
+            str(key): str(item)
+            for key, item in reproducibility.items()
+            if str(key) and valid_hash(item)
+        }
+        clean_evidence = sorted(
+            {
+                str(item).strip()
+                for item in evidence_hashes
+                if valid_hash(item)
+            }
+        )[:512]
+        return {
+            "manifest_hash": manifest_hash,
+            "reproducibility_hashes": clean_reproducibility,
+            "evidence_hashes": clean_evidence,
+            "evidence_count": len(clean_evidence),
+        }
+
+    evidence = manifest.get("evidence")
+    evidence_hashes: list[str] = []
+    if isinstance(evidence, list):
+        for item in evidence:
+            if isinstance(item, dict):
+                value_hash = item.get("locator_hash") or item.get("ref_hash")
+                if value_hash:
+                    evidence_hashes.append(str(value_hash))
+    reproducibility = manifest.get("reproducibility_hashes")
+    if not isinstance(reproducibility, dict):
+        reproducibility = {}
+    return {
+        "schema_version": str(manifest.get("schema_version") or ""),
+        "manifest_hash": str(manifest.get("manifest_hash") or ""),
+        "reproducibility_hashes": {
+            str(key): str(item)
+            for key, item in reproducibility.items()
+            if str(key) and str(item)
+        },
+        "evidence_hashes": sorted(set(evidence_hashes))[:512],
+        "evidence_count": len(evidence_hashes),
+    }
+
+
+_EXECUTION_MANIFEST_ALLOWED_KEYS = frozenset(
+    {
+        "schema_version",
+        "agent_id",
+        "agent_revision_id",
+        "agent_revision_version",
+        "team_id",
+        "execution_profile_id",
+        "subagent_id",
+        "capabilities",
+        "project_id",
+        "task_id",
+        "work_item_id",
+        "persona_id",
+        "workspace_access",
+        "network_access",
+        "run_scope_hash",
+        "authority_hash",
+        "source",
+    }
+)
+_EXECUTION_MANIFEST_SECRET_MARKERS = frozenset(
+    {"secret", "token", "password", "credential", "api_key", "cookie", "environment", "env"}
+)
+
+
+def _bounded_execution_manifest(value: Any) -> dict[str, Any] | None:
+    """Project a trusted execution manifest to bounded, secret-free metadata.
+
+    The manifest is reproducibility evidence, not a second authority.  Only
+    known scalar/list fields and hash-like identifiers are retained; arbitrary
+    provider configuration, credentials, paths, and environment values are
+    dropped.  Invalid input returns ``None`` rather than being persisted.
+    """
+
+    if not isinstance(value, dict) or len(value) > 32:
+        return None
+    clean: dict[str, Any] = {}
+    for raw_key, raw_item in value.items():
+        key = str(raw_key).strip()
+        if key not in _EXECUTION_MANIFEST_ALLOWED_KEYS:
+            continue
+        if any(marker in key.casefold() for marker in _EXECUTION_MANIFEST_SECRET_MARKERS):
+            continue
+        if isinstance(raw_item, (str, int, bool)) or raw_item is None:
+            text_value = str(raw_item) if isinstance(raw_item, str) else raw_item
+            if isinstance(text_value, str) and (
+                len(text_value) > 512
+                or "/" in text_value
+                or "\\" in text_value
+            ):
+                return None
+            if key in {"workspace_access", "network_access"} and isinstance(text_value, str):
+                allowed_values = (
+                    {"none", "read", "write"}
+                    if key == "workspace_access"
+                    else {"none", "organization", "allowlist", "broad"}
+                )
+                if text_value.casefold() not in allowed_values:
+                    return None
+            if key in {"run_scope_hash", "authority_hash"} and isinstance(text_value, str):
+                if not re.fullmatch(r"[0-9a-f]{64}", text_value.casefold()):
+                    return None
+            if key in {"agent_id", "agent_revision_id", "project_id", "task_id", "persona_id"} and isinstance(text_value, str):
+                if parse_uuid(text_value) is None:
+                    return None
+            clean[key] = text_value
+            continue
+        if isinstance(raw_item, (list, tuple)):
+            if len(raw_item) > 128 or any(not isinstance(item, (str, int, bool)) for item in raw_item):
+                return None
+            values = []
+            for item in raw_item:
+                if isinstance(item, str):
+                    if (
+                        len(item) > 160
+                        or "/" in item
+                        or "\\" in item
+                        or any(marker in item.casefold() for marker in _EXECUTION_MANIFEST_SECRET_MARKERS)
+                    ):
+                        return None
+                    if key == "capabilities" and item not in AGENT_TEAM_CAPABILITY_CATALOG:
+                        return None
+                values.append(item)
+            clean[key] = list(dict.fromkeys(values))
+            continue
+        return None
+    if not clean:
+        return None
+    return clean
+
+
+def _sanitize_context_manifest_fields(value: Any) -> Any:
+    """Strip full Manifest bodies from result/event metadata."""
+
+    if isinstance(value, list):
+        return [_sanitize_context_manifest_fields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    clean = {
+        str(key): _sanitize_context_manifest_fields(item)
+        for key, item in value.items()
+        if key != "context_manifest"
+    }
+    if "context_manifest" in value:
+        ref = _validated_context_manifest_ref(value.get("context_manifest"))
+        if ref is not None:
+            clean["context_manifest"] = ref
+        else:
+            clean.pop("context_manifest", None)
+    return clean
+
+
 def conversation_dispatch_fingerprint(payload: Dict[str, Any]) -> str:
     canonical = json.dumps(
         _jsonable(payload),
@@ -218,18 +867,49 @@ def conversation_dispatch_fingerprint(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _redact_sensitive_tool_data(value: Any) -> Any:
+def _redact_sensitive_tool_data(
+    value: Any,
+    *,
+    tool_name: str | None = None,
+) -> Any:
     """Remove transient private tool output before durable AgentRun storage."""
 
     if isinstance(value, list):
-        return [_redact_sensitive_tool_data(item) for item in value]
+        return [
+            _redact_sensitive_tool_data(item, tool_name=tool_name)
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
 
-    redacted = {
-        str(key): _redact_sensitive_tool_data(item)
-        for key, item in value.items()
-    }
+    operations_tool_name = (
+        _clean_tool_name(tool_name)
+        if _is_operations_tool_name(tool_name)
+        else _operations_tool_name_from_mapping(value)
+    )
+    if operations_tool_name:
+        # Apply generic credential redaction first so labelled/Bearer secrets
+        # in ordinary Operations fields cannot survive, then apply the
+        # field-aware projection last to retain its explicit marker and safe
+        # IDs/hashes/statuses.
+        safe_value, safe_ok = _safe_audit_redact(value)
+        if not safe_ok or not isinstance(safe_value, dict):
+            return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+        redacted = _redact_operations_value(
+            safe_value,
+            tool_name=operations_tool_name,
+        )
+    else:
+        # Generic Director/Cloud/stream payloads are also an audit boundary.
+        # Previously only Operations payloads went through the shared display
+        # redactor, allowing ``director.raw_reply`` or arbitrary provider
+        # metadata to retain labelled/Bearer credentials verbatim.  Apply the
+        # same fail-closed projection to every mapping while leaving ordinary
+        # non-secret text untouched.
+        safe_value, safe_ok = _safe_audit_redact(value)
+        if not safe_ok or not isinstance(safe_value, dict):
+            return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+        redacted = safe_value
     tool_result = redacted.get("tool_result")
     tool_name = _clean_tool_name(
         redacted.get("tool")
@@ -255,16 +935,586 @@ def _redact_sensitive_tool_data(value: Any) -> Any:
     return redacted
 
 
+def _safe_audit_redact(value: Any) -> tuple[Any, bool]:
+    """Secret-redact an audit value, failing closed on redactor errors."""
+
+    try:
+        from .outbound_privacy_service import redact_secret_for_local_display
+
+        value_for_redaction = value
+        json_string = False
+        if isinstance(value, str):
+            candidate = value.strip()
+            if candidate.startswith(("{", "[")):
+                try:
+                    value_for_redaction = json.loads(candidate)
+                    json_string = isinstance(value_for_redaction, (dict, list))
+                except (TypeError, ValueError):
+                    value_for_redaction = value
+        redacted = redact_secret_for_local_display(value_for_redaction)
+        redacted = _redact_nested_json_strings(
+            redacted,
+            redact_secret_for_local_display,
+        )
+        # Force a strict JSON boundary here: provider SDK objects and
+        # unserializable values must never fall back to their raw repr in
+        # durable audit.
+        _strict_audit_jsonable(redacted)
+        if json_string:
+            redacted = json.dumps(
+                _strict_audit_jsonable(redacted),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        return redacted, True
+    except Exception:
+        return AUDIT_REDACTION_FAILED_MARKER, False
+
+
+def _is_cloud_advisor_run_type(value: Any) -> bool:
+    return str(value or "").strip().casefold() in CLOUD_ADVISOR_RUN_TYPES
+
+
+def _is_cloud_advisor_content_key(value: Any) -> bool:
+    normalized, compact = _normalized_security_key(value)
+    return (
+        normalized in _CLOUD_ADVISOR_CONTENT_KEYS
+        or compact in _CLOUD_ADVISOR_CONTENT_KEYS_COMPACT
+    )
+
+
+def _project_cloud_advisor_audit_value(value: Any) -> tuple[Any, bool]:
+    """Project one Cloud Advisor value to metadata without retaining bodies.
+
+    Cloud Advisor's ``advisory_text`` is returned to the live parent, not to
+    durable AgentRun/audit storage.  This projection recursively removes
+    prompt/reply/payload-like fields while retaining the surrounding outcome,
+    routing, budget and usage metadata.  It is intentionally independent of
+    the privacy gateway: the gateway protects bytes before transport, whereas
+    this function protects the local durable audit boundary.
+    """
+
+    if isinstance(value, list):
+        projected: list[Any] = []
+        dropped = False
+        for item in value:
+            clean, item_dropped = _project_cloud_advisor_audit_value(item)
+            projected.append(clean)
+            dropped = dropped or item_dropped
+        return projected, dropped
+    if isinstance(value, tuple):
+        projected_items, dropped = _project_cloud_advisor_audit_value(list(value))
+        return projected_items, dropped
+    if not isinstance(value, dict):
+        return value, False
+
+    projected_dict: dict[str, Any] = {}
+    dropped = False
+    for key, item in value.items():
+        key_text = str(key)
+        if _is_cloud_advisor_content_key(key_text):
+            dropped = True
+            continue
+        clean, item_dropped = _project_cloud_advisor_audit_value(item)
+        projected_dict[key_text] = clean
+        dropped = dropped or item_dropped
+    return projected_dict, dropped
+
+
+def sanitize_cloud_advisor_audit_value(value: Any) -> dict[str, Any]:
+    """Return a metadata-only projection for Cloud Advisor persistence.
+
+    The helper is public so callers that create an audit record directly can
+    apply the same contract as :class:`AgentRunService`.  Redaction failures
+    fail closed and never fall back to ``repr(value)``.
+    """
+
+    # Tool results/transcripts often arrive as the JSON string emitted by the
+    # runtime registry.  Decode only an object-shaped envelope so status and
+    # route metadata remain useful; arbitrary text is withheld wholesale.
+    candidate = value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            decoded = None
+        candidate = decoded if isinstance(decoded, dict) else {}
+    safe_value, ok = _safe_audit_redact(candidate)
+    if not ok or not isinstance(safe_value, dict):
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+    projected, dropped = _project_cloud_advisor_audit_value(safe_value)
+    if not isinstance(projected, dict):
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+    if dropped:
+        projected["content_redacted"] = True
+    try:
+        return _strict_audit_jsonable(projected)
+    except Exception:
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+
+
+def _sanitize_cloud_advisor_event_message(
+    event_type: str,
+    message: Any,
+) -> str | None:
+    """Keep lifecycle labels while withholding advisory bodies from events."""
+
+    if message is None:
+        return None
+    text = str(message)
+    if text in _CLOUD_ADVISOR_SAFE_EVENT_MESSAGES:
+        return text
+    return CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+
+
+def _safe_audit_metadata(
+    value: Any,
+    *,
+    run_type: str | None = None,
+) -> dict[str, Any]:
+    """Normalize metadata before writing it to a durable run/edge row."""
+
+    safe = _redact_sensitive_tool_data(value if isinstance(value, dict) else {})
+    if not isinstance(safe, dict):
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+    safe = _sanitize_context_manifest_fields(safe)
+    if _is_cloud_advisor_run_type(run_type):
+        return sanitize_cloud_advisor_audit_value(safe)
+    try:
+        return _strict_audit_jsonable(safe)
+    except Exception:
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+
+
+def _sanitize_serialized_agent_run(value: Any) -> dict[str, Any]:
+    """Apply the durable audit contract at the API/read projection too.
+
+    Older rows may predate the write-side sanitizer, and tests/tools can build
+    ORM rows directly.  Never return those values verbatim from ``get_run`` or
+    ``list_runs``; re-project result, metadata, events and tool evidence on
+    read as a final defence.
+    """
+
+    payload = dict(value) if isinstance(value, dict) else {}
+    run_type = payload.get("run_type")
+    if _is_cloud_advisor_run_type(run_type):
+        if payload.get("objective"):
+            payload["objective"] = CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+        if payload.get("title"):
+            payload["title"] = CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+
+    payload["metadata"] = _safe_audit_metadata(
+        payload.get("metadata"),
+        run_type=run_type,
+    )
+    result = _sanitize_context_manifest_fields(
+        _redact_sensitive_tool_data(payload.get("result") or {})
+    )
+    if _is_cloud_advisor_run_type(run_type):
+        result = sanitize_cloud_advisor_audit_value(result)
+    if isinstance(result, dict) and "assistant_response" in result:
+        result["assistant_response"] = sanitize_assistant_display_text(
+            result.get("assistant_response")
+        )
+    payload["result"] = result
+    if payload.get("error") is not None:
+        payload["error"] = sanitize_durable_error_text(payload["error"])
+
+    events = payload.get("events")
+    if isinstance(events, list):
+        clean_events: list[dict[str, Any]] = []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            clean_event = dict(event)
+            clean_event["payload"] = _redact_sensitive_tool_data(
+                clean_event.get("payload") or {}
+            )
+            event_tool_name = _clean_tool_name(
+                clean_event["payload"].get("tool_name")
+                if isinstance(clean_event["payload"], dict)
+                else None
+            )
+            if (
+                event_tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME
+            ):
+                clean_event["payload"] = sanitize_cloud_advisor_audit_value(
+                    clean_event["payload"]
+                )
+                clean_event["message"] = CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+            elif _is_cloud_advisor_run_type(run_type):
+                clean_event["payload"] = sanitize_cloud_advisor_audit_value(
+                    clean_event["payload"]
+                )
+                clean_event["message"] = _sanitize_cloud_advisor_event_message(
+                    str(clean_event.get("event_type") or ""),
+                    clean_event.get("message"),
+                )
+            elif clean_event.get("message") is not None:
+                clean_event["message"] = sanitize_durable_error_text(
+                    clean_event["message"]
+                )
+            clean_events.append(clean_event)
+        payload["events"] = clean_events
+
+    tool_calls = payload.get("tool_calls")
+    if isinstance(tool_calls, list):
+        clean_tool_calls: list[dict[str, Any]] = []
+        for item in tool_calls:
+            if not isinstance(item, dict):
+                continue
+            clean_item = dict(item)
+            item_tool_name = _clean_tool_name(
+                clean_item.get("tool_name")
+                or clean_item.get("name")
+                or clean_item.get("tool")
+            )
+            if item_tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME:
+                clean_item["arguments"] = sanitize_cloud_advisor_audit_value(
+                    clean_item.get("arguments") or {}
+                )
+                clean_item["result"] = sanitize_cloud_advisor_audit_value(
+                    clean_item.get("result") or {}
+                )
+                clean_item["metadata"] = sanitize_cloud_advisor_audit_value(
+                    clean_item.get("metadata") or {}
+                )
+            elif _is_cloud_advisor_run_type(run_type):
+                clean_item["arguments"] = sanitize_cloud_advisor_audit_value(
+                    clean_item.get("arguments") or {}
+                )
+                clean_item["result"] = _safe_audit_result(
+                    sanitize_cloud_advisor_audit_value(
+                        _jsonable(clean_item.get("result"))
+                    )
+                )
+                clean_item["metadata"] = sanitize_cloud_advisor_audit_value(
+                    clean_item.get("metadata") or {}
+                )
+            else:
+                clean_item["arguments"] = _safe_audit_arguments(
+                    clean_item.get("arguments") or {}
+                )
+                if clean_item.get("result") is not None:
+                    clean_item["result"] = _safe_audit_result(
+                        clean_item.get("result")
+                    )
+                clean_item["metadata"] = _safe_audit_metadata(
+                    clean_item.get("metadata")
+                )
+            clean_tool_calls.append(clean_item)
+        payload["tool_calls"] = clean_tool_calls
+
+    edges = payload.get("child_edges")
+    if isinstance(edges, list):
+        for edge in edges:
+            if isinstance(edge, dict):
+                edge["metadata"] = _safe_audit_metadata(edge.get("metadata"))
+    edges = payload.get("parent_edges")
+    if isinstance(edges, list):
+        for edge in edges:
+            if isinstance(edge, dict):
+                edge["metadata"] = _safe_audit_metadata(edge.get("metadata"))
+
+    return payload
+
+
+def _redact_nested_json_strings(value: Any, redactor) -> Any:
+    """Apply secret redaction inside JSON-encoded argument/result strings."""
+
+    if isinstance(value, dict):
+        return {
+            key: _redact_nested_json_strings(item, redactor)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_nested_json_strings(item, redactor) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_nested_json_strings(item, redactor) for item in value)
+    if not isinstance(value, str):
+        return value
+    candidate = value.strip()
+    if not candidate.startswith(("{", "[")):
+        return value
+    try:
+        parsed = json.loads(candidate)
+    except (TypeError, ValueError):
+        return value
+    if not isinstance(parsed, (dict, list)):
+        return value
+    redacted = redactor(parsed)
+    redacted = _redact_nested_json_strings(redacted, redactor)
+    return json.dumps(
+        _strict_audit_jsonable(redacted),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _strict_audit_jsonable(value: Any) -> Any:
+    """Convert only known scalar/container values; reject opaque objects."""
+
+    if value is None or isinstance(value, (str, int, float, bool)):
+        if isinstance(value, float) and not (value == value and abs(value) != float("inf")):
+            raise ValueError("non-finite audit value")
+        return value
+    if isinstance(value, (datetime,)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, dict):
+        return {str(key): _strict_audit_jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_strict_audit_jsonable(item) for item in value]
+    raise TypeError(f"unsupported audit value: {type(value).__name__}")
+
+
+def _safe_audit_correlation(value: Any) -> str | None:
+    """Keep a useful correlation id without preserving token-shaped text."""
+
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if len(text) > 256 or any(ord(char) < 32 for char in text):
+        return "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    redacted, ok = _safe_audit_redact(text)
+    if not ok:
+        # Keep ordinary operation ids useful even when the optional redactor
+        # is unavailable; hash only token-shaped identifiers in this fallback.
+        if re.search(
+            r"(?i)(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|secret|password|bearer\s+|(?:sk|AIza)[-_A-Za-z0-9]{8,})",
+            text,
+        ):
+            return "sha256:" + hashlib.sha256(
+                text.encode("utf-8", "replace")
+            ).hexdigest()
+        return text
+    if not isinstance(redacted, str) or redacted != text:
+        return "sha256:" + hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+    return text
+
+
+def _safe_audit_arguments(value: Any) -> dict[str, Any]:
+    """Return a JSON object suitable for ``AgentRunToolCall.arguments``."""
+
+    redacted, ok = _safe_audit_redact(value if isinstance(value, dict) else {})
+    if ok and isinstance(redacted, dict):
+        try:
+            return _strict_audit_jsonable(redacted)
+        except Exception:
+            pass
+    return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+
+
+def _safe_audit_result(value: Any) -> str:
+    """Return a bounded, secret-redacted text result for durable audit."""
+
+    redacted, ok = _safe_audit_redact(value)
+    if not ok:
+        return AUDIT_REDACTION_FAILED_MARKER
+    if isinstance(redacted, (dict, list, tuple)):
+        try:
+            return _clip(
+                json.dumps(
+                    _strict_audit_jsonable(redacted),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            ) or ""
+        except Exception:
+            return AUDIT_REDACTION_FAILED_MARKER
+    return _clip(redacted) or ""
+
+
+def sanitize_tool_audit_payload(value: Any) -> dict[str, Any]:
+    """Redact tool stream payloads while retaining safe correlation/status.
+
+    The stream event is an audit projection, not an authority channel.  Tool
+    names, call/operation identifiers, and status booleans remain available for
+    timeline correlation; arguments/results are secret-redacted and become an
+    explicit marker if redaction cannot be completed safely.
+    """
+
+    if not isinstance(value, dict):
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+    redacted, ok = _safe_audit_redact(value)
+    if not ok or not isinstance(redacted, dict):
+        # Preserve only bounded correlation/status fields from the raw payload.
+        marker: dict[str, Any] = {
+            "_redacted": AUDIT_REDACTION_FAILED_MARKER,
+        }
+        for key in _TOOL_AUDIT_CORRELATION_KEYS:
+            if key in value and key != "id":
+                marker[key] = (
+                    _safe_audit_correlation(value[key])
+                    if key in _TOOL_AUDIT_ID_KEYS
+                    else value[key]
+                )
+        for key in ("tool", "tool_name", "name", "id"):
+            if key in value:
+                marker[key] = (
+                    _safe_audit_correlation(value[key])
+                    if key in _TOOL_AUDIT_ID_KEYS
+                    else value[key]
+                )
+        for key in _TOOL_AUDIT_ARGUMENT_KEYS | _TOOL_AUDIT_RESULT_KEYS:
+            if key in value:
+                marker[key] = AUDIT_REDACTION_FAILED_MARKER
+        nested_result = value.get("tool_result")
+        if isinstance(nested_result, dict):
+            nested_marker: dict[str, Any] = {
+                "_redacted": AUDIT_REDACTION_FAILED_MARKER,
+            }
+            for key in _TOOL_AUDIT_CORRELATION_KEYS:
+                if key in nested_result:
+                    nested_marker[key] = (
+                        _safe_audit_correlation(nested_result[key])
+                        if key in _TOOL_AUDIT_ID_KEYS
+                        else nested_result[key]
+                    )
+            for key in ("tool", "tool_name", "name", "id"):
+                if key in nested_result:
+                    nested_marker[key] = (
+                        _safe_audit_correlation(nested_result[key])
+                        if key in _TOOL_AUDIT_ID_KEYS
+                        else nested_result[key]
+                    )
+            marker["tool_result"] = nested_marker
+        return marker
+
+    payload = _strict_audit_jsonable(redacted)
+    # Keep correlation and status exactly as emitted; secret redaction only
+    # applies to argument/result-bearing fields.
+    for key in _TOOL_AUDIT_CORRELATION_KEYS:
+        if key in value:
+            payload[key] = (
+                _safe_audit_correlation(value[key])
+                if key in _TOOL_AUDIT_ID_KEYS
+                else value[key]
+            )
+    for key in _TOOL_AUDIT_ARGUMENT_KEYS | _TOOL_AUDIT_RESULT_KEYS:
+        if key not in value:
+            continue
+        raw = value[key]
+        if key in _TOOL_AUDIT_ARGUMENT_KEYS:
+            safe = _safe_audit_arguments(raw)
+            payload[key] = safe if isinstance(raw, dict) else safe
+        elif key == "tool_result" and isinstance(raw, dict):
+            nested = sanitize_tool_audit_payload(raw)
+            payload[key] = nested
+        else:
+            safe_result, result_ok = _safe_audit_redact(raw)
+            payload[key] = safe_result if result_ok else AUDIT_REDACTION_FAILED_MARKER
+    return payload
+
+
+_STREAM_DISPLAY_TEXT_KEYS = frozenset(
+    {"text", "content", "delta", "message", "output", "error"}
+)
+
+
+def sanitize_assistant_display_text(value: Any) -> str:
+    """Return a secret-redacted assistant string for persistence/UI display."""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return AUDIT_REDACTION_FAILED_MARKER
+    redacted, ok = _safe_audit_redact(value)
+    if not ok or not isinstance(redacted, str):
+        return AUDIT_REDACTION_FAILED_MARKER
+    # Assistant content is persisted as a full conversation turn.  Stream
+    # event payloads apply their own bounded projection; this helper must not
+    # truncate long replies after redacting a token near the suffix.
+    return redacted
+
+
+def sanitize_durable_error_text(value: Any) -> str:
+    """Return a secret-redacted error suitable for durable AgentRun fields."""
+
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        return AUDIT_REDACTION_FAILED_MARKER
+    redacted, ok = _safe_audit_redact(value)
+    if not ok or not isinstance(redacted, str):
+        return AUDIT_REDACTION_FAILED_MARKER
+    return _clip(redacted, max_chars=5000) or ""
+
+
+def sanitize_stream_display_payload(
+    event_type: str,
+    value: Any,
+) -> dict[str, Any]:
+    """Build one safe stream projection for both audit and websocket paths."""
+
+    normalized_type = str(event_type or "").strip().lower()
+    if normalized_type.startswith("stream."):
+        normalized_type = normalized_type.split(".", 1)[1]
+    if normalized_type in {"tool_start", "tool_end"}:
+        return sanitize_tool_audit_payload(value)
+    if not isinstance(value, dict):
+        return {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+
+    redacted, ok = _safe_audit_redact(value)
+    if not ok or not isinstance(redacted, dict):
+        # Reuse the tool sanitizer's fail-closed correlation projection for
+        # non-tool progress events, then attach only display markers.
+        marker = sanitize_tool_audit_payload(value)
+        for key in _STREAM_DISPLAY_TEXT_KEYS:
+            if key in value:
+                marker[key] = AUDIT_REDACTION_FAILED_MARKER
+        return marker
+    payload = _strict_audit_jsonable(redacted)
+    for key in _TOOL_AUDIT_CORRELATION_KEYS:
+        if key in value:
+            payload[key] = (
+                _safe_audit_correlation(value[key])
+                if key in _TOOL_AUDIT_ID_KEYS
+                else value[key]
+            )
+    for key in _STREAM_DISPLAY_TEXT_KEYS:
+        if key in value:
+            payload[key] = sanitize_assistant_display_text(value[key])
+            # Preserve the established event-size bound.  The final
+            # persistence/UI path uses sanitize_assistant_display_text
+            # directly and therefore remains untruncated.
+            if normalized_type != "stream_token":
+                text_value = payload[key]
+                if isinstance(text_value, str) and len(text_value) > 4000:
+                    payload[key] = text_value[:4000].rstrip() + "\n... (truncated)"
+    return payload
+
+
 def _durable_tool_result(tool_name: str, result: Any) -> Any:
     if _clean_tool_name(tool_name) in SENSITIVE_TOOL_RESULT_NAMES:
         return SENSITIVE_TOOL_RESULT_MARKER
+    if _clean_tool_name(tool_name).casefold() == CLOUD_ADVISOR_TOOL_NAME:
+        # Advisory text is an in-memory parent result; durable tool-call rows
+        # keep only status/routing metadata.
+        return sanitize_cloud_advisor_audit_value(result)
+    if _is_operations_tool_name(tool_name):
+        if isinstance(result, (dict, list, str)):
+            return _redact_operations_json_arguments(
+                result,
+                tool_name=_clean_tool_name(tool_name),
+            )
     return result
 
 
 def redact_sensitive_model_transcript(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Redact transient tool bodies from provider transcripts before persistence."""
+    """Redact transient tool bodies from provider transcripts before persistence.
+
+    Provider adapters do not all use the same function-call shape.  Handle
+    OpenAI-style ``tool_calls``, legacy ``function_call`` messages, and tool
+    result messages while preserving non-sensitive IDs/hashes/status fields.
+    """
 
     tool_names_by_call_id: dict[str, str] = {}
     redacted_messages: list[dict[str, Any]] = []
@@ -272,9 +1522,12 @@ def redact_sensitive_model_transcript(
         next_message = dict(message)
         tool_calls = next_message.get("tool_calls")
         if isinstance(tool_calls, list):
+            redacted_calls: list[Any] = []
             for call in tool_calls:
                 if not isinstance(call, dict):
+                    redacted_calls.append(call)
                     continue
+                redacted_call = dict(call)
                 function = call.get("function")
                 function_name = (
                     function.get("name")
@@ -287,6 +1540,53 @@ def redact_sensitive_model_transcript(
                 )
                 if call_id and tool_name:
                     tool_names_by_call_id[call_id] = tool_name
+                if tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME:
+                    if isinstance(function, dict) and "arguments" in function:
+                        redacted_function = dict(function)
+                        redacted_function["arguments"] = json.dumps(
+                            sanitize_cloud_advisor_audit_value(
+                                function.get("arguments")
+                            ),
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        redacted_call["function"] = redacted_function
+                    elif "arguments" in redacted_call:
+                        redacted_call["arguments"] = sanitize_cloud_advisor_audit_value(
+                            redacted_call.get("arguments")
+                        )
+                elif _is_operations_tool_name(tool_name):
+                    if isinstance(function, dict):
+                        redacted_function = dict(function)
+                        if "arguments" in redacted_function:
+                            redacted_function["arguments"] = _redact_operations_json_arguments(
+                                redacted_function["arguments"],
+                                tool_name=tool_name,
+                            )
+                        redacted_call["function"] = redacted_function
+                    elif "arguments" in redacted_call:
+                        redacted_call["arguments"] = _redact_operations_json_arguments(
+                            redacted_call["arguments"],
+                            tool_name=tool_name,
+                        )
+                redacted_calls.append(redacted_call)
+            next_message["tool_calls"] = redacted_calls
+
+        # Legacy OpenAI function-call shape: {function_call: {name,
+        # arguments}}.  It has no call id, so the function name is authoritative.
+        function_call = next_message.get("function_call")
+        if isinstance(function_call, dict):
+            function_name = _clean_tool_name(
+                function_call.get("name")
+                or function_call.get("tool")
+            )
+            if _is_operations_tool_name(function_name) and "arguments" in function_call:
+                redacted_function_call = dict(function_call)
+                redacted_function_call["arguments"] = _redact_operations_json_arguments(
+                    redacted_function_call["arguments"],
+                    tool_name=function_name,
+                )
+                next_message["function_call"] = redacted_function_call
 
         if next_message.get("role") == "tool":
             call_id = str(next_message.get("tool_call_id") or "")
@@ -300,6 +1600,48 @@ def redact_sensitive_model_transcript(
                 for key in ("output", "result"):
                     if key in next_message:
                         next_message[key] = SENSITIVE_TOOL_RESULT_MARKER
+            elif tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME:
+                projected = sanitize_cloud_advisor_audit_value(
+                    next_message.get("content")
+                )
+                next_message["content"] = json.dumps(
+                    projected,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+                for key in ("output", "result"):
+                    if key in next_message:
+                        next_message[key] = projected
+            elif _is_operations_tool_name(tool_name):
+                # Tool results are often JSON strings in ``content`` but some
+                # providers preserve the decoded object under ``result`` or
+                # ``output``.  Apply the same field-aware redaction to each.
+                if "content" in next_message:
+                    next_message["content"] = _redact_operations_json_arguments(
+                        next_message["content"],
+                        tool_name=tool_name,
+                    )
+                for key in ("output", "result", "arguments", "args"):
+                    if key in next_message:
+                        next_message[key] = _redact_operations_json_arguments(
+                            next_message[key],
+                            tool_name=tool_name,
+                        )
+        elif next_message.get("role") == "function":
+            tool_name = _clean_tool_name(next_message.get("name"))
+            if tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME:
+                next_message["content"] = json.dumps(
+                    sanitize_cloud_advisor_audit_value(next_message.get("content")),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            elif _is_operations_tool_name(tool_name):
+                for key in ("content", "output", "result", "arguments", "args"):
+                    if key in next_message:
+                        next_message[key] = _redact_operations_json_arguments(
+                            next_message[key],
+                            tool_name=tool_name,
+                        )
         redacted_messages.append(next_message)
     return redacted_messages
 
@@ -329,6 +1671,95 @@ def _clip(text: Any, max_chars: int = 20000) -> str | None:
     if len(value) <= max_chars:
         return value
     return value[:max_chars].rstrip() + "\n... (truncated)"
+
+
+def _canonical_tool_arguments(value: Any) -> str:
+    """Return a stable representation for approved-action argument matching."""
+
+    return json.dumps(
+        _jsonable(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def canonical_audit_digest(value: Any) -> str:
+    """Hash canonical raw tool data without retaining the raw value."""
+
+    return "sha256:" + hashlib.sha256(
+        _canonical_tool_arguments(value).encode("utf-8")
+    ).hexdigest()
+
+
+def _is_audit_digest(value: Any) -> bool:
+    text = str(value or "").strip().lower()
+    return len(text) == 71 and text.startswith("sha256:") and all(
+        character in "0123456789abcdef" for character in text[7:]
+    )
+
+
+def _approved_receipt_metadata(
+    value: Any,
+    *,
+    atomic_state: str,
+) -> dict[str, Any]:
+    """Build the bounded metadata carried by an atomic approved receipt."""
+
+    raw = value if isinstance(value, dict) else {}
+    clean = {
+        str(key): _jsonable(item)
+        for key, item in raw.items()
+        if str(key) in {
+            "source",
+            "plan_id",
+            "plan_revision",
+            "action_index",
+            "action_digest",
+            "arguments_digest",
+            "result_digest",
+        }
+    }
+    # The source and state are protocol fields, never caller-controlled.
+    clean["source"] = "approved_plan_executor"
+    clean["atomic_state"] = str(atomic_state)
+    clean["atomic"] = True
+    return _jsonable(_redact_sensitive_tool_data(clean))
+
+
+def _approved_receipt_expected_metadata(value: Any) -> dict[str, Any]:
+    """Normalize expected metadata for exact source/state validation."""
+
+    raw = value if isinstance(value, dict) else {}
+    expected: dict[str, Any] = {
+        "source": "approved_plan_executor",
+        "atomic": True,
+    }
+    for key in (
+        "plan_id",
+        "plan_revision",
+        "action_index",
+        "action_digest",
+        "arguments_digest",
+    ):
+        if key in raw:
+            expected[key] = _jsonable(raw[key])
+    return expected
+
+
+def approved_mutation_receipt_result(receipt: AgentRunToolCall | dict[str, Any]) -> Any:
+    """Decode a prior approved receipt for a tool-level idempotent replay."""
+
+    raw = receipt.result if isinstance(receipt, AgentRunToolCall) else receipt.get("result")
+    if raw is None:
+        return ""
+    if isinstance(raw, (dict, list)):
+        return raw
+    try:
+        return json.loads(str(raw))
+    except (TypeError, ValueError):
+        return str(raw)
 
 
 def fold_cancelled_chat_snapshot(
@@ -508,16 +1939,29 @@ def _event_operation_key(event: AgentRunEvent) -> str:
 
 
 def _event_tool_arguments(payload: dict[str, Any]) -> dict[str, Any]:
+    tool_name = _event_tool_name("", payload)
     for key in ("tool_args", "arguments", "args"):
         value = payload.get(key)
         if isinstance(value, dict):
-            return _jsonable(value)
+            normalized = _jsonable(value)
+            if _is_operations_tool_name(tool_name):
+                return _redact_operations_value(
+                    normalized,
+                    tool_name=tool_name,
+                )
+            return normalized
     tool_result = payload.get("tool_result")
     if isinstance(tool_result, dict):
         for key in ("arguments", "args"):
             value = tool_result.get(key)
             if isinstance(value, dict):
-                return _jsonable(value)
+                normalized = _jsonable(value)
+                if _is_operations_tool_name(tool_name):
+                    return _redact_operations_value(
+                        normalized,
+                        tool_name=tool_name,
+                    )
+                return normalized
     return {}
 
 
@@ -528,6 +1972,9 @@ def _event_tool_result(payload: dict[str, Any]) -> str | None:
     for key in ("output", "result"):
         value = tool_result.get(key)
         if value is not None:
+            tool_name = _event_tool_name("", payload)
+            if _is_operations_tool_name(tool_name):
+                value = _durable_tool_result(tool_name, value)
             return _clip(value)
     return None
 
@@ -1432,15 +2879,17 @@ def build_agent_run_timeline(run: AgentRun) -> list[dict[str, Any]]:
 class AgentRunService:
     """Create and update durable agent execution records."""
 
-    def __init__(self, db_manager: Any | None = None) -> None:
+    def __init__(self, db_manager: Any | None = None, *, config: Any | None = None) -> None:
         self._db_manager = db_manager
+        self.config = config
 
     def _get_db_manager(self) -> Any:
         return self._db_manager or get_database_manager()
 
     async def _session(self) -> AsyncSession:
         db_manager = self._get_db_manager()
-        return await db_manager.get_session()
+        value = db_manager.get_session()
+        return await value if asyncio.iscoroutine(value) or hasattr(value, "__await__") else value
 
     async def create_run(
         self,
@@ -1463,6 +2912,15 @@ class AgentRunService:
         parent_run_id: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        agent_id: str | None = None,
+        agent_revision_id: str | None = None,
+        task_id: str | None = None,
+        work_item_id: str | None = None,
+        work_item_attempt: int | None = None,
+        acting_subagent_id: str | None = None,
+        previous_attempt_run_id: str | None = None,
+        execution_manifest: Dict[str, Any] | None = None,
+        execution_manifest_hash: str | None = None,
     ) -> Dict[str, Any]:
         session = await self._session()
         try:
@@ -1488,6 +2946,180 @@ class AgentRunService:
                     )
                     base_revision = parent.base_revision
                     result_revision = parent.result_revision
+                    # A child run cannot manufacture a different autonomous
+                    # identity or revision from request payload.  Preserve
+                    # the parent's typed identity when one exists.
+                    agent_id = str(parent.agent_id) if parent.agent_id else None
+                    agent_revision_id = (
+                        str(parent.agent_revision_id)
+                        if parent.agent_revision_id
+                        else None
+                    )
+                    task_id = str(parent.task_id) if parent.task_id else None
+                    work_item_id = str(parent.work_item_id) if parent.work_item_id else None
+                    acting_subagent_id = parent.acting_subagent_id
+                    previous_attempt_run_id = (
+                        str(parent.previous_attempt_run_id)
+                        if parent.previous_attempt_run_id
+                        else previous_attempt_run_id
+                    )
+                    execution_manifest = (
+                        dict(parent.resolved_execution_manifest)
+                        if isinstance(parent.resolved_execution_manifest, dict)
+                        else execution_manifest
+                    )
+                    execution_manifest_hash = parent.execution_manifest_hash or execution_manifest_hash
+
+            agent_uuid = parse_uuid(agent_id)
+            revision_uuid = parse_uuid(agent_revision_id)
+            task_uuid = parse_uuid(task_id)
+            work_item_uuid = parse_uuid(work_item_id)
+            previous_attempt_uuid = parse_uuid(previous_attempt_run_id)
+            if work_item_attempt is not None:
+                try:
+                    work_item_attempt = int(work_item_attempt)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("invalid work_item_attempt") from exc
+                if work_item_attempt < 1:
+                    raise ValueError("work_item_attempt must be positive")
+            if task_id and task_uuid is None:
+                raise ValueError("invalid task_id")
+            if work_item_id and work_item_uuid is None:
+                raise ValueError("invalid work_item_id")
+            if previous_attempt_run_id and previous_attempt_uuid is None:
+                raise ValueError("invalid previous_attempt_run_id")
+            if agent_revision_id and revision_uuid is None:
+                raise ValueError("invalid agent_revision_id")
+            if agent_id and agent_uuid is None:
+                raise ValueError("invalid agent_id")
+            if revision_uuid is not None and agent_uuid is None:
+                raise ValueError("agent_revision_id requires agent_id")
+            if agent_uuid is not None and revision_uuid is None:
+                raise ValueError("typed Agent runs require an exact AgentRevision")
+            existing_attempt = None
+            agent_row = None
+            # A legacy ``user_id`` is a human-only column.  Reject a UUID that
+            # resolves to an Agent even when the caller omitted the typed
+            # ``agent_id`` field; otherwise a client can silently impersonate
+            # an Agent by writing its ID through the old column.
+            user_uuid_candidate = parse_uuid(user_id)
+            if user_uuid_candidate is not None:
+                user_agent_row = await _lookup_agent_for_legacy_user(
+                    session, user_uuid_candidate
+                )
+                if user_agent_row is not None:
+                    raise ValueError("Agent IDs must not be stored in user_id")
+            if agent_uuid is not None:
+                agent_row = await session.get(Agent, agent_uuid)
+                if agent_row is None or str(agent_row.state or "") != "active":
+                    raise ValueError("agent is not active")
+                if user_id and (
+                    str(user_id).strip() == str(agent_uuid)
+                    or parse_uuid(user_id) == agent_uuid
+                ):
+                    raise ValueError("Agent IDs must not be stored in user_id")
+            revision_row = None
+            if revision_uuid is not None:
+                revision_row = await session.get(AgentRevision, revision_uuid)
+                if revision_row is None or revision_row.agent_id != agent_uuid:
+                    raise ValueError("agent revision is not bound to agent")
+            _validate_typed_agent_actor(
+                user_id=user_id,
+                agent_id=agent_uuid,
+                agent_revision=revision_row if revision_uuid is not None else None,
+                acting_subagent_id=acting_subagent_id,
+                agent_row=agent_row,
+                config=self.config,
+            )
+            if previous_attempt_uuid is not None:
+                previous_row = await session.get(AgentRun, previous_attempt_uuid)
+                if previous_row is None:
+                    raise ValueError("previous attempt run not found")
+                if agent_uuid is not None and previous_row.agent_id != agent_uuid:
+                    raise ValueError("previous attempt run belongs to another agent")
+            if task_uuid is not None:
+                task_row = await session.get(Task, task_uuid)
+                if task_row is None:
+                    raise ValueError("task not found")
+                requested_project_uuid = parse_uuid(project_id)
+                if requested_project_uuid is not None and task_row.project_id != requested_project_uuid:
+                    raise ValueError("task does not belong to project")
+            if work_item_uuid is not None:
+                work_item_row = await session.get(AgentWorkItem, work_item_uuid)
+                if work_item_row is None:
+                    raise ValueError("work item not found")
+                if (
+                    agent_uuid is not None
+                    and work_item_row.assigned_agent_id != agent_uuid
+                ):
+                    raise ValueError("work item is assigned to another agent")
+                if agent_uuid is None and work_item_row.assigned_agent_id is not None:
+                    raise ValueError("work item requires its typed Agent binding")
+                if (
+                    revision_uuid is not None
+                    and work_item_row.agent_revision_id != revision_uuid
+                ):
+                    raise ValueError("work item is pinned to another Agent revision")
+                if revision_uuid is None and work_item_row.agent_revision_id is not None:
+                    raise ValueError("work item requires its pinned AgentRevision")
+                if work_item_row.project_id is not None and work_item_row.project_id != parse_uuid(project_id):
+                    raise ValueError("work item does not bind to project")
+                if work_item_row.task_id is not None and work_item_row.task_id != task_uuid:
+                    raise ValueError("work item does not bind to task")
+                if work_item_attempt is not None:
+                    existing_attempt = (
+                        await session.execute(
+                            select(AgentRun)
+                            .where(
+                                AgentRun.work_item_id == work_item_uuid,
+                                AgentRun.work_item_attempt == work_item_attempt,
+                            )
+                            .limit(1)
+                        )
+                    ).scalars().first()
+            safe_manifest = _bounded_execution_manifest(execution_manifest)
+            _validate_manifest_bindings(
+                safe_manifest,
+                agent_id=agent_uuid,
+                revision_id=revision_uuid,
+                task_id=task_uuid,
+                work_item_id=work_item_uuid,
+                project_id=parse_uuid(project_id),
+            )
+            safe_manifest_hash = None
+            if safe_manifest is not None:
+                computed_manifest_hash = hashlib.sha256(
+                    json.dumps(
+                        safe_manifest,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                ).hexdigest()
+                if execution_manifest_hash and str(execution_manifest_hash).strip().lower() != computed_manifest_hash:
+                    raise ValueError("execution_manifest_hash does not match manifest")
+                safe_manifest_hash = computed_manifest_hash
+            elif execution_manifest_hash:
+                candidate_hash = str(execution_manifest_hash).strip().lower()
+                if not re.fullmatch(r"[0-9a-f]{64}", candidate_hash):
+                    raise ValueError("invalid execution_manifest_hash")
+                safe_manifest_hash = candidate_hash
+
+            if existing_attempt is not None:
+                if (
+                    existing_attempt.agent_id != agent_uuid
+                    or existing_attempt.agent_revision_id != revision_uuid
+                    or existing_attempt.task_id != task_uuid
+                    or existing_attempt.project_id != parse_uuid(project_id)
+                    or existing_attempt.previous_attempt_run_id != previous_attempt_uuid
+                    or existing_attempt.run_type
+                    != (str(run_type or "chat_turn").strip() or "chat_turn")
+                    or existing_attempt.execution_manifest_hash != safe_manifest_hash
+                ):
+                    raise ValueError(
+                        "work item attempt idempotency binding conflict"
+                    )
+                return existing_attempt.to_dict()
 
             if app_id and not base_revision:
                 try:
@@ -1499,7 +3131,25 @@ class AgentRunService:
                     # remains durable and the missing revision is explicit.
                     base_revision = None
 
-            run = AgentRun(
+            normalized_run_type = str(run_type or "chat_turn").strip() or "chat_turn"
+            safe_objective = str(objective or "")
+            safe_title = str(title or "")[:255]
+            if _is_cloud_advisor_run_type(normalized_run_type):
+                # A Cloud Advisor query is transient provider input.  Keep a
+                # stable marker in AgentRun rather than copying the prompt
+                # into the durable objective column.
+                safe_objective = (
+                    CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+                    if safe_objective
+                    else ""
+                )
+                safe_title = (
+                    CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+                    if safe_title
+                    else ""
+                )
+
+            run_values = dict(
                 parent_run_id=parent_uuid,
                 root_run_id=root_uuid,
                 session_id=parse_uuid(session_id),
@@ -1507,6 +3157,18 @@ class AgentRunService:
                 project_id=parse_uuid(project_id),
                 app_id=parse_uuid(app_id),
                 app_target_id=parse_uuid(app_target_id),
+                agent_id=agent_uuid,
+                agent_revision_id=revision_uuid,
+                task_id=task_uuid,
+                work_item_id=work_item_uuid,
+                work_item_attempt=work_item_attempt,
+                acting_subagent_id=(
+                    str(acting_subagent_id).strip()[:100]
+                    if acting_subagent_id
+                    else None
+                ),
+                previous_attempt_run_id=previous_attempt_uuid,
+                execution_manifest_hash=safe_manifest_hash,
                 base_revision=str(base_revision).strip() if base_revision else None,
                 result_revision=str(result_revision).strip() if result_revision else None,
                 user_id=str(user_id) if user_id else None,
@@ -1519,20 +3181,30 @@ class AgentRunService:
                     else None
                 ),
                 request_fingerprint=request_fingerprint,
-                run_type=run_type or "chat_turn",
+                run_type=normalized_run_type,
                 status="queued",
-                title=(title or "")[:255],
-                objective=str(objective or ""),
+                title=safe_title,
+                objective=safe_objective,
                 generation_profile=generation_profile,
                 provider=provider,
                 model=model,
                 result={},
                 validation={},
-                run_metadata=_jsonable(metadata),
+                run_metadata=_safe_audit_metadata(
+                    metadata,
+                    run_type=normalized_run_type,
+                ),
                 created_at=now,
                 updated_at=now,
                 last_event_at=now,
             )
+            # SQLAlchemy's JSON type serializes an explicit ``None`` as JSON
+            # ``null`` on some dialects.  The nullable column must receive a
+            # real SQL NULL so the migration check permits legacy/human runs
+            # that have no execution manifest.
+            if safe_manifest is not None:
+                run_values["resolved_execution_manifest"] = safe_manifest
+            run = AgentRun(**run_values)
             session.add(run)
             await session.flush()
             if run.root_run_id is None:
@@ -1551,6 +3223,30 @@ class AgentRunService:
             await session.commit()
             await session.refresh(run)
             return run.to_dict()
+        except IntegrityError as exc:
+            await session.rollback()
+            # The partial unique index is the cross-process idempotency fence
+            # for one WorkItem attempt. If another worker committed first,
+            # return its immutable AgentRun rather than creating a duplicate.
+            if work_item_uuid is not None and work_item_attempt is not None:
+                try:
+                    winner = (
+                        await session.execute(
+                            select(AgentRun)
+                            .where(
+                                AgentRun.work_item_id == work_item_uuid,
+                                AgentRun.work_item_attempt == work_item_attempt,
+                            )
+                            .limit(1)
+                        )
+                    ).scalars().first()
+                    if winner is not None:
+                        return winner.to_dict()
+                except Exception:
+                    pass
+            if not client_message_id:
+                logger.exception("Failed to create agent run")
+            raise
         except Exception as exc:
             await session.rollback()
             if not (client_message_id and isinstance(exc, IntegrityError)):
@@ -1648,6 +3344,14 @@ class AgentRunService:
         objective: str = "",
         generation_profile: str | None = None,
         metadata: Dict[str, Any] | None = None,
+        agent_id: str | None = None,
+        agent_revision_id: str | None = None,
+        task_id: str | None = None,
+        work_item_id: str | None = None,
+        acting_subagent_id: str | None = None,
+        previous_attempt_run_id: str | None = None,
+        execution_manifest: Dict[str, Any] | None = None,
+        execution_manifest_hash: str | None = None,
     ) -> tuple[Dict[str, Any], str, bool]:
         """Create message, run and durable outbox in one transaction.
 
@@ -1710,6 +3414,28 @@ class AgentRunService:
                     raise DispatchConflictError(
                         "client_message_id was reused with a different request"
                     )
+                requested_agent_uuid = parse_uuid(agent_id)
+                requested_revision_uuid = parse_uuid(agent_revision_id)
+                if agent_id and requested_agent_uuid is None:
+                    raise ValueError("invalid agent_id")
+                if agent_revision_id and requested_revision_uuid is None:
+                    raise ValueError("invalid agent_revision_id")
+                if agent_id and existing.agent_id != requested_agent_uuid:
+                    raise DispatchConflictError("client_message_id was reused for another Agent")
+                if agent_revision_id and existing.agent_revision_id != requested_revision_uuid:
+                    raise DispatchConflictError("client_message_id was reused for another Agent revision")
+                requested_task_uuid = parse_uuid(task_id)
+                if task_id and requested_task_uuid is None:
+                    raise ValueError("invalid task_id")
+                if task_id and existing.task_id != requested_task_uuid:
+                    raise DispatchConflictError("client_message_id was reused for another Task")
+                requested_work_item_uuid = parse_uuid(work_item_id)
+                if work_item_id and requested_work_item_uuid is None:
+                    raise ValueError("invalid work_item_id")
+                if work_item_id and existing.work_item_id != requested_work_item_uuid:
+                    raise DispatchConflictError("client_message_id was reused for another WorkItem")
+                if acting_subagent_id and existing.acting_subagent_id != str(acting_subagent_id).strip():
+                    raise DispatchConflictError("client_message_id was reused for another Subagent")
                 if existing.trigger_message_id is None:
                     raise RuntimeError("idempotent dispatch run is incomplete")
                 await db_session.commit()
@@ -1800,13 +3526,122 @@ class AgentRunService:
 
             now = datetime.utcnow()
             run_id = uuid.uuid4()
+            typed_agent_uuid = parse_uuid(agent_id)
+            typed_revision_uuid = parse_uuid(agent_revision_id)
+            typed_task_uuid = parse_uuid(task_id)
+            typed_work_item_uuid = parse_uuid(work_item_id)
+            typed_previous_uuid = parse_uuid(previous_attempt_run_id)
+            if agent_id and typed_agent_uuid is None:
+                raise ValueError("invalid agent_id")
+            if agent_revision_id and typed_revision_uuid is None:
+                raise ValueError("invalid agent_revision_id")
+            if task_id and typed_task_uuid is None:
+                raise ValueError("invalid task_id")
+            if work_item_id and typed_work_item_uuid is None:
+                raise ValueError("invalid work_item_id")
+            if previous_attempt_run_id and typed_previous_uuid is None:
+                raise ValueError("invalid previous_attempt_run_id")
+            if typed_agent_uuid is not None and typed_revision_uuid is None:
+                raise ValueError("typed Agent runs require an exact AgentRevision")
+            # ``user_id`` is a legacy human-only field.  Reject any UUID that
+            # already belongs to an Agent even when this dispatch payload has
+            # no typed agent marker, preventing silent Agent impersonation.
+            normalized_user_uuid = parse_uuid(normalized_user_id)
+            if normalized_user_uuid is not None:
+                user_agent_row = await _lookup_agent_for_legacy_user(
+                    db_session, normalized_user_uuid
+                )
+                if user_agent_row is not None:
+                    raise ValueError("Agent IDs must not be stored in user_id")
+            typed_agent_row = None
+            if typed_agent_uuid is not None:
+                typed_agent_row = await db_session.get(Agent, typed_agent_uuid)
+                if typed_agent_row is None or str(typed_agent_row.state or "") != "active":
+                    raise ValueError("agent is not active")
+                if normalized_user_id == str(typed_agent_uuid) or parse_uuid(normalized_user_id) == typed_agent_uuid:
+                    raise ValueError("Agent IDs must not be stored in user_id")
+            typed_revision_row = None
+            if typed_revision_uuid is not None:
+                typed_revision_row = await db_session.get(AgentRevision, typed_revision_uuid)
+                if typed_revision_row is None or typed_revision_row.agent_id != typed_agent_uuid:
+                    raise ValueError("agent revision is not bound to agent")
+            _validate_typed_agent_actor(
+                user_id=normalized_user_id,
+                agent_id=typed_agent_uuid,
+                agent_revision=typed_revision_row,
+                acting_subagent_id=acting_subagent_id,
+                agent_row=typed_agent_row,
+                config=self.config,
+            )
+            if typed_previous_uuid is not None:
+                previous_row = await db_session.get(AgentRun, typed_previous_uuid)
+                if previous_row is None or (
+                    typed_agent_uuid is not None
+                    and previous_row.agent_id != typed_agent_uuid
+                ):
+                    raise ValueError("previous attempt run is not bound to agent")
+            if typed_task_uuid is not None:
+                task_row = await db_session.get(Task, typed_task_uuid)
+                if task_row is None:
+                    raise ValueError("task not found")
+                project_uuid = parse_uuid(project_id)
+                if project_uuid is not None and task_row.project_id != project_uuid:
+                    raise ValueError("task does not belong to project")
+            if typed_work_item_uuid is not None:
+                typed_work_item = await db_session.get(AgentWorkItem, typed_work_item_uuid)
+                if typed_work_item is None:
+                    raise ValueError("work item not found")
+                if (
+                    typed_agent_uuid is not None
+                    and typed_work_item.assigned_agent_id != typed_agent_uuid
+                ):
+                    raise ValueError("work item is assigned to another agent")
+                if (
+                    typed_agent_uuid is None
+                    and typed_work_item.assigned_agent_id is not None
+                ):
+                    raise ValueError("work item requires its typed Agent binding")
+                if (
+                    typed_revision_uuid is not None
+                    and typed_work_item.agent_revision_id != typed_revision_uuid
+                ):
+                    raise ValueError("work item is pinned to another Agent revision")
+                if (
+                    typed_revision_uuid is None
+                    and typed_work_item.agent_revision_id is not None
+                ):
+                    raise ValueError("work item requires its pinned AgentRevision")
+                if typed_work_item.project_id is not None and typed_work_item.project_id != parse_uuid(project_id):
+                    raise ValueError("work item does not bind to project")
+                if typed_work_item.task_id is not None and typed_work_item.task_id != typed_task_uuid:
+                    raise ValueError("work item does not bind to task")
+            safe_manifest = _bounded_execution_manifest(execution_manifest)
+            _validate_manifest_bindings(
+                safe_manifest,
+                agent_id=typed_agent_uuid,
+                revision_id=typed_revision_uuid,
+                task_id=typed_task_uuid,
+                work_item_id=typed_work_item_uuid,
+                project_id=parse_uuid(project_id),
+            )
+            manifest_hash = None
+            if safe_manifest is not None:
+                manifest_hash = hashlib.sha256(
+                    json.dumps(safe_manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                ).hexdigest()
+                if execution_manifest_hash and str(execution_manifest_hash).strip().lower() != manifest_hash:
+                    raise ValueError("execution_manifest_hash does not match manifest")
+            elif execution_manifest_hash:
+                if not re.fullmatch(r"[0-9a-f]{64}", str(execution_manifest_hash).strip().lower()):
+                    raise ValueError("invalid execution_manifest_hash")
+                manifest_hash = str(execution_manifest_hash).strip().lower()
             durable_payload = {
                 **outbox_payload,
                 "agent_run_id": str(run_id),
                 "persisted_user_message_id": str(message_uuid),
                 "skip_user_persistence": True,
             }
-            run = AgentRun(
+            run_values = dict(
                 id=run_id,
                 root_run_id=run_id,
                 session_id=session_uuid,
@@ -1814,6 +3649,13 @@ class AgentRunService:
                 project_id=parse_uuid(project_id),
                 app_id=parse_uuid(app_id),
                 app_target_id=parse_uuid(app_target_id),
+                agent_id=typed_agent_uuid,
+                agent_revision_id=typed_revision_uuid,
+                task_id=typed_task_uuid,
+                work_item_id=typed_work_item_uuid,
+                acting_subagent_id=str(acting_subagent_id).strip()[:100] if acting_subagent_id else None,
+                previous_attempt_run_id=typed_previous_uuid,
+                execution_manifest_hash=manifest_hash,
                 base_revision=str(base_revision).strip() if base_revision else None,
                 result_revision=str(result_revision).strip() if result_revision else None,
                 user_id=normalized_user_id,
@@ -1827,11 +3669,14 @@ class AgentRunService:
                 generation_profile=generation_profile,
                 result={},
                 validation={},
-                run_metadata=_jsonable(metadata),
+                run_metadata=_safe_audit_metadata(metadata, run_type="chat_turn"),
                 created_at=now,
                 updated_at=now,
                 last_event_at=now,
             )
+            if safe_manifest is not None:
+                run_values["resolved_execution_manifest"] = safe_manifest
+            run = AgentRun(**run_values)
             outbox = ConversationDispatchOutbox(
                 run_id=run_id,
                 session_id=session_uuid,
@@ -1851,6 +3696,12 @@ class AgentRunService:
                 # ForeignKeyViolation になるため、user message を先に確定させる。
                 db_session.add(message)
                 await db_session.flush()
+                from ..features import Features
+
+                if Features.virtual_company() and Features.autonomous_agent_runtime():
+                    from .agent_automation_events import record_chat_message_event
+
+                    await record_chat_message_event(db_session, message, conversation)
             db_session.add_all(
                 [
                     run,
@@ -1970,12 +3821,14 @@ class AgentRunService:
         *,
         run_id: str,
         lease_seconds: float = 5.0,
+        max_attempts: int = DISPATCH_MAX_ATTEMPTS,
     ) -> Dict[str, Any] | None:
         run_uuid = parse_uuid(run_id)
         if run_uuid is None:
             return None
         now = datetime.utcnow()
         lease_token = str(uuid.uuid4())
+        safe_max_attempts = max(1, min(int(max_attempts or DISPATCH_MAX_ATTEMPTS), 100))
         session = await self._session()
         try:
             result = await session.execute(
@@ -1989,6 +3842,7 @@ class AgentRunService:
                             ConversationDispatchOutbox.lease_expires_at < now,
                         ),
                     ),
+                    ConversationDispatchOutbox.attempts < safe_max_attempts,
                 )
                 .values(
                     status="claimed",
@@ -2004,6 +3858,14 @@ class AgentRunService:
             payload = result.scalar_one_or_none()
             await session.commit()
             if payload is None:
+                # If the row exists but exhausted its retry budget, transition
+                # it to a durable dead letter and terminalize the run.  A
+                # missing/non-eligible row remains a harmless no-op.
+                await self.deadletter_dispatch(
+                    run_id,
+                    reason="Dispatch retry budget exhausted",
+                    max_attempts=safe_max_attempts,
+                )
                 return None
             return {
                 "lease_token": lease_token,
@@ -2012,6 +3874,75 @@ class AgentRunService:
         except Exception:
             await session.rollback()
             raise
+        finally:
+            await session.close()
+
+    async def deadletter_dispatch(
+        self,
+        run_id: str | None,
+        *,
+        reason: str = "Dispatch retry budget exhausted",
+        max_attempts: int = DISPATCH_MAX_ATTEMPTS,
+    ) -> bool:
+        """Permanently settle an exhausted dispatch/outbox row.
+
+        The existing outbox table is retained as the idempotency authority;
+        ``deadletter`` is an additive status and the associated AgentRun gets
+        one terminal failure event.  Repeated calls are no-ops.
+        """
+
+        run_uuid = parse_uuid(run_id)
+        if run_uuid is None:
+            return False
+        now = datetime.utcnow()
+        safe_reason = sanitize_durable_error_text(reason)
+        safe_max_attempts = max(1, min(int(max_attempts or DISPATCH_MAX_ATTEMPTS), 100))
+        session = await self._session()
+        try:
+            outbox = await session.get(ConversationDispatchOutbox, run_uuid)
+            if outbox is None or outbox.status == DISPATCH_DEADLETTER_STATUS:
+                return False
+            if int(outbox.attempts or 0) < safe_max_attempts:
+                return False
+            if outbox.status not in {"pending", "claimed"}:
+                return False
+            outbox.status = DISPATCH_DEADLETTER_STATUS
+            outbox.lease_owner = None
+            outbox.lease_token = None
+            outbox.lease_expires_at = None
+            outbox.updated_at = now
+            run = await session.get(AgentRun, run_uuid, with_for_update=True)
+            if run is not None and run.status not in RUN_TERMINAL_STATUSES:
+                run.status = "failed"
+                run.error = safe_reason
+                run.ended_at = run.ended_at or now
+                run.updated_at = now
+                await self._append_event(
+                    session,
+                    run,
+                    "dispatch.deadlettered",
+                    status="failed",
+                    message=safe_reason,
+                    payload={
+                        "attempts": int(outbox.attempts or 0),
+                        "max_attempts": safe_max_attempts,
+                        "outbox_status": DISPATCH_DEADLETTER_STATUS,
+                    },
+                )
+                await self._append_event(
+                    session,
+                    run,
+                    "run.failed",
+                    status="failed",
+                    message=safe_reason,
+                    payload={"reason": "dispatch_deadletter"},
+                )
+            await session.commit()
+            return True
+        except Exception:
+            await session.rollback()
+            logger.warning("Failed to dead-letter dispatch: %s", run_id, exc_info=True)
+            return False
         finally:
             await session.close()
 
@@ -2195,7 +4126,10 @@ class AgentRunService:
                 metadata["route_source"] = normalized_route_source
             if normalized_effort:
                 metadata["reasoning_effort"] = normalized_effort
-            run.run_metadata = _jsonable(metadata)
+            run.run_metadata = _safe_audit_metadata(
+                metadata,
+                run_type=run.run_type,
+            )
             run.updated_at = datetime.utcnow()
 
             await session.commit()
@@ -2269,20 +4203,48 @@ class AgentRunService:
             run = result.scalars().first()
             if not run:
                 return None
-            payload = run.to_dict(
-                include_events=include_events,
-                include_tool_calls=include_tool_calls,
-                include_edges=include_edges,
+            payload = _sanitize_serialized_agent_run(
+                run.to_dict(
+                    include_events=include_events,
+                    include_tool_calls=include_tool_calls,
+                    include_edges=include_edges,
+                )
             )
             if include_timeline:
-                payload["resource_mutations"] = build_agent_resource_mutations(
+                resource_mutations = build_agent_resource_mutations(
                     run.tool_calls or []
                 )
-                payload["timeline"] = build_agent_run_timeline(run)
+                payload["resource_mutations"] = [
+                    sanitize_cloud_advisor_audit_value(item)
+                    if _is_cloud_advisor_run_type(run.run_type)
+                    else _redact_sensitive_tool_data(item)
+                    for item in resource_mutations
+                    if isinstance(item, dict)
+                ]
+                timeline = build_agent_run_timeline(run)
+                if _is_cloud_advisor_run_type(run.run_type):
+                    payload["timeline"] = [
+                        sanitize_cloud_advisor_audit_value(item)
+                        for item in timeline
+                        if isinstance(item, dict)
+                    ]
+                else:
+                    payload["timeline"] = [
+                        _redact_sensitive_tool_data(item)
+                        for item in timeline
+                        if isinstance(item, dict)
+                    ]
             elif include_tool_calls:
-                payload["resource_mutations"] = build_agent_resource_mutations(
+                resource_mutations = build_agent_resource_mutations(
                     run.tool_calls or []
                 )
+                payload["resource_mutations"] = [
+                    sanitize_cloud_advisor_audit_value(item)
+                    if _is_cloud_advisor_run_type(run.run_type)
+                    else _redact_sensitive_tool_data(item)
+                    for item in resource_mutations
+                    if isinstance(item, dict)
+                ]
             return payload
         finally:
             await session.close()
@@ -2292,6 +4254,8 @@ class AgentRunService:
         *,
         session_id: str | None = None,
         project_id: str | None = None,
+        agent_id: str | None = None,
+        task_id: str | None = None,
         status: str | None = None,
         limit: int = 50,
     ) -> list[Dict[str, Any]]:
@@ -2300,14 +4264,24 @@ class AgentRunService:
         filters = []
         session_uuid = parse_uuid(session_id)
         project_uuid = parse_uuid(project_id)
+        agent_uuid = parse_uuid(agent_id)
+        task_uuid = parse_uuid(task_id)
         if session_id and session_uuid is None:
             return []
         if project_id and project_uuid is None:
+            return []
+        if agent_id and agent_uuid is None:
+            return []
+        if task_id and task_uuid is None:
             return []
         if session_uuid:
             filters.append(AgentRun.session_id == session_uuid)
         if project_uuid:
             filters.append(AgentRun.project_id == project_uuid)
+        if agent_uuid:
+            filters.append(AgentRun.agent_id == agent_uuid)
+        if task_uuid:
+            filters.append(AgentRun.task_id == task_uuid)
         if status:
             filters.append(AgentRun.status == str(status))
         if filters:
@@ -2317,7 +4291,10 @@ class AgentRunService:
         session = await self._session()
         try:
             result = await session.execute(stmt)
-            return [run.to_dict() for run in result.scalars().all()]
+            return [
+                _sanitize_serialized_agent_run(run.to_dict())
+                for run in result.scalars().all()
+            ]
         finally:
             await session.close()
 
@@ -2336,16 +4313,49 @@ class AgentRunService:
 
         session = await self._session()
         try:
-            run = await session.get(AgentRun, run_uuid)
+            # Lock before checking terminal state. Without this, concurrent
+            # complete/fail calls can both observe a queued run and overwrite
+            # the first terminal outcome after the event-sequence lock.
+            try:
+                locked = await session.execute(
+                    select(AgentRun)
+                    .where(AgentRun.id == run_uuid)
+                    .with_for_update()
+                )
+                run = locked.scalars().first()
+            except Exception:
+                run = await session.get(AgentRun, run_uuid)
             if not run:
                 return None
-            safe_payload = _redact_sensitive_tool_data(payload or {})
+            raw_payload = payload or {}
+            if event_type in {"stream.tool_start", "stream.tool_end"}:
+                raw_payload = sanitize_tool_audit_payload(raw_payload)
+            safe_payload = _sanitize_context_manifest_fields(
+                _redact_sensitive_tool_data(raw_payload)
+            )
+            if (
+                _clean_tool_name(safe_payload.get("tool_name"))
+                .casefold()
+                == CLOUD_ADVISOR_TOOL_NAME
+            ):
+                safe_payload = sanitize_cloud_advisor_audit_value(safe_payload)
+            elif _is_cloud_advisor_run_type(run.run_type):
+                safe_payload = sanitize_cloud_advisor_audit_value(safe_payload)
+            safe_message = (
+                _sanitize_cloud_advisor_event_message(event_type, message)
+                if _is_cloud_advisor_run_type(run.run_type)
+                else (
+                    sanitize_durable_error_text(message)
+                    if event_type in {"run.failed", "run.cancelled"}
+                    else message
+                )
+            )
             event = await self._append_event(
                 session,
                 run,
                 event_type,
                 status=status,
-                message=message,
+                message=safe_message,
                 payload=safe_payload,
             )
             usage = _normalized_agent_run_usage(safe_payload.get("usage"))
@@ -2373,7 +4383,57 @@ class AgentRunService:
                     ]
                     usage_keys.append(usage_key)
                     metadata["_usage_event_keys"] = usage_keys[-256:]
-                run.run_metadata = _jsonable(metadata)
+                run.run_metadata = _safe_audit_metadata(
+                    metadata,
+                    run_type=run.run_type,
+                )
+            # Interaction requests/resolutions use the existing AgentRun
+            # metadata as the restart-visible pending marker.  Resolution and
+            # terminal events clear it idempotently; no in-memory Future is
+            # persisted or reconstructed.
+            if isinstance(safe_payload, dict):
+                pending_id = str(
+                    safe_payload.get("pending_interaction_id")
+                    or ""
+                ).strip()
+                if pending_id or event_type in {
+                    "interaction.resolution",
+                    "interaction.resolved",
+                    "interaction.cancelled",
+                    "interaction.timeout",
+                }:
+                    metadata = dict(run.run_metadata or {})
+                    if pending_id and event_type in {
+                        "interaction.requested",
+                        "interaction.request",
+                        "plan.requested",
+                    }:
+                        metadata["pending_interaction_id"] = pending_id
+                        metadata["pending_interaction_kind"] = str(
+                            safe_payload.get("interaction_kind") or ""
+                        )
+                        metadata["pending_interaction_revision"] = int(
+                            safe_payload.get("revision") or 0
+                        )
+                    elif event_type in {
+                        "interaction.resolution",
+                        "interaction.resolved",
+                        "interaction.cancelled",
+                        "interaction.timeout",
+                    }:
+                        current_pending = str(
+                            metadata.get("pending_interaction_id") or ""
+                        ).strip()
+                        # Do not clear a newer request when a delayed response
+                        # for an older interaction arrives.
+                        if not pending_id or not current_pending or pending_id == current_pending:
+                            metadata.pop("pending_interaction_id", None)
+                            metadata.pop("pending_interaction_kind", None)
+                            metadata.pop("pending_interaction_revision", None)
+                    run.run_metadata = _safe_audit_metadata(
+                        metadata,
+                        run_type=run.run_type,
+                    )
             await session.commit()
             return event.to_dict()
         except Exception:
@@ -2403,6 +4463,149 @@ class AgentRunService:
             started=True,
         )
 
+    async def set_pending_interaction(
+        self,
+        run_id: str | None,
+        pending_interaction_id: str | None,
+        *,
+        kind: str | None = None,
+        revision: int | None = None,
+    ) -> Dict[str, Any] | None:
+        """Set/clear the restart-visible pending interaction marker.
+
+        This is metadata-only; the interaction lifecycle itself is appended by
+        :meth:`record_event`, so callers can use this helper when they need to
+        mark a request before a provider/websocket callback is available.
+        """
+
+        run_uuid = parse_uuid(run_id)
+        if run_uuid is None:
+            return None
+        session = await self._session()
+        try:
+            run = await session.get(AgentRun, run_uuid)
+            if run is None:
+                return None
+            metadata = dict(run.run_metadata or {})
+            pending = str(pending_interaction_id or "").strip()
+            if pending:
+                metadata["pending_interaction_id"] = pending
+                if kind is not None:
+                    metadata["pending_interaction_kind"] = str(kind)
+                if revision is not None:
+                    metadata["pending_interaction_revision"] = max(0, int(revision))
+            else:
+                metadata.pop("pending_interaction_id", None)
+                metadata.pop("pending_interaction_kind", None)
+                metadata.pop("pending_interaction_revision", None)
+            run.run_metadata = _safe_audit_metadata(
+                metadata,
+                run_type=run.run_type,
+            )
+            run.updated_at = datetime.utcnow()
+            await session.commit()
+            await session.refresh(run)
+            return run.to_dict()
+        except Exception:
+            await session.rollback()
+            logger.warning("Failed to update pending interaction marker: %s", run_id, exc_info=True)
+            return None
+        finally:
+            await session.close()
+
+    async def reconcile_stale_runs_after_restart(
+        self,
+        *,
+        limit: int = 500,
+        reason: str = "Agent run interrupted by process restart",
+    ) -> dict[str, Any]:
+        """Fail-closed reconciliation for in-flight runs after startup.
+
+        In-memory provider tasks/Futures are intentionally not recreated.  Any
+        run that was ``running`` at startup is marked failed once and receives
+        an explicit audit event.  Queued dispatch rows remain recoverable by
+        the outbox worker.  Open Director edges to terminal children are also
+        closed in the same transaction.
+        """
+
+        safe_limit = min(max(int(limit or 500), 1), 5000)
+        session = await self._session()
+        reconciled: list[str] = []
+        closed_edges = 0
+        try:
+            result = await session.execute(
+                select(AgentRun)
+                .where(AgentRun.status == "running")
+                .order_by(AgentRun.updated_at)
+                .limit(safe_limit)
+                .with_for_update()
+            )
+            now = datetime.utcnow()
+            safe_reason = sanitize_durable_error_text(reason)
+            for run in result.scalars().all():
+                if run.status in RUN_TERMINAL_STATUSES:
+                    continue
+                run.status = "failed"
+                run.error = safe_reason
+                run.ended_at = run.ended_at or now
+                run.updated_at = now
+                metadata = dict(run.run_metadata or {})
+                pending_id = metadata.get("pending_interaction_id")
+                metadata.pop("pending_interaction_id", None)
+                metadata.pop("pending_interaction_kind", None)
+                metadata.pop("pending_interaction_revision", None)
+                metadata["reconciled_after_restart"] = True
+                run.run_metadata = _safe_audit_metadata(
+                    metadata,
+                    run_type=run.run_type,
+                )
+                await self._append_event(
+                    session,
+                    run,
+                    "run.reconciled_after_restart",
+                    status="failed",
+                    message=safe_reason,
+                    payload={
+                        "previous_status": "running",
+                        "pending_interaction_id": pending_id,
+                        "reconciled_after_restart": True,
+                    },
+                )
+                reconciled.append(str(run.id))
+
+            # Director child edges are independently durable.  Close any open
+            # edge whose child is already terminal, including children that
+            # completed before a crash but missed the controller callback.
+            edge_result = await session.execute(
+                select(AgentRunEdge, AgentRun.status)
+                .join(AgentRun, AgentRun.id == AgentRunEdge.child_run_id)
+                .where(
+                    AgentRunEdge.status == "open",
+                    AgentRun.status.in_(tuple(RUN_TERMINAL_STATUSES)),
+                )
+                .limit(safe_limit)
+            )
+            for edge, child_status in edge_result.all():
+                edge.status = str(child_status)
+                edge.closed_at = edge.closed_at or now
+                closed_edges += 1
+            await session.commit()
+            return {
+                "reconciled_run_ids": reconciled,
+                "reconciled": len(reconciled),
+                "closed_edges": closed_edges,
+            }
+        except Exception:
+            await session.rollback()
+            logger.warning("Failed to reconcile stale AgentRuns after restart", exc_info=True)
+            return {"reconciled_run_ids": [], "reconciled": 0, "closed_edges": 0}
+        finally:
+            await session.close()
+
+    # Short alias for startup hooks/callers that prefer the noun first.
+    async def reconcile_stale_runs(self, **kwargs: Any) -> dict[str, Any]:
+        return await self.reconcile_stale_runs_after_restart(**kwargs)
+
     async def complete_run(
         self,
         run_id: str | None,
@@ -2430,8 +4633,19 @@ class AgentRunService:
         status: str = "failed",
         metadata: Dict[str, Any] | None = None,
     ) -> Dict[str, Any] | None:
-        safe_status = status if status in {"failed", "cancelled"} else "failed"
-        event_type = "run.cancelled" if safe_status == "cancelled" else "run.failed"
+        safe_status = (
+            status
+            if status in {"failed", "cancelled", "awaiting_approval"}
+            else "failed"
+        )
+        event_type = (
+            "run.cancelled"
+            if safe_status == "cancelled"
+            else "run.awaiting_approval"
+            if safe_status == "awaiting_approval"
+            else "run.failed"
+        )
+        ended = safe_status in {"failed", "cancelled"}
         return await self._set_status(
             run_id,
             safe_status,
@@ -2440,7 +4654,7 @@ class AgentRunService:
             result=result,
             metadata=metadata,
             error=error,
-            ended=True,
+            ended=ended,
         )
 
     async def cancel_run(
@@ -2615,6 +4829,10 @@ class AgentRunService:
             )
 
             now = datetime.utcnow()
+            safe_cancel_message = sanitize_durable_error_text(message)
+            safe_snapshot_content = sanitize_assistant_display_text(
+                snapshot["content"]
+            )
             assistant_message_id = uuid.uuid5(
                 uuid.NAMESPACE_URL,
                 f"aoitalk:cancelled-agent-run:{run.id}",
@@ -2640,7 +4858,7 @@ class AgentRunService:
                 id=assistant_message_id,
                 session_id=session_uuid,
                 role="assistant",
-                content=str(snapshot["content"] or ""),
+                content=safe_snapshot_content,
                 parent_message_id=parent_message_id,
                 branch_index=branch_index,
                 is_active_branch=message_is_active,
@@ -2653,14 +4871,14 @@ class AgentRunService:
 
             if run.status not in {"succeeded", "failed", "cancelled"}:
                 run.status = "cancelled"
-                run.error = _clip(message, max_chars=5000)
+                run.error = safe_cancel_message
                 run.ended_at = now
                 await self._append_event(
                     session,
                     run,
                     "run.cancelled",
                     status="cancelled",
-                    message=message,
+                    message=safe_cancel_message,
                     payload={},
                 )
             elif run.status == "cancelled" and run.ended_at is None:
@@ -2669,7 +4887,7 @@ class AgentRunService:
             current_result.update(
                 {
                     "assistant_message_id": str(assistant_message_id),
-                    "assistant_response": str(snapshot["content"] or ""),
+                    "assistant_response": safe_snapshot_content,
                     "partial": True,
                     "finish_reason": "user_stop",
                 }
@@ -2717,6 +4935,288 @@ class AgentRunService:
         finally:
             await session.close()
 
+    @staticmethod
+    def _validate_approved_mutation_receipt(
+        receipt: AgentRunToolCall,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Any,
+        metadata: Any,
+    ) -> None:
+        """Validate a durable winner before a retry is allowed to replay it."""
+
+        if str(receipt.tool_call_id or "") != tool_call_id:
+            raise ValueError("approved mutation receipt call id mismatch")
+        if str(receipt.tool_name or "") != tool_name:
+            raise ValueError("approved mutation receipt tool mismatch")
+        durable_metadata = receipt.result_metadata or {}
+        if not isinstance(durable_metadata, dict):
+            raise ValueError("approved mutation receipt metadata is invalid")
+        stored_arguments_digest = str(
+            durable_metadata.get("arguments_digest") or ""
+        ).strip()
+        expected_arguments_digest = canonical_audit_digest(arguments)
+        if stored_arguments_digest:
+            if stored_arguments_digest != expected_arguments_digest:
+                raise ValueError(
+                    "approved mutation receipt arguments mismatch (digest)"
+                )
+        elif _canonical_tool_arguments(receipt.arguments) not in {
+            _canonical_tool_arguments(_safe_audit_arguments(arguments)),
+            _canonical_tool_arguments(arguments),
+        }:
+            # Rows written before the digest contract retain their safe args;
+            # keep the legacy equality check for compatibility only.
+            raise ValueError("approved mutation receipt arguments mismatch")
+        # An approved mutation receipt is complete only when both the success
+        # and mutation confirmation flags agree.  A durable failed receipt is
+        # still replayable (the planning runtime will stop-first on it), but a
+        # mixed/partial row is never accepted as a winner.
+        if bool(receipt.success) != bool(receipt.mutation_confirmed):
+            raise ValueError("approved mutation receipt confirmation mismatch")
+        if durable_metadata.get("source") != "approved_plan_executor":
+            raise ValueError("approved mutation receipt source mismatch")
+        # Older approved receipts predate the atomic marker and digest fields.
+        # They remain replayable only through the safe-args compatibility path;
+        # new rows must carry both an explicit atomic marker and terminal state.
+        if stored_arguments_digest or durable_metadata.get("atomic") is True:
+            if durable_metadata.get("atomic") is not True:
+                raise ValueError("approved mutation receipt atomic marker missing")
+            if durable_metadata.get("atomic_state") not in {"committed", "failed"}:
+                raise ValueError("approved mutation receipt is not committed")
+        elif durable_metadata.get("atomic_state") not in {None, "committed", "failed"}:
+            raise ValueError("approved mutation receipt state is invalid")
+        stored_result_digest = str(durable_metadata.get("result_digest") or "").strip()
+        if stored_result_digest and not _is_audit_digest(stored_result_digest):
+            raise ValueError("approved mutation receipt result digest is invalid")
+        expected = _approved_receipt_expected_metadata(metadata)
+        expected_digest = expected.pop("arguments_digest", None)
+        if not stored_arguments_digest and durable_metadata.get("atomic") is not True:
+            # ``atomic`` was not present on legacy approved receipts.
+            expected.pop("atomic", None)
+        if expected_digest is not None and expected_digest != expected_arguments_digest:
+            raise ValueError("approved mutation expected arguments digest mismatch")
+        if stored_arguments_digest and expected_digest is not None:
+            # The row and server-owned directive must agree on the same raw
+            # canonical bytes, not merely on their redacted projections.
+            if stored_arguments_digest != expected_digest:
+                raise ValueError(
+                    "approved mutation receipt arguments mismatch (digest)"
+                )
+        for key, expected_value in expected.items():
+            if durable_metadata.get(key) != expected_value:
+                raise ValueError(
+                    f"approved mutation receipt metadata mismatch: {key}"
+                )
+
+    async def prepare_approved_mutation_receipt(
+        self,
+        session: AsyncSession,
+        *,
+        run_id: str | uuid.UUID,
+        tool_name: str,
+        tool_call_id: str,
+        arguments: Dict[str, Any] | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> PreparedApprovedMutationReceipt:
+        """Reserve one approved mutation in the caller's transaction.
+
+        The provisional row is flushed before the resource write.  The unique
+        ``(run_id, tool_call_id)`` constraint is the cross-worker fence; a
+        concurrent loser rolls back only its empty transaction and returns the
+        committed winner for replay.  No commit or event is performed here.
+        """
+
+        run_uuid = parse_uuid(run_id)
+        normalized_tool = str(tool_name or "").strip()
+        normalized_call_id = str(tool_call_id or "").strip()
+        if run_uuid is None:
+            raise ValueError("approved mutation requires a valid run id")
+        if not normalized_tool or not normalized_call_id:
+            raise ValueError("approved mutation requires tool and call id")
+        run = await session.get(AgentRun, run_uuid)
+        if run is None:
+            raise ValueError("approved mutation run not found")
+
+        raw_arguments = arguments or {}
+        normalized_arguments = _safe_audit_arguments(raw_arguments)
+        raw_arguments_digest = canonical_audit_digest(raw_arguments)
+        expected_metadata = _approved_receipt_expected_metadata(metadata)
+        supplied_arguments_digest = str(
+            expected_metadata.get("arguments_digest") or ""
+        ).strip()
+        if supplied_arguments_digest and supplied_arguments_digest != raw_arguments_digest:
+            raise ValueError("approved mutation expected arguments digest mismatch")
+        expected_metadata["arguments_digest"] = raw_arguments_digest
+        existing = await session.scalar(
+            select(AgentRunToolCall).where(
+                AgentRunToolCall.run_id == run_uuid,
+                AgentRunToolCall.tool_call_id == normalized_call_id,
+            )
+        )
+        if existing is not None:
+            self._validate_approved_mutation_receipt(
+                existing,
+                tool_name=normalized_tool,
+                tool_call_id=normalized_call_id,
+                arguments=raw_arguments,
+                metadata=expected_metadata,
+            )
+            return PreparedApprovedMutationReceipt(
+                run_id=run_uuid,
+                tool_name=normalized_tool,
+                tool_call_id=normalized_call_id,
+                receipt=existing,
+                owned=False,
+                metadata=expected_metadata,
+            )
+
+        provisional = AgentRunToolCall(
+            run_id=run_uuid,
+            tool_name=normalized_tool,
+            tool_call_id=normalized_call_id,
+            arguments=normalized_arguments,
+            result=None,
+            success=False,
+            mutation_confirmed=False,
+            result_metadata=_approved_receipt_metadata(
+                expected_metadata,
+                atomic_state="prepared",
+            ),
+            created_at=datetime.utcnow(),
+        )
+        session.add(provisional)
+        try:
+            # Explicit flush is the reservation point.  The caller must not
+            # perform a resource write until this succeeds.
+            await session.flush()
+        except IntegrityError:
+            await session.rollback()
+            winner = await session.scalar(
+                select(AgentRunToolCall).where(
+                    AgentRunToolCall.run_id == run_uuid,
+                    AgentRunToolCall.tool_call_id == normalized_call_id,
+                )
+            )
+            if winner is None:
+                raise
+            self._validate_approved_mutation_receipt(
+                winner,
+                tool_name=normalized_tool,
+                tool_call_id=normalized_call_id,
+                arguments=raw_arguments,
+                metadata=expected_metadata,
+            )
+            return PreparedApprovedMutationReceipt(
+                run_id=run_uuid,
+                tool_name=normalized_tool,
+                tool_call_id=normalized_call_id,
+                receipt=winner,
+                owned=False,
+                metadata=expected_metadata,
+            )
+        return PreparedApprovedMutationReceipt(
+            run_id=run_uuid,
+            tool_name=normalized_tool,
+            tool_call_id=normalized_call_id,
+            receipt=provisional,
+            owned=True,
+            metadata=expected_metadata,
+        )
+
+    async def finalize_approved_mutation_receipt(
+        self,
+        session: AsyncSession,
+        prepared: PreparedApprovedMutationReceipt,
+        *,
+        arguments: Dict[str, Any] | None = None,
+        result: Any = None,
+        success: bool = True,
+        mutation_confirmed: bool | None = None,
+        metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        """Stage the final receipt and audit event in the same transaction."""
+
+        raw_arguments = arguments or {}
+        normalized_arguments = _safe_audit_arguments(raw_arguments)
+        if not prepared.owned:
+            self._validate_approved_mutation_receipt(
+                prepared.receipt,
+                tool_name=prepared.tool_name,
+                tool_call_id=prepared.tool_call_id,
+                arguments=raw_arguments,
+                metadata=prepared.metadata,
+            )
+            return prepared.receipt.to_dict()
+
+        receipt = prepared.receipt
+        raw_arguments_digest = canonical_audit_digest(raw_arguments)
+        expected_arguments_digest = str(
+            prepared.metadata.get("arguments_digest") or ""
+        ).strip()
+        if expected_arguments_digest and raw_arguments_digest != expected_arguments_digest:
+            raise ValueError("approved mutation final arguments digest mismatch")
+        if _canonical_tool_arguments(receipt.arguments) != _canonical_tool_arguments(
+            normalized_arguments
+        ):
+            raise ValueError("approved mutation final arguments mismatch")
+        effective_success = bool(success)
+        effective_confirmed = (
+            effective_success
+            if mutation_confirmed is None
+            else bool(mutation_confirmed)
+        )
+        if effective_confirmed != effective_success:
+            raise ValueError("approved mutation confirmation must match success")
+        receipt.arguments = normalized_arguments
+        raw_result = result
+        durable_result = _durable_tool_result(prepared.tool_name, raw_result)
+        receipt.result = (
+            None if durable_result is None else _safe_audit_result(durable_result)
+        )
+        receipt.success = effective_success
+        receipt.mutation_confirmed = effective_confirmed
+        merged_metadata = dict(prepared.metadata)
+        if isinstance(metadata, dict):
+            for key in (
+                "plan_id",
+                "plan_revision",
+                "action_index",
+                "action_digest",
+            ):
+                if key in metadata:
+                    merged_metadata[key] = _jsonable(metadata[key])
+        receipt.result_metadata = _approved_receipt_metadata(
+            merged_metadata,
+            atomic_state="committed" if effective_success else "failed",
+        )
+        receipt.result_metadata["arguments_digest"] = raw_arguments_digest
+        receipt.result_metadata["result_digest"] = canonical_audit_digest(raw_result)
+        await session.flush()
+        run = await session.get(AgentRun, prepared.run_id)
+        if run is None:
+            raise ValueError("approved mutation run disappeared")
+        event = await self._append_event(
+            session,
+            run,
+            "tool.end" if effective_success else "tool.failed",
+            status="succeeded" if effective_success else "failed",
+            message=prepared.tool_name,
+            payload={
+                "tool_name": prepared.tool_name,
+                "tool_call_id": prepared.tool_call_id,
+                "success": effective_success,
+                "mutation_confirmed": effective_confirmed,
+                "source": "approved_plan_executor",
+                "atomic": True,
+            },
+        )
+        await session.flush()
+        receipt.event_id = event.id
+        await session.flush()
+        return receipt.to_dict()
+
     async def record_tool_call(
         self,
         run_id: str | None,
@@ -2744,24 +5244,90 @@ class AgentRunService:
             if not run:
                 return None
             now = datetime.utcnow()
-            safe_result = _durable_tool_result(tool_name, result)
+            raw_arguments = arguments or {}
+            raw_result = result
+            durable_result = _durable_tool_result(tool_name, raw_result)
+            # Cloud Advisor is a parent-owned advisory capability even when
+            # its canonical tool is invoked from an ordinary ``chat_turn``.
+            # The run type is not a sufficient write-boundary signal: generic
+            # chat runs may call ``consult_cloud_advisor`` and must never
+            # persist the advisory body or query in ``AgentRunToolCall``.
+            cloud_advisor_tool = (
+                _clean_tool_name(tool_name).casefold()
+                == CLOUD_ADVISOR_TOOL_NAME
+            )
+            if _is_cloud_advisor_run_type(run.run_type) or cloud_advisor_tool:
+                durable_result = sanitize_cloud_advisor_audit_value(
+                    raw_result
+                )
+            operations_tool = _is_operations_tool_name(tool_name)
+            safe_arguments = _safe_audit_arguments(raw_arguments)
+            if operations_tool:
+                # Apply the field-aware Operations projection after generic
+                # secret redaction so its explicit body marker remains
+                # visible while ordinary values such as ``tokenizer`` stay
+                # intact.
+                safe_arguments = _redact_operations_value(
+                    safe_arguments,
+                    tool_name=_clean_tool_name(tool_name),
+                )
+            if _is_cloud_advisor_run_type(run.run_type):
+                safe_arguments = sanitize_cloud_advisor_audit_value(
+                    raw_arguments
+                )
+            elif cloud_advisor_tool:
+                safe_arguments = sanitize_cloud_advisor_audit_value(
+                    raw_arguments
+                )
+            safe_result = (
+                None if durable_result is None else _safe_audit_result(durable_result)
+            )
+            if operations_tool and isinstance(safe_result, str):
+                safe_result = _redact_operations_json_arguments(
+                    safe_result,
+                    tool_name=_clean_tool_name(tool_name),
+                )
             effective_mutation_confirmed = _mutation_confirmation_for_tool(
                 tool_name,
                 mutation_confirmed,
                 success,
             )
+            raw_metadata = metadata or {}
+            safe_metadata, metadata_ok = _safe_audit_redact(raw_metadata)
+            if metadata_ok and isinstance(safe_metadata, dict):
+                safe_metadata = _redact_sensitive_tool_data(
+                    safe_metadata,
+                    tool_name=tool_name,
+                )
+            if not metadata_ok or not isinstance(safe_metadata, dict):
+                safe_metadata = {"_redacted": AUDIT_REDACTION_FAILED_MARKER}
+            if _is_cloud_advisor_run_type(run.run_type):
+                safe_metadata = sanitize_cloud_advisor_audit_value(raw_metadata)
+            elif cloud_advisor_tool:
+                safe_metadata = sanitize_cloud_advisor_audit_value(raw_metadata)
+            approved_atomic = (
+                isinstance(raw_metadata, dict)
+                and raw_metadata.get("source") == "approved_plan_executor"
+            )
+            if approved_atomic:
+                safe_metadata = _approved_receipt_metadata(
+                    raw_metadata,
+                    atomic_state="committed" if bool(success) else "failed",
+                )
+                safe_metadata["arguments_digest"] = canonical_audit_digest(
+                    raw_arguments
+                )
+                safe_metadata["result_digest"] = canonical_audit_digest(raw_result)
             tool_call = AgentRunToolCall(
                 run_id=run.id,
                 event_id=parse_uuid(event_id),
                 tool_name=str(tool_name),
                 tool_call_id=normalized_tool_call_id,
-                arguments=_jsonable(arguments),
-                result=_clip(safe_result),
+                arguments=safe_arguments,
+                result=safe_result,
                 success=bool(success),
                 mutation_confirmed=effective_mutation_confirmed,
-                result_metadata=_jsonable(
-                    _redact_sensitive_tool_data(metadata or {})
-                ),
+                result_metadata=safe_metadata,
                 started_at=started_at,
                 ended_at=ended_at,
                 duration_ms=duration_ms,
@@ -2797,6 +5363,16 @@ class AgentRunService:
                     )
                     existing = existing_result.scalar_one_or_none()
                     if existing is not None:
+                        if isinstance(metadata, dict) and metadata.get(
+                            "source"
+                        ) == "approved_plan_executor":
+                            self._validate_approved_mutation_receipt(
+                                existing,
+                                tool_name=str(tool_name),
+                                tool_call_id=normalized_tool_call_id,
+                                arguments=arguments or {},
+                                metadata=metadata,
+                            )
                         return existing.to_dict()
                 except Exception:
                     logger.exception(
@@ -2834,7 +5410,7 @@ class AgentRunService:
                 child_run_id=child_uuid,
                 purpose=purpose,
                 status="open",
-                edge_metadata=_jsonable(metadata),
+                edge_metadata=_safe_audit_metadata(metadata),
                 created_at=now,
             )
             session.add(edge)
@@ -2885,8 +5461,14 @@ class AgentRunService:
             edge = result.scalar_one_or_none()
             if edge is None:
                 return None
+            if edge.status in RUN_TERMINAL_STATUSES and edge.closed_at is not None:
+                # Closing a Director edge is itself idempotent; preserve the
+                # first terminal outcome and timestamp on duplicate callbacks.
+                await session.commit()
+                await session.refresh(edge)
+                return edge.to_dict()
             edge.status = normalized_status
-            edge.closed_at = datetime.utcnow()
+            edge.closed_at = edge.closed_at or datetime.utcnow()
             await session.commit()
             await session.refresh(edge)
             return edge.to_dict()
@@ -2920,28 +5502,75 @@ class AgentRunService:
         if run_uuid is None:
             return None
 
-        session = await self._session()
+        status_lock = _status_lock(run_uuid)
+        await status_lock.acquire()
         try:
-            run = await session.get(AgentRun, run_uuid)
+            session = await self._session()
+        except Exception:
+            status_lock.release()
+            raise
+        try:
+            try:
+                locked = await session.execute(
+                    select(AgentRun)
+                    .where(AgentRun.id == run_uuid)
+                    .with_for_update()
+                )
+                run = locked.scalars().first()
+            except Exception:
+                run = await session.get(AgentRun, run_uuid)
             if not run:
                 return None
+            safe_error = (
+                sanitize_durable_error_text(error)
+                if error is not None
+                else ""
+            )
+            safe_status_message = (
+                sanitize_durable_error_text(message)
+                if event_type
+                in {"run.failed", "run.cancelled", "run.awaiting_approval"}
+                else message
+            )
             already_started = bool(started and run.started_at is not None)
-            if run.status in RUN_TERMINAL_STATUSES and run.status != status:
-                await self._append_event(
-                    session,
-                    run,
-                    f"{event_type}.ignored",
-                    status=run.status,
-                    message=message,
-                    payload={
-                        "attempted_status": status,
-                        "current_status": run.status,
-                    },
-                )
+            if run.status in RUN_TERMINAL_STATUSES:
+                if run.status != status:
+                    # Preserve an audit trail for a conflicting terminal
+                    # mutation, but never mutate terminal state twice.
+                    await self._append_event(
+                        session,
+                        run,
+                        f"{event_type}.ignored",
+                        status=run.status,
+                        message=safe_status_message,
+                        payload={
+                            "attempted_status": status,
+                            "current_status": run.status,
+                        },
+                    )
+                # Same-status retries are idempotent and must not append a
+                # duplicate terminal event or rewrite ended_at/result.
                 await session.commit()
                 await session.refresh(run)
                 return run.to_dict()
             now = datetime.utcnow()
+            if ended and status in RUN_TERMINAL_STATUSES:
+                # SQLite does not provide row-level FOR UPDATE semantics and
+                # multiple processes can still race after the read. Claim
+                # the first terminal transition with a compare-and-set
+                # update; only its winner may append the terminal event.
+                terminal_claim = await session.execute(
+                    update(AgentRun)
+                    .where(
+                        AgentRun.id == run_uuid,
+                        ~AgentRun.status.in_(tuple(RUN_TERMINAL_STATUSES)),
+                    )
+                    .values(status=status, updated_at=now)
+                )
+                if int(getattr(terminal_claim, "rowcount", 0) or 0) != 1:
+                    await session.rollback()
+                    winner = await session.get(AgentRun, run_uuid)
+                    return winner.to_dict() if winner is not None else None
             run.status = status
             run.updated_at = now
             if started and run.started_at is None:
@@ -2968,26 +5597,40 @@ class AgentRunService:
                 run.provider = provider
             if model:
                 run.model = model
-            if error:
-                run.error = _clip(error, max_chars=5000)
+            if error is not None:
+                run.error = safe_error
             safe_result = (
-                _redact_sensitive_tool_data(result)
+                _sanitize_context_manifest_fields(
+                    _redact_sensitive_tool_data(result)
+                )
                 if result is not None
                 else None
             )
+            if (
+                safe_result is not None
+                and _is_cloud_advisor_run_type(run.run_type)
+            ):
+                safe_result = sanitize_cloud_advisor_audit_value(safe_result)
+            if isinstance(safe_result, dict) and "assistant_response" in safe_result:
+                safe_result["assistant_response"] = sanitize_assistant_display_text(
+                    safe_result.get("assistant_response")
+                )
             if safe_result is not None:
                 run.result = _jsonable(safe_result)
             if metadata:
                 current = dict(run.run_metadata or {})
-                current.update(_jsonable(metadata))
-                run.run_metadata = current
+                current.update(metadata)
+                run.run_metadata = _safe_audit_metadata(
+                    current,
+                    run_type=run.run_type,
+                )
             if not already_started:
                 await self._append_event(
                     session,
                     run,
                     event_type,
                     status=status,
-                    message=message,
+                    message=safe_status_message,
                     payload=(
                         {"result": _jsonable(safe_result)}
                         if safe_result is not None
@@ -3014,6 +5657,7 @@ class AgentRunService:
             return None
         finally:
             await session.close()
+            _release_status_lock(run_uuid, status_lock)
 
     async def _append_event(
         self,
@@ -3025,6 +5669,14 @@ class AgentRunService:
         message: str | None = None,
         payload: Dict[str, Any] | None = None,
     ) -> AgentRunEvent:
+        lock_result = await session.execute(
+            select(AgentRun.id)
+            .where(AgentRun.id == run.id)
+            .with_for_update(),
+            execution_options={"autoflush": False},
+        )
+        if lock_result.scalar_one_or_none() is None:
+            raise RuntimeError("agent run disappeared while allocating event sequence")
         result = await session.execute(
             select(func.max(AgentRunEvent.sequence)).where(
                 AgentRunEvent.run_id == run.id
@@ -3032,13 +5684,40 @@ class AgentRunService:
         )
         sequence = int(result.scalar() or 0) + 1
         now = datetime.utcnow()
+        safe_payload = _redact_sensitive_tool_data(payload or {})
+        safe_message = message
+        event_tool_name = (
+            _clean_tool_name(safe_payload.get("tool_name"))
+            if isinstance(safe_payload, dict)
+            else ""
+        )
+        event_type_text = str(event_type or "").strip().casefold()
+        message_is_cloud_advisor = (
+            str(message or "").strip().casefold()
+            == CLOUD_ADVISOR_TOOL_NAME
+        )
+        if (
+            event_tool_name.casefold() == CLOUD_ADVISOR_TOOL_NAME
+            or message_is_cloud_advisor
+            or "cloud_advisor" in event_type_text
+        ):
+            safe_payload = sanitize_cloud_advisor_audit_value(safe_payload)
+            safe_message = CLOUD_ADVISOR_CONTENT_REDACTED_MARKER
+        elif _is_cloud_advisor_run_type(getattr(run, "run_type", None)):
+            safe_payload = sanitize_cloud_advisor_audit_value(safe_payload)
+            safe_message = _sanitize_cloud_advisor_event_message(
+                event_type,
+                message,
+            )
         event = AgentRunEvent(
             run_id=run.id,
             sequence=sequence,
             event_type=event_type,
             status=status,
-            message=message,
-            payload=_jsonable(payload),
+            message=safe_message,
+            # This is the final durable event boundary; re-apply field-aware
+            # redaction even when a caller bypasses ``record_event``.
+            payload=_jsonable(safe_payload),
             created_at=now,
         )
         session.add(event)

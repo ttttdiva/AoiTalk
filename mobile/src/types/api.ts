@@ -12,6 +12,8 @@ export type {
   paths as GeneratedApiPaths,
 } from "./api-types.gen";
 
+import type { components } from "./api-types.gen";
+
 // ========== チャット ==========
 
 export interface ConversationSession {
@@ -79,6 +81,14 @@ export interface AgentRun {
   status: string;
   title?: string;
   error?: string | null;
+  agent_id?: string | null;
+  agent_revision_id?: string | null;
+  task_id?: string | null;
+  acting_subagent_id?: string | null;
+  previous_attempt_run_id?: string | null;
+  resolved_execution_manifest?: Record<string, unknown> | null;
+  execution_manifest?: Record<string, unknown> | null;
+  execution_manifest_hash?: string | null;
   timeline?: AgentRunTimelineItem[];
 }
 
@@ -158,6 +168,8 @@ export interface TaskOccurrence {
   status: string;
   start_at: string;
   end_at?: string | null;
+  /** Canonical RRULE occurrence start (actual start may include an override). */
+  original_start_at?: string | null;
   all_day: boolean;
   reminder_offsets: number[];
   auto_close_on_due?: boolean;
@@ -299,6 +311,8 @@ export interface Project {
   created_at?: string | null;
   updated_at?: string | null;
   deleted_at?: string | null;
+  /** Per-user operational scope, independent of global-admin read access. */
+  is_participating?: boolean | null;
   membership?: {
     role?: string | null;
     permissions?: Record<string, unknown> | null;
@@ -733,15 +747,15 @@ export interface TrpgReferenceStats {
 
 // ========== WebSocket ==========
 
-export interface ChatResponseModelSelection {
-  provider: string;
-  model: string;
-}
+export type ChatResponseModelSelection = components["schemas"]["ResponseModelSelection"];
 
 export interface ChatResponseModelOption extends ChatResponseModelSelection {
   label: string;
   providerLabel: string;
   modelLabel: string;
+  reasoningEffortOptions?: string[];
+  reasoningEffortDefault?: string | null;
+  reasoningEffortKind?: string;
   isCurrent?: boolean;
 }
 
@@ -754,6 +768,9 @@ export interface LlmCatalogModelOption {
   source_label?: string;
   provider_configured?: boolean;
   custom_current?: boolean;
+  reasoning_effort_options?: string[];
+  reasoning_effort_default?: string | null;
+  reasoning_effort_kind?: string;
 }
 
 export interface LlmCatalogProvider {
@@ -766,6 +783,13 @@ export interface LlmCatalogProvider {
   unavailable?: boolean;
   availability_reason?: string | null;
   models: LlmCatalogModelOption[];
+  /** Runtime-served models for chat; settings keep the full catalog above. */
+  chat_models?: LlmCatalogModelOption[];
+  available_models?: LlmCatalogModelOption[];
+  availability?: {
+    state?: string;
+    error?: string | null;
+  };
   settings?: {
     api_key_configured?: boolean;
   };
@@ -806,6 +830,9 @@ export interface LlmDeploymentMetadata {
 export interface LlmModelCatalogResponse {
   current: ChatResponseModelSelection;
   providers: LlmCatalogProvider[];
+  provider_visibility?: {
+    hidden_provider_ids?: unknown;
+  };
   deployment?: LlmDeploymentMetadata | null;
 }
 
@@ -1172,6 +1199,11 @@ export interface DocsNode {
   access?: "owner" | "read" | "write" | string | null;
   read_only?: boolean;
   system_key: string | null;
+  /** Server-derived discriminator for a persisted blank paragraph. */
+  is_explicit_blank?: boolean;
+  /** Server-authoritative Project-information title (additive sync field). */
+  canonical_title?: string | null;
+  lifecycle?: Record<string, unknown> | null;
   title: string;
   aliases: string[];
   description: string | null;

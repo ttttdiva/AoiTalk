@@ -18,8 +18,10 @@ import {
   encodeDocsBoolean,
   encodeDocsJson,
   type DocsSqliteAsyncTransaction,
+  withForegroundYieldingDocsExclusiveTransaction,
   withDocsExclusiveTransaction,
 } from "../db/docs-sync-async";
+import { runForegroundSqliteWrite } from "../db/sqlite-write-coordinator";
 import { getToken, getTokenAuthScope } from "../lib/auth";
 import { canonicalizeIngestUrl, isSafeSourceRefUrl } from "../lib/clip-url";
 import type {
@@ -36,11 +38,35 @@ import {
   enqueueOutbox,
   randomId,
   recordOutboxServerSnapshot,
+  type OutboxConflictReference,
+  type OutboxConflictResolutionResult,
+  validateOutboxConflictServerScope,
 } from "./outbox";
 import {
   docsNodeDeletionIds,
   expandProtectedDocsNodeAncestors,
 } from "./docs-reconciliation";
+import {
+  buildDocsAuthoritativeSets,
+  forEachDocsPromotionChunk,
+  loadDocsDirtyRowsPagedTx,
+  loadDocsMembershipSnapshotTx,
+  loadDocsQuarantineMembershipSnapshotTx,
+  loadDocsQuarantineOutboxSnapshotTx,
+  loadDocsScopedOutboxProtectionTx,
+} from "./docs-promotion-snapshot";
+import {
+  blankParagraphBodyJson,
+  clearBlankParagraphMarker,
+  isEditableDocsBlockBody,
+  isExplicitBlankParagraph,
+} from "../lib/docs-blank";
+export {
+  blankParagraphBodyJson,
+  clearBlankParagraphMarker,
+  isEditableDocsBlockBody,
+  isExplicitBlankParagraph,
+} from "../lib/docs-blank";
 
 type DbNode = typeof schema.knowledgeNodes.$inferSelect;
 type DbSupertag = typeof schema.knowledgeSupertags.$inferSelect;
@@ -511,6 +537,11 @@ async function saveLocalDocsServerSnapshot(
 // ---------- 行 → API 形マッパ ----------
 
 function toNode(row: DbNode): DocsNode {
+  const bodyJson = (row.bodyJson as Record<string, unknown> | null) ?? null;
+  const nodeType = (row.nodeType as DocsNode["node_type"]) ?? "node";
+  const systemKey = typeof row.systemKey === "string" ? row.systemKey.trim() : "";
+  const explicitBlank = !systemKey
+    && isExplicitBlankParagraph(row.title, bodyJson, nodeType);
   return {
     id: row.id,
     workspace_id: row.workspaceId ?? null,
@@ -524,9 +555,14 @@ function toNode(row: DbNode): DocsNode {
     title: row.title,
     aliases: Array.isArray(row.aliases) ? (row.aliases as string[]) : [],
     description: row.description ?? null,
-    body_json: (row.bodyJson as Record<string, unknown> | null) ?? null,
-    body_text: row.bodyText ?? null,
-    node_type: (row.nodeType as DocsNode["node_type"]) ?? "node",
+    body_json: bodyJson,
+    body_text: explicitBlank ? "" : row.bodyText ?? null,
+    node_type: nodeType,
+    // The local schema intentionally stores the marker in body_json (the
+    // server's ``is_explicit_blank`` column is a server-owned projection).
+    // Expose the same discriminator to mobile callers without adding another
+    // SQLite migration or risking stale duplicate state.
+    is_explicit_blank: explicitBlank,
     display_props: (row.displayProps as Record<string, unknown> | null) ?? null,
     query_json: (row.queryJson as Record<string, unknown> | null) ?? null,
     view_json: (row.viewJson as Record<string, unknown> | null) ?? null,
@@ -597,6 +633,27 @@ function toFieldValue(row: DbFieldValue): DocsFieldValue {
 // ---------- applyRemote 群（pull / push 応答の反映） ----------
 
 function remoteDocsNodeValues(n: DocsNode, now: string) {
+  const rawTitle = n.title ?? "";
+  const systemKey = typeof n.system_key === "string" ? n.system_key.trim() : "";
+  const canonicalTitle = typeof n.canonical_title === "string"
+    && n.canonical_title.trim().length > 0
+    && systemKey.startsWith("project_information:")
+    ? n.canonical_title.trim()
+    : null;
+  const title = canonicalTitle ?? rawTitle;
+  const nodeType = n.node_type ?? "node";
+  const serverBlankDiscriminatorKnown = typeof n.is_explicit_blank === "boolean";
+  const explicitBlank = !systemKey
+    && title === ""
+    && nodeType === "node"
+    && (serverBlankDiscriminatorKnown
+      ? n.is_explicit_blank === true
+      : isExplicitBlankParagraph(title, n.body_json, nodeType));
+  const bodyJson = explicitBlank
+    ? blankParagraphBodyJson(n.body_json)
+    : serverBlankDiscriminatorKnown && title === ""
+      ? clearBlankParagraphMarker(n.body_json)
+      : (n.body_json as unknown) ?? null;
   return {
     id: n.id,
     workspaceId: n.workspace_id ?? null,
@@ -607,12 +664,12 @@ function remoteDocsNodeValues(n: DocsNode, now: string) {
     access: n.access ?? null,
     readOnly: n.read_only ?? n.access === "read",
     systemKey: n.system_key ?? null,
-    title: n.title ?? "",
+    title,
     aliases: (n.aliases as unknown) ?? [],
     description: n.description ?? null,
-    bodyJson: (n.body_json as unknown) ?? null,
-    bodyText: n.body_text ?? null,
-    nodeType: n.node_type ?? "node",
+    bodyJson,
+    bodyText: explicitBlank ? "" : canonicalTitle ?? n.body_text ?? null,
+    nodeType,
     displayProps: (n.display_props as unknown) ?? null,
     queryJson: (n.query_json as unknown) ?? null,
     viewJson: (n.view_json as unknown) ?? null,
@@ -712,6 +769,365 @@ export async function applyRemoteDocsNodes(
         set: remoteDocsNodeUpdateSet(values),
       });
   });
+}
+
+function docsTxFirst<T = any>(query: any): T | null {
+  if (typeof query?.get === "function") {
+    return (query.get() as T | undefined) ?? null;
+  }
+  const rows = docsTxRows(query);
+  return (rows?.[0] as T | undefined) ?? null;
+}
+
+function nullableConflictString(
+  payload: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+  fallback: string | null,
+): string | null {
+  if (Object.prototype.hasOwnProperty.call(payload, snakeKey)) {
+    const value = payload[snakeKey];
+    return value == null ? null : String(value);
+  }
+  if (Object.prototype.hasOwnProperty.call(payload, camelKey)) {
+    const value = payload[camelKey];
+    return value == null ? null : String(value);
+  }
+  return fallback;
+}
+
+/** Read a conflict field while distinguishing an omitted key from an
+ * explicit `null`.  Server snapshots are authoritative for keys they carry;
+ * only genuinely omitted fields fall back to the current local row. */
+function conflictValue(
+  payload: Record<string, unknown>,
+  snakeKey: string,
+  camelKey: string,
+  fallback: unknown,
+): unknown {
+  if (Object.prototype.hasOwnProperty.call(payload, snakeKey)) return payload[snakeKey];
+  if (Object.prototype.hasOwnProperty.call(payload, camelKey)) return payload[camelKey];
+  return fallback;
+}
+
+/** Merge a validated full server node onto the current row for remote mapping.
+ *
+ * The conflict endpoint normally returns every Docs field.  Keeping the
+ * current value only for omitted optional fields preserves compatibility with
+ * older servers while still requiring the identity/title/version fields in
+ * the scope validator before any write is attempted.
+ */
+function conflictServerNode(
+  payload: Record<string, unknown>,
+  current: DocsNode,
+): DocsNode {
+  const updatedAt = nullableConflictString(
+    payload,
+    "updated_at",
+    "updatedAt",
+    current.updated_at,
+  );
+  const workspaceId = nullableConflictString(
+    payload,
+    "workspace_id",
+    "workspaceId",
+    current.workspace_id,
+  );
+  const projectId = nullableConflictString(
+    payload,
+    "project_id",
+    "projectId",
+    current.project_id,
+  );
+  const parentId = nullableConflictString(payload, "parent_id", "parentId", current.parent_id);
+  const rootPageId = nullableConflictString(
+    payload,
+    "root_page_id",
+    "rootPageId",
+    current.root_page_id,
+  );
+  const title = typeof payload.title === "string" ? payload.title : current.title;
+  const canonicalTitleValue = conflictValue(
+    payload,
+    "canonical_title",
+    "canonicalTitle",
+    undefined,
+  );
+  const aliasesValue = conflictValue(payload, "aliases", "aliases", current.aliases);
+  const aliases = Array.isArray(aliasesValue)
+    ? aliasesValue as string[]
+    : aliasesValue == null ? [] : current.aliases;
+  const bodyJsonValue = conflictValue(payload, "body_json", "bodyJson", current.body_json);
+  const bodyJson = bodyJsonValue == null
+    ? null
+    : bodyJsonValue as Record<string, unknown>;
+  const bodyText = nullableConflictString(payload, "body_text", "bodyText", current.body_text);
+  const description = nullableConflictString(
+    payload,
+    "description",
+    "description",
+    current.description,
+  );
+  const sourceValue = conflictValue(payload, "source", "source", current.source);
+  const accessValue = conflictValue(payload, "access", "access", current.access);
+  const readOnlyValue = conflictValue(payload, "read_only", "readOnly", current.read_only);
+  const nodeTypeValue = conflictValue(payload, "node_type", "nodeType", current.node_type);
+  const explicitBlankValue = conflictValue(
+    payload,
+    "is_explicit_blank",
+    "isExplicitBlank",
+    undefined,
+  );
+  const displayPropsValue = conflictValue(
+    payload,
+    "display_props",
+    "displayProps",
+    current.display_props,
+  );
+  const queryJsonValue = conflictValue(payload, "query_json", "queryJson", current.query_json);
+  const viewJsonValue = conflictValue(payload, "view_json", "viewJson", current.view_json);
+  return {
+    ...current,
+    id: String(payload.id),
+    workspace_id: workspaceId,
+    parent_id: parentId,
+    root_page_id: rootPageId,
+    project_id: projectId,
+    source: sourceValue == null ? null : sourceValue as DocsNode["source"],
+    access: accessValue == null ? null : accessValue as DocsNode["access"],
+    read_only: typeof readOnlyValue === "boolean"
+      ? readOnlyValue
+      : accessValue === "read",
+    system_key: nullableConflictString(payload, "system_key", "systemKey", current.system_key),
+    title,
+    canonical_title: typeof canonicalTitleValue === "string" ? canonicalTitleValue : undefined,
+    aliases,
+    description,
+    body_json: bodyJson,
+    body_text: bodyText,
+    node_type: (nodeTypeValue ?? "node") as DocsNode["node_type"],
+    is_explicit_blank: typeof explicitBlankValue === "boolean"
+      ? explicitBlankValue
+      : undefined,
+    display_props: displayPropsValue == null
+      ? null
+      : displayPropsValue as Record<string, unknown>,
+    query_json: queryJsonValue == null
+      ? null
+      : queryJsonValue as Record<string, unknown>,
+    view_json: viewJsonValue == null
+      ? null
+      : viewJsonValue as Record<string, unknown>,
+    day_date: nullableConflictString(payload, "day_date", "dayDate", current.day_date),
+    sort_order: typeof payload.sort_order === "number"
+      ? payload.sort_order
+      : typeof payload.sortOrder === "number"
+        ? payload.sortOrder
+        : current.sort_order,
+    created_by: nullableConflictString(payload, "created_by", "createdBy", current.created_by),
+    updated_by: nullableConflictString(payload, "updated_by", "updatedBy", current.updated_by),
+    created_at: nullableConflictString(payload, "created_at", "createdAt", current.created_at),
+    updated_at: updatedAt,
+    archived_at: nullableConflictString(payload, "archived_at", "archivedAt", current.archived_at),
+  };
+}
+
+function exactOutboxConflictRow(
+  row: any,
+  reference: OutboxConflictReference,
+): boolean {
+  return Boolean(
+    row
+      && row.opId === reference.opId
+      && row.tableName === reference.tableName
+      && row.action === reference.action
+      && row.entityId === reference.entityId
+      && row.payload === reference.payload
+      && (row.baseUpdatedAt ?? null) === (reference.baseUpdatedAt ?? null)
+      && row.authScope === reference.authScope
+      && (row.docsScopeKey ?? null) === (reference.docsScopeKey ?? null)
+      && typeof row.lastError === "string"
+      && row.lastError.startsWith("conflict:")
+      && JSON.stringify(row.conflictPayload ?? null)
+        === JSON.stringify(reference.conflictPayload ?? null),
+  );
+}
+
+class DocsConflictAdoptionAbort extends Error {
+  constructor(readonly reason: OutboxConflictResolutionResult["reason"]) {
+    super(`Docs conflict adoption aborted: ${reason}`);
+    this.name = "DocsConflictAdoptionAbort";
+  }
+}
+
+/**
+ * Atomically adopt a knowledge_nodes server conflict.
+ *
+ * Unlike the generic outbox callback helper, this operation owns the complete
+ * SQLite write unit: it revalidates auth/scope/ACL, maps the server snapshot
+ * with the same remote semantics used by pull, updates the live node and
+ * deletes the exact conflict row in one transaction.  Foreground serialization
+ * prevents a regular Docs edit from interleaving between the live update and
+ * outbox CAS; a failed CAS rolls the transaction back.
+ */
+export async function adoptDocsNodeServerConflict(
+  reference: OutboxConflictReference,
+): Promise<OutboxConflictResolutionResult> {
+  if (reference.tableName !== "knowledge_nodes" || reference.action !== "update") {
+    return { ok: false, reason: "outbox_replaced" };
+  }
+  const initialScope = await getToken();
+  const initialAuthScope = initialScope ? getTokenAuthScope(initialScope) : null;
+  if (!initialAuthScope || initialAuthScope !== reference.authScope) {
+    return { ok: false, reason: "auth_scope_changed" };
+  }
+  const initialServer = validateOutboxConflictServerScope(
+    reference,
+    reference.conflictPayload,
+  );
+  if (!initialServer.ok) return { ok: false, reason: initialServer.reason };
+  const docsScopeKey = reference.docsScopeKey;
+  if (!docsScopeKey) return { ok: false, reason: "docs_scope_missing" };
+
+  try {
+    return await runForegroundSqliteWrite(async () => {
+      // The token is read immediately before entering the transaction.  A
+      // queued operation must not adopt a row after an account switch.
+      const token = await getToken();
+      const authScope = token ? getTokenAuthScope(token) : null;
+      if (!authScope || authScope !== reference.authScope) {
+        return { ok: false, reason: "auth_scope_changed" };
+      }
+      const db = getDb();
+      let outcome: OutboxConflictResolutionResult = {
+        ok: false,
+        reason: "outbox_replaced",
+      };
+      db.transaction((tx) => {
+        const row = docsTxFirst<any>(
+          tx
+            .select()
+            .from(schema.outbox)
+            .where(eq(schema.outbox.opId, reference.opId)),
+        );
+        if (!exactOutboxConflictRow(row, reference)) return;
+
+        const serverValidation = validateOutboxConflictServerScope(
+          reference,
+          row.conflictPayload,
+        );
+        if (!serverValidation.ok) {
+          outcome = { ok: false, reason: serverValidation.reason };
+          return;
+        }
+        const serverPayload = serverValidation.payload;
+        const liveRow = docsTxFirst<DbNode>(
+          tx
+            .select()
+            .from(schema.knowledgeNodes)
+            .where(eq(schema.knowledgeNodes.id, reference.entityId)),
+        );
+        const liveSystemKey = typeof liveRow?.systemKey === "string"
+          ? liveRow.systemKey.trim()
+          : "";
+        if (
+          !liveRow
+          || liveRow.readOnly === true
+          || liveRow.access === "read"
+          || liveRow.archivedAt != null
+          || liveSystemKey === "project_information_root"
+          || liveSystemKey.startsWith("project_information:")
+          || docsScopeKeyForRow(liveRow) !== docsScopeKey
+        ) {
+          outcome = {
+            ok: false,
+            reason: docsScopeKeyForRow(liveRow) === docsScopeKey
+              ? "node_not_writable"
+              : "docs_scope_mismatch",
+          };
+          return;
+        }
+        if (!schema.docsScopeMembership) {
+          outcome = { ok: false, reason: "docs_scope_missing" };
+          return;
+        }
+        const memberships = docsTxRows(
+          tx
+            .select({
+              state: schema.docsScopeMembership.state,
+              access: schema.docsScopeMembership.access,
+              readOnly: schema.docsScopeMembership.readOnly,
+            })
+            .from(schema.docsScopeMembership)
+            .where(and(
+              eq(schema.docsScopeMembership.authScope, reference.authScope),
+              eq(schema.docsScopeMembership.scopeKey, docsScopeKey),
+              eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+              eq(schema.docsScopeMembership.entityKey, reference.entityId),
+            )),
+        ) ?? [];
+        const writableMembership = memberships.some((membership: any) =>
+          membership.state === "active"
+          && membership.access !== "read"
+          && membership.readOnly !== true,
+        );
+        if (!writableMembership) {
+          outcome = { ok: false, reason: "docs_scope_not_writable" };
+          return;
+        }
+        const serverUpdatedAt = nullableConflictString(
+          serverPayload,
+          "updated_at",
+          "updatedAt",
+          null,
+        );
+        if (!serverUpdatedAt) {
+          outcome = { ok: false, reason: "server_version_missing" };
+          return;
+        }
+        const serverNode = conflictServerNode(serverPayload, toNode(liveRow));
+        const values = remoteDocsNodeValues(serverNode, new Date().toISOString());
+        tx
+          .update(schema.knowledgeNodes)
+          .set(remoteDocsNodeUpdateSet(values))
+          .where(eq(schema.knowledgeNodes.id, reference.entityId))
+          .run();
+
+        const deleteResult = tx
+          .delete(schema.outbox)
+          .where(and(
+            eq(schema.outbox.opId, reference.opId),
+            eq(schema.outbox.tableName, reference.tableName),
+            eq(schema.outbox.action, reference.action),
+            eq(schema.outbox.entityId, reference.entityId),
+            eq(schema.outbox.payload, reference.payload),
+            reference.baseUpdatedAt === null
+              ? isNull(schema.outbox.baseUpdatedAt)
+              : eq(schema.outbox.baseUpdatedAt, reference.baseUpdatedAt),
+            eq(schema.outbox.authScope, reference.authScope),
+            eq(schema.outbox.docsScopeKey, docsScopeKey),
+            eq(schema.outbox.lastError, row.lastError),
+          ))
+          .run();
+        // Expo SQLite returns a changes count.  Tiny compatibility doubles
+        // used by migration tests may return void; the row was already read
+        // and matched every CAS field above, so only an explicit non-one
+        // count is treated as a failed delete.
+        if (deleteResult != null && Number(deleteResult?.changes ?? 0) !== 1) {
+          throw new DocsConflictAdoptionAbort("outbox_replaced");
+        }
+        outcome = { ok: true, serverPayload };
+      });
+      return outcome;
+    });
+  } catch (error) {
+    if (error instanceof DocsConflictAdoptionAbort) {
+      return { ok: false, reason: error.reason };
+    }
+    // A transaction failure is deliberately surfaced to the caller.  No
+    // partial local/UI update is allowed when the transaction cannot commit.
+    throw error;
+  }
 }
 
 export type ClipIngestOutlineLine = {
@@ -962,6 +1378,13 @@ export type ClipIngestTreeInput = {
   sortOrder: number;
   outline: readonly ClipIngestOutlineLine[];
   blocks?: readonly ClipIngestDocBlockInput[];
+  /** Durable operation receipt to complete in the same SQLite transaction. */
+  operation?: {
+    id: string;
+    operationKey: string;
+    authScope: string;
+    result: Record<string, unknown>;
+  };
 };
 
 /**
@@ -995,6 +1418,12 @@ export async function createClipIngestTree(
   // a mutation that the server will reject after ACL revocation.
   const parentRow = await getNodeRow(parentId);
   assertDocsWritable(parentRow);
+  if (
+    input.projectId !== undefined
+    && (input.projectId ?? null) !== (parentRow?.projectId ?? null)
+  ) {
+    throw new Error("親nodeと作成対象Projectが一致しません");
+  }
   const outline = input.outline.map((line) => ({
     text: String(line.text ?? "").trim(),
     children: (line.children ?? [])
@@ -1022,6 +1451,26 @@ export async function createClipIngestTree(
   const tokenValue = await getToken();
   const token = Boolean(tokenValue);
   const authScope = tokenValue ? getTokenAuthScope(tokenValue) : null;
+  if (
+    input.operation
+    && (!authScope || authScope !== input.operation.authScope)
+  ) {
+    throw new Error("ClipIngest operationの認証スコープが変わりました");
+  }
+  // A scoped local write must carry the same read projection as its parent.
+  // The live row/outbox alone is not enough after a restart: membership-aware
+  // reads intentionally hide dirty rows whose composite scope is not active
+  // for the current account.  Personal/unscoped rows (workspaceId = null) do
+  // not need a membership row and retain the legacy dirty-row visibility path.
+  const localScopeKey = docsScopeKeyForRow(parentRow);
+  const requiresScopedMembership = Boolean(
+    schema.docsScopeMembership
+    && parentRow?.workspaceId
+    && localScopeKey
+  );
+  if (requiresScopedMembership && !authScope) {
+    throw new Error("現在の認証スコープを確認できないためDocsへ保存できません");
+  }
   const db = getDb();
   const now = new Date().toISOString();
   const rootPageId = input.rootPageId ?? parentId;
@@ -1062,6 +1511,21 @@ export async function createClipIngestTree(
     updated_at: now,
     archived_at: null,
   };
+
+  let durableResultJson: string | null = null;
+  if (input.operation) {
+    try {
+      durableResultJson = JSON.stringify({
+        ...input.operation.result,
+        changed_node_id: rootId,
+        changed_node_title: rootNode.title,
+        open_node_id: rootId,
+        open_node_title: rootNode.title,
+      });
+    } catch {
+      throw new Error("ClipIngest operation結果をシリアライズできません");
+    }
+  }
   const nodes: DocsNode[] = [rootNode];
   let lineOrder = 1024;
   for (const line of outline) {
@@ -1181,18 +1645,184 @@ export async function createClipIngestTree(
     blockedReason: node.workspace_id ? null : "docs_scope_ambiguous",
   });
 
-  // ここから先は同期 transaction。callback 内で await せず、例外は SQLite
-  // が自動 rollback するため nodes/outbox が部分的に残らない。
-  db.transaction((tx) => {
-    for (const node of nodes) {
-      tx.insert(schema.knowledgeNodes).values(nodeValues(node)).run();
-    }
-    if (token) {
-      for (const node of nodes) {
-        tx.insert(schema.outbox).values(outboxValues(node)).run();
+  let replayNodeId: string | null = null;
+
+  // Complete foreground write unit: operation receipt + Docs nodes + outbox.
+  // Nothing awaits inside the native transaction, so any failure rolls back
+  // the entire unit and cannot leave a tree that replay would duplicate.
+  await runForegroundSqliteWrite(() => {
+    db.transaction((tx) => {
+      if (input.operation) {
+        const journal = tx
+          .select({
+            status: schema.pendingClipIngests.status,
+            delivery: schema.pendingClipIngests.delivery,
+            resultJson: schema.pendingClipIngests.resultJson,
+          })
+          .from(schema.pendingClipIngests)
+          .where(
+            and(
+              eq(schema.pendingClipIngests.id, input.operation.id),
+              eq(
+                schema.pendingClipIngests.operationKey,
+                input.operation.operationKey,
+              ),
+              eq(
+                schema.pendingClipIngests.authScope,
+                input.operation.authScope,
+              ),
+            ),
+          )
+          .get();
+        if (!journal) {
+          throw new Error("ClipIngest operation journalが見つかりません");
+        }
+        if (journal.status === "local_succeeded") {
+          try {
+            const receipt = JSON.parse(String(journal.resultJson || "{}")) as {
+              open_node_id?: unknown;
+            };
+            if (typeof receipt.open_node_id !== "string") {
+              throw new Error("missing open_node_id");
+            }
+            replayNodeId = receipt.open_node_id;
+            return;
+          } catch {
+            throw new Error("ClipIngest operation receiptが壊れています");
+          }
+        }
+        if (
+          journal.status !== "local_pending"
+          || journal.delivery !== "local"
+        ) {
+          throw new Error(
+            `ClipIngest local operation is not writable: ${journal.status}`,
+          );
+        }
       }
-    }
+
+      // Validate the parent's current membership in the same SQLite snapshot
+      // as the child inserts.  Copying the stale access/read_only fields from
+      // the live parent row would re-expose a revoked or downgraded scope.
+      let membershipForCreate: {
+        scopeId: string;
+        projectId: string | null;
+        access: string | null;
+        readOnly: boolean | null;
+      } | null = null;
+      if (requiresScopedMembership) {
+        const parentMembership = tx
+          .select({
+            scopeId: schema.docsScopeMembership.scopeId,
+            projectId: schema.docsScopeMembership.projectId,
+            state: schema.docsScopeMembership.state,
+            access: schema.docsScopeMembership.access,
+            readOnly: schema.docsScopeMembership.readOnly,
+          })
+          .from(schema.docsScopeMembership)
+          .where(
+            and(
+              eq(schema.docsScopeMembership.authScope, authScope!),
+              eq(schema.docsScopeMembership.scopeKey, localScopeKey!),
+              eq(schema.docsScopeMembership.tableName, "knowledge_nodes"),
+              eq(schema.docsScopeMembership.entityKey, parentId),
+            ),
+          )
+          .get();
+        const parentWritable = Boolean(
+          parentMembership
+          && parentMembership.state === "active"
+          && parentMembership.readOnly !== true
+          && parentMembership.access !== "read"
+          && parentRow?.readOnly !== true
+          && parentRow?.access !== "read",
+        );
+        const scopeId = String(
+          parentMembership?.scopeId ?? parentRow?.workspaceId ?? "",
+        ).trim();
+        if (!parentWritable || !scopeId) {
+          throw new Error(
+            "取り込み先Docsの現在の認証スコープ権限を確認できないため保存できません",
+          );
+        }
+        membershipForCreate = {
+          scopeId,
+          projectId: parentMembership?.projectId
+            ?? parentRow?.projectId
+            ?? null,
+          access: parentMembership?.access
+            ?? parentRow?.access
+            ?? null,
+          readOnly: parentMembership?.readOnly
+            ?? parentRow?.readOnly
+            ?? false,
+        };
+      }
+
+      for (const node of nodes) {
+        tx.insert(schema.knowledgeNodes).values(nodeValues(node)).run();
+      }
+      if (membershipForCreate) {
+        for (const node of nodes) {
+          tx.insert(schema.docsScopeMembership)
+            .values({
+              authScope: authScope!,
+              scopeKey: localScopeKey!,
+              scopeId: membershipForCreate.scopeId,
+              projectId: membershipForCreate.projectId,
+              tableName: "knowledge_nodes",
+              entityKey: node.id,
+              state: "active",
+              access: membershipForCreate.access,
+              readOnly: membershipForCreate.readOnly,
+              updatedAt: now,
+            })
+            .run();
+        }
+      }
+      if (token) {
+        for (const node of nodes) {
+          tx.insert(schema.outbox).values(outboxValues(node)).run();
+        }
+      }
+      if (input.operation) {
+        tx
+          .update(schema.pendingClipIngests)
+          .set({
+            status: "local_succeeded",
+            resultJson: durableResultJson,
+            errorJson: null,
+            lastError: null,
+            terminalAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.pendingClipIngests.id, input.operation.id),
+              eq(
+                schema.pendingClipIngests.operationKey,
+                input.operation.operationKey,
+              ),
+              eq(
+                schema.pendingClipIngests.authScope,
+                input.operation.authScope,
+              ),
+              eq(schema.pendingClipIngests.status, "local_pending"),
+              eq(schema.pendingClipIngests.delivery, "local"),
+            ),
+          )
+          .run();
+      }
+    });
   });
+
+  if (replayNodeId) {
+    const replayNode = await getNodeRow(replayNodeId);
+    if (!replayNode) {
+      throw new Error("ClipIngest operation receiptの保存ノードが見つかりません");
+    }
+    return toNode(replayNode);
+  }
   return rootNode;
 }
 
@@ -1992,7 +2622,17 @@ function docsScopeKeyFromEntry(scope: DocsScopeSetEntry): string {
 }
 
 function docsTxRows(query: any): any[] | null {
-  if (typeof query?.all !== "function") return null;
+  if (typeof query?.all !== "function") {
+    if (typeof query?.get === "function") {
+      try {
+        const row = query.get();
+        return row == null ? [] : [row];
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }
   try {
     return query.all() as any[];
   } catch {
@@ -3322,39 +3962,11 @@ async function promoteDocsSyncRunCompatibility(
  * every read and write participates in one SQLite exclusive transaction.
  */
 
-type RawDocsMembership = {
-  auth_scope: string;
-  scope_key: string;
-  scope_id: string;
-  project_id: string | null;
-  table_name: string;
-  entity_key: string;
-  state: string;
-  access: string | null;
-  read_only: unknown;
-  updated_at?: string;
-};
-
-type RawDocsOutbox = {
-  op_id: string;
-  table_name: string;
-  entity_id: string;
-  docs_scope_key: string | null;
-  auth_scope?: string | null;
-};
-
 type RawDocsStaging = {
   table_name: string;
   entity_key: string;
   payload_json: unknown;
   is_tombstone: unknown;
-};
-
-type RawDirtyRows = {
-  nodes: Set<string>;
-  supertags: Set<string>;
-  nodeSupertags: Set<string>;
-  fieldValues: Set<string>;
 };
 
 function sqliteBoolean(value: unknown): boolean {
@@ -3384,93 +3996,6 @@ async function docsTxAll<T>(
   ...params: unknown[]
 ): Promise<T[]> {
   return tx.getAllAsync<T>(source, ...params);
-}
-
-async function loadDocsDirtyRowsTx(
-  tx: DocsSqliteAsyncTransaction,
-): Promise<RawDirtyRows> {
-  const nodes = await docsTxAll<{ id: string }>(
-    tx,
-    "SELECT id FROM knowledge_nodes WHERE dirty = 1",
-  );
-  const supertags = await docsTxAll<{ id: string }>(
-    tx,
-    "SELECT id FROM knowledge_supertags WHERE dirty = 1",
-  );
-  const nodeSupertags = await docsTxAll<{ node_id: string; supertag_id: string }>(
-    tx,
-    "SELECT node_id, supertag_id FROM knowledge_node_supertags WHERE dirty = 1",
-  );
-  const fieldValues = await docsTxAll<{ node_id: string; field_id: string }>(
-    tx,
-    "SELECT node_id, field_id FROM knowledge_field_values WHERE dirty = 1",
-  );
-  return {
-    nodes: new Set(nodes.map((row) => row.id)),
-    supertags: new Set(supertags.map((row) => row.id)),
-    nodeSupertags: new Set(
-      nodeSupertags.map((row) => `${row.node_id}:${row.supertag_id}`),
-    ),
-    fieldValues: new Set(
-      fieldValues.map((row) => `${row.node_id}:${row.field_id}`),
-    ),
-  };
-}
-
-async function loadDocsPreservationSetsTx(
-  tx: DocsSqliteAsyncTransaction,
-  table: string,
-  authScope: string,
-  scopeKey: string,
-): Promise<DocsPreservationSets> {
-  const outboxRows = await docsTxAll<{
-    entity_id: string;
-    auth_scope: string | null;
-    docs_scope_key: string | null;
-  }>(
-    tx,
-    "SELECT entity_id, auth_scope, docs_scope_key FROM outbox WHERE table_name = ?",
-    table,
-  );
-  const outbox = new Set(
-    outboxRows
-      .filter((row) =>
-        (row.auth_scope == null || row.auth_scope === authScope)
-        && (
-          !scopeKey
-          || !table.startsWith("knowledge_")
-          || row.docs_scope_key === scopeKey
-        ),
-      )
-      .map((row) => row.entity_id),
-  );
-  const dirty = new Set<string>();
-  if (table === "knowledge_nodes") {
-    const rows = await docsTxAll<{ id: string }>(
-      tx,
-      "SELECT id FROM knowledge_nodes WHERE dirty = 1",
-    );
-    for (const row of rows) dirty.add(row.id);
-  } else if (table === "knowledge_supertags") {
-    const rows = await docsTxAll<{ id: string }>(
-      tx,
-      "SELECT id FROM knowledge_supertags WHERE dirty = 1",
-    );
-    for (const row of rows) dirty.add(row.id);
-  } else if (table === "knowledge_node_supertags") {
-    const rows = await docsTxAll<{ node_id: string; supertag_id: string }>(
-      tx,
-      "SELECT node_id, supertag_id FROM knowledge_node_supertags WHERE dirty = 1",
-    );
-    for (const row of rows) dirty.add(`${row.node_id}:${row.supertag_id}`);
-  } else if (table === "knowledge_field_values") {
-    const rows = await docsTxAll<{ node_id: string; field_id: string }>(
-      tx,
-      "SELECT node_id, field_id FROM knowledge_field_values WHERE dirty = 1",
-    );
-    for (const row of rows) dirty.add(`${row.node_id}:${row.field_id}`);
-  }
-  return { outbox, dirty };
 }
 
 async function deleteDocsLiveRowAsync(
@@ -3647,45 +4172,22 @@ async function quarantineDocsScopeAsync(
   requestedScopeKey?: string,
 ): Promise<void> {
   const scopeKey = requestedScopeKey ?? docsScopeKeyFromEntry(scope);
-  const membershipRows = await docsTxAll<RawDocsMembership>(
+  const membership = await loadDocsQuarantineMembershipSnapshotTx(
     tx,
-    `SELECT auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
-            state, access, read_only, updated_at
-       FROM docs_scope_membership
-      WHERE auth_scope = ? AND scope_key = ?`,
     authScope,
     scopeKey,
+    mode,
   );
-  const allMembershipRows = await docsTxAll<RawDocsMembership>(
+  const outbox = await loadDocsQuarantineOutboxSnapshotTx(
     tx,
-    `SELECT auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
-            state, access, read_only, updated_at
-       FROM docs_scope_membership
-      WHERE auth_scope = ?`,
     authScope,
+    scopeKey,
+    DOCS_SCOPE_TABLE_NAMES,
   );
-  const outboxRows = await docsTxAll<RawDocsOutbox>(
-    tx,
-    `SELECT op_id, table_name, entity_id, docs_scope_key
-       FROM outbox WHERE auth_scope = ?`,
-    authScope,
-  );
-  const dirtyRows = await loadDocsDirtyRowsTx(tx);
-  const refs = new Map<string, number>();
-  for (const row of allMembershipRows) {
-    if (row.state === "deleted") continue;
-    const refKey = `${row.table_name}:${row.entity_key}`;
-    refs.set(refKey, (refs.get(refKey) ?? 0) + 1);
-  }
-  const scopedKeys = new Set(
-    membershipRows
-      .filter((row) => mode === "revoke" ? row.state !== "deleted" : row.state === "active")
-      .map((row) => `${row.table_name}:${row.entity_key}`),
-  );
-  const scopedOutboxRows = outboxRows.filter((row) =>
-    (DOCS_SCOPE_TABLE_NAMES as readonly string[]).includes(row.table_name)
-    && row.docs_scope_key === scopeKey,
-  );
+  const dirtyRows = await loadDocsDirtyRowsPagedTx(tx);
+  const refs = membership.refs;
+  const scopedKeys = membership.scopedKeys;
+  const scopedOutboxRows = outbox.rows;
   const dirtyKeys = new Set<string>();
   for (const id of dirtyRows.nodes) dirtyKeys.add(`knowledge_nodes:${id}`);
   for (const id of dirtyRows.supertags) dirtyKeys.add(`knowledge_supertags:${id}`);
@@ -3696,16 +4198,8 @@ async function quarantineDocsScopeAsync(
     const separator = compound.indexOf(":");
     const table = compound.slice(0, separator);
     const key = compound.slice(separator + 1);
-    const protectedRow = dirtyKeys.has(compound)
-      || scopedOutboxRows.some((row) => `${row.table_name}:${row.entity_id}` === compound);
-    const hasOtherWritableMembership = allMembershipRows.some(
-      (row) => row.table_name === table
-        && row.entity_key === key
-        && row.scope_key !== scopeKey
-        && row.state === "active"
-        && !sqliteBoolean(row.read_only)
-        && row.access !== "read",
-    );
+    const protectedRow = dirtyKeys.has(compound) || outbox.entityKeys.has(compound);
+    const hasOtherWritableMembership = membership.otherWritableKeys.has(compound);
     if (protectedRow) {
       if (mode === "downgrade" && table === "knowledge_nodes" && !hasOtherWritableMembership) {
         await tx.runAsync(
@@ -4058,60 +4552,38 @@ async function promoteDocsSyncRunAsync(
   const tableNames = [...DOCS_SCOPE_TABLE_NAMES];
   const scopeKey = options.scopeKey
     ?? `${options.scopeId ?? "personal"}|project:${options.projectId ?? ""}`;
+  const authoritativeByTable = await buildDocsAuthoritativeSets(
+    options.authoritative,
+    tableNames,
+  );
 
-  return withDocsExclusiveTransaction(async (tx) => {
+  return withForegroundYieldingDocsExclusiveTransaction(async (tx) => {
     // Everything below, including the protection snapshot, runs on the same
     // native transaction object.  No Drizzle query is allowed to observe or
     // mutate the promotion while it is in flight.
-    const membershipRows = await docsTxAll<RawDocsMembership>(
+    const membershipSnapshot = await loadDocsMembershipSnapshotTx(
       tx,
-      `SELECT auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
-              state, access, read_only, updated_at
-         FROM docs_scope_membership
-        WHERE auth_scope = ? AND scope_key = ?`,
       options.authScope,
       scopeKey,
     );
-    const allMembershipRows = await docsTxAll<RawDocsMembership>(
+    const outboxProtection = await loadDocsScopedOutboxProtectionTx(
       tx,
-      `SELECT auth_scope, scope_key, scope_id, project_id, table_name, entity_key,
-              state, access, read_only, updated_at
-         FROM docs_scope_membership
-        WHERE auth_scope = ?`,
       options.authScope,
+      scopeKey,
+      tableNames,
     );
-
-    const preservation = new Map<string, DocsPreservationSets>();
-    for (const table of tableNames) {
-      preservation.set(
-        table,
-        await loadDocsPreservationSetsTx(tx, table, options.authScope, scopeKey),
-      );
-    }
-    const dirty = await loadDocsDirtyRowsTx(tx);
+    const dirty = await loadDocsDirtyRowsPagedTx(tx);
     const isProtected = (table: string, key: string): boolean => {
-      const sets = preservation.get(table);
-      if (sets?.outbox.has(key)) return true;
+      if (outboxProtection.get(table)?.has(key)) return true;
       if (table === "knowledge_nodes" && dirty.nodes.has(key)) return true;
       if (table === "knowledge_supertags" && dirty.supertags.has(key)) return true;
       if (table === "knowledge_node_supertags" && dirty.nodeSupertags.has(key)) return true;
       if (table === "knowledge_field_values" && dirty.fieldValues.has(key)) return true;
-      return Boolean(sets?.dirty.has(key));
+      return false;
     };
 
-    const membershipRefs = new Map<string, number>();
-    for (const row of allMembershipRows) {
-      if (row.state === "deleted") continue;
-      const refKey = `${row.table_name}:${row.entity_key}`;
-      membershipRefs.set(refKey, (membershipRefs.get(refKey) ?? 0) + 1);
-    }
-    const scopedMembership = new Map<string, Set<string>>();
-    for (const row of membershipRows) {
-      if (row.state === "deleted") continue;
-      const bucket = scopedMembership.get(row.table_name) ?? new Set<string>();
-      bucket.add(row.entity_key);
-      scopedMembership.set(row.table_name, bucket);
-    }
+    const membershipRefs = membershipSnapshot.refs;
+    const scopedMembership = membershipSnapshot.scoped;
     const ensureMembership = (table: string, key: string): void => {
       const scopeBucket = scopedMembership.get(table) ?? new Set<string>();
       if (scopeBucket.has(key)) return;
@@ -4129,24 +4601,12 @@ async function promoteDocsSyncRunAsync(
       if (count > 0) membershipRefs.set(refKey, count);
       else membershipRefs.delete(refKey);
     };
-    const authoritativeIds = (table: string): Set<string> | null => {
-      const ids = options.authoritative[table]?.ids;
-      return ids == null ? null : new Set(ids);
-    };
+    const authoritativeIds = (table: string): Set<string> | null =>
+      authoritativeByTable.get(table) ?? null;
     const workspaceId = options.scopeId
       ?? options.authoritative.knowledge_nodes?.scopeId
       ?? options.authoritative.knowledge_supertags?.scopeId
       ?? options.authoritative.knowledge_fields?.scopeId;
-
-    const staleNodes = authoritativeIds("knowledge_nodes")
-      && [...(scopedMembership.get("knowledge_nodes") ?? new Set<string>())]
-        .filter((id) => !authoritativeIds("knowledge_nodes")!.has(id));
-    const staleSupertags = authoritativeIds("knowledge_supertags")
-      && [...(scopedMembership.get("knowledge_supertags") ?? new Set<string>())]
-        .filter((id) => !authoritativeIds("knowledge_supertags")!.has(id));
-    const staleFields = authoritativeIds("knowledge_fields")
-      && [...(scopedMembership.get("knowledge_fields") ?? new Set<string>())]
-        .filter((id) => !authoritativeIds("knowledge_fields")!.has(id));
 
     const upsertMembership = async (
       table: string,
@@ -4175,9 +4635,11 @@ async function promoteDocsSyncRunAsync(
     ): Promise<void> => setDocsConflictAsync(tx, options, scopeKey, table, key, payload);
 
     for (const table of tableNames) {
-      for (const key of authoritativeIds(table) ?? []) {
+      const ids = authoritativeIds(table);
+      if (!ids) continue;
+      await forEachDocsPromotionChunk(ids, (key) => {
         ensureMembership(table, key);
-      }
+      });
     }
 
     const stagedTelemetry: DocsSyncPromotionTelemetry = {
@@ -4281,60 +4743,85 @@ async function promoteDocsSyncRunAsync(
     // persist that membership before reconciliation just like the legacy
     // promotion path did.
     for (const table of tableNames) {
-      for (const key of authoritativeIds(table) ?? []) {
-        await upsertMembership(table, key);
-      }
+      const ids = authoritativeIds(table);
+      if (!ids) continue;
+      await forEachDocsPromotionChunk(ids, (key) =>
+        upsertMembership(table, key),
+      );
     }
     await applyStagedRows();
 
-    for (const id of staleNodes || []) {
-      if (isProtected("knowledge_nodes", id)) {
-        await blockMembershipTx("knowledge_nodes", id);
-        await setConflict("knowledge_nodes", id, {
-          id,
-          deleted: true,
-          authoritative_scope_id: workspaceId,
-        });
-        await tx.runAsync(
-          "UPDATE knowledge_nodes SET access = 'read', read_only = 1 WHERE id = ?",
-          id,
-        );
-        continue;
-      }
-      await removeMembershipTx("knowledge_nodes", id);
-      removeMembership("knowledge_nodes", id);
-      if (membershipRefs.has(`knowledge_nodes:${id}`)) continue;
-      await deleteDocsLiveRowAsync(tx, "knowledge_nodes", id);
+    const nodeAuthoritative = authoritativeIds("knowledge_nodes");
+    if (nodeAuthoritative) {
+      await forEachDocsPromotionChunk(
+        scopedMembership.get("knowledge_nodes") ?? [],
+        async (id) => {
+          if (nodeAuthoritative.has(id)) return;
+          if (isProtected("knowledge_nodes", id)) {
+            await blockMembershipTx("knowledge_nodes", id);
+            await setConflict("knowledge_nodes", id, {
+              id,
+              deleted: true,
+              authoritative_scope_id: workspaceId,
+            });
+            await tx.runAsync(
+              "UPDATE knowledge_nodes SET access = 'read', read_only = 1 WHERE id = ?",
+              id,
+            );
+            return;
+          }
+          await removeMembershipTx("knowledge_nodes", id);
+          removeMembership("knowledge_nodes", id);
+          if (membershipRefs.has(`knowledge_nodes:${id}`)) return;
+          await deleteDocsLiveRowAsync(tx, "knowledge_nodes", id);
+        },
+      );
     }
-    for (const id of staleSupertags || []) {
-      if (isProtected("knowledge_supertags", id)) {
-        await blockMembershipTx("knowledge_supertags", id);
-        await setConflict("knowledge_supertags", id, {
-          id,
-          deleted: true,
-          authoritative_scope_id: workspaceId,
-        });
-        continue;
-      }
-      await removeMembershipTx("knowledge_supertags", id);
-      removeMembership("knowledge_supertags", id);
-      if (membershipRefs.has(`knowledge_supertags:${id}`)) continue;
-      await deleteDocsLiveRowAsync(tx, "knowledge_supertags", id);
+
+    const supertagAuthoritative = authoritativeIds("knowledge_supertags");
+    if (supertagAuthoritative) {
+      await forEachDocsPromotionChunk(
+        scopedMembership.get("knowledge_supertags") ?? [],
+        async (id) => {
+          if (supertagAuthoritative.has(id)) return;
+          if (isProtected("knowledge_supertags", id)) {
+            await blockMembershipTx("knowledge_supertags", id);
+            await setConflict("knowledge_supertags", id, {
+              id,
+              deleted: true,
+              authoritative_scope_id: workspaceId,
+            });
+            return;
+          }
+          await removeMembershipTx("knowledge_supertags", id);
+          removeMembership("knowledge_supertags", id);
+          if (membershipRefs.has(`knowledge_supertags:${id}`)) return;
+          await deleteDocsLiveRowAsync(tx, "knowledge_supertags", id);
+        },
+      );
     }
-    for (const id of staleFields || []) {
-      if (isProtected("knowledge_fields", id)) {
-        await blockMembershipTx("knowledge_fields", id);
-        await setConflict("knowledge_fields", id, {
-          id,
-          deleted: true,
-          authoritative_scope_id: workspaceId,
-        });
-        continue;
-      }
-      await removeMembershipTx("knowledge_fields", id);
-      removeMembership("knowledge_fields", id);
-      if (membershipRefs.has(`knowledge_fields:${id}`)) continue;
-      await deleteDocsLiveRowAsync(tx, "knowledge_fields", id);
+
+    const fieldAuthoritative = authoritativeIds("knowledge_fields");
+    if (fieldAuthoritative) {
+      await forEachDocsPromotionChunk(
+        scopedMembership.get("knowledge_fields") ?? [],
+        async (id) => {
+          if (fieldAuthoritative.has(id)) return;
+          if (isProtected("knowledge_fields", id)) {
+            await blockMembershipTx("knowledge_fields", id);
+            await setConflict("knowledge_fields", id, {
+              id,
+              deleted: true,
+              authoritative_scope_id: workspaceId,
+            });
+            return;
+          }
+          await removeMembershipTx("knowledge_fields", id);
+          removeMembership("knowledge_fields", id);
+          if (membershipRefs.has(`knowledge_fields:${id}`)) return;
+          await deleteDocsLiveRowAsync(tx, "knowledge_fields", id);
+        },
+      );
     }
 
     const nodeScope = scopedMembership.get("knowledge_nodes") ?? new Set<string>();
@@ -4367,66 +4854,81 @@ async function promoteDocsSyncRunAsync(
       if (!membershipRefs.has(`${table}:${key}`)) await remove();
     };
     const nodeSupertagAuth = authoritativeIds("knowledge_node_supertags");
-    for (const key of [...(scopedMembership.get("knowledge_node_supertags") ?? new Set<string>())]) {
-      const [nodeId, supertagId] = key.split(":", 2);
-      await reconcileRelation(
-        "knowledge_node_supertags",
-        key,
-        nodeScope.has(nodeId) || supertagScope.has(supertagId),
-        nodeSupertagAuth,
-        () => deleteDocsLiveRowAsync(tx, "knowledge_node_supertags", key),
-      );
-    }
+    await forEachDocsPromotionChunk(
+      scopedMembership.get("knowledge_node_supertags") ?? [],
+      async (key) => {
+        const [nodeId, supertagId] = key.split(":", 2);
+        await reconcileRelation(
+          "knowledge_node_supertags",
+          key,
+          nodeScope.has(nodeId) || supertagScope.has(supertagId),
+          nodeSupertagAuth,
+          () => deleteDocsLiveRowAsync(tx, "knowledge_node_supertags", key),
+        );
+      },
+    );
     const fieldValueAuth = authoritativeIds("knowledge_field_values");
-    for (const key of [...(scopedMembership.get("knowledge_field_values") ?? new Set<string>())]) {
-      const [nodeId, fieldId] = key.split(":", 2);
-      await reconcileRelation(
-        "knowledge_field_values",
-        key,
-        nodeScope.has(nodeId) || fieldScope.has(fieldId),
-        fieldValueAuth,
-        () => deleteDocsLiveRowAsync(tx, "knowledge_field_values", key),
-      );
-    }
+    await forEachDocsPromotionChunk(
+      scopedMembership.get("knowledge_field_values") ?? [],
+      async (key) => {
+        const [nodeId, fieldId] = key.split(":", 2);
+        await reconcileRelation(
+          "knowledge_field_values",
+          key,
+          nodeScope.has(nodeId) || fieldScope.has(fieldId),
+          fieldValueAuth,
+          () => deleteDocsLiveRowAsync(tx, "knowledge_field_values", key),
+        );
+      },
+    );
     const supertagFieldAuth = authoritativeIds("knowledge_supertag_fields");
-    for (const key of [...(scopedMembership.get("knowledge_supertag_fields") ?? new Set<string>())]) {
-      const [supertagId, fieldId] = key.split(":", 2);
-      await reconcileRelation(
-        "knowledge_supertag_fields",
-        key,
-        supertagScope.has(supertagId) || fieldScope.has(fieldId),
-        supertagFieldAuth,
-        () => deleteDocsLiveRowAsync(tx, "knowledge_supertag_fields", key),
-      );
-    }
+    await forEachDocsPromotionChunk(
+      scopedMembership.get("knowledge_supertag_fields") ?? [],
+      async (key) => {
+        const [supertagId, fieldId] = key.split(":", 2);
+        await reconcileRelation(
+          "knowledge_supertag_fields",
+          key,
+          supertagScope.has(supertagId) || fieldScope.has(fieldId),
+          supertagFieldAuth,
+          () => deleteDocsLiveRowAsync(tx, "knowledge_supertag_fields", key),
+        );
+      },
+    );
     const placementAuth = authoritativeIds("knowledge_node_placements");
-    for (const key of [...(scopedMembership.get("knowledge_node_placements") ?? new Set<string>())]) {
-      if (!placementAuth || placementAuth.has(key)) continue;
-      if (isProtected("knowledge_node_placements", key)) {
-        await blockMembershipTx("knowledge_node_placements", key);
-        await setConflict("knowledge_node_placements", key, { id: key, deleted: true });
-        continue;
-      }
-      await removeMembershipTx("knowledge_node_placements", key);
-      removeMembership("knowledge_node_placements", key);
-      if (!membershipRefs.has(`knowledge_node_placements:${key}`)) {
-        await deleteDocsLiveRowAsync(tx, "knowledge_node_placements", key);
-      }
-    }
+    await forEachDocsPromotionChunk(
+      scopedMembership.get("knowledge_node_placements") ?? [],
+      async (key) => {
+        if (!placementAuth || placementAuth.has(key)) return;
+        if (isProtected("knowledge_node_placements", key)) {
+          await blockMembershipTx("knowledge_node_placements", key);
+          await setConflict("knowledge_node_placements", key, { id: key, deleted: true });
+          return;
+        }
+        await removeMembershipTx("knowledge_node_placements", key);
+        removeMembership("knowledge_node_placements", key);
+        if (!membershipRefs.has(`knowledge_node_placements:${key}`)) {
+          await deleteDocsLiveRowAsync(tx, "knowledge_node_placements", key);
+        }
+      },
+    );
     const edgeAuth = authoritativeIds("knowledge_edges");
-    for (const key of [...(scopedMembership.get("knowledge_edges") ?? new Set<string>())]) {
-      if (!edgeAuth || edgeAuth.has(key)) continue;
-      if (isProtected("knowledge_edges", key)) {
-        await blockMembershipTx("knowledge_edges", key);
-        await setConflict("knowledge_edges", key, { id: key, deleted: true });
-        continue;
-      }
-      await removeMembershipTx("knowledge_edges", key);
-      removeMembership("knowledge_edges", key);
-      if (!membershipRefs.has(`knowledge_edges:${key}`)) {
-        await deleteDocsLiveRowAsync(tx, "knowledge_edges", key);
-      }
-    }
+    await forEachDocsPromotionChunk(
+      scopedMembership.get("knowledge_edges") ?? [],
+      async (key) => {
+        if (!edgeAuth || edgeAuth.has(key)) return;
+        if (isProtected("knowledge_edges", key)) {
+          await blockMembershipTx("knowledge_edges", key);
+          await setConflict("knowledge_edges", key, { id: key, deleted: true });
+          return;
+        }
+        await removeMembershipTx("knowledge_edges", key);
+        removeMembership("knowledge_edges", key);
+        if (!membershipRefs.has(`knowledge_edges:${key}`)) {
+          await deleteDocsLiveRowAsync(tx, "knowledge_edges", key);
+        }
+      },
+    );
 
     if (options.scopeSet) {
       const nextKeys = new Set(options.scopeSet.newScopes.map(docsScopeKeyFromEntry));
@@ -5256,22 +5758,44 @@ export const docsRepo = {
     const db = getDb();
     const id = randomId();
     const now = new Date().toISOString();
+    const rawTitle = input.title ?? "";
+    const title = rawTitle.trim().length === 0 ? "" : rawTitle;
     const parentId = input.parentId ?? null;
     const parent = parentId ? await getNodeRow(parentId) : null;
+    if (
+      parent
+      && input.projectId !== undefined
+      && (input.projectId ?? null) !== (parent.projectId ?? null)
+    ) {
+      throw new Error("親nodeと作成対象Projectが一致しません");
+    }
+    const projectId = input.projectId !== undefined
+      ? input.projectId ?? null
+      : parent?.projectId ?? null;
     if (parentId) assertDocsWritable(parent);
+    if (parent?.archivedAt) throw new Error("アーカイブ済みnodeの下には作成できません");
+     if (parent?.systemKey?.trim() === "project_information_root" && projectId == null) {
+      throw new Error("案件情報hub直下にはProject経由でのみ作成できます");
+    }
     const sortOrder =
       typeof input.sortOrder === "number"
         ? input.sortOrder
         : await nextSortOrder(parentId);
-    const projectId = input.projectId !== undefined
-      ? input.projectId ?? null
-      : parent?.projectId ?? null;
     // root_page_id はサーバ権威。ローカルは親から推定し、pull で正規化される。
     let rootPageId: string | null = null;
     if (parentId) {
       rootPageId = parent?.rootPageId ?? parent?.id ?? null;
     }
     const nodeType = input.nodeType ?? "node";
+    // Empty outline rows are first-class content, but they must carry the
+    // same discriminator that the server validates.  Normalize every local
+    // ``title: ""`` create before applying it to SQLite or enqueueing it so
+    // Enter/createSibling cannot produce a legacy naked empty node.
+    const explicitBlank = nodeType === "node" && title === "";
+    const bodyJson = explicitBlank
+      ? blankParagraphBodyJson(input.bodyJson)
+      : input.bodyJson ?? null;
+    const bodyText = explicitBlank ? "" : input.bodyText ?? null;
     const sourceRefs = sanitizeClipIngestSourceRefs(input.sourceRefs);
     const node: DocsNode = {
       id,
@@ -5283,12 +5807,13 @@ export const docsRepo = {
       access: parent?.access ?? "write",
       read_only: parent?.readOnly ?? false,
       system_key: null,
-      title: input.title ?? "",
+      title,
       aliases: [],
       description: input.description ?? null,
-      body_json: input.bodyJson ?? null,
-      body_text: input.bodyText ?? null,
+      body_json: bodyJson,
+      body_text: bodyText,
       node_type: nodeType as DocsNode["node_type"],
+      is_explicit_blank: explicitBlank,
       display_props: null,
       query_json: null,
       view_json: null,
@@ -5321,7 +5846,7 @@ export const docsRepo = {
           node_type: nodeType,
           day_date: node.day_date,
           sort_order: sortOrder,
-          ...(input.bodyJson ? { body_json: input.bodyJson } : {}),
+          ...(node.body_json !== null ? { body_json: node.body_json } : {}),
           ...(sourceRefs.length ? { source_refs: sourceRefs } : {}),
         },
       });
@@ -5383,27 +5908,91 @@ export const docsRepo = {
     const db = getDb();
     const before = await getNodeRow(id);
     assertDocsWritable(before);
+    if ("projectId" in patch && (patch.projectId ?? null) !== (before?.projectId ?? null)) {
+      // Project ownership is established by dedicated task/Project routes and
+      // server-side ACLs.  An offline generic Docs edit must never rebind a
+      // node across Projects (or detach it) and later replay that mutation.
+      throw new Error("Docs nodeのProject所属は通常の更新では変更できません");
+    }
     const now = new Date().toISOString();
     const localSet: Partial<typeof schema.knowledgeNodes.$inferInsert> = {
       updatedAt: now,
       dirty: true,
     };
     const payload: Record<string, unknown> = {};
-    if ("title" in patch && patch.title !== undefined) {
-      localSet.title = patch.title;
-      payload.title = patch.title;
+    const titleProvided = "title" in patch && patch.title !== undefined;
+    const bodyJsonProvided = "bodyJson" in patch && patch.bodyJson !== undefined;
+    if (
+      (titleProvided || (bodyJsonProvided
+        && isExplicitBlankParagraph("", patch.bodyJson, before?.nodeType ?? "node")))
+       && (before?.systemKey?.trim() === "project_information_root"
+         || (before?.systemKey?.trim() ?? "").startsWith("project_information:"))
+    ) {
+      // Project metadata owns canonical-root titles.  Keep the local row
+      // stable until the next authoritative pull rather than enqueuing a
+      // generic rename/blank operation that the server must reject.
+      return before ? toNode(before) : (await this.getNode(id))!;
+    }
+    const currentNodeType = before?.nodeType ?? "node";
+    const wasExplicitBlank = before
+      ? isExplicitBlankParagraph(before.title, before.bodyJson, currentNodeType)
+      : false;
+    const rawNextTitle = titleProvided ? (patch.title as string) : before?.title ?? "";
+    const normalizedNextTitle = titleProvided
+      ? rawNextTitle.trim().length === 0 ? "" : rawNextTitle
+      : rawNextTitle;
+    // Typed markdown/code labels are not outline paragraphs.  Do not turn a
+    // cleared block label into a paragraph marker (which would discard its
+    // block identity); retain its existing label instead.
+    const nextTitle = titleProvided
+      && normalizedNextTitle === ""
+      && isEditableDocsBlockBody(before?.bodyJson)
+      ? (before?.title?.trim() || "本文")
+      : normalizedNextTitle;
+    // A cleared ordinary paragraph remains a real, persistent blank row.  The
+    // body marker is required in the same mutation as the empty title so the
+    // server can distinguish it from a malformed/naked empty node.
+    const requestedExplicitBlank = titleProvided
+      && nextTitle === ""
+      && currentNodeType === "node";
+    if (titleProvided) {
+      localSet.title = nextTitle;
+      payload.title = nextTitle;
+      if (requestedExplicitBlank) {
+        const canonicalBody = blankParagraphBodyJson(
+          bodyJsonProvided ? patch.bodyJson : before?.bodyJson,
+        );
+        localSet.bodyJson = canonicalBody;
+        localSet.bodyText = "";
+        payload.body_json = canonicalBody;
+        payload.body_text = "";
+      } else if (wasExplicitBlank && nextTitle !== "") {
+        // Leaving a blank paragraph removes only the marker; retain any
+        // unrelated body metadata and mirror the new title in body_text.
+        const nextBody = clearBlankParagraphMarker(
+          bodyJsonProvided ? patch.bodyJson : before?.bodyJson,
+        );
+        localSet.bodyJson = nextBody;
+        localSet.bodyText = patch.bodyText ?? nextTitle;
+        payload.body_json = nextBody;
+        payload.body_text = patch.bodyText ?? nextTitle;
+      }
     }
     if ("description" in patch && patch.description !== undefined) {
       localSet.description = patch.description;
       payload.description = patch.description;
     }
-    if ("bodyJson" in patch && patch.bodyJson !== undefined) {
+    if (bodyJsonProvided && !requestedExplicitBlank && !(wasExplicitBlank && titleProvided && patch.title !== "")) {
       localSet.bodyJson = patch.bodyJson as unknown;
       payload.body_json = patch.bodyJson;
     }
     if ("bodyText" in patch && patch.bodyText !== undefined) {
-      localSet.bodyText = patch.bodyText;
-      payload.body_text = patch.bodyText;
+      // Explicit blanks always carry an empty body_text mirror, even when a
+      // caller accidentally supplies stale/non-empty body text alongside the
+      // clear operation.
+      const bodyText = requestedExplicitBlank ? "" : patch.bodyText;
+      localSet.bodyText = bodyText;
+      payload.body_text = bodyText;
     }
     if ("sourceRefs" in patch && patch.sourceRefs !== undefined) {
       const sourceRefs = sanitizeClipIngestSourceRefs(patch.sourceRefs);
@@ -5420,21 +6009,28 @@ export const docsRepo = {
       localSet.projectId = patch.projectId ?? null;
       payload.project_id = patch.projectId ?? null;
     }
-    await db
-      .update(schema.knowledgeNodes)
-      .set(localSet)
-      .where(eq(schema.knowledgeNodes.id, id));
-    if (Object.keys(payload).length && (await hasToken())) {
-      await enqueueOutbox({
-        table: "knowledge_nodes",
-        action: "update",
-        entityId: id,
-        payload,
-        baseUpdatedAt: before?.serverUpdatedAt ?? null,
-        basePayload: before ? toNode(before) : null,
-        docsScopeKey: docsScopeKeyForRow(before),
-      });
-    }
+    const tokenAvailable = await hasToken();
+    // Serialize the complete foreground Docs edit unit with conflict
+    // adoption.  Without this coordinator boundary a server-adopt transaction
+    // could commit between the live-row update and outbox merge, replacing the
+    // newer local value in the live cache while the outbox still held it.
+    await runForegroundSqliteWrite(async () => {
+      await db
+        .update(schema.knowledgeNodes)
+        .set(localSet)
+        .where(eq(schema.knowledgeNodes.id, id));
+      if (Object.keys(payload).length && tokenAvailable) {
+        await enqueueOutbox({
+          table: "knowledge_nodes",
+          action: "update",
+          entityId: id,
+          payload,
+          baseUpdatedAt: before?.serverUpdatedAt ?? null,
+          basePayload: before ? toNode(before) : null,
+          docsScopeKey: docsScopeKeyForRow(before),
+        });
+      }
+    });
     const after = await getNodeRow(id);
     return after ? toNode(after) : (await this.getNode(id))!;
   },
@@ -5450,6 +6046,21 @@ export const docsRepo = {
     const newParent = await getNodeRow(newParentId);
     assertDocsWritable(before);
     assertDocsWritable(newParent);
+    if (newParent?.archivedAt) throw new Error("アーカイブ済みnodeの下には移動できません");
+    if ((before?.projectId ?? null) !== (newParent?.projectId ?? null)) {
+      // The server rejects cross-Project reparenting.  Reject it before the
+      // optimistic SQLite/root-page rewrite so an offline retry cannot leave a
+      // permanent local hierarchy that the next pull must quarantine.
+      throw new Error("異なるProject間ではDocs nodeを移動できません");
+    }
+    if (newParent?.systemKey?.trim() === "project_information_root") {
+      throw new Error("案件情報hub直下への通常のDocs moveはできません");
+    }
+    const beforeNode = before ? toNode(before) : null;
+    if (beforeNode && (beforeNode.system_key?.trim() === "project_information_root"
+      || (beforeNode.system_key?.trim() ?? "").startsWith("project_information:"))) {
+      throw new Error("案件情報の正本nodeは通常のDocs moveでは移動できません");
+    }
     const nextRootPageId = newParent?.rootPageId ?? newParent?.id ?? newParentId;
     const now = new Date().toISOString();
     const nextSort =
@@ -5567,18 +6178,63 @@ export const docsRepo = {
     const db = getDb();
     const before = await getNodeRow(id);
     assertDocsWritable(before);
+    const beforeNode = before ? toNode(before) : null;
+    if (beforeNode && (beforeNode.system_key?.trim() === "project_information_root"
+      || (beforeNode.system_key?.trim() ?? "").startsWith("project_information:"))) {
+      throw new Error("案件情報の正本nodeは通常のDocs archiveでは変更できません");
+    }
     const now = new Date().toISOString();
-    // ローカルは archivedAt を立てる（deletedAt は立てない: アーカイブ表示のため）。
+    // The server archives the complete subtree.  Mirror that closure locally
+    // so a mobile outline cannot show active descendants after an offline
+    // archive request (the single outbox operation remains the root delete).
+    const placements = await db
+      .select({
+        id: schema.knowledgeNodes.id,
+        parentId: schema.knowledgeNodes.parentId,
+        archivedAt: schema.knowledgeNodes.archivedAt,
+        dirty: schema.knowledgeNodes.dirty,
+      })
+      .from(schema.knowledgeNodes);
+    const descendants: string[] = [];
+    const pending = [id];
+    while (pending.length > 0) {
+      const parentId = pending.shift()!;
+      for (const row of placements) {
+        if (row.parentId !== parentId || row.id === id || descendants.includes(row.id)) continue;
+        descendants.push(row.id);
+        pending.push(row.id);
+      }
+    }
     await db
       .update(schema.knowledgeNodes)
       .set({ archivedAt: now, updatedAt: now, dirty: true })
-      .where(eq(schema.knowledgeNodes.id, id));
+      .where(inArray(schema.knowledgeNodes.id, [id, ...descendants]));
     if (await hasToken()) {
+      const archivedNodeIds = [id, ...descendants];
+      const previousArchivedAt = Object.fromEntries(
+        placements
+          .filter((row) => archivedNodeIds.includes(row.id))
+          .map((row) => [row.id, row.archivedAt ?? null]),
+      );
+      const previousDirty = Object.fromEntries(
+        placements
+          .filter((row) => archivedNodeIds.includes(row.id))
+          .map((row) => [row.id, row.dirty === true]),
+      );
       await enqueueOutbox({
         table: "knowledge_nodes",
         action: "delete",
         entityId: id,
-        payload: {},
+        // Keep the optimistic closure snapshot with the operation.  If the
+        // server rejects the archive (for example an ancestor contains a
+        // protected Project pointer), sync can restore exactly the prior
+        // archived state instead of leaving a hidden local ghost.
+        payload: {
+          archived_node_ids: archivedNodeIds,
+          previous_archived_at: previousArchivedAt,
+          previous_dirty: previousDirty,
+          archive_updated_at: now,
+        },
         baseUpdatedAt: before?.serverUpdatedAt ?? null,
         basePayload: before ? toNode(before) : null,
         docsScopeKey: docsScopeKeyForRow(before),
@@ -5811,6 +6467,76 @@ export const docsRepo = {
     return supertag;
   },
 };
+
+/** Restore the local optimistic archive when the server rejects the delete.
+ * The operation payload contains the exact closure snapshot captured by
+ * archiveNode; older outbox rows fall back to the root id and a null prior
+ * archive timestamp. */
+export async function rollbackDocsArchiveOptimistic(
+  entityId: string,
+  rawPayload: unknown,
+): Promise<void> {
+  const db = getDb();
+  let payload: Record<string, unknown> = {};
+  if (typeof rawPayload === "string") {
+    try {
+      const parsed = JSON.parse(rawPayload);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        payload = parsed as Record<string, unknown>;
+      }
+    } catch {
+      payload = {};
+    }
+  } else if (rawPayload && typeof rawPayload === "object" && !Array.isArray(rawPayload)) {
+    payload = rawPayload as Record<string, unknown>;
+  }
+  const ids = Array.isArray(payload.archived_node_ids)
+    ? payload.archived_node_ids.filter((value): value is string => typeof value === "string" && Boolean(value))
+    : [entityId];
+  const archivedAtById = payload.previous_archived_at && typeof payload.previous_archived_at === "object"
+    ? payload.previous_archived_at as Record<string, unknown>
+    : {};
+  const dirtyById = payload.previous_dirty && typeof payload.previous_dirty === "object"
+    ? payload.previous_dirty as Record<string, unknown>
+    : {};
+  const archiveUpdatedAt = typeof payload.archive_updated_at === "string"
+    ? payload.archive_updated_at
+    : null;
+  for (const id of [...new Set(ids)]) {
+    const [current] = await db
+      .select({
+        archivedAt: schema.knowledgeNodes.archivedAt,
+        updatedAt: schema.knowledgeNodes.updatedAt,
+        dirty: schema.knowledgeNodes.dirty,
+      })
+      .from(schema.knowledgeNodes)
+      .where(eq(schema.knowledgeNodes.id, id));
+    // A newer local edit may have merged into the same outbox operation while
+    // the delete was in flight.  Do not roll that edit back; leave it dirty so
+    // the conflict/retry path can surface it to the user.
+    const hasNewerLocalEdit = Boolean(
+      archiveUpdatedAt
+      && current
+      && current.archivedAt === archiveUpdatedAt
+      && current.updatedAt !== archiveUpdatedAt,
+    );
+    // A newer edit keeps the optimistic archive timestamp but must become
+    // visible again when the delete is rejected.  Preserve its dirty bit and
+    // content; only an untouched archive restores the previous dirty state.
+    if (archiveUpdatedAt && current && current.archivedAt !== archiveUpdatedAt) continue;
+    const previousArchivedAt = archivedAtById[id];
+    const archivedAt = previousArchivedAt === null || typeof previousArchivedAt === "string"
+      ? previousArchivedAt as string | null
+      : null;
+    const dirty = hasNewerLocalEdit
+      ? current?.dirty === true
+      : typeof dirtyById[id] === "boolean" ? Boolean(dirtyById[id]) : false;
+    await db
+      .update(schema.knowledgeNodes)
+      .set({ archivedAt, dirty })
+      .where(eq(schema.knowledgeNodes.id, id));
+  }
+}
 
 function sortBySortThenTitle(a: DocsNode, b: DocsNode): number {
   const aSort =

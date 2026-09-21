@@ -52,7 +52,10 @@ export function useFilerOperations({
   });
 
   const deleteTargets = useCallback(
-    (targets: FilerDeleteTarget[], options?: { onDeleted?: () => void }) => {
+    (
+      targets: FilerDeleteTarget[],
+      options?: { onDeleted?: (deletedPaths?: string[]) => void },
+    ) => {
       const { capabilities, refresh, confirm } = paramsRef.current;
       return runFilerDelete({
         targets,

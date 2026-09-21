@@ -51,6 +51,18 @@ type ActiveGenerationEvent = {
  */
 export class ConversationGenerationEventGate {
   private active: ActiveGenerationEvent | null = null;
+  private retiredIds = new Set<string>();
+
+  acceptsStart(event: WSMessage): boolean {
+    return !generationTransportIds(event).some((id) => this.retiredIds.has(id));
+  }
+
+  acceptsToken(event: WSMessage, current: GenerationIdentity | null): boolean {
+    if (!current || !this.active || !sameGeneration(current, this.active.generation)) return false;
+    const ids = generationTransportIds(event);
+    return !ids.some((id) => this.retiredIds.has(id)) &&
+      (ids.length === 0 || ids.some((id) => this.active!.transportIds.has(id)));
+  }
 
   bind(event: WSMessage, generation: GenerationIdentity): void {
     this.bindTransportIds(generationTransportIds(event), generation);
@@ -89,11 +101,14 @@ export class ConversationGenerationEventGate {
 
   complete(expected: GenerationIdentity): void {
     if (this.active && sameGeneration(this.active.generation, expected)) {
+      for (const id of this.active.transportIds) this.retiredIds.add(id);
+      while (this.retiredIds.size > 256) this.retiredIds.delete(this.retiredIds.values().next().value!);
       this.active = null;
     }
   }
 
   reset(): void {
+    this.retiredIds.clear();
     this.active = null;
   }
 

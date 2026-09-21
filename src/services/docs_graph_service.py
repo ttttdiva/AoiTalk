@@ -5,15 +5,17 @@ from __future__ import annotations
 import os
 import re
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
 
-from sqlalchemy import String, and_, case, cast, delete, func, or_, select
+from sqlalchemy import String, and_, case, cast, delete, func, literal, or_, select, text, union_all
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
+from sqlalchemy import inspect as sa_inspect
 
 from ..memory.models import (
     KnowledgeEdge,
@@ -25,6 +27,7 @@ from ..memory.models import (
     KnowledgeRevision,
     KnowledgeSearchIndex,
     KnowledgeSupertag,
+    KnowledgeSupertagField,
     DocsLibrary,
     Project,
     Task,
@@ -41,12 +44,13 @@ from .docs_acl import (
     apply_docs_visibility,
     can_read_node,
     can_write_node,
-    docs_readable_node_predicate,
+    docs_node_renderable_predicate,
     library_can_write,
 )
 from .clip_ingest_policy import is_film_docs_node
 from .docs_scope import DocsScope
-from .task_management_service import TaskManagementService
+from .docs_consistency import docs_id_predicate
+from .task_management_service import TaskManagementError, TaskManagementService
 
 
 SYSTEM_TASK_TAG = "task"
@@ -57,6 +61,13 @@ TASK_FIELD_TO_TASK_UPDATE = {
     "task_priority": "priority",
     "task_project": "project_id",
 }
+
+# Python str.strip() whitespace, also used by the defensive email-tree check.
+_QUERY_STRIP_CHARS = (
+    "\t\n\v\f\r\x1c\x1d\x1e\x1f \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -125,21 +136,52 @@ class ParsedOutlineLine:
     fields: dict[str, str]
 
 
+@dataclass(frozen=True)
+class DocsQueryResult:
+    """A bounded Docs query page with exact match metadata.
+
+    ``nodes`` remains deliberately bounded by the caller's requested limit.
+    The count and grouping metadata are computed from the same ACL-filtered
+    candidate relation before offset/limit is applied. ``truncated`` means the
+    page omits any matches; ``has_more`` means matches follow this page.
+    """
+
+    nodes: list[KnowledgeNode]
+    total_matches: int
+    returned: int
+    truncated: bool
+    has_more: bool
+    group_counts: dict[str, int]
+    offset: int = 0
+
+    @property
+    def count(self) -> int:
+        """Compatibility alias for the historical returned-row count."""
+
+        return self.returned
+
+    @property
+    def next_offset(self) -> int | None:
+        return self.offset + self.returned if self.has_more and self.returned else None
+
+
 def _now() -> datetime:
     return datetime.utcnow()
 
 
 def _title_mirror(title: Any) -> str:
-    """title 由来の検索ミラー本文を返す（不変条件: 改行禁止・500字以内）。
+    """title 由来の検索ミラー本文を返す（不変条件: 改行禁止・20,000字以内、空白保持）。
 
     Web `docsNodeTitleMirror`（docs-node-writer.ts）と同一挙動。body_text は本文正本
     ではなく title のミラーであり、Web↔モバイル往復で検索インデックス・暗号化を
     一致させるためここで一元生成する。
     """
-    mirror = str(title or "").strip()
+    mirror = str(title or "")
     if "\n" in mirror or "\r" in mirror:
         raise ValueError("Docs node body_text mirror must not contain newlines")
-    return mirror[:500]
+    if len(mirror) > 20_000:
+        raise ValueError("Docs node title must be 20,000 characters or less")
+    return mirror
 
 
 def docs_searchable_body_text(body_text: Any, body_json: Any = None) -> str:
@@ -291,6 +333,21 @@ def _notify_docs_node_changed(docs_library_id: uuid.UUID, node_id: uuid.UUID) ->
 class DocsGraphService:
     """Operate on Docs nodes while preserving revisions and derived indexes."""
 
+    async def _project_pointer_for_node(self, node_id: uuid.UUID) -> Project | None:
+        """Return any persisted Project reverse pointer, including stale rows."""
+
+        if not isinstance(self.session, AsyncSession):
+            return None
+        result = await self.session.execute(
+            select(Project)
+            .where(Project.knowledge_node_id == node_id)
+            .limit(2)
+        )
+        rows = result.scalars().all()
+        if len(rows) > 1:
+            raise ValueError("複数のProjectが同じDocs nodeを参照しているため操作を中止しました")
+        return rows[0] if rows else None
+
     async def _canonical_project_for_node(self, node_id: uuid.UUID) -> Project | None:
         """Resolve the active Project reverse-pointer without fail-open errors.
 
@@ -304,15 +361,53 @@ class DocsGraphService:
 
         if not isinstance(self.session, AsyncSession):
             return None
-        result = await self.session.execute(
-            select(Project)
+        project = await self._project_pointer_for_node(node_id)
+        if project is None:
+            return None
+        node = await self.session.get(KnowledgeNode, node_id)
+        if (
+            node is None
+            or node.project_id != project.id
+            or str(getattr(node, "system_key", "") or "").strip()
+            != f"project_information:{project.id}"
+            or getattr(node, "node_type", "node") != "node"
+            or getattr(node, "is_explicit_blank", False) is True
+        ):
+            return None
+        library = await self.session.get(DocsLibrary, node.docs_library_id)
+        if (
+            library is None
+            or str(getattr(library, "library_type", "personal") or "personal").lower() != "personal"
+            or library.owner_user_id != project.owner_id
+            or node.archived_at is not None
+            or node.parent_id is None
+            or node.root_page_id != node.parent_id
+        ):
+            return None
+        parent = await self.session.get(KnowledgeNode, node.parent_id)
+        if (
+            parent is None
+            or parent.docs_library_id != library.id
+            or parent.system_key != "project_information_root"
+            or parent.title != "案件情報"
+            or parent.parent_id is not None
+            or parent.root_page_id not in (None, parent.id)
+            or parent.archived_at is not None
+        ):
+            return None
+        tag_result = await self.session.execute(
+            select(KnowledgeNodeSupertag.node_id)
+            .join(KnowledgeSupertag, KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id)
             .where(
-                Project.knowledge_node_id == node_id,
-                Project.deleted_at.is_(None),
+                KnowledgeNodeSupertag.node_id == node.id,
+                KnowledgeSupertag.docs_library_id == library.id,
+                KnowledgeSupertag.system_key == "project_info",
             )
             .limit(1)
         )
-        return result.scalars().first()
+        if tag_result.scalar_one_or_none() is None:
+            return None
+        return project
 
     async def _ensure_parent_title_available(
         self,
@@ -332,14 +427,17 @@ class DocsGraphService:
         # Lock the parent row so a concurrent rename of the parent cannot slip
         # in between this read check and the insert/update.
         locked_parent = await self.session.execute(
-            select(KnowledgeNode.title)
+            select(KnowledgeNode.title, KnowledgeNode.archived_at)
             .where(
                 KnowledgeNode.id == parent.id,
                 KnowledgeNode.docs_library_id == docs_library_id,
             )
             .with_for_update()
         )
-        parent_title = locked_parent.scalar_one_or_none()
+        parent_row = locked_parent.first()
+        if parent_row is not None and parent_row[1] is not None:
+            raise ValueError("アーカイブ済みnodeの下には作成/移動できません")
+        parent_title = parent_row[0] if parent_row is not None else None
         if parent_title is None:
             parent_title = getattr(parent, "title", None)
         if normalize_docs_title_identity(parent_title) == title_identity:
@@ -785,11 +883,23 @@ class DocsGraphService:
         docs_library_id = _resolve_docs_library_id(docs_library_id, workspace_id)
         if parent is not None and parent.docs_library_id != docs_library_id:
             raise ValueError("親nodeと作成先workspaceが一致しません")
+        if parent is not None and getattr(parent, "archived_at", None) is not None:
+            raise ValueError("アーカイブ済みnodeの下には作成できません")
         # Descendants inherit the canonical Project scope from their parent.
         # Resolve it before ACL enforcement so a writer does not need to send
-        # a redundant project_id for every child create.
-        if project_id is None and parent is not None:
-            project_id = _coerce_uuid(getattr(parent, "project_id", None))
+        # a redundant project_id for every child create.  An explicit mismatch
+        # is rejected rather than allowing a cross-Project bridge through a
+        # direct service caller that bypassed the REST preflight.
+        if parent is not None:
+            parent_project_id = _coerce_uuid(getattr(parent, "project_id", None))
+            if (
+                parent_project_id is not None
+                and project_id is not None
+                and _coerce_uuid(project_id) != parent_project_id
+            ):
+                raise ValueError("親nodeと作成対象Projectが一致しません")
+            if parent_project_id is not None:
+                project_id = parent_project_id
         if user_id is not None:
             if parent is not None:
                 await self._ensure_write_access(parent, user_id, project_id=project_id)
@@ -806,7 +916,7 @@ class DocsGraphService:
         root_page_id = None
         if parent is not None:
             root_page_id = parent.root_page_id or parent.id
-        clean_title = (title or "").strip()[:500]
+        clean_title = _title_mirror(title)
         normalized_body_json = (
             dict(body_json) if isinstance(body_json, dict) else {}
         )
@@ -814,14 +924,21 @@ class DocsGraphService:
             clean_title,
             normalized_body_json,
             node_type,
-        )
-        if not clean_title and not explicit_blank:
+        ) and not str(system_key or "").strip()
+        if not clean_title.strip() and not explicit_blank:
             raise ValueError("空行はDocs nodeとして保存できません")
         if clean_title and normalized_body_json.get("blank") is True:
             # ``blank`` is a discriminator, not arbitrary user metadata.  A
             # meaningful title must never be persisted with a stale marker.
             normalized_body_json = clear_blank_paragraph_marker(normalized_body_json)
-        if parent is not None and clean_title:
+        if (
+            parent is not None
+            and clean_title
+            # A Project-information root may intentionally have the same
+            # label as the Personal 案件情報 hub.  Ordinary children retain
+            # the parent-title uniqueness invariant.
+            and not str(system_key or "").strip().startswith("project_information:")
+        ):
             await self._ensure_parent_title_available(
                 docs_library_id=docs_library_id,
                 parent=parent,
@@ -837,7 +954,7 @@ class DocsGraphService:
             # body value through the legacy body_text argument.
             if body_text not in (None, ""):
                 raise ValueError("空paragraphのbody_textは空である必要があります")
-        elif str(body_text or "").strip() not in {"", body_text_value}:
+        elif str(body_text or "") not in {"", body_text_value}:
             raise ValueError("Docs body content must be represented by child nodes")
         node = KnowledgeNode(
             id=node_id if node_id is not None else uuid.uuid4(),
@@ -847,6 +964,7 @@ class DocsGraphService:
             project_id=project_id,
             system_key=system_key,
             title=clean_title,
+            is_explicit_blank=explicit_blank and not bool(system_key),
             body_text=body_text_value,
             body_json=normalized_body_json,
             node_type=node_type,
@@ -950,13 +1068,20 @@ class DocsGraphService:
         if existing.title != clean_title:
             existing.title = clean_title
             existing.body_text = clean_title
+            existing.is_explicit_blank = False
             changed = True
         expected_body_json = body_json or {}
         if existing.body_json != expected_body_json:
             existing.body_json = expected_body_json
+            existing.is_explicit_blank = False
             changed = True
         if existing.archived_at is not None:
             existing.archived_at = None
+            changed = True
+        if getattr(existing, "is_explicit_blank", False):
+            # System nodes are identity-bearing and must never be projected as
+            # user-created blank paragraphs.
+            existing.is_explicit_blank = False
             changed = True
         if changed:
             existing.updated_by = user_id
@@ -981,11 +1106,71 @@ class DocsGraphService:
         source_refs: list[dict[str, Any]] | None = None,
         change_summary: str = "nodeを更新",
     ) -> KnowledgeNode:
+        # Serialize direct/tool writes with Project pointer repair.  Read the
+        # current structural scope first, lock any relevant Project rows in a
+        # deterministic order, then lock the target node before evaluating
+        # canonical identity or mutating content.
+        if isinstance(self.session, AsyncSession):
+            node_identity = sa_inspect(node).identity
+            node_id = node_identity[0] if node_identity else node.id
+            current_result = await self.session.execute(
+                select(KnowledgeNode).where(KnowledgeNode.id == node_id).limit(1)
+            )
+            current_row = current_result.scalar_one_or_none()
+            if current_row is None:
+                raise ValueError("Docs node not found")
+            project_conditions: list[Any] = [Project.knowledge_node_id == node_id]
+            if current_row.project_id is not None:
+                project_conditions.append(Project.id == current_row.project_id)
+            await self.session.execute(
+                select(Project)
+                .where(or_(*project_conditions))
+                .order_by(Project.id)
+                .with_for_update()
+            )
+            locked_result = await self.session.execute(
+                select(KnowledgeNode).where(KnowledgeNode.id == node_id).with_for_update()
+            )
+            locked_node = locked_result.scalar_one_or_none()
+            if locked_node is None:
+                raise ValueError("Docs node not found")
+            node = locked_node
         await self._ensure_write_access(
             node,
             user_id,
             project_id=_coerce_uuid(getattr(node, "project_id", None)),
         )
+        pointer_project = await self._project_pointer_for_node(node.id)
+        canonical_project = await self._canonical_project_for_node(node.id)
+        if pointer_project is not None and canonical_project is None:
+            raise ValueError("Project canonical identityを確認できないためDocs操作を中止しました")
+        if canonical_project is not None:
+            if canonical_project.deleted_at is not None or bool(canonical_project.is_completed):
+                raise ValueError(
+                    "完了/削除済みProjectのcanonical情報rootは通常のDocs操作では変更できません"
+                )
+            # Project metadata owns the identity label.  Generic callers may
+            # retry a stale rename/blank clear, but the canonical root is
+            # normalized back to the current Project name and never receives
+            # an ordinary paragraph blank envelope.
+            title = str(canonical_project.name or "").strip() or "案件情報"
+            if isinstance(body_json, dict) and is_explicit_blank_paragraph(
+                "", body_json, getattr(node, "node_type", "node")
+            ):
+                body_json = None
+        identity_key = str(getattr(node, "system_key", "") or "").strip()
+        if identity_key == "project_information_root" or identity_key.startswith(
+            "project_information:"
+        ):
+            if pointer_project is None:
+                raise ValueError(
+                    "stale案件情報の正本nodeは専用クリーンアップ/修復経路でのみ変更できます"
+                )
+            title = str(title or "").strip() or str(node.title or "").strip() or "案件情報"
+            if isinstance(body_json, dict) and is_explicit_blank_paragraph(
+                "", body_json, getattr(node, "node_type", "node")
+            ):
+                body_json = None
         # ``body_json`` is the same-request discriminator for a persisted
         # blank paragraph.  Existing metadata is copied before we mutate it
         # so a nonblank transition removes only ``blank`` and never loses
@@ -995,24 +1180,40 @@ class DocsGraphService:
             dict(node.body_json) if isinstance(node.body_json, dict) else {}
         )
         next_title = node.title
-        explicit_blank = False
-        if title is not None:
-            next_title = title.strip()[:500]
-            explicit_blank = is_explicit_blank_paragraph(
+        # Keep the discriminator synchronized even for metadata-only updates.
+        # The ORM body_json property is decrypted at this boundary, so the
+        # strict body marker remains the semantic source of truth.
+        explicit_blank = (
+            not bool(getattr(node, "system_key", None))
+            and is_explicit_blank_paragraph(
                 next_title,
-                body_json,
+                current_body_json,
                 getattr(node, "node_type", "node"),
             )
-            if not next_title and not explicit_blank:
+        )
+        if title is not None:
+            next_title = _title_mirror(title)
+            explicit_blank = (
+                is_explicit_blank_paragraph(
+                    next_title,
+                    body_json,
+                    getattr(node, "node_type", "node"),
+                )
+                and not str(getattr(node, "system_key", "") or "").strip()
+            )
+            if not next_title.strip() and not explicit_blank:
                 raise ValueError("空行はDocs nodeとして保存できません")
         elif not next_title and supplied_body_json:
             # A metadata-only update of an already blank paragraph must carry
             # the marker in that same request as well; otherwise it would
             # silently turn the row into an invalid legacy blank.
-            explicit_blank = is_explicit_blank_paragraph(
-                next_title,
-                body_json,
-                getattr(node, "node_type", "node"),
+            explicit_blank = (
+                is_explicit_blank_paragraph(
+                    next_title,
+                    body_json,
+                    getattr(node, "node_type", "node"),
+                )
+                and not str(getattr(node, "system_key", "") or "").strip()
             )
             if not explicit_blank:
                 raise ValueError("空paragraphの更新にはblank markerが必要です")
@@ -1022,11 +1223,14 @@ class DocsGraphService:
                 parent = await self.session.get(KnowledgeNode, node.parent_id)
                 if parent is None:
                     raise ValueError("親nodeが見つかりません")
-                await self._ensure_parent_title_available(
-                    docs_library_id=node.docs_library_id,
-                    parent=parent,
-                    title=next_title,
-                )
+                if not str(getattr(node, "system_key", "") or "").strip().startswith(
+                    "project_information:"
+                ):
+                    await self._ensure_parent_title_available(
+                        docs_library_id=node.docs_library_id,
+                        parent=parent,
+                        title=next_title,
+                    )
             node.title = next_title
             # 不変条件(1.6a): title 変更のたび body_text ミラーを再計算する。
             node.body_text = _title_mirror(node.title)
@@ -1058,13 +1262,14 @@ class DocsGraphService:
             # A legacy malformed blank row must not be silently made valid by
             # an unrelated metadata/description update.
             raise ValueError("空行はDocs nodeとして保存できません")
+        node.is_explicit_blank = bool(explicit_blank and not getattr(node, "system_key", None))
         if body_text is not None:
             if not node.title:
                 if body_text not in (None, ""):
                     raise ValueError("空paragraphのbody_textは空である必要があります")
                 node.body_text = ""
             else:
-                requested = str(body_text).strip()
+                requested = str(body_text)
                 mirror = _title_mirror(node.title)
                 if requested not in {"", mirror}:
                     raise ValueError("Docs body content must be represented by child nodes")
@@ -1081,7 +1286,17 @@ class DocsGraphService:
         node: KnowledgeNode,
         tag: KnowledgeSupertag,
         user_id: uuid.UUID | None,
+        task_project_id: uuid.UUID | None = None,
     ) -> bool:
+        system_key = str(getattr(node, "system_key", "") or "").strip()
+        if system_key == "project_information_root" or system_key.startswith(
+            "project_information:"
+        ):
+            raise ValueError("案件情報の正本nodeは通常のDocs supertag操作で変更できません")
+        node_identity = sa_inspect(node).identity
+        node_id = node_identity[0] if node_identity else node.id
+        if await self._project_pointer_for_node(node_id) is not None or await self._canonical_project_for_node(node_id) is not None:
+            raise ValueError("Project canonical/stale nodeは通常のDocs supertag操作で変更できません")
         if tag.name.strip() == "倉庫":
             locked_result = await self.session.execute(
                 select(KnowledgeNode).where(
@@ -1111,7 +1326,9 @@ class DocsGraphService:
         )
         await self.session.flush()
         if tag.system_key == SYSTEM_TASK_TAG:
-            await self._ensure_bound_task(node=node, user_id=user_id)
+            await self._ensure_bound_task(
+                node=node, user_id=user_id, project_id=task_project_id,
+            )
         return True
 
     async def remove_tag(
@@ -1121,6 +1338,15 @@ class DocsGraphService:
         tag: KnowledgeSupertag,
         user_id: uuid.UUID | None,
     ) -> bool:
+        system_key = str(getattr(node, "system_key", "") or "").strip()
+        if system_key == "project_information_root" or system_key.startswith(
+            "project_information:"
+        ):
+            raise ValueError("案件情報の正本nodeは通常のDocs supertag操作で変更できません")
+        node_identity = sa_inspect(node).identity
+        node_id = node_identity[0] if node_identity else node.id
+        if await self._project_pointer_for_node(node_id) is not None or await self._canonical_project_for_node(node_id) is not None:
+            raise ValueError("Project canonical/stale nodeは通常のDocs supertag操作で変更できません")
         await self._ensure_write_access(
             node,
             user_id,
@@ -1138,7 +1364,13 @@ class DocsGraphService:
             await self._unlink_bound_task(node=node, user_id=user_id)
         return True
 
-    async def _ensure_bound_task(self, *, node: KnowledgeNode, user_id: uuid.UUID | None) -> None:
+    async def _ensure_bound_task(
+        self,
+        *,
+        node: KnowledgeNode,
+        user_id: uuid.UUID | None,
+        project_id: uuid.UUID | None = None,
+    ) -> None:
         if user_id is None:
             return
         existing = await self.session.execute(
@@ -1146,10 +1378,18 @@ class DocsGraphService:
         )
         if existing.scalar_one_or_none() is not None:
             return
+        # Default preserves historical direct-graph behavior: pass the node's
+        # project_id, including None, so create_task may ensure Inbox setup.
+        # An explicit override is the Agent prelock path only.
+        target_project_id = (
+            _coerce_uuid(project_id)
+            if project_id is not None
+            else _coerce_uuid(getattr(node, "project_id", None))
+        )
         await TaskManagementService().create_task(
             self.session,
             user_id=user_id,
-            project_id=node.project_id,
+            project_id=target_project_id,
             knowledge_node_id=node.id,
             title=node.title or "Untitled",
             description=node.description or None,
@@ -1159,6 +1399,18 @@ class DocsGraphService:
             task_metadata={"source": "docs", "knowledge_node_id": str(node.id)},
             commit=False,
         )
+
+    async def resolve_existing_inbox_project_for_task_bind(
+        self, user_id: uuid.UUID
+    ) -> Project:
+        """Return the actor's canonical Inbox Project without creating it."""
+        project = await ProjectRepository.get_user_inbox_project(self.session, user_id)
+        if project is None:
+            raise TaskManagementError(
+                "Inbox project is not available for this user",
+                status_code=503,
+            )
+        return project
 
     async def _unlink_bound_task(self, *, node: KnowledgeNode, user_id: uuid.UUID | None) -> None:
         if user_id is None:
@@ -1194,6 +1446,73 @@ class DocsGraphService:
             commit=False,
         )
 
+    async def resolve_schema_for_tag_ids(
+        self,
+        *,
+        docs_library_id: uuid.UUID,
+        tag_ids: Iterable[uuid.UUID],
+    ) -> tuple[set[uuid.UUID], dict[str, KnowledgeField]]:
+        """Resolve effective tags and Field refs from a direct-tag ID set.
+
+        Direct tags expand through same-library parent Supertags. Fields
+        include those owned by the effective tags and those shared onto them
+        via KnowledgeSupertagField. The Field map uses UUID, casefolded name,
+        and casefolded system_key keys.
+        """
+        seed_ids = sorted({uuid.UUID(str(tag_id)) for tag_id in tag_ids}, key=str)
+        if not seed_ids:
+            return set(), {}
+        seed_result = await self.session.execute(
+            select(KnowledgeSupertag.id).where(
+                KnowledgeSupertag.id.in_(seed_ids),
+                KnowledgeSupertag.docs_library_id == docs_library_id,
+            )
+        )
+        library_seed = list(seed_result.scalars().all())
+        if not library_seed:
+            return set(), {}
+        effective = select(KnowledgeSupertag.id, KnowledgeSupertag.parent_supertag_id).where(
+            KnowledgeSupertag.id.in_(library_seed),
+            KnowledgeSupertag.docs_library_id == docs_library_id,
+        ).cte("docs_effective_field_tags", recursive=True)
+        effective = effective.union(
+            select(KnowledgeSupertag.id, KnowledgeSupertag.parent_supertag_id).join(
+                effective, KnowledgeSupertag.id == effective.c.parent_supertag_id,
+            ).where(KnowledgeSupertag.docs_library_id == docs_library_id)
+        )
+        effective_tag_ids = set(
+            (await self.session.execute(select(effective.c.id))).scalars().all()
+        )
+        if not effective_tag_ids:
+            return set(), {}
+        field_result = await self.session.execute(
+            select(KnowledgeField)
+            .where(
+                or_(
+                    KnowledgeField.supertag_id.in_(sorted(effective_tag_ids, key=str)),
+                    select(KnowledgeSupertagField.field_id).where(
+                        KnowledgeSupertagField.field_id == KnowledgeField.id,
+                        KnowledgeSupertagField.supertag_id.in_(
+                            sorted(effective_tag_ids, key=str)
+                        ),
+                    ).exists(),
+                ),
+                KnowledgeField.docs_library_id == docs_library_id,
+                select(KnowledgeSupertag.id).where(
+                    KnowledgeSupertag.id == KnowledgeField.supertag_id,
+                    KnowledgeSupertag.docs_library_id == docs_library_id,
+                ).exists(),
+            )
+            .order_by(KnowledgeField.sort_order, KnowledgeField.created_at, KnowledgeField.id)
+        )
+        fields: dict[str, KnowledgeField] = {}
+        for field in field_result.scalars().all():
+            fields[str(field.id)] = field
+            fields[field.name.casefold()] = field
+            if field.system_key:
+                fields[field.system_key.casefold()] = field
+        return effective_tag_ids, fields
+
     async def resolve_node_fields(self, node: KnowledgeNode) -> dict[str, KnowledgeField]:
         tag_result = await self.session.execute(
             select(KnowledgeSupertag.id)
@@ -1203,22 +1522,10 @@ class DocsGraphService:
                 KnowledgeSupertag.docs_library_id == node.docs_library_id,
             )
         )
-        tag_ids = list(tag_result.scalars().all())
-        if not tag_ids:
-            return {}
-        field_result = await self.session.execute(
-            select(KnowledgeField)
-            .where(
-                KnowledgeField.supertag_id.in_(tag_ids),
-                KnowledgeField.docs_library_id == node.docs_library_id,
-            )
-            .order_by(KnowledgeField.sort_order, KnowledgeField.created_at)
+        _effective, fields = await self.resolve_schema_for_tag_ids(
+            docs_library_id=node.docs_library_id,
+            tag_ids=list(tag_result.scalars().all()),
         )
-        fields: dict[str, KnowledgeField] = {}
-        for field in field_result.scalars().all():
-            fields[field.name.casefold()] = field
-            if field.system_key:
-                fields[field.system_key.casefold()] = field
         return fields
 
     async def set_fields(
@@ -1228,6 +1535,16 @@ class DocsGraphService:
         values: dict[str, Any],
         user_id: uuid.UUID | None,
     ) -> dict[str, str]:
+        node_identity = sa_inspect(node).identity
+        node_id = node_identity[0] if node_identity else node.id
+        system_key = str(getattr(node, "system_key", "") or "").strip()
+        if (
+            system_key == "project_information_root"
+            or system_key.startswith("project_information:")
+            or await self._project_pointer_for_node(node_id) is not None
+            or await self._canonical_project_for_node(node_id) is not None
+        ):
+            raise ValueError("Project canonical/stale nodeは通常のDocs field操作で変更できません")
         await self._ensure_write_access(
             node,
             user_id,
@@ -1380,6 +1697,76 @@ class DocsGraphService:
         user_id: uuid.UUID | None,
         leave_reference: bool = False,
     ) -> KnowledgeNode:
+        node_identity = sa_inspect(node).identity
+        node_id = node_identity[0] if node_identity else node.id
+        if await self._project_pointer_for_node(node_id) is not None:
+            raise ValueError("Projectが参照するDocs nodeを含むため通常のDocs moveでは移動できません")
+        canonical_project = await self._canonical_project_for_node(node_id)
+        identity_system_key = str(getattr(node, "system_key", "") or "").strip()
+        if identity_system_key == "project_information_root" or identity_system_key.startswith(
+            "project_information:"
+        ):
+            raise ValueError("案件情報hubは通常のDocs moveでは移動できません")
+        # Moving an ancestor rewrites root_page_id for its complete subtree.
+        # Protect identity-bearing descendants even when a legacy row lost its
+        # reverse Project pointer; otherwise a stale canonical child can be
+        # buried under an ordinary move and become impossible to clean up.
+        closure_result = await self.session.execute(
+            text(
+                """
+                with recursive descendants as (
+                    select id, system_key, array[id]::uuid[] as visited_path, 0 as depth
+                    from knowledge_nodes
+                    where id = :node_id and docs_library_id = :library_id
+                    union all
+                    select child.id, child.system_key,
+                           parent.visited_path || array[child.id]::uuid[],
+                           parent.depth + 1
+                    from knowledge_nodes child
+                    join descendants parent on child.parent_id = parent.id
+                    where child.docs_library_id = :library_id
+                      and parent.depth < 512
+                      and not child.id = any(parent.visited_path)
+                )
+                select d.id, d.system_key, p.id as pointer_id
+                from descendants d
+                left join projects p on p.knowledge_node_id = d.id
+                """
+            ),
+            {"node_id": node.id, "library_id": node.docs_library_id},
+        )
+        closure_rows = closure_result.all()
+        if any(
+            row.id != node.id
+            and (
+                str(row.system_key or "").strip() == "project_information_root"
+                or str(row.system_key or "").strip().startswith("project_information:")
+            )
+            for row in closure_rows
+        ):
+            raise ValueError("Project canonical/stale identityを含むDocs subtreeは通常のmoveで変更できません")
+        if any(row.pointer_id is not None for row in closure_rows):
+            raise ValueError("Projectが参照するDocs nodeを含むため通常のDocs moveでは移動できません")
+        # Recheck the closure under row locks immediately before mutation. The
+        # Project rows are locked first (matching canonical repair), then the
+        # source/descendant nodes; a late pointer assignment cannot slip
+        # between the guard and root-page propagation.
+        if isinstance(self.session, AsyncSession) and closure_rows:
+            closure_ids = [row.id for row in closure_rows]
+            await self.session.execute(
+                select(Project.id)
+                .where(Project.knowledge_node_id.in_(closure_ids))
+                .order_by(Project.id)
+                .with_for_update()
+            )
+            await self.session.execute(
+                select(KnowledgeNode.id, KnowledgeNode.system_key)
+                .where(
+                    KnowledgeNode.docs_library_id == node.docs_library_id,
+                    KnowledgeNode.id.in_(closure_ids),
+                )
+                .with_for_update()
+            )
         node_library_id = _coerce_uuid(getattr(node, "docs_library_id", None))
         parent_library_id = _coerce_uuid(getattr(new_parent, "docs_library_id", None))
         if (
@@ -1411,7 +1798,6 @@ class DocsGraphService:
         # root pointer.  Moving that node under an arbitrary same-project
         # parent would silently destroy the canonical hierarchy; only the
         # validated owner Personal hub is an allowed destination.
-        canonical_project = await self._canonical_project_for_node(node.id)
         if canonical_project is not None:
             hub_ok = (
                 parent_project_id is None
@@ -1440,6 +1826,10 @@ class DocsGraphService:
             user_id,
             project_id=node_project_id,
         )
+        if getattr(new_parent, "archived_at", None) is not None:
+            raise ValueError("アーカイブ済みnodeの下には移動できません")
+        if str(getattr(new_parent, "system_key", "") or "").strip() == "project_information_root":
+            raise ValueError("案件情報hub直下への通常のDocs moveはできません")
         await self._ensure_write_access(
             new_parent,
             user_id,
@@ -1530,8 +1920,14 @@ class DocsGraphService:
             stack.extend(children.get(node.id, []))
 
     async def archive_node(self, *, node: KnowledgeNode, user_id: uuid.UUID | None) -> KnowledgeNode:
-        if await self._canonical_project_for_node(node.id) is not None:
-            raise ValueError("案件情報の正本rootはアーカイブできません")
+        identity_system_key = str(getattr(node, "system_key", "") or "").strip()
+        if (
+            identity_system_key == "project_information_root"
+            or identity_system_key.startswith("project_information:")
+            or await self._project_pointer_for_node(node.id) is not None
+            or await self._canonical_project_for_node(node.id) is not None
+        ):
+            raise ValueError("案件情報の正本/stale nodeはアーカイブできません")
         await self._ensure_write_access(
             node,
             user_id,
@@ -1553,29 +1949,90 @@ class DocsGraphService:
         user_id: uuid.UUID | None,
     ) -> list[KnowledgeNode]:
         """root以下を全てarchiveし、activeな孤児・検索結果を残さない。"""
-        if await self._canonical_project_for_node(root.id) is not None:
-            raise ValueError("案件情報の正本rootはアーカイブできません")
+        # Run the pointer/canonical authority checks before reading other ORM
+        # attributes.  A caller may have rolled back a prior operation, which
+        # expires those attributes; the fail-closed lookup must still surface
+        # its real outage instead of triggering an implicit async refresh.
+        root_identity = sa_inspect(root).identity
+        root_id = root_identity[0] if root_identity else root.id
+        if (
+            await self._project_pointer_for_node(root_id) is not None
+            or await self._canonical_project_for_node(root_id) is not None
+        ):
+            raise ValueError("案件情報の正本/stale nodeはアーカイブできません")
+        identity_system_key = str(getattr(root, "system_key", "") or "").strip()
+        if identity_system_key == "project_information_root" or identity_system_key.startswith("project_information:"):
+            raise ValueError("案件情報の正本/stale nodeはアーカイブできません")
         await self._ensure_write_access(
             root,
             user_id,
             project_id=_coerce_uuid(getattr(root, "project_id", None)),
         )
-        result = await self.session.execute(
-            select(KnowledgeNode).where(KnowledgeNode.docs_library_id == root.docs_library_id)
+        library_id = root.docs_library_id
+        root_id = root_id
+
+        async def snapshot_closure() -> list[tuple[uuid.UUID, int]]:
+            result = await self.session.execute(
+                text(
+                    """
+                    with recursive descendants as (
+                        select id, parent_id, array[id]::uuid[] as visited_path, 0 as depth
+                        from knowledge_nodes
+                        where id = :node_id and docs_library_id = :library_id
+                        union all
+                        select child.id, child.parent_id,
+                               parent.visited_path || array[child.id]::uuid[],
+                               parent.depth + 1
+                        from knowledge_nodes child
+                        join descendants parent on child.parent_id = parent.id
+                        where child.docs_library_id = :library_id
+                          and parent.depth < 512
+                          and not child.id = any(parent.visited_path)
+                    )
+                    select id, depth from descendants order by depth asc, id asc
+                    """
+                ),
+                {"node_id": root_id, "library_id": library_id},
+            )
+            return [(row.id, int(row.depth)) for row in result]
+
+        closure_snapshot = await snapshot_closure()
+        closure_ids = [item_id for item_id, _depth in closure_snapshot]
+        if not closure_ids:
+            raise ValueError("Docs subtreeが見つかりません")
+        pointer_result = await self.session.execute(
+            select(Project.id)
+            .where(Project.knowledge_node_id.in_(closure_ids))
+            .order_by(Project.id)
+            .with_for_update()
         )
-        children: dict[uuid.UUID | None, list[KnowledgeNode]] = {}
-        for node in result.scalars().all():
-            children.setdefault(node.parent_id, []).append(node)
-        ordered = [root]
-        cursor = 0
-        seen: set[uuid.UUID] = set()
-        while cursor < len(ordered):
-            node = ordered[cursor]
-            cursor += 1
-            if node.id in seen:
-                continue
-            seen.add(node.id)
-            ordered.extend(children.get(node.id, []))
+        if pointer_result.first() is not None:
+            raise ValueError("Projectが参照するDocs nodeを含むためアーカイブできません")
+        locked_result = await self.session.execute(
+            select(KnowledgeNode)
+            .where(
+                KnowledgeNode.docs_library_id == library_id,
+                KnowledgeNode.id.in_(closure_ids),
+            )
+            .with_for_update()
+        )
+        locked_nodes = list(locked_result.scalars().all())
+        if len(locked_nodes) != len(closure_ids):
+            raise ValueError("Docs subtreeが同時変更されたためアーカイブを中止しました")
+        fresh_snapshot = await snapshot_closure()
+        if {item_id for item_id, _depth in fresh_snapshot} != set(closure_ids):
+            raise ValueError("Docs subtreeが同時変更されたためアーカイブを中止しました")
+        depth_by_id = {item_id: depth for item_id, depth in closure_snapshot}
+        ordered = sorted(locked_nodes, key=lambda item: (depth_by_id.get(item.id, 0), item.id))
+        if any(
+            item.id != root_id
+            and (
+                str(getattr(item, "system_key", "") or "").strip() == "project_information_root"
+                or str(getattr(item, "system_key", "") or "").strip().startswith("project_information:")
+            )
+            for item in ordered
+        ):
+            raise ValueError("Project canonical/stale identityを含むDocs subtreeはアーカイブできません")
         archived: list[KnowledgeNode] = []
         for node in ordered:
             if node.archived_at is None:
@@ -1655,6 +2112,8 @@ class DocsGraphService:
                 user_id,
                 project_id=_coerce_uuid(getattr(existing, "project_id", None)),
             )
+            if getattr(existing, "is_explicit_blank", False):
+                existing.is_explicit_blank = False
             return existing
         # Web は rootPageId=parentId（直近の親）を採用するため、それを踏襲する。
         node = KnowledgeNode(
@@ -1662,7 +2121,8 @@ class DocsGraphService:
             docs_library_id=docs_library_id,
             parent_id=parent_id,
             root_page_id=parent_id,
-            title=title[:500],
+            is_explicit_blank=False,
+            title=_title_mirror(title),
             body_text=_title_mirror(title),
             body_json={"inline": [{"type": "text", "text": title}]},
             node_type=node_type,
@@ -1912,12 +2372,18 @@ class DocsGraphService:
         tag: str = "",
         limit: int = 20,
         user_id: uuid.UUID | None = None,
+        node_ids: Iterable[uuid.UUID] | None = None,
+        turn_project_id: uuid.UUID | None = None,
     ) -> list[KnowledgeNode]:
         docs_library_id = _resolve_docs_library_id(docs_library_id, workspace_id)
         stmt = (
             select(KnowledgeNode)
-            .join(KnowledgeSearchIndex, KnowledgeSearchIndex.node_id == KnowledgeNode.id)
-            .where(KnowledgeNode.docs_library_id == docs_library_id, KnowledgeNode.archived_at.is_(None))
+            .outerjoin(KnowledgeSearchIndex, KnowledgeSearchIndex.node_id == KnowledgeNode.id)
+            .where(
+                KnowledgeNode.docs_library_id == docs_library_id,
+                KnowledgeNode.archived_at.is_(None),
+                docs_node_renderable_predicate(KnowledgeNode),
+            )
         )
         if user_id is not None:
             library_row = await self.session.get(DocsLibrary, docs_library_id)
@@ -1933,6 +2399,8 @@ class DocsGraphService:
             )
         if project_id is not None:
             stmt = stmt.where(KnowledgeNode.project_id == project_id)
+        if node_ids is not None:
+            stmt = stmt.where(docs_id_predicate(KnowledgeNode.id, node_ids, self.session))
         id_rank = None
         if query.strip():
             query_text = query.strip()
@@ -1948,6 +2416,7 @@ class DocsGraphService:
                 .exists()
             )
             lexical_match = or_(
+                KnowledgeNode.title.ilike(like_term),
                 KnowledgeSearchIndex.title_text.ilike(like_term),
                 KnowledgeSearchIndex.body_text_plain.ilike(like_term),
                 email_body_match,
@@ -1985,7 +2454,12 @@ class DocsGraphService:
         order_columns = []
         if id_rank is not None:
             order_columns.append(id_rank)
-        order_columns.append(KnowledgeNode.updated_at.desc())
+        if query.strip():
+            order_columns.append(case((func.lower(KnowledgeNode.title) == query.strip().casefold(), 0), else_=1))
+        stmt = self._query_email_turn_visibility(
+            stmt, docs_library_id=docs_library_id, turn_project_id=turn_project_id,
+        )
+        order_columns.extend([KnowledgeNode.updated_at.desc(), KnowledgeNode.id])
         stmt = stmt.order_by(*order_columns).limit(max(1, min(int(limit or 20), 100)))
         result = await self.session.execute(stmt)
         return list(result.scalars().unique().all())
@@ -2077,27 +2551,48 @@ class DocsGraphService:
         query: str,
         docs_scope: DocsScope,
         limit: int = 20,
+        user_id: uuid.UUID | None = None,
+        tag: str = "",
+        turn_project_id: uuid.UUID | None = None,
     ) -> list[KnowledgeNode]:
-        """Search each allowed library, then enforce the resolved node lanes."""
+        """Constrain candidates by scope and current ACL before each search limit."""
 
         global_limit = min(int(limit or 0), 100)
         if global_limit <= 0 or not docs_scope.allowed_library_ids:
             return []
-        per_library_limit = min(global_limit, 20)
+        allowed_ids = set(docs_scope.canonical_node_ids) | set(docs_scope.related_node_ids)
+        if not allowed_ids:
+            return []
         candidates: list[KnowledgeNode] = []
         for library_id in docs_scope.allowed_library_ids:
-            candidates.extend(
-                await self.search(
+            try:
+                matches = await self.search(
                     docs_library_id=library_id,
                     query=query,
-                    limit=per_library_limit,
+                    limit=global_limit,
+                    user_id=user_id,
+                    tag=tag,
+                    node_ids=allowed_ids,
+                    turn_project_id=turn_project_id,
                 )
-            )
-        return self._merge_scoped_nodes(
+            except ValueError as exc:
+                if tag and str(exc).startswith("supertag not found:"):
+                    continue
+                raise
+            candidates.extend(matches)
+        ranked = self._merge_scoped_nodes(
             candidates=candidates,
             docs_scope=docs_scope,
-            limit=global_limit,
+            limit=len(candidates),
         )
+        text = query.strip().casefold()
+        prefix = text.replace("-", "")
+        identity = bool(re.fullmatch(r"[0-9a-f]{8,32}", prefix))
+        ranked.sort(key=lambda node: not (
+            (identity and str(node.id).replace("-", "").startswith(prefix))
+            or (text and node.title.casefold() == text)
+        ))
+        return ranked[:global_limit]
 
     async def outline_lines(
         self,
@@ -2187,6 +2682,7 @@ class DocsGraphService:
         nodes: list[KnowledgeNode],
         *,
         user_id: uuid.UUID | None = None,
+        include_parent_titles: bool = True,
     ) -> str:
         if user_id is not None:
             nodes = [
@@ -2200,15 +2696,19 @@ class DocsGraphService:
         tag_rows = await self.session.execute(
             select(KnowledgeNodeSupertag.node_id, KnowledgeSupertag.name)
             .join(KnowledgeSupertag, KnowledgeNodeSupertag.supertag_id == KnowledgeSupertag.id)
+            .join(KnowledgeNode, KnowledgeNode.id == KnowledgeNodeSupertag.node_id)
             .where(
                 KnowledgeNodeSupertag.node_id.in_(node_ids),
-                KnowledgeSupertag.docs_library_id == nodes[0].docs_library_id,
+                KnowledgeSupertag.docs_library_id == KnowledgeNode.docs_library_id,
             )
         )
         tags_by_node: dict[uuid.UUID, list[str]] = {}
         for node_id, tag_name in tag_rows.all():
             tags_by_node.setdefault(node_id, []).append(tag_name)
-        parents_by_node = await self._parent_titles(nodes, user_id=user_id)
+        parents_by_node = (
+            await self._parent_titles(nodes, user_id=user_id)
+            if include_parent_titles else {}
+        )
         lines = []
         for node in nodes:
             tags = " ".join(f"#{name}" for name in tags_by_node.get(node.id, [])[:5])
@@ -2401,6 +2901,7 @@ class DocsGraphService:
         node: KnowledgeNode,
         *,
         user_id: uuid.UUID | None = None,
+        turn_project_id: uuid.UUID | None = None,
     ) -> dict[str, str]:
         """Return current field name -> display value for a node.
 
@@ -2420,10 +2921,11 @@ class DocsGraphService:
         values: dict[str, str] = {}
         for field, value in result.all():
             if (
-                user_id is not None
-                and str(field.field_type or "") == "reference"
+                str(field.field_type or "") == "reference"
                 and value.target_node_id is not None
-                and not await can_read_node(self.session, value.target_node_id, user_id)
+                and not await self._query_reference_visible(
+                    value.target_node_id, user_id=user_id, turn_project_id=turn_project_id
+                )
             ):
                 continue
             rendered = self._format_field_value(field, value)
@@ -2448,6 +2950,760 @@ class DocsGraphService:
                     values[field.name] = raw.isoformat() if isinstance(raw, datetime) else str(raw)
         return values
 
+    async def _query_reference_visible(
+        self, target_id: uuid.UUID, *, user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None,
+    ) -> bool:
+        """References need both target ACL and the turn-local email boundary."""
+        if user_id is not None and not await can_read_node(self.session, target_id, user_id):
+            return False
+        turn_id = _coerce_uuid(turn_project_id)
+        if turn_id is None:
+            return True
+        target = await self.session.get(KnowledgeNode, target_id)
+        if target is None:
+            return False
+        if target.project_id is None or target.project_id == turn_id:
+            return True
+        stmt = self._query_email_turn_visibility(
+            select(KnowledgeNode.id).where(KnowledgeNode.id == target_id),
+            docs_library_id=target.docs_library_id, turn_project_id=turn_id,
+        )
+        result = await self.session.execute(stmt)
+        return result.scalar_one_or_none() is not None
+
+    @staticmethod
+    def _query_email_turn_visibility(
+        stmt: Any,
+        *,
+        docs_library_id: uuid.UUID,
+        turn_project_id: uuid.UUID | None,
+    ) -> Any:
+        """Exclude foreign-project email trees in the query relation.
+
+        The direct tool historically applied this rule after its bounded query
+        page was loaded.  Keeping the same rule in SQL makes exact counts and
+        group totals observe the same turn-local email boundary as returned
+        rows. The relation starts in one Library, records the first foreign
+        parent for tag parity, and uses UNION so malformed cycles terminate.
+        """
+
+        normalized_project_id = _coerce_uuid(turn_project_id)
+        if normalized_project_id is None:
+            return stmt
+
+        ancestors = (
+            select(
+                KnowledgeNode.id.label("descendant_id"),
+                KnowledgeNode.id.label("ancestor_id"),
+                KnowledgeNode.parent_id.label("ancestor_parent_id"),
+                KnowledgeNode.docs_library_id.label("docs_library_id"),
+                KnowledgeNode.system_key.label("system_key"),
+            )
+            .where(KnowledgeNode.docs_library_id == docs_library_id)
+            .cte(f"docs_query_email_ancestors_{docs_library_id.hex}", recursive=True)
+        )
+        parent = aliased(KnowledgeNode)
+        ancestors = ancestors.union(
+            select(
+                ancestors.c.descendant_id,
+                parent.id,
+                parent.parent_id,
+                parent.docs_library_id,
+                parent.system_key,
+            ).join(
+                parent,
+                and_(
+                    parent.id == ancestors.c.ancestor_parent_id,
+                    # The defensive traversal records the first foreign parent
+                    # for tag checking, then stops at that library boundary.
+                    ancestors.c.docs_library_id == docs_library_id,
+                ),
+            )
+        )
+        email_tag = (
+            select(literal(1))
+            .select_from(KnowledgeNodeSupertag)
+            .join(
+                KnowledgeSupertag,
+                KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+            )
+            .where(
+                KnowledgeNodeSupertag.node_id == ancestors.c.ancestor_id,
+                KnowledgeSupertag.docs_library_id == docs_library_id,
+                KnowledgeSupertag.system_key == "email",
+            )
+            .exists()
+        )
+        is_email_tree = (
+            select(literal(1))
+            .select_from(ancestors)
+            .where(
+                ancestors.c.descendant_id == KnowledgeNode.id,
+                or_(
+                    and_(
+                        ancestors.c.docs_library_id == docs_library_id,
+                        func.substr(
+                            func.btrim(ancestors.c.system_key, _QUERY_STRIP_CHARS), 1, 12
+                        ) == "project_mail",
+                    ),
+                    email_tag,
+                ),
+            )
+            .exists()
+        )
+        return stmt.where(
+            or_(
+                KnowledgeNode.project_id.is_(None),
+                KnowledgeNode.project_id == normalized_project_id,
+                ~is_email_tree,
+            )
+        )
+
+    async def _split_task_field_filters(
+        self,
+        *,
+        docs_library_id: uuid.UUID,
+        field_filters: dict[str, str] | None,
+    ) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+        """Separate SQL-safe, synthetic, and typed Docs field filters.
+
+        Ordinary ASCII text uses the shared SQL scalar. Typed, synthetic,
+        legacy JSON, and Unicode values use canonical Python resolution
+        (including reference ACL checks), as does their grouping.
+        """
+
+        filters = {
+            str(name): str(value)
+            for name, value in (field_filters or {}).items()
+            if str(name).strip()
+        }
+        if not filters:
+            return {}, {}, {}
+        requested = {name.strip().casefold() for name in filters}
+        field_rows = await self._query_field_rows([docs_library_id], requested)
+        task_references: set[str] = set()
+        typed_references: set[str] = set()
+        for name, system_key, field_type, python_value in field_rows:
+            normalized_name = str(name or "").strip().casefold()
+            normalized_system_key = str(system_key or "").casefold()
+            if normalized_system_key in TASK_FIELD_TO_TASK_UPDATE:
+                task_references.add(normalized_name)
+                task_references.add(normalized_system_key)
+            elif str(field_type or "text").casefold() != "text" or python_value:
+                typed_references.add(normalized_name)
+                typed_references.add(normalized_system_key)
+        native: dict[str, str] = {}
+        task: dict[str, str] = {}
+        typed: dict[str, str] = {}
+        for name, value in filters.items():
+            normalized_name = name.strip().casefold()
+            if normalized_name in task_references:
+                # Keep the caller's alias so two aliases for one task field
+                # remain independent AND predicates instead of overwriting
+                # each other after canonicalization.
+                task[name] = value
+            elif normalized_name in typed_references:
+                typed[name] = value
+            else:
+                native[name] = value
+        return native, task, typed
+
+    async def _build_structured_query_statement(
+        self,
+        *,
+        docs_library_id: uuid.UUID | None = None,
+        workspace_id: uuid.UUID | None = None,
+        tags: list[str] | None = None,
+        text: str = "",
+        project_id: uuid.UUID | None = None,
+        field_filters: dict[str, str] | None = None,
+        user_id: uuid.UUID | None = None,
+        node_ids: Iterable[uuid.UUID] | None = None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> tuple[Any, Any]:
+        """Build one ACL-filtered structured-query relation.
+
+        Callers use this relation twice: once for exact metadata and once for
+        the bounded page.  Keeping all predicates in this shared builder is
+        what prevents the count query from drifting from the returned rows.
+        """
+
+        resolved_library_id = _resolve_docs_library_id(docs_library_id, workspace_id)
+        stmt = select(KnowledgeNode).where(
+            KnowledgeNode.docs_library_id == resolved_library_id,
+            KnowledgeNode.archived_at.is_(None),
+            docs_node_renderable_predicate(KnowledgeNode),
+        )
+        shared_nodes = None
+        library_row = None
+        if user_id is not None:
+            library_row = await self.session.get(DocsLibrary, resolved_library_id)
+            actor = _coerce_uuid(user_id)
+            if actor is not None and getattr(library_row, "owner_user_id", None) != actor:
+                shared_nodes = _shared_nodes_cte(
+                    docs_library_id=resolved_library_id,
+                    user_id=actor,
+                    name=f"docs_query_shared_nodes_{resolved_library_id.hex}",
+                )
+            stmt = apply_docs_visibility(
+                stmt,
+                docs_library_id=resolved_library_id,
+                user_id=user_id,
+                node_model=KnowledgeNode,
+                library_owner_id=getattr(library_row, "owner_user_id", None),
+                shared_nodes=shared_nodes,
+            )
+        if node_ids is not None:
+            normalized_node_ids = [
+                node_id
+                for raw_node_id in node_ids
+                if (node_id := _coerce_uuid(raw_node_id)) is not None
+            ]
+            stmt = stmt.where(docs_id_predicate(KnowledgeNode.id, normalized_node_ids, self.session))
+        if project_id is not None:
+            stmt = stmt.where(KnowledgeNode.project_id == project_id)
+        if text.strip():
+            stmt = stmt.where(KnowledgeNode.title.ilike(f"%{text.strip()}%"))
+        for tag_name in tags or []:
+            tag_name = str(tag_name).strip().lstrip("#")
+            if not tag_name:
+                continue
+            try:
+                tag_row = await self.resolve_supertag(
+                    docs_library_id=resolved_library_id, tag=tag_name, create=False
+                )
+            except ValueError as exc:
+                if not str(exc).startswith("supertag not found:"):
+                    raise
+                # Tags are local to a library; only this relation is empty.
+                stmt = stmt.where(KnowledgeNode.id.in_([]))
+                continue
+            tag_exists = (
+                select(KnowledgeNodeSupertag.node_id)
+                .select_from(KnowledgeNodeSupertag)
+                .join(
+                    KnowledgeSupertag,
+                    KnowledgeSupertag.id == KnowledgeNodeSupertag.supertag_id,
+                )
+                .where(
+                    KnowledgeNodeSupertag.node_id == KnowledgeNode.id,
+                    KnowledgeNodeSupertag.supertag_id == tag_row.id,
+                    KnowledgeSupertag.id == tag_row.id,
+                    KnowledgeSupertag.docs_library_id == resolved_library_id,
+                )
+                .exists()
+            )
+            stmt = stmt.where(tag_exists)
+        for field_name, expected in (field_filters or {}).items():
+            field_name = str(field_name).strip()
+            if not field_name:
+                continue
+            stmt = stmt.where(
+                func.lower(self._query_text_value(
+                    KnowledgeNode.id, KnowledgeNode.docs_library_id, field_name
+                )) == str(expected).strip().casefold()
+            )
+        stmt = self._query_email_turn_visibility(
+            stmt,
+            docs_library_id=resolved_library_id,
+            turn_project_id=turn_project_id,
+        )
+        return stmt, library_row
+
+    @staticmethod
+    def _lookup_group_value(values: dict[str, Any], group_by: str) -> str:
+        requested = str(group_by or "").strip().casefold()
+        for name, value in values.items():
+            if str(name).casefold() == requested:
+                return str(value or "")
+        return ""
+
+    async def _node_group_value(
+        self,
+        node: KnowledgeNode,
+        *,
+        group_by: str,
+        user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> str:
+        """Resolve a group value by either field name or system key.
+
+        Both typed aggregation and bounded-row rendering use the canonical
+        field reference map, which retains identity for colliding names.
+        """
+
+        values = await self._canonical_query_fields(
+            node, user_id=user_id, turn_project_id=turn_project_id
+        )
+        entry = values.get(str(group_by or "").strip().casefold())
+        return entry[1] if entry else ""
+
+    @staticmethod
+    def _query_python_value_exists() -> Any:
+        # Legacy text values may live in JSON. Python str(dict/list) is not a
+        # database JSON serialization. Unicode casefold is also not SQL lower;
+        # non-ASCII text values use Python comparison regardless of DB locale.
+        return select(literal(1)).select_from(KnowledgeFieldValue).where(
+            KnowledgeFieldValue.field_id == KnowledgeField.id,
+            or_(
+                and_(
+                    KnowledgeFieldValue.value_text.is_(None),
+                    KnowledgeFieldValue.value_json.is_not(None),
+                    cast(KnowledgeFieldValue.value_json, String) != "null",
+                ),
+                func.octet_length(KnowledgeFieldValue.value_text)
+                != func.length(KnowledgeFieldValue.value_text),
+            ),
+        ).correlate(KnowledgeField).exists()
+
+    async def _query_field_rows(
+        self, library_ids: Iterable[uuid.UUID], requested: set[str]
+    ) -> list[tuple[str, str | None, str, bool]]:
+        # Discover definitions with the same normalization as the canonical
+        # resolver. SQL lower(name) would lose e.g. Straße when asked for STRASSE.
+        result = await self.session.execute(select(
+            KnowledgeField.name, KnowledgeField.system_key, KnowledgeField.field_type,
+            self._query_python_value_exists(),
+        ).where(KnowledgeField.docs_library_id.in_(list(library_ids))))
+        return [
+            (name, key, kind, bool(python_value or not name.isascii() or not (key or "").isascii()))
+            for name, key, kind, python_value in result.all()
+            if name.casefold() in requested or (key or "").casefold() in requested
+        ]
+
+    @staticmethod
+    def _query_text_value(node_id: Any, library_id: Any, requested: str) -> Any:
+        """SQL counterpart of _canonical_query_fields for ordinary text.
+
+        Ignore empty values, prefer a populated system alias over a display
+        name, then choose the last field in stable field order. Filters and
+        aggregates must use this same scalar expression.
+        """
+        wanted = requested.strip().casefold()
+        alias_match = func.lower(KnowledgeField.system_key) == wanted
+        return (
+            select(KnowledgeFieldValue.value_text)
+            .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
+            .where(
+                KnowledgeFieldValue.node_id == node_id,
+                KnowledgeField.docs_library_id == library_id,
+                or_(func.lower(KnowledgeField.name) == wanted, alias_match),
+                KnowledgeFieldValue.value_text.is_not(None),
+                KnowledgeFieldValue.value_text != "",
+            )
+            .order_by(
+                case((alias_match, 1), else_=0).desc(),
+                KnowledgeField.sort_order.desc(),
+                KnowledgeField.created_at.desc().nulls_last(),
+                KnowledgeField.id.desc(),
+            )
+            .limit(1)
+            .correlate_except(KnowledgeField, KnowledgeFieldValue)
+            .scalar_subquery()
+        )
+
+    async def _canonical_query_fields(
+        self, node: KnowledgeNode, *, user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> dict[str, tuple[KnowledgeField, str]]:
+        """Resolve populated field references without discarding field IDs.
+
+        Task values replace only their own field ID. Duplicate display names
+        select the last populated field; stable system aliases take precedence
+        over display names. The order matches _query_text_value.
+        """
+        result = await self.session.execute(
+            select(KnowledgeField, KnowledgeFieldValue)
+            .join(KnowledgeFieldValue, KnowledgeFieldValue.field_id == KnowledgeField.id)
+            .where(KnowledgeFieldValue.node_id == node.id,
+                   KnowledgeField.docs_library_id == node.docs_library_id)
+        )
+        entries: dict[uuid.UUID, tuple[KnowledgeField, str]] = {}
+        for field, value in result.all():
+            if (field.field_type == "reference" and value.target_node_id is not None
+                    and not await self._query_reference_visible(
+                        value.target_node_id, user_id=user_id, turn_project_id=turn_project_id
+                    )):
+                continue
+            entries[field.id] = (field, self._format_field_value(field, value))
+        task = await self._get_bound_task(node)
+        if task is not None and await self._can_read_bound_task_metadata(
+            node=node, task=task, user_id=user_id
+        ):
+            definitions = await self.session.execute(
+                select(KnowledgeField)
+                .join(KnowledgeNodeSupertag,
+                      KnowledgeNodeSupertag.supertag_id == KnowledgeField.supertag_id)
+                .where(
+                    KnowledgeNodeSupertag.node_id == node.id,
+                    KnowledgeField.docs_library_id == node.docs_library_id,
+                    func.lower(KnowledgeField.system_key).in_(TASK_FIELD_TO_TASK_UPDATE),
+                )
+            )
+            for field in definitions.scalars().unique().all():
+                task_attr = TASK_FIELD_TO_TASK_UPDATE[field.system_key.casefold()]
+                raw = getattr(task, task_attr, None)
+                if raw not in (None, ""):
+                    entries[field.id] = (
+                        field, raw.isoformat() if isinstance(raw, datetime) else str(raw)
+                    )
+        names: dict[str, tuple[KnowledgeField, str]] = {}
+        aliases: dict[str, tuple[KnowledgeField, str]] = {}
+        for field, value in sorted(entries.values(), key=lambda entry: (
+            entry[0].sort_order or 0, entry[0].created_at or datetime.min, entry[0].id
+        )):
+            if value == "":
+                continue
+            names[field.name.casefold()] = (field, value)
+            if field.system_key:
+                aliases[field.system_key.casefold()] = (field, value)
+        return {**names, **aliases}
+
+    @staticmethod
+    def _field_filter_value_matches(
+        actual: Any,
+        expected: Any,
+        *,
+        field_type: str = "text",
+    ) -> bool:
+        """Compare the user-facing field value without SQL wildcard leaks."""
+
+        actual_text = str(actual or "")
+        expected_text = str(expected or "").strip()
+        normalized_type = str(field_type or "text").casefold()
+        if normalized_type == "number":
+            try:
+                return Decimal(actual_text) == Decimal(expected_text)
+            except (InvalidOperation, ValueError):
+                return actual_text.casefold() == expected_text.casefold()
+        if normalized_type == "reference":
+            if actual_text.casefold() == expected_text.casefold():
+                return True
+            match = re.fullmatch(r"\[\[node:([^\]]+)\]\]", actual_text.strip(), re.I)
+            if match is None:
+                return False
+            target_text = match.group(1).replace("-", "").casefold()
+            compact_expected = expected_text.replace("-", "").casefold()
+            # Preserve the historical short-UUID reference filter, but only
+            # for a safe hexadecimal prefix.  Arbitrary input (including `%`
+            # or `_`) must never become a SQL LIKE pattern.
+            return bool(
+                re.fullmatch(r"[0-9a-f]{8,32}", compact_expected)
+                and target_text.startswith(compact_expected)
+            )
+        return actual_text.casefold() == expected_text.casefold()
+
+    async def _node_matches_field_filters(
+        self,
+        node: KnowledgeNode,
+        field_filters: dict[str, str],
+        *,
+        user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> bool:
+        """Apply canonical rendered-field equality to a candidate node."""
+
+        if not field_filters:
+            return True
+        values = await self._canonical_query_fields(
+            node, user_id=user_id, turn_project_id=turn_project_id
+        )
+        for name, expected in field_filters.items():
+            requested = str(name or "").strip().casefold()
+            entry = values.get(requested)
+            if entry is None:
+                return False
+            field, actual = entry
+            if not self._field_filter_value_matches(
+                actual,
+                expected,
+                field_type=getattr(field, "field_type", "text"),
+            ):
+                return False
+        return True
+
+    async def _query_group_counts(
+        self,
+        stmt: Any,
+        *,
+        docs_library_id: uuid.UUID | Iterable[uuid.UUID],
+        group_by: str,
+        total_matches: int,
+        user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> dict[str, int]:
+        """Return exact group totals from the ACL-filtered candidate relation.
+
+        Plain text fields use a correlated SQL aggregate.  Typed fields,
+        reference fields, and synthetic Task fields fall back to the existing
+        value renderer so their display/ACL semantics remain identical to
+        ``get_node_field_values``.
+        """
+
+        requested = str(group_by or "").strip()
+        if not requested:
+            return {}
+        field_rows = await self._query_field_rows(
+            [docs_library_id] if isinstance(docs_library_id, uuid.UUID) else docs_library_id,
+            {requested.casefold()},
+        )
+        field_types = {str(row[2] or "text").casefold() for row in field_rows}
+        field_system_keys = {str(row[1] or "").casefold() for row in field_rows}
+        sql_text_group = bool(field_rows) and field_types == {"text"}
+        if any(row[3] for row in field_rows):
+            sql_text_group = False
+        if any(key in TASK_FIELD_TO_TASK_UPDATE for key in field_system_keys):
+            sql_text_group = False
+
+        if sql_text_group:
+            candidates = (
+                stmt.order_by(None)
+                .with_only_columns(
+                    KnowledgeNode.id, KnowledgeNode.docs_library_id, maintain_column_froms=True
+                )
+                .subquery("docs_query_group_candidates")
+            )
+            value_subquery = self._query_text_value(
+                candidates.c.id, candidates.c.docs_library_id, requested
+            )
+            group_key = func.coalesce(
+                func.nullif(value_subquery, ""), literal("(none)")
+            )
+            grouped = await self.session.execute(
+                select(group_key.label("group_key"), func.count())
+                .select_from(candidates)
+                .group_by(group_key)
+            )
+            return {
+                str(group_key_value or "(none)"): int(count or 0)
+                for group_key_value, count in grouped.all()
+            }
+
+        if not field_rows:
+            return {"(none)": total_matches} if total_matches else {}
+
+        # Typed/reference/task fields need the canonical Python renderer to
+        # preserve date/checkbox/reference formatting and target ACL checks.
+        counts: dict[str, int] = {}
+        async for node in self._query_candidate_batches(stmt):
+            key = await self._node_group_value(
+                node,
+                group_by=requested,
+                user_id=user_id,
+                turn_project_id=turn_project_id,
+            ) or "(none)"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    async def _group_counts_from_nodes(
+        self,
+        nodes: Iterable[KnowledgeNode],
+        *,
+        group_by: str,
+        user_id: uuid.UUID | None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> dict[str, int]:
+        """Group an already exact, ACL-filtered node set via canonical values."""
+
+        requested = str(group_by or "").strip()
+        if not requested:
+            return {}
+        counts: dict[str, int] = {}
+        for node in nodes:
+            key = await self._node_group_value(
+                node,
+                group_by=requested,
+                user_id=user_id,
+                turn_project_id=turn_project_id,
+            ) or "(none)"
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    async def query_nodes_result(
+        self,
+        *,
+        docs_library_id: uuid.UUID | None = None,
+        workspace_id: uuid.UUID | None = None,
+        tags: list[str] | None = None,
+        text: str = "",
+        project_id: uuid.UUID | None = None,
+        field_filters: dict[str, str] | None = None,
+        limit: int = 50,
+        user_id: uuid.UUID | None = None,
+        node_ids: Iterable[uuid.UUID] | None = None,
+        group_by: str = "",
+        turn_project_id: uuid.UUID | None = None,
+        date_from: str = "",
+        date_to: str = "",
+        order_by: str = "updated_at",
+        order: str = "desc",
+        offset: int = 0,
+    ) -> DocsQueryResult:
+        """Run a structured query with exact ACL-filtered metadata."""
+
+        resolved_library_id = _resolve_docs_library_id(docs_library_id, workspace_id)
+        (
+            native_field_filters,
+            task_field_filters,
+            typed_field_filters,
+        ) = await self._split_task_field_filters(
+            docs_library_id=resolved_library_id,
+            field_filters=field_filters,
+        )
+        stmt, _library_row = await self._build_structured_query_statement(
+            docs_library_id=resolved_library_id,
+            tags=tags,
+            text=text,
+            project_id=project_id,
+            field_filters=native_field_filters,
+            user_id=user_id,
+            node_ids=node_ids,
+            turn_project_id=turn_project_id,
+        )
+        return await self._execute_query_result(
+            stmt, library_ids=[resolved_library_id],
+            canonical_field_filters={**typed_field_filters, **task_field_filters},
+            turn_project_id=turn_project_id,
+            group_by=group_by, limit=limit, user_id=user_id,
+            date_from=date_from, date_to=date_to, order_by=order_by, order=order, offset=offset,
+        )
+
+    @staticmethod
+    def _query_window(
+        stmt: Any, *, date_from: str, date_to: str, order_by: str, order: str, offset: int
+    ) -> Any:
+        """Closed timeline controls; date bounds apply to the ordering field.
+
+        Date-only upper bounds include the entire day. Timestamp bounds are
+        inclusive instants, normalized to UTC for the naive DB timestamps.
+        NULLs sort last in either direction; UUID ascending breaks all ties.
+        """
+        if not isinstance(order_by, str) or order_by not in {"updated_at", "created_at", "day_date"}:
+            raise ValueError("order_by must be updated_at, created_at or day_date")
+        if not isinstance(order, str) or order not in {"asc", "desc"}:
+            raise ValueError("order must be asc or desc")
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValueError("offset must be a nonnegative integer")
+        column = getattr(KnowledgeNode, order_by)
+        bounds: list[date | datetime | None] = []
+        upper_exclusive = False
+        for index, raw in enumerate((date_from, date_to)):
+            value = str(raw or "").strip()
+            if not value:
+                bounds.append(None)
+                continue
+            if order_by == "day_date":
+                bound = date.fromisoformat(value)
+            else:
+                bound = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if bound.tzinfo is not None:
+                    bound = bound.astimezone(timezone.utc).replace(tzinfo=None)
+                if index == 1 and len(value) == 10:
+                    bound += timedelta(days=1)
+                    upper_exclusive = True
+            bounds.append(bound)
+        lower, upper = bounds
+        if lower is not None and upper is not None and (
+            lower > upper or (upper_exclusive and lower == upper)
+        ):
+            raise ValueError("date_from must not follow date_to")
+        if lower is not None:
+            stmt = stmt.where(column >= lower)
+        if upper is not None:
+            stmt = stmt.where(column < upper if upper_exclusive else column <= upper)
+        return stmt.order_by(None).order_by(
+            (column.asc() if order == "asc" else column.desc()).nulls_last(),
+            KnowledgeNode.id.asc(),
+        )
+
+    async def _query_candidate_batches(self, stmt: Any) -> AsyncIterator[KnowledgeNode]:
+        """Bound materialization for fields that require Python rendering."""
+        position = 0
+        ordered = stmt.order_by(KnowledgeNode.id.asc())
+        while True:
+            result = await self.session.execute(ordered.limit(200).offset(position))
+            nodes = list(result.scalars().unique().all())
+            for node in nodes:
+                yield node
+            if len(nodes) < 200:
+                break
+            position += len(nodes)
+
+    async def _execute_query_result(
+        self, stmt: Any, *, library_ids: list[uuid.UUID],
+        canonical_field_filters: dict[str, str], group_by: str,
+        limit: int, user_id: uuid.UUID | None, date_from: str, date_to: str,
+        order_by: str, order: str, offset: int,
+        canonical_filters_by_library: dict[uuid.UUID, dict[str, str]] | None = None,
+        turn_project_id: uuid.UUID | None = None,
+    ) -> DocsQueryResult:
+        stmt = self._query_window(
+            stmt, date_from=date_from, date_to=date_to,
+            order_by=order_by, order=order, offset=offset,
+        )
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise ValueError("limit must be a positive integer")
+        bounded_limit = min(limit, 200)
+        per_library_filters = canonical_filters_by_library or {}
+        if canonical_field_filters or any(per_library_filters.values()):
+            # Task values are synthetic fields backed by a separate table, and
+            # typed/reference values need their canonical renderer (including
+            # reference ACL checks).  Resolve them after the shared SQL
+            # candidate relation has enforced all stored Docs predicates; this
+            # keeps the exact count and bounded page on the same ACL set.
+            nodes: list[KnowledgeNode] = []
+            total_matches = 0
+            group_counts: dict[str, int] = {}
+            async for node in self._query_candidate_batches(stmt):
+                if await self._node_matches_field_filters(
+                    node,
+                    {**canonical_field_filters, **per_library_filters.get(node.docs_library_id, {})},
+                    user_id=user_id,
+                    turn_project_id=turn_project_id,
+                ):
+                    if offset <= total_matches < offset + bounded_limit:
+                        nodes.append(node)
+                    total_matches += 1
+                    if group_by.strip():
+                        key = await self._node_group_value(
+                            node, group_by=group_by, user_id=user_id, turn_project_id=turn_project_id
+                        ) or "(none)"
+                        group_counts[key] = group_counts.get(key, 0) + 1
+        else:
+            count_candidates = (
+                stmt.order_by(None)
+                .with_only_columns(KnowledgeNode.id, maintain_column_froms=True)
+                .subquery("docs_query_count_candidates")
+            )
+            total_result = await self.session.execute(
+                select(func.count()).select_from(count_candidates)
+            )
+            total_matches = int(total_result.scalar_one() or 0)
+            rows_result = await self.session.execute(
+                stmt.limit(bounded_limit).offset(offset)
+            )
+            nodes = list(rows_result.scalars().unique().all())
+            group_counts = await self._query_group_counts(
+                stmt,
+                docs_library_id=library_ids,
+                group_by=group_by,
+                total_matches=total_matches,
+                user_id=user_id,
+                turn_project_id=turn_project_id,
+            )
+        returned = len(nodes)
+        has_more = total_matches > offset + returned
+        return DocsQueryResult(
+            nodes=nodes,
+            total_matches=total_matches,
+            returned=returned,
+            truncated=total_matches > returned,
+            has_more=has_more,
+            group_counts=group_counts,
+            offset=offset,
+        )
+
     async def query_nodes(
         self,
         *,
@@ -2461,102 +3717,96 @@ class DocsGraphService:
         user_id: uuid.UUID | None = None,
     ) -> list[KnowledgeNode]:
         """Structured query: AND over tags, optional field equality, text ILIKE."""
-        docs_library_id = _resolve_docs_library_id(docs_library_id, workspace_id)
-        stmt = select(KnowledgeNode).where(
-            KnowledgeNode.docs_library_id == docs_library_id,
-            KnowledgeNode.archived_at.is_(None),
+        result = await self.query_nodes_result(
+            docs_library_id=docs_library_id,
+            workspace_id=workspace_id,
+            tags=tags,
+            text=text,
+            project_id=project_id,
+            field_filters=field_filters,
+            limit=limit,
+            user_id=user_id,
         )
-        shared_nodes = None
-        library_row = None
-        if user_id is not None:
-            library_row = await self.session.get(DocsLibrary, docs_library_id)
-            actor = _coerce_uuid(user_id)
-            if actor is not None and getattr(library_row, "owner_user_id", None) != actor:
-                shared_nodes = _shared_nodes_cte(
-                    docs_library_id=docs_library_id,
-                    user_id=actor,
-                    name="docs_query_shared_nodes",
-                )
-            stmt = apply_docs_visibility(
-                stmt,
-                docs_library_id=docs_library_id,
+        return result.nodes
+
+    async def query_with_scope_result(
+        self,
+        *,
+        docs_scope: DocsScope,
+        tags: list[str] | None = None,
+        text: str | None = None,
+        field_filters: dict[str, str] | None = None,
+        group_by: str = "",
+        limit: int = 20,
+        user_id: uuid.UUID | None = None,
+        turn_project_id: uuid.UUID | None = None,
+        date_from: str = "",
+        date_to: str = "",
+        order_by: str = "updated_at",
+        order: str = "desc",
+        offset: int = 0,
+    ) -> DocsQueryResult:
+        """Run a scoped structured query with exact pre-limit aggregates."""
+
+        # Build per-library authorized relations, then order/count/page their
+        # union in SQL. No per-library page is discarded before global paging.
+        library_ids = list(dict.fromkeys(
+            value for raw in docs_scope.allowed_library_ids
+            if (value := _coerce_uuid(raw)) is not None
+        ))
+        canonical_ids = {
+            node_id
+            for raw_node_id in docs_scope.canonical_node_ids
+            if (node_id := _coerce_uuid(raw_node_id)) is not None
+        }
+        related_ids = {
+            node_id
+            for raw_node_id in docs_scope.related_node_ids
+            if (node_id := _coerce_uuid(raw_node_id)) is not None
+        }
+        scoped_node_ids = canonical_ids | related_ids
+        if not library_ids or not scoped_node_ids:
+            self._query_window(
+                select(KnowledgeNode), date_from=date_from, date_to=date_to,
+                order_by=order_by, order=order, offset=offset,
+            )
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+                raise ValueError("limit must be a positive integer")
+            return DocsQueryResult([], 0, 0, False, False, {}, offset=offset)
+        relations = []
+        canonical_filters_by_library: dict[uuid.UUID, dict[str, str]] = {}
+        for library_id in library_ids:
+            native, task, typed = await self._split_task_field_filters(
+                docs_library_id=library_id, field_filters=field_filters
+            )
+            # The same reference may denote a number, text or synthetic task
+            # field in different libraries. Keep its execution plan local:
+            # SQL applies only this library's native predicates, and Python
+            # applies only its remaining predicates after the scoped union.
+            canonical_filters_by_library[library_id] = {**task, **typed}
+            relation, _ = await self._build_structured_query_statement(
+                docs_library_id=library_id,
+                tags=tags,
+                text=text or "",
+                field_filters=native,
                 user_id=user_id,
-                node_model=KnowledgeNode,
-                library_owner_id=getattr(library_row, "owner_user_id", None),
-                shared_nodes=shared_nodes,
+                node_ids=scoped_node_ids,
+                turn_project_id=turn_project_id,
             )
-        if project_id is not None:
-            stmt = stmt.where(KnowledgeNode.project_id == project_id)
-        if text.strip():
-            stmt = stmt.where(KnowledgeNode.title.ilike(f"%{text.strip()}%"))
-        for tag_name in tags or []:
-            tag_name = str(tag_name).strip().lstrip("#")
-            if not tag_name:
-                continue
-            tag_row = await self.resolve_supertag(
-                docs_library_id=docs_library_id, tag=tag_name, create=False
-            )
-            tag_exists = (
-                select(KnowledgeNodeSupertag.node_id)
-                .where(
-                    KnowledgeNodeSupertag.node_id == KnowledgeNode.id,
-                    KnowledgeNodeSupertag.supertag_id == tag_row.id,
-                    KnowledgeSupertag.docs_library_id == docs_library_id,
-                )
-                .exists()
-            )
-            stmt = stmt.where(tag_exists)
-        for field_name, expected in (field_filters or {}).items():
-            field_name = str(field_name).strip()
-            if not field_name:
-                continue
-            expected_text = str(expected).strip()
-            field_match = (
-                select(KnowledgeFieldValue.node_id)
-                .join(KnowledgeField, KnowledgeField.id == KnowledgeFieldValue.field_id)
-                .where(
-                    KnowledgeFieldValue.node_id == KnowledgeNode.id,
-                    KnowledgeField.docs_library_id == docs_library_id,
-                    or_(
-                        func.lower(KnowledgeField.name) == field_name.casefold(),
-                        func.lower(KnowledgeField.system_key) == field_name.casefold(),
-                    ),
-                    or_(
-                        func.lower(func.coalesce(KnowledgeFieldValue.value_text, "")) == expected_text.casefold(),
-                        cast(KnowledgeFieldValue.value_number, String) == expected_text,
-                        cast(KnowledgeFieldValue.target_node_id, String).ilike(f"{expected_text}%"),
-                    ),
-                )
-                .exists()
-            )
-            if user_id is not None:
-                target_node = aliased(KnowledgeNode)
-                target_visible = (
-                    select(target_node.id)
-                    .where(
-                        target_node.id == KnowledgeFieldValue.target_node_id,
-                        docs_readable_node_predicate(
-                            target_node,
-                            docs_library_id=docs_library_id,
-                            user_id=user_id,
-                            library_owner_id=getattr(library_row, "owner_user_id", None),
-                            shared_nodes=shared_nodes,
-                        ),
-                    )
-                    .exists()
-                )
-                field_match = field_match.where(
-                    or_(
-                        KnowledgeFieldValue.target_node_id.is_(None),
-                        target_visible,
-                    )
-                )
-            stmt = stmt.where(field_match)
-        stmt = stmt.order_by(KnowledgeNode.updated_at.desc()).limit(
-            max(1, min(int(limit or 50), 200))
+            relations.append(relation.with_only_columns(
+                KnowledgeNode.id, maintain_column_froms=True
+            ))
+        stmt = select(KnowledgeNode).where(
+            KnowledgeNode.id.in_(union_all(*relations)) if relations
+            else KnowledgeNode.id.in_([])
         )
-        result = await self.session.execute(stmt)
-        return list(result.scalars().unique().all())
+        return await self._execute_query_result(
+            stmt, library_ids=library_ids, canonical_field_filters={},
+            canonical_filters_by_library=canonical_filters_by_library,
+            turn_project_id=turn_project_id,
+            group_by=group_by, limit=limit, user_id=user_id,
+            date_from=date_from, date_to=date_to, order_by=order_by, order=order, offset=offset,
+        )
 
     async def query_with_scope(
         self,

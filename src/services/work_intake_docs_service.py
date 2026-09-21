@@ -51,6 +51,7 @@ INBOX_STATUS_VALUES = {
 }
 INBOX_UPDATE_TEXT_LIMIT = 131_072
 INBOX_GENERATED_NODE_LIMIT = 450
+INLINE_SOURCE_LABEL_LIMIT = 120
 
 _CLASSIFICATION_LABELS = {
     "question": "質問",
@@ -112,6 +113,38 @@ def _title_chunks(text: str, *, limit: int = 450) -> list[str]:
             chunks.append(cursor[:limit])
             cursor = cursor[limit:]
     return chunks
+
+
+def _inline_source_display_label(
+    source: KnowledgeNode,
+    *,
+    limit: int = INLINE_SOURCE_LABEL_LIMIT,
+) -> str:
+    """Return a bounded human label without changing source identity.
+
+    Email source node titles are archival identities in ``date | sender |
+    subject`` form.  Inline provenance links need only the subject; the node
+    UUID remains the authoritative reference in the link token and edge.
+    """
+
+    title = str(getattr(source, "title", "") or "")
+    source_format = str(
+        (getattr(source, "body_json", {}) or {}).get("format") or ""
+    )
+    if source_format == "email_message":
+        parts = title.split(" | ", 2)
+        if len(parts) == 3 and parts[2].strip():
+            title = parts[2]
+
+    title = " ".join(title.replace("\r", " ").replace("\n", " ").split())
+    title = title.replace("[", "").replace("]", "").replace("|", "／").strip()
+    if not title:
+        title = "参照元"
+
+    bounded = max(16, min(int(limit or INLINE_SOURCE_LABEL_LIMIT), 240))
+    if len(title) > bounded:
+        title = f"{title[: bounded - 1].rstrip()}…"
+    return title
 
 
 def _document_node_count(
@@ -676,7 +709,7 @@ class WorkIntakeDocsService:
             source = source_nodes.get(source_key)
             if source is None:
                 continue
-            label = source.title.replace("]", "")[:320]
+            label = _inline_source_display_label(source)
             await self.docs.create_node(
                 docs_library_id=item.docs_library_id,
                 user_id=user_id,
@@ -723,6 +756,19 @@ class WorkIntakeDocsService:
         ):
             raise ValueError("指定したDocsノードはInbox項目ではありません。")
         docs_library_id = target.docs_library_id
+        # Task writers acquire the Project advisory/ACL rows before the Task
+        # row, and only then touch a bound Docs node.  Inbox replacement must
+        # use the same order; locking the Inbox node first creates a reverse
+        # Project/Docs cycle with a concurrent task update.
+        if isinstance(self.session, AsyncSession):
+            from .task_management.service import TaskManagementService
+
+            await TaskManagementService()._lock_project_acl_for_task_write(
+                self.session,
+                project_ids=(target.project_id or project_id,),
+                user_id=user_id,
+                require_read=True,
+            )
         result = await self.session.execute(
             select(KnowledgeNode)
             .where(
@@ -868,12 +914,71 @@ class WorkIntakeDocsService:
         task_id: UUID,
         user_id: UUID,
     ) -> None:
-        item = await self.session.get(KnowledgeNode, item_id)
+        # Binding is a Docs mutation boundary, not merely a foreign-key
+        # assignment.  Validate Project→Docs ACL/identity before taking the
+        # Task row lock: TaskManagementService follows that order for updates,
+        # so a concurrent project move cannot deadlock against this workflow.
         task = await self.session.get(Task, task_id)
+        item = await self.session.get(KnowledgeNode, item_id)
         if item is None or task is None or task.deleted_at is not None:
             raise ValueError("Inbox項目またはタスクが見つかりません。")
         if item.project_id != task.project_id:
             raise ValueError("Inbox項目とタスクのプロジェクトが一致しません。")
+        item_system_key = str(getattr(item, "system_key", "") or "").strip()
+        if not (
+            item_system_key == INBOX_ITEM_SYSTEM_PREFIX
+            or item_system_key.startswith(f"{INBOX_ITEM_SYSTEM_PREFIX}:")
+        ):
+            raise ValueError("指定されたDocs nodeはInbox項目ではありません。")
+
+        from .task_management.service import TaskManagementService
+
+        task_service = TaskManagementService()
+        if isinstance(self.session, AsyncSession):
+            await task_service._lock_project_acl_for_task_write(
+                self.session,
+                project_ids=(task.project_id,),
+                user_id=user_id,
+                require_read=True,
+            )
+            item = await task_service._validate_knowledge_node_binding(
+                self.session,
+                knowledge_node_id=item_id,
+                task_project_id=task.project_id,
+                user_id=user_id,
+            )
+
+            # Re-read and lock the Task only after the Docs-side locks have
+            # been acquired.  A concurrent task move either waits for this
+            # transaction or is observed here as a project mismatch.
+            task_result = await self.session.execute(
+                select(Task)
+                .where(Task.id == task_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            task = task_result.scalar_one_or_none()
+            if task is None or task.deleted_at is not None:
+                raise ValueError("Inbox項目またはタスクが見つかりません。")
+            if item.project_id != task.project_id:
+                raise ValueError("Inbox項目とタスクのプロジェクトが一致しません。")
+            # `_validate_knowledge_node_binding` refreshes/locks the Docs row;
+            # re-check the Inbox identity from that locked snapshot rather
+            # than trusting the preflight key above. A concurrent rekey must
+            # not turn an ordinary node into an Inbox task binding.
+            locked_item_system_key = str(getattr(item, "system_key", "") or "").strip()
+            if not (
+                locked_item_system_key == INBOX_ITEM_SYSTEM_PREFIX
+                or locked_item_system_key.startswith(f"{INBOX_ITEM_SYSTEM_PREFIX}:")
+            ):
+                raise ValueError("指定されたDocs nodeはInbox項目ではありません。")
+        else:
+            # Dependency-free service doubles do not expose the full ACL
+            # query surface, but still receive the managed-Guide invariant.
+            await task_service._assert_task_docs_guide_binding_allowed(
+                self.session,
+                item,
+            )
         task.knowledge_node_id = item.id
         task_tag = await self.docs.resolve_supertag(
             docs_library_id=item.docs_library_id,

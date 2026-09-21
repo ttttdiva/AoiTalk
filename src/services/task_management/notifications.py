@@ -13,7 +13,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import httpx
-from sqlalchemy import delete, func, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -54,6 +54,12 @@ from ..web_push import (
     validate_web_push_endpoint,
     send_web_push,
 )
+from ..outbound_privacy_service import (
+    ExternalProviderBlocked,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
 from ._shared import (
     DEFAULT_MEMBER_PERMISSIONS,
     DEFAULT_USER_NOTIFICATION_MINUTES,
@@ -65,7 +71,6 @@ from ._shared import (
     TaskManagementError,
     build_occurrence_schedule,
     build_time_report,
-    correct_likely_timer_started_at,
     normalize_priority,
     normalize_task_status,
     _ensure_reminder_offsets,
@@ -107,6 +112,542 @@ def _web_push_late_ttl() -> timedelta:
 
 
 _PUSH_LATE_TTL = _web_push_late_ttl()
+
+# Project Steward rows are legacy durable inbox records.  New Steward runs no
+# longer create notifications, but rows written by an older worker (or by a
+# mixed-version deployment during rollout) can still be present.  Keep this
+# classifier intentionally narrow: only the two explicit notification types
+# and the one legacy payload kind belong to Steward.  Do not infer Steward
+# ownership from titles, dedupe keys, projects, or arbitrary payload fields so
+# ordinary task/system notifications retain their existing semantics.
+_PROJECT_STEWARD_NOTIFICATION_TYPES = frozenset(
+    {"project_steward", "project_steward_alert"}
+)
+
+# Knowledge Capture deliberately has its own notification namespace.  Keep
+# this classifier independent from the Project Steward classifier below: a
+# mixed-version deployment must never make a new capture row look like a
+# Steward alert, and Steward's legacy filtering must remain unchanged.
+KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES = frozenset(
+    {"knowledge_capture_question", "knowledge_capture_draft"}
+)
+_KNOWLEDGE_CAPTURE_OPEN_MODE = "knowledge_capture_review"
+_KNOWLEDGE_CAPTURE_MAX_TITLE = 160
+_KNOWLEDGE_CAPTURE_MAX_MESSAGE = 1000
+_KNOWLEDGE_CAPTURE_PAYLOAD_KEYS = frozenset(
+    {"kind", "candidate_id", "question_id", "candidate_version"}
+)
+
+
+def _notification_field(notification: Any, name: str) -> Any:
+    """Read a notification field from either an ORM row or a mapping."""
+
+    if isinstance(notification, Mapping):
+        return notification.get(name)
+    return getattr(notification, name, None)
+
+
+def is_project_steward_notification(notification: Any) -> bool:
+    """Return whether *notification* is a Project Steward inbox row.
+
+    The explicit type values are normalized for compatibility with rows from
+    mixed-version workers.  Payload ``kind`` intentionally accepts only the
+    exact legacy value; no title/message or fuzzy matching is performed.
+    """
+
+    notification_type = _notification_field(notification, "notification_type")
+    if (
+        isinstance(notification_type, str)
+        and notification_type.strip().casefold()
+        in _PROJECT_STEWARD_NOTIFICATION_TYPES
+    ):
+        return True
+
+    payload = _notification_field(notification, "payload")
+    if isinstance(payload, Mapping):
+        return payload.get("kind") == "project_steward_alert"
+    return False
+
+
+# Keep a private spelling available for callers/tests that follow the existing
+# module-level helper naming convention while exposing the descriptive public
+# helper for new code.
+_is_project_steward_notification = is_project_steward_notification
+
+
+def _coerce_uuid(value: Any, field_name: str) -> UUID:
+    """Coerce a typed knowledge-capture identifier without accepting junk."""
+
+    try:
+        return value if isinstance(value, UUID) else UUID(str(value))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise TaskManagementError(
+            f"Invalid knowledge capture {field_name}", status_code=400
+        ) from exc
+
+
+def _knowledge_capture_payload(
+    *,
+    candidate_id: UUID,
+    question_id: UUID | None,
+    candidate_version: int,
+) -> dict[str, Any]:
+    """Build the closed notification payload contract.
+
+    The payload contains identifiers and a version only.  In particular, it
+    has no model-controlled URL/action field; clients derive navigation from
+    the known internal route and re-check Project ACL at the destination.
+    """
+
+    try:
+        version = int(candidate_version)
+    except (TypeError, ValueError) as exc:
+        raise TaskManagementError(
+            "Invalid knowledge capture candidate version", status_code=400
+        ) from exc
+    if version <= 0:
+        raise TaskManagementError(
+            "Invalid knowledge capture candidate version", status_code=400
+        )
+    return {
+        "kind": "knowledge_capture",
+        "candidate_id": str(candidate_id),
+        "question_id": str(question_id) if question_id is not None else None,
+        "candidate_version": version,
+    }
+
+
+def is_knowledge_capture_notification(notification: Any) -> bool:
+    """Return whether a row is a valid, typed Knowledge Capture notification."""
+
+    notification_type = _notification_field(notification, "notification_type")
+    if notification_type not in KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES:
+        return False
+    payload = _notification_field(notification, "payload")
+    if not isinstance(payload, Mapping):
+        return False
+    if set(payload) != set(_KNOWLEDGE_CAPTURE_PAYLOAD_KEYS):
+        return False
+    if payload.get("kind") != "knowledge_capture":
+        return False
+    try:
+        _coerce_uuid(payload.get("candidate_id"), "candidate_id")
+        question_id = payload.get("question_id")
+        if question_id is not None:
+            _coerce_uuid(question_id, "question_id")
+        version = int(payload.get("candidate_version"))
+    except (TaskManagementError, TypeError, ValueError):
+        return False
+    return version > 0
+
+
+def knowledge_capture_notification_dedupe_key(
+    *,
+    candidate_id: UUID,
+    notification_type: str,
+    question_id: UUID | None = None,
+    candidate_version: int | None = None,
+) -> str:
+    """Return the stable dedupe key for one capture state notification."""
+
+    candidate_uuid = _coerce_uuid(candidate_id, "candidate_id")
+    if notification_type == "knowledge_capture_question":
+        if question_id is None:
+            raise TaskManagementError(
+                "Knowledge Capture question notifications require question_id",
+                status_code=400,
+            )
+        question_uuid = _coerce_uuid(question_id, "question_id")
+        return f"knowledge_capture:{candidate_uuid}:question:{question_uuid}"
+    if notification_type == "knowledge_capture_draft":
+        if question_id is not None:
+            raise TaskManagementError(
+                "Knowledge Capture draft notifications cannot have question_id",
+                status_code=400,
+            )
+        try:
+            version = int(candidate_version)
+        except (TypeError, ValueError) as exc:
+            raise TaskManagementError(
+                "Knowledge Capture draft notifications require candidate_version",
+                status_code=400,
+            ) from exc
+        if version <= 0:
+            raise TaskManagementError(
+                "Knowledge Capture draft notifications require candidate_version",
+                status_code=400,
+            )
+        return f"knowledge_capture:{candidate_uuid}:draft:{version}"
+    raise TaskManagementError(
+        "Unsupported Knowledge Capture notification type", status_code=400
+    )
+
+
+def _bounded_capture_text(value: Any, *, field_name: str, limit: int) -> str:
+    text = str(value or "").replace("\x00", "").strip()
+    if not text or len(text) > limit:
+        raise TaskManagementError(
+            f"Invalid Knowledge Capture notification {field_name}", status_code=400
+        )
+    return text
+
+
+def _knowledge_capture_notification_route(notification: Any) -> str | None:
+    """Build the neutral notification-id route for a capture push item."""
+
+    if not is_knowledge_capture_notification(notification):
+        return None
+    project_id = _notification_field(notification, "project_id")
+    payload = _notification_field(notification, "payload") or {}
+    try:
+        # Keep the model/id validation boundary, but do not expose domain
+        # identifiers or UI state in a push URL.  The notification endpoint
+        # resolves the typed row after the client opens this neutral route.
+        _coerce_uuid(project_id, "project_id")
+        _coerce_uuid(payload.get("candidate_id"), "candidate_id")
+        notification_uuid = _coerce_uuid(
+            _notification_field(notification, "id"), "notification_id"
+        )
+    except TaskManagementError:
+        return None
+    return f"/chat?open_notification={notification_uuid}"
+
+
+async def persist_knowledge_capture_notification(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    recipient_user_id: UUID,
+    candidate_id: UUID,
+    notification_type: str,
+    candidate_version: int,
+    question_id: UUID | None = None,
+    title: str,
+    message: str,
+    scheduled_for: Optional[datetime] = None,
+    commit: bool = False,
+) -> Optional[NotificationDelivery]:
+    """Persist one Project-authorized Knowledge Capture inbox row.
+
+    This helper is intentionally transaction-friendly.  Worker callers can
+    keep the candidate transition and notification insert in one transaction
+    by leaving ``commit`` false; standalone callers may request a short commit.
+    """
+
+    project_uuid = _coerce_uuid(project_id, "project_id")
+    recipient_uuid = _coerce_uuid(recipient_user_id, "recipient_user_id")
+    candidate_uuid = _coerce_uuid(candidate_id, "candidate_id")
+    question_uuid = (
+        _coerce_uuid(question_id, "question_id") if question_id is not None else None
+    )
+    if notification_type not in KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES:
+        raise TaskManagementError(
+            "Unsupported Knowledge Capture notification type", status_code=400
+        )
+    if notification_type == "knowledge_capture_question" and question_uuid is None:
+        raise TaskManagementError(
+            "Knowledge Capture question notifications require question_id",
+            status_code=400,
+        )
+    if notification_type == "knowledge_capture_draft" and question_uuid is not None:
+        raise TaskManagementError(
+            "Knowledge Capture draft notifications cannot have question_id",
+            status_code=400,
+        )
+
+    # Revalidate the recipient against the live Project ACL immediately before
+    # writing.  A stale candidate/worker must not notify a removed member.
+    if not await ProjectRepository.has_permission(
+        session,
+        project_id=project_uuid,
+        user_id=recipient_uuid,
+        permission="read",
+    ):
+        raise TaskManagementError(
+            "Knowledge Capture notification recipient is not authorized",
+            status_code=403,
+        )
+
+    payload = _knowledge_capture_payload(
+        candidate_id=candidate_uuid,
+        question_id=question_uuid,
+        candidate_version=candidate_version,
+    )
+    dedupe_key = knowledge_capture_notification_dedupe_key(
+        candidate_id=candidate_uuid,
+        notification_type=notification_type,
+        question_id=question_uuid,
+        candidate_version=int(candidate_version),
+    )
+    delivery = await _insert_notification_if_missing(
+        session,
+        dedupe_key=dedupe_key,
+        project_id=project_uuid,
+        task_id=None,
+        occurrence_id=None,
+        user_id=recipient_uuid,
+        channel="in_app",
+        notification_type=notification_type,
+        title=_bounded_capture_text(
+            title, field_name="title", limit=_KNOWLEDGE_CAPTURE_MAX_TITLE
+        ),
+        message=_bounded_capture_text(
+            message, field_name="message", limit=_KNOWLEDGE_CAPTURE_MAX_MESSAGE
+        ),
+        scheduled_for=scheduled_for or datetime.utcnow(),
+        payload=payload,
+    )
+    if delivery is None:
+        # A duplicate retry is still successful from the workflow's point of
+        # view.  Return the durable winner when it is visible to this session.
+        result = await session.execute(
+            select(NotificationDelivery).where(
+                NotificationDelivery.dedupe_key == dedupe_key
+            )
+        )
+        delivery = result.scalar_one_or_none()
+    if commit:
+        await session.commit()
+        if delivery is not None and callable(getattr(session, "refresh", None)):
+            await session.refresh(delivery)
+    return delivery
+
+
+async def close_knowledge_capture_notifications(
+    session: AsyncSession,
+    *,
+    candidate_id: UUID,
+    question_id: UUID | None = None,
+    project_id: UUID | None = None,
+    commit: bool = False,
+) -> int:
+    """Cancel open capture rows for an answer, dismiss, or publication.
+
+    ``question_id`` narrows closure to one question.  Omitting it closes all
+    capture rows for the candidate, which is used by dismiss/publish.
+    """
+
+    candidate_uuid = _coerce_uuid(candidate_id, "candidate_id")
+    question_uuid = (
+        _coerce_uuid(question_id, "question_id") if question_id is not None else None
+    )
+    conditions = [
+        NotificationDelivery.channel == "in_app",
+        NotificationDelivery.notification_type.in_(
+            tuple(KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES)
+        ),
+        NotificationDelivery.status != "cancelled",
+    ]
+    if project_id is not None:
+        conditions.append(
+            NotificationDelivery.project_id == _coerce_uuid(project_id, "project_id")
+        )
+    result = await session.execute(select(NotificationDelivery).where(and_(*conditions)))
+    now = datetime.utcnow()
+    closed = 0
+    for notification in result.scalars().all():
+        payload = notification.payload if isinstance(notification.payload, Mapping) else {}
+        if payload.get("kind") != "knowledge_capture":
+            continue
+        if str(payload.get("candidate_id")) != str(candidate_uuid):
+            continue
+        if question_uuid is not None and str(payload.get("question_id")) != str(question_uuid):
+            continue
+        notification.status = "cancelled"
+        notification.delivered_at = now
+        notification.updated_at = now
+        closed += 1
+    if commit:
+        await session.commit()
+    return closed
+
+
+# Service-style facade for candidate/research workers that do not need the
+# full TaskManagementService object.  Keeping this small also gives tests a
+# focused seam without changing Project Steward construction.
+class KnowledgeCaptureNotificationService:
+    persist = staticmethod(persist_knowledge_capture_notification)
+    close = staticmethod(close_knowledge_capture_notifications)
+
+
+def _notification_gateway(service: Any) -> OutboundPrivacyGateway:
+    """Resolve the request/worker-scoped privacy gateway for webhooks."""
+
+    injected = getattr(service, "privacy_gateway", None)
+    if injected is None:
+        injected = getattr(service, "_privacy_gateway", None)
+    if injected is not None:
+        return injected
+
+    inherited = get_privacy_policy_context()
+    config = getattr(service, "config", None)
+    if config is None:
+        config = getattr(service, "_config", None)
+    return OutboundPrivacyGateway(
+        config,
+        user_id=str(getattr(service, "user_id", "") or ""),
+        session_id=str(getattr(service, "session_id", "") or ""),
+        session_context=inherited.session_context,
+        project_metadata=inherited.project_metadata,
+    )
+
+
+def _notification_egress_descriptor(*, destination: str):
+    """Build a descriptor for a Discord background webhook delivery."""
+
+    try:
+        from ..outbound_privacy_service import EgressDescriptor
+
+        return EgressDescriptor(
+            action="task_notification.webhook",
+            transport="httpx",
+            destination=destination,
+            provider="discord",
+            tool="task_notification",
+            model="",
+        )
+    except ImportError:  # pragma: no cover - compatibility with old embeds
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            action="task_notification.webhook",
+            transport="httpx",
+            destination=destination,
+            provider="discord",
+            tool="task_notification",
+            model="",
+        )
+
+
+async def _insert_notification_if_missing(
+    session: AsyncSession,
+    *,
+    dedupe_key: str,
+    project_id: UUID,
+    task_id: Optional[UUID],
+    occurrence_id: Optional[UUID],
+    user_id: Optional[UUID],
+    channel: str,
+    notification_type: str,
+    title: str,
+    message: str,
+    scheduled_for: datetime,
+    payload: Optional[dict[str, Any]] = None,
+) -> Optional[NotificationDelivery]:
+    """Insert one durable notification, converging concurrent retries.
+
+    ``NotificationDelivery.dedupe_key`` is the sole idempotency boundary for
+    both task reminders and Project Steward alerts.  Keeping this primitive
+    module-level lets the Steward persist an inbox row without constructing a
+    full task-management service (and therefore without opening any task or
+    Docs mutation path).
+    """
+
+    result = await session.execute(
+        _conflict_safe_insert(session, NotificationDelivery)
+        .values(
+            id=uuid4(),
+            project_id=project_id,
+            task_id=task_id,
+            occurrence_id=occurrence_id,
+            user_id=user_id,
+            channel=channel,
+            notification_type=notification_type,
+            dedupe_key=dedupe_key,
+            title=title,
+            message=message,
+            scheduled_for=scheduled_for,
+            status="pending",
+            payload=payload or {},
+        )
+        .on_conflict_do_nothing(index_elements=[NotificationDelivery.dedupe_key])
+        .returning(NotificationDelivery)
+    )
+    return result.scalar_one_or_none()
+
+
+async def persist_project_steward_notification(
+    session: AsyncSession,
+    *,
+    project_id: UUID,
+    owner_user_id: UUID,
+    dedupe_key: str,
+    title: str,
+    message: str,
+    payload: Optional[dict[str, Any]] = None,
+    scheduled_for: Optional[datetime] = None,
+) -> Optional[NotificationDelivery]:
+    """Persist an owner-scoped Project Steward inbox alert.
+
+    The project owner check is performed immediately before the insert.  A
+    project can be deleted or transferred between evidence collection and
+    alert persistence; in that case the operation fails closed rather than
+    leaking an alert to the former owner.  The unique dedupe key makes a
+    retry/redelivery exactly-once even when the first attempt already wrote
+    the row but the caller lost the response.
+    """
+
+    try:
+        project_uuid = (
+            project_id if isinstance(project_id, UUID) else UUID(str(project_id))
+        )
+        owner_uuid = (
+            owner_user_id
+            if isinstance(owner_user_id, UUID)
+            else UUID(str(owner_user_id))
+        )
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise TaskManagementError(
+            "Invalid Project Steward notification scope", status_code=400
+        ) from exc
+
+    # Importing Project at module load is safe (it is already imported above),
+    # and this query intentionally requires an active project owner match.
+    owner_result = await session.execute(
+        select(Project.owner_id).where(
+            Project.id == project_uuid,
+            Project.deleted_at.is_(None),
+        )
+    )
+    current_owner = owner_result.scalar_one_or_none()
+    if current_owner is None or str(current_owner) != str(owner_uuid):
+        raise TaskManagementError(
+            "Project Steward notification scope is no longer authorized",
+            status_code=404,
+        )
+
+    # Do not let malformed/legacy callers turn this helper into an unbounded
+    # text sink.  Steward model output is validated upstream, but this
+    # boundary is also used by mixed-version workers during rollout.
+    normalized_dedupe = str(dedupe_key or "").strip()
+    normalized_title = str(title or "").strip()
+    normalized_message = str(message or "").strip()
+    if not normalized_dedupe or len(normalized_dedupe) > 255:
+        raise TaskManagementError("Invalid notification dedupe key", status_code=400)
+    if not normalized_title or len(normalized_title) > 255:
+        raise TaskManagementError("Invalid notification title", status_code=400)
+    if not normalized_message:
+        raise TaskManagementError("Invalid notification message", status_code=400)
+
+    delivery = await _insert_notification_if_missing(
+        session,
+        dedupe_key=normalized_dedupe,
+        project_id=project_uuid,
+        task_id=None,
+        occurrence_id=None,
+        user_id=owner_uuid,
+        channel="in_app",
+        notification_type="project_steward",
+        title=normalized_title,
+        message=normalized_message,
+        scheduled_for=scheduled_for or datetime.utcnow(),
+        payload=payload,
+    )
+    # The helper owns this short transaction.  Calling code treats both a new
+    # row and an existing dedupe winner as success, while a commit failure
+    # propagates and therefore prevents a Heartbeat cursor advance.
+    await session.commit()
+    return delivery
 
 
 def _task_notification_lookahead_minutes() -> int:
@@ -350,6 +891,131 @@ def _recipient_reminder_offsets(
 class NotificationMixin:
     """通知設定と配信。"""
 
+    async def _knowledge_capture_notification_is_current(
+        self,
+        session: AsyncSession,
+        notification: NotificationDelivery,
+    ) -> bool:
+        """Revalidate the recipient's live Project read permission."""
+
+        if not is_knowledge_capture_notification(notification):
+            return True
+        project_id = getattr(notification, "project_id", None)
+        user_id = getattr(notification, "user_id", None)
+        try:
+            project_uuid = _coerce_uuid(project_id, "project_id")
+            user_uuid = _coerce_uuid(user_id, "user_id")
+        except TaskManagementError:
+            return False
+        return await ProjectRepository.has_permission(
+            session,
+            project_id=project_uuid,
+            user_id=user_uuid,
+            permission="read",
+        )
+
+    async def create_knowledge_capture_notification(
+        self,
+        session: AsyncSession,
+        *,
+        project_id: UUID,
+        recipient_user_id: UUID,
+        candidate_id: UUID,
+        notification_type: str,
+        candidate_version: int,
+        question_id: UUID | None = None,
+        title: str,
+        message: str,
+        scheduled_for: Optional[datetime] = None,
+        commit: bool = False,
+    ) -> Optional[NotificationDelivery]:
+        """Persist a typed, Project-authorized capture notification."""
+
+        return await persist_knowledge_capture_notification(
+            session,
+            project_id=project_id,
+            recipient_user_id=recipient_user_id,
+            candidate_id=candidate_id,
+            notification_type=notification_type,
+            candidate_version=candidate_version,
+            question_id=question_id,
+            title=title,
+            message=message,
+            scheduled_for=scheduled_for,
+            commit=commit,
+        )
+
+    async def close_knowledge_capture_notifications(
+        self,
+        session: AsyncSession,
+        *,
+        candidate_id: UUID,
+        question_id: UUID | None = None,
+        project_id: UUID | None = None,
+        commit: bool = False,
+    ) -> int:
+        """Close question/draft rows after a candidate mutation."""
+
+        return await close_knowledge_capture_notifications(
+            session,
+            candidate_id=candidate_id,
+            question_id=question_id,
+            project_id=project_id,
+            commit=commit,
+        )
+
+    async def _project_steward_notification_is_current(
+        self,
+        session: AsyncSession,
+        notification: NotificationDelivery,
+    ) -> bool:
+        """Revalidate owner scope before inbox/read or external delivery.
+
+        Steward rows are intentionally owner-only.  A soft-deleted project or
+        an ownership transfer must invalidate a pending row even though the
+        original ``user_id`` and dedupe key remain unchanged.
+        """
+
+        if not is_project_steward_notification(notification):
+            return True
+        project_id = getattr(notification, "project_id", None)
+        user_id = getattr(notification, "user_id", None)
+        if project_id is None or user_id is None:
+            return False
+        result = await session.execute(
+            select(Project.owner_id).where(
+                Project.id == project_id,
+                Project.deleted_at.is_(None),
+            )
+        )
+        owner_id = result.scalar_one_or_none()
+        return owner_id is not None and str(owner_id) == str(user_id)
+
+    async def create_project_steward_notification(
+        self,
+        session: AsyncSession,
+        *,
+        project_id: UUID,
+        owner_user_id: UUID,
+        dedupe_key: str,
+        title: str,
+        message: str,
+        payload: Optional[dict[str, Any]] = None,
+        scheduled_for: Optional[datetime] = None,
+    ) -> Optional[NotificationDelivery]:
+        """Mixin facade for the owner-scoped durable Steward alert helper."""
+
+        return await persist_project_steward_notification(
+            session,
+            project_id=project_id,
+            owner_user_id=owner_user_id,
+            dedupe_key=dedupe_key,
+            title=title,
+            message=message,
+            payload=payload,
+            scheduled_for=scheduled_for,
+        )
+
     async def get_or_create_notification_setting(
         self,
         session: AsyncSession,
@@ -576,10 +1242,12 @@ class NotificationMixin:
     ) -> list[dict[str, Any]]:
         stmt = (
             select(NotificationDelivery)
+            .join(Project, Project.id == NotificationDelivery.project_id)
             .where(
                 NotificationDelivery.channel == "in_app",
                 NotificationDelivery.user_id == user_id,
                 NotificationDelivery.status != "cancelled",
+                Project.deleted_at.is_(None),
             )
             .order_by(
                 NotificationDelivery.scheduled_for.desc(),
@@ -590,7 +1258,31 @@ class NotificationMixin:
             stmt = stmt.where(NotificationDelivery.read_at.is_(None))
 
         result = await session.execute(stmt)
-        return [notification.to_dict() for notification in result.scalars().all()]
+        notifications = []
+        for notification in result.scalars().all():
+            # Project Steward is background housekeeping, not a user-facing
+            # inbox item.  Suppress every legacy Steward row regardless of
+            # owner validity; the durable row remains available for bounded
+            # cleanup/audit while ordinary notifications keep their existing
+            # owner/project checks.
+            if is_project_steward_notification(notification):
+                continue
+            if is_knowledge_capture_notification(notification) and not await self._knowledge_capture_notification_is_current(
+                session,
+                notification,
+            ):
+                # Membership revocation/deletion invalidates a capture inbox
+                # row just like candidate authorization at the API boundary.
+                continue
+            if not await self._project_steward_notification_is_current(
+                session,
+                notification,
+            ):
+                # Keep the durable dedupe row for audit/retry convergence but
+                # never expose stale owner-scoped alerts through the inbox.
+                continue
+            notifications.append(notification.to_dict())
+        return notifications
 
     async def mark_notification_read(
         self,
@@ -600,14 +1292,33 @@ class NotificationMixin:
         notification_id: UUID,
     ) -> dict[str, Any]:
         result = await session.execute(
-            select(NotificationDelivery).where(
+            select(NotificationDelivery)
+            .join(Project, Project.id == NotificationDelivery.project_id)
+            .where(
                 NotificationDelivery.id == notification_id,
                 NotificationDelivery.channel == "in_app",
                 NotificationDelivery.user_id == user_id,
+                Project.deleted_at.is_(None),
             )
         )
         notification = result.scalar_one_or_none()
-        if notification is None:
+        # Project Steward results are never user-readable through the normal
+        # notification API, including rows created by older workers.  Return
+        # the same not-found contract as an unknown or unauthorized row and do
+        # not mutate the durable record.
+        if notification is not None and is_project_steward_notification(notification):
+            raise TaskManagementError("Notification not found", status_code=404)
+        if notification is not None and is_knowledge_capture_notification(
+            notification
+        ) and not await self._knowledge_capture_notification_is_current(
+            session,
+            notification,
+        ):
+            raise TaskManagementError("Notification not found", status_code=404)
+        if notification is None or not await self._project_steward_notification_is_current(
+            session,
+            notification,
+        ):
             raise TaskManagementError("Notification not found", status_code=404)
 
         notification.read_at = datetime.utcnow()
@@ -625,14 +1336,30 @@ class NotificationMixin:
     ) -> int:
         """未読通知を一括既読化し、更新件数を返す（Web BFF の read-all と同契約）。"""
         result = await session.execute(
-            select(NotificationDelivery).where(
+            select(NotificationDelivery)
+            .join(Project, Project.id == NotificationDelivery.project_id)
+            .where(
                 NotificationDelivery.user_id == user_id,
                 NotificationDelivery.channel == "in_app",
                 NotificationDelivery.read_at.is_(None),
                 NotificationDelivery.status != "cancelled",
+                ~NotificationDelivery.notification_type.in_(
+                    tuple(KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES)
+                ),
+                Project.deleted_at.is_(None),
             )
         )
-        notifications = result.scalars().all()
+        notifications = [
+            notification
+            for notification in result.scalars().all()
+            if not is_project_steward_notification(notification)
+            # Keep this defensive type-only guard even though the SQL
+            # predicate above is authoritative.  A mocked result or a mixed
+            # transaction snapshot must never let a malformed/stale KC row
+            # through based on payload validity.
+            and _notification_field(notification, "notification_type")
+            not in KNOWLEDGE_CAPTURE_NOTIFICATION_TYPES
+        ]
         now = datetime.utcnow()
         for notification in notifications:
             notification.read_at = now
@@ -658,29 +1385,20 @@ class NotificationMixin:
         scheduled_for: datetime,
         payload: Optional[dict[str, Any]] = None,
     ) -> Optional[NotificationDelivery]:
-        result = await session.execute(
-            _conflict_safe_insert(session, NotificationDelivery)
-            .values(
-                id=uuid4(),
-                project_id=project_id,
-                task_id=task_id,
-                occurrence_id=occurrence_id,
-                user_id=user_id,
-                channel=channel,
-                notification_type=notification_type,
-                dedupe_key=dedupe_key,
-                title=title,
-                message=message,
-                scheduled_for=scheduled_for,
-                status="pending",
-                payload=payload or {},
-            )
-            .on_conflict_do_nothing(
-                index_elements=[NotificationDelivery.dedupe_key]
-            )
-            .returning(NotificationDelivery)
+        return await _insert_notification_if_missing(
+            session,
+            dedupe_key=dedupe_key,
+            project_id=project_id,
+            task_id=task_id,
+            occurrence_id=occurrence_id,
+            user_id=user_id,
+            channel=channel,
+            notification_type=notification_type,
+            title=title,
+            message=message,
+            scheduled_for=scheduled_for,
+            payload=payload,
         )
-        return result.scalar_one_or_none()
 
     async def _create_in_app_reminder_deliveries(
         self,
@@ -1145,7 +1863,36 @@ class NotificationMixin:
             if getattr(notification, "read_at", None) is not None:
                 notification.status = "read"
                 continue
+            if is_project_steward_notification(notification):
+                # Project Steward is operational background work, never a
+                # user-notification channel.  Cancel legacy pending rows
+                # before touching websocket, web-push, or external delivery so
+                # mixed-version workers cannot leak a Steward result.  Keep
+                # the durable dedupe row for bounded cleanup/audit.
+                notification.status = "cancelled"
+                notification.delivered_at = current_time
+                continue
+            if is_knowledge_capture_notification(notification) and not await self._knowledge_capture_notification_is_current(
+                session,
+                notification,
+            ):
+                # Do not broadcast or push a candidate after its recipient
+                # loses Project access.  Keep the durable dedupe row for
+                # audit/retry convergence.
+                notification.status = "cancelled"
+                notification.delivered_at = current_time
+                continue
             if notification.channel == "in_app":
+                if not await self._project_steward_notification_is_current(
+                    session,
+                    notification,
+                ):
+                    # Owner transfer/project deletion invalidates a pending
+                    # Steward row.  Preserve its unique dedupe record but do
+                    # not broadcast or push stale project intelligence.
+                    notification.status = "cancelled"
+                    notification.delivered_at = current_time
+                    continue
                 reminder_is_current = True
                 if notification.notification_type == "reminder":
                     reminder_is_current = await self._push_notification_is_current(
@@ -1175,6 +1922,15 @@ class NotificationMixin:
                             WebPushSubscription.user_id == notification.user_id
                         )
                     )
+                    knowledge_route = _knowledge_capture_notification_route(
+                        notification
+                    )
+                    knowledge_payload = (
+                        notification.payload
+                        if is_knowledge_capture_notification(notification)
+                        and isinstance(notification.payload, Mapping)
+                        else {}
+                    )
                     push_payload = {
                         "title": notification.title,
                         "body": notification.message,
@@ -1182,7 +1938,15 @@ class NotificationMixin:
                         "taskId": str(notification.task_id)
                         if notification.task_id
                         else None,
-                        "url": (
+                        "candidateId": knowledge_payload.get("candidate_id"),
+                        "questionId": knowledge_payload.get("question_id"),
+                        "projectId": str(notification.project_id)
+                        if knowledge_route
+                        else None,
+                        # Knowledge Capture routes are derived from typed IDs;
+                        # payload-provided action URLs are never forwarded.
+                        "url": knowledge_route
+                        or (
                             f"/tasks/{notification.task_id}"
                             if notification.task_id
                             else "/"
@@ -1190,6 +1954,8 @@ class NotificationMixin:
                         "tag": f"aoitalk-{notification.id}",
                         "scheduledFor": notification.scheduled_for.isoformat(),
                     }
+                    if knowledge_route:
+                        push_payload["openMode"] = _KNOWLEDGE_CAPTURE_OPEN_MODE
                     for subscription in subscriptions_result.scalars().all():
                         try:
                             endpoint = await validate_web_push_endpoint(
@@ -1251,20 +2017,50 @@ class NotificationMixin:
                     continue
 
                 try:
-                    async with httpx.AsyncClient(
-                        timeout=10.0,
-                        follow_redirects=False,
-                    ) as client:
-                        response = await client.post(
-                            webhook_url,
-                            json={
-                                "content": f"**{notification.title}**\n{notification.message}"
-                            },
+                    gateway = _notification_gateway(self)
+                    descriptor = _notification_egress_descriptor(
+                        destination=webhook_url,
+                    )
+
+                    async def send(protected_payload):
+                        if not isinstance(protected_payload, Mapping):
+                            raise PrivacyError(
+                                "privacy protection returned no protected payload"
+                            )
+                        async with httpx.AsyncClient(
+                            timeout=10.0,
+                            follow_redirects=False,
+                        ) as client:
+                            return await client.post(
+                                webhook_url,
+                                json=dict(protected_payload),
+                            )
+
+                    execute = getattr(gateway, "execute", None)
+                    if not callable(execute):
+                        # Background workers must never bypass the privacy
+                        # transaction when running against a mixed-version
+                        # gateway.  Fail closed instead of sending raw text.
+                        raise PrivacyError(
+                            "outbound privacy gateway does not support execution"
                         )
+                    response = await execute(
+                        {
+                            "content": f"**{notification.title}**\n{notification.message}"
+                        },
+                        provider="discord",
+                        descriptor=descriptor,
+                        sender=send,
+                        base_url=webhook_url,
+                        source_kind="task_notification.webhook",
+                    )
                     response.raise_for_status()
                     notification.delivered_at = current_time
                     notification.status = "delivered"
                     stats["delivered"] += 1
+                except (ExternalProviderBlocked, PrivacyError):
+                    notification.status = "failed"
+                    stats["failed"] += 1
                 except Exception:
                     notification.status = "failed"
                     stats["failed"] += 1

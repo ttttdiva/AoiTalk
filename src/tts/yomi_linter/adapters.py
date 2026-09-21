@@ -6,6 +6,13 @@ from typing import Any, Dict, Iterable, Set, Tuple
 
 import httpx
 
+from ...services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+    get_privacy_policy_context,
+)
+
 
 class VoicevoxCompatibleDictionaryAdapter:
     """明示語を同期し、AoiTalkが所有するremote UUIDだけを削除する。"""
@@ -18,6 +25,79 @@ class VoicevoxCompatibleDictionaryAdapter:
         self._fulfilled: Dict[Tuple[str, str], Set[str]] = {}
         self._known_clean: Set[Tuple[str, str]] = set()
         self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _gateway(engine: Any, base_url: str) -> OutboundPrivacyGateway:
+        """Create a policy-scoped gateway for configurable VoiceVox routes."""
+
+        config = getattr(engine, "config", None)
+        if config is None:
+            try:
+                from ...config import Config
+
+                config = Config()
+            except Exception as exc:
+                raise PrivacyError("VoiceVox dictionary privacy configuration is unavailable") from exc
+        context = get_privacy_policy_context()
+        session = context.session_context or {}
+        return OutboundPrivacyGateway(
+            config,
+            user_id=str(session.get("user_id") or getattr(engine, "session_user_id", "") or ""),
+            session_id=str(session.get("session_id") or session.get("id") or getattr(engine, "current_session_id", "") or ""),
+            session_context=context.session_context,
+            project_metadata=context.project_metadata,
+        )
+
+    @classmethod
+    async def _request(
+        cls,
+        engine: Any,
+        client: httpx.AsyncClient,
+        base_url: str,
+        method: str,
+        path: str,
+        *,
+        params: Dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        """Perform exactly one dictionary HTTP operation behind the gateway."""
+
+        normalized_method = str(method or "GET").upper()
+        request = {
+            "method": normalized_method,
+            "path": str(path or ""),
+            "params": dict(params or {}),
+        }
+        gateway = cls._gateway(engine, base_url)
+
+        async def sender(final_payload: Any) -> httpx.Response:
+            if not isinstance(final_payload, dict):
+                raise PrivacyError("VoiceVox dictionary payload is malformed")
+            if str(final_payload.get("method") or "").upper() != normalized_method:
+                raise PrivacyError("VoiceVox dictionary method binding changed")
+            if str(final_payload.get("path") or "") != str(path or ""):
+                raise PrivacyError("VoiceVox dictionary destination binding changed")
+            final_params = final_payload.get("params")
+            if not isinstance(final_params, dict):
+                raise PrivacyError("VoiceVox dictionary parameters are malformed")
+            request_method = getattr(client, normalized_method.lower(), None)
+            if not callable(request_method):
+                raise PrivacyError("VoiceVox dictionary HTTP method is unsupported")
+            return await request_method(str(path or ""), params=final_params)
+
+        return await gateway.execute(
+            request,
+            provider="voicevox",
+            descriptor=EgressDescriptor(
+                action=f"voicevox.dictionary.{normalized_method.lower()}",
+                transport="httpx.AsyncClient",
+                destination=f"{base_url}{path}",
+                provider="voicevox",
+                tool="tts.yomi_linter",
+            ),
+            base_url=base_url,
+            source_kind="voicevox_dictionary",
+            sender=sender,
+        )
 
     async def apply(
         self,
@@ -64,7 +144,13 @@ class VoicevoxCompatibleDictionaryAdapter:
             desired = {str(entry["id"]): entry for entry in entries}
             fulfilled: Set[str] = set()
             async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
-                response = await client.get("/user_dict")
+                response = await self._request(
+                    engine,
+                    client,
+                    base_url,
+                    "GET",
+                    "/user_dict",
+                )
                 response.raise_for_status()
                 remote = response.json() or {}
                 remote_words = remote if isinstance(remote, dict) else {}
@@ -87,8 +173,12 @@ class VoicevoxCompatibleDictionaryAdapter:
                         == int(entry.get("accent_type") or 0)
                     )
                     if not same:
-                        deleted = await client.delete(
-                            f"/user_dict_word/{sync['remote_word_uuid']}"
+                        deleted = await self._request(
+                            engine,
+                            client,
+                            base_url,
+                            "DELETE",
+                            f"/user_dict_word/{sync['remote_word_uuid']}",
                         )
                         if deleted.status_code not in {204, 404}:
                             deleted.raise_for_status()
@@ -111,7 +201,11 @@ class VoicevoxCompatibleDictionaryAdapter:
                         and int(word.get("accent_type") or 0) == accent
                     ), None)
                     if exact_remote_uuid is None:
-                        created = await client.post(
+                        created = await self._request(
+                            engine,
+                            client,
+                            base_url,
+                            "POST",
                             "/user_dict_word",
                             params={
                                 "surface": entry["surface"],
@@ -163,8 +257,12 @@ class VoicevoxCompatibleDictionaryAdapter:
             if syncs:
                 async with httpx.AsyncClient(base_url=base_url, timeout=5.0) as client:
                     for sync in syncs:
-                        deleted = await client.delete(
-                            f"/user_dict_word/{sync['remote_word_uuid']}"
+                        deleted = await self._request(
+                            engine,
+                            client,
+                            base_url,
+                            "DELETE",
+                            f"/user_dict_word/{sync['remote_word_uuid']}",
                         )
                         if deleted.status_code not in {204, 404}:
                             deleted.raise_for_status()

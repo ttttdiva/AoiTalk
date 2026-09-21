@@ -48,6 +48,7 @@ AGENT_HARNESS_SAFE_RUNNERS = frozenset(
     {"codex_exec", "codex_cli", "claude_code", "claude_cli", "custom_command"}
 )
 AGENT_HARNESS_SAFE_SANDBOXES = frozenset({"read-only", "workspace-write"})
+AGENT_HARNESS_SAFE_EXECUTION_BACKENDS = frozenset({"wsl_bwrap", "wsl2_bwrap"})
 AGENT_HARNESS_SAFE_APPROVAL_POLICIES = frozenset(
     {"never", "on-request", "on-failure", "untrusted", "unless-trusted"}
 )
@@ -619,6 +620,13 @@ class AgentHarnessSettings:
     max_turns: int = 20
     max_retry_backoff_ms: int = 300_000
     failure_retry_base_ms: int = 10_000
+    # Deployment-owned Enterprise execution policy.  These values are kept
+    # out of the HTTP update allowlist above: an API caller must not be able to
+    # select a host process backend or enlarge the server-issued capability.
+    execution_enabled: bool = True
+    execution_backend: str = "wsl_bwrap"
+    execution_network: str = "none"
+    execution_resource_limits: dict[str, Any] = field(default_factory=dict)
     tracker: HarnessTrackerSettings = field(default_factory=HarnessTrackerSettings)
     hooks: HarnessHookSettings = field(default_factory=HarnessHookSettings)
     codex: HarnessCodexSettings = field(default_factory=HarnessCodexSettings)
@@ -641,6 +649,7 @@ class AgentHarnessSettings:
         codex_raw = raw.get("codex", {}) or {}
         claude_raw = raw.get("claude", {}) or {}
         custom_command_raw = raw.get("custom_command", {}) or {}
+        execution_raw = raw.get("execution", {}) or {}
         if not isinstance(tracker_raw, dict):
             tracker_raw = {}
         if not isinstance(hooks_raw, dict):
@@ -651,6 +660,8 @@ class AgentHarnessSettings:
             claude_raw = {}
         if not isinstance(custom_command_raw, dict):
             custom_command_raw = {}
+        if not isinstance(execution_raw, dict):
+            execution_raw = {}
         codex_cli_raw = _config_get(config, "codex_cli", {}) or {}
         claude_cli_raw = _config_get(config, "claude_cli", {}) or {}
         if not isinstance(codex_cli_raw, dict):
@@ -708,6 +719,20 @@ class AgentHarnessSettings:
             max_turns=_as_int(raw.get("max_turns"), 20, minimum=1),
             max_retry_backoff_ms=_as_int(raw.get("max_retry_backoff_ms"), 300_000, minimum=1),
             failure_retry_base_ms=_as_int(raw.get("failure_retry_base_ms"), 10_000, minimum=1),
+            execution_enabled=_as_bool(execution_raw.get("enabled"), True),
+            execution_backend=str(
+                execution_raw.get("backend") or "wsl_bwrap"
+            ).strip().lower().replace("-", "_"),
+            execution_network=str(
+                execution_raw.get("network")
+                or execution_raw.get("network_capability")
+                or "none"
+            ).strip().lower(),
+            execution_resource_limits=(
+                dict(execution_raw.get("resource_limits"))
+                if isinstance(execution_raw.get("resource_limits"), dict)
+                else {}
+            ),
             tracker=HarnessTrackerSettings(
                 active_states=_as_str_list(
                     tracker_raw.get("active_states"),

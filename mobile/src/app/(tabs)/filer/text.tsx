@@ -1,26 +1,79 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Platform,
   StyleSheet,
   View,
 } from "react-native";
-import { Button, Text, TextInput } from "react-native-paper";
+import { Button, Text } from "react-native-paper";
 import { useLocalSearchParams, useRouter } from "expo-router";
+import { ThemedTextInput } from "../../../components/themed-text-input";
 import { ScreenHeader } from "../../../components/screen-header";
+import { useAuth } from "../../../contexts/AuthContext";
+import { useProject } from "../../../contexts/ProjectContext";
 import { SOURCE_LABELS } from "../../../features/files/file-browser-model";
 import { parseFilesTextEditorParams } from "../../../features/files/files-text-editor-route";
-import { filesApi } from "../../../lib/files-api";
+import {
+  filesApi,
+  isProjectFilesNamespacePath,
+  parseProjectFilesPath,
+} from "../../../lib/files-api";
 import { goBackOrReplace } from "../../../lib/navigation";
+import { getProjectCapabilities } from "../../../lib/project-api";
+import {
+  isServerKnownUnreachable,
+  useNetworkStore,
+} from "../../../stores/network";
 
 export default function FilesTextEditorScreen() {
   const router = useRouter();
+  const { isAuthenticated, user } = useAuth();
+  const { projects } = useProject();
+  const networkConnected = useNetworkStore(
+    (state) => state.connected !== false,
+  );
+  const networkServerReachable = useNetworkStore(
+    (state) => state.serverReachable,
+  );
+  const networkCheckedAt = useNetworkStore((state) => state.serverCheckedAt);
+  const isOffline = useMemo(
+    () => isServerKnownUnreachable() || !networkConnected,
+    // Internet reachability is not the same as AoiTalk reachability.  A LAN
+    // server must remain usable while Android reports online=false.
+    [networkCheckedAt, networkConnected, networkServerReachable],
+  );
   const rawParams = useLocalSearchParams<{
     source?: string;
     path?: string;
     name?: string;
   }>();
   const identity = parseFilesTextEditorParams(rawParams);
+  const projectPath =
+    identity?.source === "server" ? parseProjectFilesPath(identity.path) : null;
+  const usesProjectNamespace =
+    identity?.source === "server" && isProjectFilesNamespacePath(identity.path);
+  const project = projectPath
+    ? projects.find(
+        (candidate) =>
+          candidate.id.toLowerCase() === projectPath.projectId.toLowerCase(),
+      ) ?? null
+    : null;
+  const projectCanWrite = Boolean(
+    projectPath?.relativePath &&
+      project &&
+      getProjectCapabilities(project, user).canWrite,
+  );
+  const canUseServerSave =
+    identity?.source !== "server" ||
+    (isAuthenticated &&
+      !isOffline &&
+      (!usesProjectNamespace || projectCanWrite));
 
   const [sessionKey, setSessionKey] = useState(0);
   const [initialContent, setInitialContent] = useState("");
@@ -33,6 +86,7 @@ export default function FilesTextEditorScreen() {
   const saveGenerationRef = useRef(0);
   const contentRef = useRef("");
   const mountedRef = useRef(true);
+  const navigationRequestedRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -42,10 +96,23 @@ export default function FilesTextEditorScreen() {
   }, []);
 
   const handleBack = useCallback(() => {
+    // Native-stack transitions can leave this screen mounted briefly.  Make
+    // back idempotent and invalidate an in-flight save so it cannot request a
+    // second transition after a manual back.
+    if (navigationRequestedRef.current) return;
+    navigationRequestedRef.current = true;
+    saveGenerationRef.current += 1;
     goBackOrReplace(router, "/(tabs)/filer");
   }, [router]);
 
   useEffect(() => {
+    navigationRequestedRef.current = false;
+    // Invalidate any in-flight save before handling a new set of route
+    // parameters, including an invalid route.  Otherwise a save started for
+    // the previous file could resolve after the route changes and navigate
+    // away from the replacement editor.
+    saveGenerationRef.current += 1;
+
     if (!identity) {
       setLoading(false);
       setReadError("ファイル情報が不正です。");
@@ -55,7 +122,16 @@ export default function FilesTextEditorScreen() {
     let cancelled = false;
     const { source, path } = identity;
 
-    saveGenerationRef.current += 1;
+    // Do not start a server request without a physical network path.  Local
+    // files remain available regardless of NetInfo state.
+    if (source === "server" && !networkConnected) {
+      setLoading(false);
+      setReadError("オフラインのためファイルを読み込めません。");
+      return () => {
+        cancelled = true;
+      };
+    }
+
     savingRef.current = false;
     setSaving(false);
     setLoading(true);
@@ -87,10 +163,18 @@ export default function FilesTextEditorScreen() {
     return () => {
       cancelled = true;
     };
-  }, [identity?.source, identity?.path, reloadNonce]);
+  }, [identity?.source, identity?.path, networkConnected, reloadNonce]);
 
   const handleSave = useCallback(async () => {
-    if (!identity || loading || savingRef.current || readError) return;
+    if (
+      !identity ||
+      loading ||
+      savingRef.current ||
+      readError ||
+      !canUseServerSave
+    ) {
+      return;
+    }
 
     const saveGeneration = saveGenerationRef.current;
     const { source, path } = identity;
@@ -99,8 +183,10 @@ export default function FilesTextEditorScreen() {
     savingRef.current = true;
     setSaving(true);
     setSaveError(null);
+    let saveSucceeded = false;
     try {
       await filesApi.saveText(source, path, content);
+      saveSucceeded = true;
     } catch (error) {
       if (
         mountedRef.current &&
@@ -119,7 +205,18 @@ export default function FilesTextEditorScreen() {
         setSaving(false);
       }
     }
-  }, [identity, loading, readError]);
+
+    // Navigation is deliberately sequenced after the awaited save.  Keep the
+    // generation/mounted guards so a stale request cannot close a replacement
+    // editor, and failed saves remain on this screen for retry.
+    if (
+      saveSucceeded &&
+      mountedRef.current &&
+      saveGenerationRef.current === saveGeneration
+    ) {
+      handleBack();
+    }
+  }, [canUseServerSave, handleBack, identity, loading, readError]);
 
   const handleRetryRead = useCallback(() => {
     if (!identity) return;
@@ -128,7 +225,12 @@ export default function FilesTextEditorScreen() {
 
   const title = identity?.name ?? "Editor";
   const subtitle = identity ? SOURCE_LABELS[identity.source] : undefined;
-  const canSave = Boolean(identity) && !loading && !readError && !saving;
+  const canSave =
+    Boolean(identity) &&
+    !loading &&
+    !readError &&
+    !saving &&
+    canUseServerSave;
 
   return (
     <View style={styles.container}>
@@ -173,14 +275,16 @@ export default function FilesTextEditorScreen() {
           {saveError ? (
             <Text style={styles.saveErrorText}>{saveError}</Text>
           ) : null}
-          <TextInput
+          <ThemedTextInput
             key={`editor-${sessionKey}`}
             mode="flat"
             multiline
             defaultValue={initialContent}
+            cursorColor="#ffffff"
             onChangeText={(text) => {
               contentRef.current = text;
             }}
+            editable={!saving}
             style={styles.editorInput}
             contentStyle={styles.editorInputContent}
             underlineColor="transparent"

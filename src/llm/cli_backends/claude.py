@@ -130,7 +130,12 @@ class ClaudeCLIBackend(CLIBackendBase):
     def execute_prompt(self, *args: Any, **kwargs: Any):
         self._reset_stream_state()
         success, output = super().execute_prompt(*args, **kwargs)
-        if success or not _stream_json_supported or self._saw_stream_json_line:
+        if (
+            success
+            or not _stream_json_supported
+            or self._saw_stream_json_line
+            or getattr(self, "_aoitalk_egress_transaction", False)
+        ):
             return success, output
 
         # stream-json 行を一度も観測せずに失敗した場合は、

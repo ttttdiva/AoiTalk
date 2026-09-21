@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { AgentRunTimeline } from "@/components/chat/agent-run-timeline";
+import { WorkIntelligenceInspector } from "@/components/chat/work-intelligence-inspector";
 import {
   RelatedInformationPanel,
   type RelatedInformationSection,
@@ -19,6 +20,7 @@ import {
 } from "@/components/chat/related-information-panel";
 import type {
   ContextSnapshot,
+  ContextSnapshotBinding,
   ConversationMessage,
   ConversationSession,
 } from "@/lib/chat-api";
@@ -176,6 +178,7 @@ export function ChatContextRail({
   projectName,
   contextSnapshot,
   contextSnapshotStatus,
+  contextBinding,
   persistent = false,
 }: {
   sessionId: string | null;
@@ -192,6 +195,7 @@ export function ChatContextRail({
   projectName?: string | null;
   contextSnapshot?: ContextSnapshot | null;
   contextSnapshotStatus?: string;
+  contextBinding?: ContextSnapshotBinding | null;
   persistent?: boolean;
 }) {
   const [activeTab, setActiveTab] = useState<RailTab>(generationLive ? "execution" : "context");
@@ -199,6 +203,13 @@ export function ChatContextRail({
   // Keep the badge tied to the page-owned generation state.
   const executionLive = Boolean(generationLive);
   const hasExecution = Boolean(generationLive || agentRunId);
+  const inspectorBinding =
+    contextBinding &&
+    contextBinding.active_branch &&
+    contextBinding.session_id === sessionId &&
+    Boolean(contextBinding.message_id)
+      ? contextBinding
+      : null;
   const [taskCount, setTaskCount] = useState(0);
   const handleTasksChange = useCallback(
     (tasks: RelatedTaskSummary[]) => {
@@ -287,6 +298,14 @@ export function ChatContextRail({
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div id="chat-context-rail-panel-context" role="tabpanel" aria-labelledby="chat-context-rail-tab-context" hidden={activeTab !== "context"} className="min-h-full">
             <ContextSnapshotSummary snapshot={contextSnapshot} status={contextSnapshotStatus} />
+            {activeTab === "context" && (
+              <WorkIntelligenceInspector
+                inspector={inspectorBinding ? contextSnapshot?.inspector : null}
+                capabilities={inspectorBinding ? contextSnapshot?.capabilities : null}
+                binding={inspectorBinding}
+                authorizedReferences={inspectorBinding ? contextSnapshot?.authorized_references : undefined}
+              />
+            )}
             {activeTab === "context" && renderSection("context")}
           </div>
           <div id="chat-context-rail-panel-execution" role="tabpanel" aria-labelledby="chat-context-rail-tab-execution" hidden={activeTab !== "execution"} className="min-h-full">

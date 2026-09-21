@@ -73,6 +73,7 @@ $E2ESpecs = @(
     "e2e/login.spec.ts",
     "e2e/reset-password.spec.ts",
     "e2e/navigation.spec.ts",
+    "e2e/filer-editor-double-escape.spec.ts",
     "e2e/chat.spec.ts",
     "e2e/tasks.spec.ts",
     "e2e/remediation-smoke.spec.ts"
@@ -267,17 +268,23 @@ function Start-CanonicalPostgres {
             if ($LASTEXITCODE -eq 0) {
                 $port = Find-FreeTcpPort
                 $container = "aoitalk-canonical-verify-$PID-$([guid]::NewGuid().ToString('N').Substring(0, 6))"
+                # Keep the database itself unmistakably disposable.  The
+                # integration-test guard refuses the ordinary
+                # ``aoitalk_memory`` name even when it happens to live in a
+                # fresh container, preventing an accidental env mix-up from
+                # authorizing writes to a developer database.
+                $database = "aoitalk_canonical_$([guid]::NewGuid().ToString('N').Substring(0, 8))"
                 & docker run -d --name $container `
                     -e POSTGRES_USER=aoitalk `
                     -e POSTGRES_PASSWORD=ci `
-                    -e POSTGRES_DB=aoitalk_memory `
+                    -e POSTGRES_DB=$database `
                     -p "${port}:5432" `
                     postgres:16 | Out-Null
                 if ($LASTEXITCODE -ne 0) {
                     throw "docker run postgres:16 failed"
                 }
 
-                Wait-PostgresReady -HostName "127.0.0.1" -Port $port -User "aoitalk" -Database "aoitalk_memory" -Password "ci"
+                Wait-PostgresReady -HostName "127.0.0.1" -Port $port -User "aoitalk" -Database $database -Password "ci"
                 return [pscustomobject]@{
                     Mode            = "docker"
                     ContainerName   = $container
@@ -285,15 +292,25 @@ function Start-CanonicalPostgres {
                     Port            = $port
                     User            = "aoitalk"
                     Password        = "ci"
-                    Database        = "aoitalk_memory"
+                    Database        = $database
                     TempDatabase    = $null
                     AdminUser       = "aoitalk"
                     AdminPassword   = "ci"
+                    VerificationRunId = [guid]::NewGuid().ToString()
+                    VerificationHarnessKey = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
                     StartedByScript = $true
                 }
             }
         }
         catch {
+            # If the container started but readiness/migration probing failed,
+            # remove that exact disposable container before falling back to a
+            # local ephemeral database.  Otherwise a failed canonical run can
+            # leave a postgres process (and port) behind despite the outer
+            # teardown never receiving a context object.
+            if ($container) {
+                & docker rm -f $container 2>$null | Out-Null
+            }
             Write-Host "Docker postgres failed — trying local ephemeral database." -ForegroundColor Yellow
         }
     }
@@ -330,6 +347,8 @@ function Start-CanonicalPostgres {
         TempDatabase    = $tempDb
         AdminUser       = $adminUser
         AdminPassword   = $adminPassword
+        VerificationRunId = [guid]::NewGuid().ToString()
+        VerificationHarnessKey = ([guid]::NewGuid().ToString("N") + [guid]::NewGuid().ToString("N"))
         StartedByScript = $true
     }
 }
@@ -372,11 +391,25 @@ function Set-PostgresEnv {
     param([object]$Context)
 
     $url = "postgres://$($Context.User):$($Context.Password)@$($Context.Host):$($Context.Port)/$($Context.Database)"
+    # A fresh database is the isolation boundary for this runner.  Do not
+    # inherit a developer's POSTGRES_SCHEMA from the parent process and
+    # accidentally migrate/query a different worktree namespace.
+    Remove-Item Env:POSTGRES_SCHEMA -ErrorAction SilentlyContinue
     $env:POSTGRES_HOST = $Context.Host
     $env:POSTGRES_PORT = "$($Context.Port)"
     $env:POSTGRES_USER = $Context.User
     $env:POSTGRES_PASSWORD = $Context.Password
     $env:POSTGRES_DB = $Context.Database
+    # Verification-capable E2E writers receive a per-database UUID and an
+    # ephemeral HMAC key.  The key never leaves this process and prevents a
+    # browser/client from inventing a disposable run against another DB.
+    $env:AOITALK_VERIFICATION_RUN_ID = $Context.VerificationRunId
+    $env:AOITALK_VERIFICATION_HARNESS = "scripts/run_canonical_verification.ps1"
+    # All suites in one canonical database share one durable run row.  Keep
+    # their signed source stable so the server can bind artifacts to that row
+    # without trusting human-readable test titles or paths.
+    $env:AOITALK_VERIFICATION_SOURCE = "scripts/run_canonical_verification.ps1"
+    $env:AOITALK_VERIFICATION_HARNESS_KEY = $Context.VerificationHarnessKey
     $env:DATABASE_URL = $url
     return $url
 }

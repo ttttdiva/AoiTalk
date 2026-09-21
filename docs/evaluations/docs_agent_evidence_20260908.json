@@ -1,0 +1,132 @@
+{
+  "benchmark": "synthetic_docs_evidence_v1",
+  "model": "BAAI/bge-m3",
+  "device": "cpu",
+  "created_at": "2026-09-08T05:16:04.483654+00:00",
+  "cases": 6,
+  "corpus_nodes": 22,
+  "top_k": 3,
+  "context_char_budget": 12000,
+  "elapsed_seconds": 12.89304180000181,
+  "summary": {
+    "baseline_hit_at_3": 0.6666666666666666,
+    "record_hit_at_3": 1.0,
+    "baseline_evidence_coverage": 0.6666666666666666,
+    "record_and_context_evidence_coverage": 1.0
+  },
+  "results": [
+    {
+      "case": "gpu_conditions",
+      "query": "RTX 5090でQwenを動かした速度とメモリ量、実行環境を教えて",
+      "baseline_hit_at_3": true,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 1.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "RTX 5090でQwenを使う",
+        "VRAMは32GB",
+        "27B Q8なら26 tok/s"
+      ],
+      "record_top_titles": [
+        "RTX 5090でQwenを使う",
+        "起動オプション",
+        "VRAMは32GB"
+      ]
+    },
+    {
+      "case": "mail_delivery",
+      "query": "制御基板の部品はいつ到着する予定ですか",
+      "baseline_hit_at_3": true,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 1.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "仕入先からの連絡",
+        "仕入先からの連絡",
+        "古いパソコンの整理"
+      ],
+      "record_top_titles": [
+        "仕入先からの連絡",
+        "仕入先からの連絡",
+        "古いパソコンの整理"
+      ]
+    },
+    {
+      "case": "project_budget",
+      "query": "Atlasプロジェクトの正式な予算上限",
+      "baseline_hit_at_3": false,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 0.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "予算計算の一般論",
+        "認証APIの移行方針",
+        "旧APIは2026年12月に廃止される"
+      ],
+      "record_top_titles": [
+        "案件の条件",
+        "案件の条件",
+        "旧APIは2026年12月に廃止される"
+      ]
+    },
+    {
+      "case": "api_limit",
+      "query": "OrionというサービスのAPI呼び出し制限",
+      "baseline_hit_at_3": true,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 1.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "認証APIの移行方針",
+        "新APIはOAuth2に対応する",
+        "接続条件"
+      ],
+      "record_top_titles": [
+        "接続条件",
+        "新APIはOAuth2に対応する",
+        "接続条件"
+      ]
+    },
+    {
+      "case": "migration_reason",
+      "query": "なぜ旧認証APIから移行することになったか",
+      "baseline_hit_at_3": true,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 1.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "認証APIの移行方針",
+        "新APIはOAuth2に対応する",
+        "旧APIは2026年12月に廃止される"
+      ],
+      "record_top_titles": [
+        "認証APIの移行方針",
+        "新APIはOAuth2に対応する",
+        "旧APIは2026年12月に廃止される"
+      ]
+    },
+    {
+      "case": "incident_owner",
+      "query": "障害対応の担当者と連絡経路",
+      "baseline_hit_at_3": false,
+      "record_hit_at_3": true,
+      "baseline_evidence_coverage": 0.0,
+      "record_and_context_evidence_coverage": 1.0,
+      "baseline_top_titles": [
+        "会議室の予約方法",
+        "仕入先からの連絡",
+        "仕入先からの連絡"
+      ],
+      "record_top_titles": [
+        "運用メモ",
+        "運用メモ",
+        "会議室の予約方法"
+      ]
+    }
+  ],
+  "limitations": [
+    "Synthetic corpus; no production data",
+    "Evidence retrieval, not LLM answer quality",
+    "Dense-only ablation; hybrid/ACL separately runtime-tested"
+  ]
+}

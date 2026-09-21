@@ -1,5 +1,5 @@
 import React from "react";
-import { Animated, AppState, View } from "react-native";
+import { AppState, View } from "react-native";
 import { ActivityIndicator, Button, Surface, Text } from "react-native-paper";
 import {
   conversationPerformanceDiagnostics,
@@ -10,15 +10,15 @@ import { chatScreenStyles as styles } from "./chat-screen.styles";
 export function ChatScreenShell({
   loading,
   error,
-  opacity,
   onReload,
   children,
+  header,
 }: {
   loading: boolean;
   error: string | null;
-  opacity: Animated.Value;
   onReload: () => void;
   children: React.ReactNode;
+  header?: React.ReactNode;
 }) {
   conversationPerformanceDiagnostics.recordRender("ChatScreenShell");
   React.useEffect(() => {
@@ -42,15 +42,9 @@ export function ChatScreenShell({
       stopFrameObserver();
     };
   }, []);
-  if (loading) {
-    return (
-      <View style={styles.loadingContainer}>
-        <ActivityIndicator size="large" color="#7c3aed" />
-      </View>
-    );
-  }
   return (
-    <Animated.View style={[styles.container, { opacity }]}>
+    <View style={styles.container}>
+      {header}
       {error ? (
         <Surface style={styles.errorBanner} elevation={0}>
           <Text style={styles.errorText}>{error}</Text>
@@ -69,6 +63,9 @@ export function ChatScreenShell({
         </Surface>
       ) : null}
       {children}
-    </Animated.View>
+      {loading ? <View pointerEvents="none" style={{ position: "absolute", top: "45%", alignSelf: "center" }}>
+        <ActivityIndicator size="large" color="#7c3aed" />
+      </View> : null}
+    </View>
   );
 }

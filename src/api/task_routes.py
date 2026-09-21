@@ -25,7 +25,6 @@ from sqlalchemy import select
 
 from ..memory.models import (
     ConversationMessage,
-    ConversationParticipant,
     ConversationSession,
     KnowledgeNode,
     DocsLibrary,
@@ -36,6 +35,7 @@ from ..memory.models import (
 )
 from ..memory.project_repository import ProjectRepository
 from ..services.docs_acl import can_read_node
+from ..services.task_reference_service import conversation_reference_visible
 from ..services.google_calendar_service import (
     GoogleCalendarService,
     GoogleCalendarServiceError,
@@ -87,6 +87,7 @@ from .routes.tasks._shared import (  # noqa: F401  (既存 import 面を維持)
     _build_update_task_updates,
     _deep_merge_settings,
     _parse_datetime,
+    _parse_timer_datetime,
     _parse_wall_clock_datetime,
 )
 from .uuid_http import parse_uuid_or_400
@@ -104,6 +105,7 @@ def create_task_router(
     require_auth_dependency,
     broadcaster=None,
     workspace_root: "str | PathLike[str] | None" = None,
+    config: Any | None = None,
 ) -> APIRouter:
     """Create task management router with injected dependencies.
 
@@ -115,8 +117,8 @@ def create_task_router(
     """
 
     router = APIRouter(prefix="/api", tags=["tasks"])
-    service = TaskManagementService(broadcaster=broadcaster)
-    google_calendar = GoogleCalendarService()
+    service = TaskManagementService(broadcaster=broadcaster, config=config)
+    google_calendar = GoogleCalendarService(config=config)
     from ..tools.file_explorer import (
         get_root_dir as get_workspace_root,
         is_safe_workspace_path,
@@ -214,6 +216,7 @@ def create_task_router(
         *,
         user_id: UUID,
         can_remove: bool,
+        allowed_project_ids: Optional[set[UUID]] = None,
     ) -> dict[str, Any]:
         data = reference.to_dict()
         data.update(
@@ -228,6 +231,29 @@ def create_task_router(
                 },
             }
         )
+        def mark_missing(display_name: str | None = None) -> None:
+            data.update(
+                {
+                    "display_name": display_name or "参照先が見つかりません",
+                    "subtitle": "参照先が見つかりません",
+                    "exists": False,
+                }
+            )
+            if allowed_project_ids is not None:
+                # Explicit browse responses must not carry an identifier/path
+                # for a reference that failed its in-scope ACL check.
+                data.update(
+                    {
+                        "target_id": None,
+                        "target_path": None,
+                        "target_url": None,
+                        "metadata": {},
+                        "open": {"id": None, "path": None, "url": None},
+                    }
+                )
+        if allowed_project_ids is not None and reference.project_id not in allowed_project_ids:
+            mark_missing()
+            return data
         if reference.reference_type in {"conversation_session", "conversation_message"}:
             conversation = None
             try:
@@ -242,29 +268,15 @@ def create_task_router(
                     )
                 )
                 candidate = result.scalar_one_or_none()
-                if candidate and (
-                    candidate.user_id == str(user_id)
-                    or (
-                        await session.execute(
-                            select(ConversationParticipant.id).where(
-                                ConversationParticipant.session_id == candidate.id,
-                                ConversationParticipant.participant_type == "user",
-                                ConversationParticipant.participant_id == str(user_id),
-                                ConversationParticipant.status == "joined",
-                            )
-                        )
-                    ).scalar_one_or_none()
-                    is not None
+                if await conversation_reference_visible(
+                    session,
+                    candidate,
+                    user_id=user_id,
+                    project_id=reference.project_id,
                 ):
                     conversation = candidate
             if conversation is None:
-                data.update(
-                    {
-                        "display_name": reference.display_name or "参照先が見つかりません",
-                        "subtitle": "参照先が見つかりません",
-                        "exists": False,
-                    }
-                )
+                mark_missing(reference.display_name)
             else:
                 metadata = reference.reference_metadata or {}
                 message_id = metadata.get("message_id") or metadata.get("trigger_message_id")
@@ -283,12 +295,7 @@ def create_task_router(
                         or message.session_id != conversation.id
                         or message.deleted_at is not None
                     ):
-                        data.update(
-                            {
-                                "subtitle": "参照先が見つかりません",
-                                "exists": False,
-                            }
-                        )
+                        mark_missing(reference.display_name)
                     else:
                         data["subtitle"] = "発生元メッセージ"
                         data["open"] = {
@@ -317,17 +324,21 @@ def create_task_router(
                 row = result.first()
                 if row:
                     candidate, owner_id = row
-                    if await can_read_node(session, candidate, user_id):
+                    if (
+                        (allowed_project_ids is None
+                         or getattr(candidate, "project_id", None) in allowed_project_ids)
+                        and await can_read_node(session, candidate, user_id)
+                    ):
                         node = candidate
             if node is None:
-                data.update({"subtitle": "参照先が見つかりません", "exists": False})
+                mark_missing(reference.display_name)
             else:
                 data["display_name"] = node.title or reference.display_name or "Docsノード"
                 data["subtitle"] = "Docs"
                 data["open"] = {"id": node.id, "path": f"/docs/{node.id}", "url": None}
         elif reference.reference_type == "workspace_file":
             if not reference.target_path:
-                data.update({"subtitle": "参照先が見つかりません", "exists": False})
+                mark_missing(reference.display_name)
             else:
                 try:
                     _, root_path = await _project_storage_root(reference.project_id)
@@ -336,7 +347,10 @@ def create_task_router(
                 except (HTTPException, OSError):
                     exists = False
                 data["exists"] = exists
-                data["subtitle"] = "library" if exists else "参照先が見つかりません"
+                if exists:
+                    data["subtitle"] = "library"
+                else:
+                    mark_missing(reference.display_name)
         elif reference.reference_type == "url":
             data["subtitle"] = "URL"
             data["exists"] = bool(reference.target_url)

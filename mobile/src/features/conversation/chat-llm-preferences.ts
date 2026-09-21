@@ -11,7 +11,10 @@ import {
   type DirectMobileLlmSelection,
   normalizeDirectReasoningEffort,
 } from "../../lib/mobile-llm";
-import { isDirectMobileLlmProvider } from "../../lib/cloud-model-catalog";
+import {
+  isDirectMobileLlmProvider,
+  isForbiddenModelId,
+} from "../../lib/cloud-model-catalog";
 import type { LlmModeResponse } from "../../lib/chat-api";
 import type {
   ChatResponseModelOption,
@@ -73,8 +76,10 @@ export function normalizeLlmMode(value: unknown): LlmModeResponse {
     ? (value as Record<string, unknown>)
     : null;
   const mode = stringValue(record?.mode);
-  if (!mode) return defaultLlmMode();
-  const options = uniqueStrings(record?.available_modes);
+  if (!mode || isForbiddenModelId(mode)) return defaultLlmMode();
+  const options = uniqueStrings(record?.available_modes).filter(
+    (item) => !isForbiddenModelId(item),
+  );
   if (!options.includes(mode)) options.unshift(mode);
   const rawLabels = record?.labels;
   const labels: Record<string, string> = {};
@@ -91,7 +96,10 @@ export function normalizeLlmMode(value: unknown): LlmModeResponse {
     labels,
     kind: stringValue(record?.kind) ?? undefined,
     provider: stringValue(record?.provider) ?? undefined,
-    model: stringValue(record?.model) ?? undefined,
+    model:
+      stringValue(record?.model) && !isForbiddenModelId(record?.model)
+        ? stringValue(record?.model) ?? undefined
+        : undefined,
     success: typeof record?.success === "boolean" ? record.success : undefined,
     message: stringValue(record?.message) ?? undefined,
   };
@@ -103,7 +111,10 @@ function normalizeResponseModel(value: unknown): ChatResponseModelSelection | un
     : null;
   const provider = stringValue(record?.provider);
   const model = stringValue(record?.model);
-  return provider && model ? { provider, model } : undefined;
+  return provider && model && !isForbiddenModelId(model)
+    ? { provider, model, ...(stringValue(record?.reasoning_effort)
+      ? { reasoning_effort: stringValue(record?.reasoning_effort)! } : {}) }
+    : undefined;
 }
 
 export function normalizeResponseTarget(value: unknown): ChatResponseTarget {
@@ -117,7 +128,12 @@ export function normalizeResponseTarget(value: unknown): ChatResponseTarget {
     const provider = stringValue(selectionRecord?.provider);
     const model = stringValue(selectionRecord?.model);
     const reasoningEffort = stringValue(selectionRecord?.reasoningEffort);
-    if (provider && model && isDirectMobileLlmProvider(provider)) {
+    if (
+      provider &&
+      model &&
+      !isForbiddenModelId(model) &&
+      isDirectMobileLlmProvider(provider)
+    ) {
       const normalizedEffort = normalizeDirectReasoningEffort(
         provider,
         model,
@@ -152,7 +168,7 @@ function normalizeResponseModelOptions(value: unknown): ChatResponseModelOption[
       : null;
     const provider = stringValue(record?.provider);
     const model = stringValue(record?.model);
-    if (!provider || !model) continue;
+    if (!provider || !model || isForbiddenModelId(model)) continue;
     const key = `${provider}:${model}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -165,6 +181,11 @@ function normalizeResponseModelOptions(value: unknown): ChatResponseModelOption[
       modelLabel,
       label: stringValue(record?.label) ?? `${providerLabel} / ${modelLabel}`,
       isCurrent: record?.isCurrent === true,
+      ...(Array.isArray(record?.reasoningEffortOptions) ? {
+        reasoningEffortOptions: uniqueStrings(record.reasoningEffortOptions),
+        reasoningEffortDefault: stringValue(record?.reasoningEffortDefault),
+        reasoningEffortKind: stringValue(record?.reasoningEffortKind) ?? undefined,
+      } : {}),
     });
   }
   return result;

@@ -39,45 +39,88 @@ export function DocsShareDialog({
   const [selectedUserId, setSelectedUserId] = useState("");
   const [permission, setPermission] = useState<"read" | "write">("read");
   const [loading, setLoading] = useState(false);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open || !nodeId) return;
     let cancelled = false;
-    const resetTimer = window.setTimeout(() => {
-      if (!cancelled) {
-        setLoading(true);
-        setError(null);
-      }
+    // Keep the first tick asynchronous so the dialog can paint immediately.
+    // DocsWorkspace keys this component by node and handleOpenChange clears
+    // picker state on close; resetting state here could clobber a query typed
+    // during the opening frame.
+    const timer = window.setTimeout(() => {
+      if (cancelled) return;
+      setLoading(true);
+      setError(null);
+      void apiFetch<{ shares: Share[] }>(`/api/docs/shares/${nodeId}`)
+        .then((data) => {
+          if (!cancelled) setShares(data.shares ?? []);
+        })
+        .catch((reason) => {
+          if (!cancelled) setError(reason instanceof Error ? reason.message : "共有設定を読み込めません");
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
     }, 0);
-    void apiFetch<{ shares: Share[] }>(`/api/docs/shares/${nodeId}`)
-      .then((data) => {
-        if (!cancelled) setShares(data.shares ?? []);
-      })
-      .catch((reason) => {
-        if (!cancelled) setError(reason instanceof Error ? reason.message : "共有設定を読み込めません");
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
     return () => {
       cancelled = true;
-      window.clearTimeout(resetTimer);
+      window.clearTimeout(timer);
     };
   }, [apiFetch, nodeId, open]);
 
   useEffect(() => {
-    if (!open) return;
+    const normalizedQuery = query.trim();
+    if (!open || !nodeId || !normalizedQuery) return;
+    let cancelled = false;
     const timer = window.setTimeout(() => {
-      void apiFetch<{ users: UserOption[] }>(`/api/users/search?q=${encodeURIComponent(query)}`)
-        .then((data) => setUsers(data.users ?? []))
-        .catch(() => setUsers([]));
+      if (cancelled) return;
+      setSearchLoading(true);
+      setSearchError(null);
+      void apiFetch<{ users: UserOption[] }>(
+        `/api/users/search?q=${encodeURIComponent(normalizedQuery)}`,
+      )
+        .then((data) => {
+          if (cancelled) return;
+          const nextUsers = data.users ?? [];
+          setUsers(nextUsers);
+          setSelectedUserId((current) =>
+            current && nextUsers.some((candidate) => candidate.id === current)
+              ? current
+              : "",
+          );
+        })
+        .catch((reason) => {
+          if (!cancelled) {
+            setUsers([]);
+            setSearchError(
+              reason instanceof Error
+                ? reason.message
+                : "ユーザー検索に失敗しました",
+            );
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setSearchLoading(false);
+        });
     }, 180);
-    return () => window.clearTimeout(timer);
-  }, [apiFetch, open, query]);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [apiFetch, nodeId, open, query]);
+
+  const selectableUsers = users.filter(
+    (candidate) => !shares.some((share) => share.user_id === candidate.id),
+  );
+  const selectedUserIsAvailable = selectableUsers.some(
+    (candidate) => candidate.id === selectedUserId,
+  );
 
   async function addShare() {
-    if (!nodeId || !selectedUserId) return;
+    if (!nodeId || !selectedUserIsAvailable) return;
     setError(null);
     try {
       const data = await apiFetch<{ share: Share }>(`/api/docs/shares/${nodeId}`, {
@@ -92,6 +135,9 @@ export function DocsShareDialog({
       }
       setSelectedUserId("");
       setQuery("");
+      setUsers([]);
+      setSearchLoading(false);
+      setSearchError(null);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "共有設定を保存できません");
     }
@@ -120,8 +166,23 @@ export function DocsShareDialog({
     }
   }
 
+  function handleOpenChange(nextOpen: boolean) {
+    if (!nextOpen) {
+      setShares([]);
+      setUsers([]);
+      setQuery("");
+      setSelectedUserId("");
+      setPermission("read");
+      setLoading(false);
+      setSearchLoading(false);
+      setSearchError(null);
+      setError(null);
+    }
+    onOpenChange(nextOpen);
+  }
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogContent size="lg">
         <DialogHeader>
           <DialogTitle>Docsを共有{nodeTitle ? `: ${nodeTitle}` : ""}</DialogTitle>
@@ -132,22 +193,38 @@ export function DocsShareDialog({
             <Input
               id="docs-share-user-search"
               value={query}
-              onChange={(event) => setQuery(event.target.value)}
+              onChange={(event) => {
+                const nextQuery = event.target.value;
+                setQuery(nextQuery);
+                setSelectedUserId("");
+                setUsers([]);
+                setSearchLoading(Boolean(nextQuery.trim()));
+                setSearchError(null);
+              }}
               placeholder="名前・メールアドレス・ユーザー名"
             />
-            <AppSelect
-              value={selectedUserId}
-              onChange={(event) => setSelectedUserId(event.target.value)}
-              className="h-9 w-full rounded border bg-background px-2 text-sm"
-              aria-label="共有するユーザー"
-            >
-              <option value="">ユーザーを選択…</option>
-              {users.map((candidate) => (
-                <option key={candidate.id} value={candidate.id}>
-                  {candidate.display_name || candidate.username}{candidate.email ? ` (${candidate.email})` : ""}
-                </option>
-              ))}
-            </AppSelect>
+            {searchLoading ? (
+              <p className="text-xs text-muted-foreground">ユーザーを検索中…</p>
+            ) : null}
+            {!searchLoading && query.trim() && selectableUsers.length === 0 && !searchError ? (
+              <p className="text-xs text-muted-foreground">一致するユーザーがいません。</p>
+            ) : null}
+            {selectableUsers.length > 0 ? (
+              <AppSelect
+                value={selectedUserIsAvailable ? selectedUserId : ""}
+                onChange={(event) => setSelectedUserId(event.target.value)}
+                className="h-9 w-full rounded border bg-background px-2 text-sm"
+                aria-label="共有するユーザー"
+              >
+                <option value="">ユーザーを選択…</option>
+                {selectableUsers.map((candidate) => (
+                  <option key={candidate.id} value={candidate.id}>
+                    {candidate.display_name || candidate.username}{candidate.email ? ` (${candidate.email})` : ""}
+                  </option>
+                ))}
+              </AppSelect>
+            ) : null}
+            {searchError ? <p className="text-xs text-destructive">{searchError}</p> : null}
             <div className="flex items-center gap-2">
               <AppSelect
                 value={permission}
@@ -158,7 +235,7 @@ export function DocsShareDialog({
                 <option value="read">閲覧のみ</option>
                 <option value="write">編集可能</option>
               </AppSelect>
-              <Button type="button" size="sm" onClick={() => void addShare()} disabled={!selectedUserId}>追加</Button>
+              <Button type="button" size="sm" onClick={() => void addShare()} disabled={!selectedUserIsAvailable}>追加</Button>
             </div>
           </div>
           <div className="space-y-2">
@@ -186,7 +263,7 @@ export function DocsShareDialog({
           </div>
         </div>
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>閉じる</Button>
+          <Button type="button" variant="outline" onClick={() => handleOpenChange(false)}>閉じる</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

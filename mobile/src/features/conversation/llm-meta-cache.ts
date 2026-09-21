@@ -92,6 +92,16 @@ export async function getCachedLlmModelCatalog(
   return flight;
 }
 
+/** 明示更新時だけ、このscopeのmodel catalog TTLを無効化して再取得する。 */
+export async function refreshLlmModelCatalog(
+  explicitScope?: string,
+): Promise<LlmModelCatalogResponse> {
+  const scope = currentScope(explicitScope);
+  ensureScope(scope);
+  if (catalogCache?.scope === scope) catalogCache = null;
+  return getCachedLlmModelCatalog(scope);
+}
+
 export async function getCachedSkillSlashCommands(
   projectId?: string | null,
   explicitScope?: string,

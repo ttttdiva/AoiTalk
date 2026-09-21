@@ -75,14 +75,20 @@ def _run_async(coro_factory, timeout: int = 45):
     except RuntimeError:
         return asyncio.run(coro_factory())
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        # Preserve request-local privacy/turn ContextVars when a synchronous
-        # caller invokes the bridge from an already-running event loop.
-        context = contextvars.copy_context()
-        future = executor.submit(
-            lambda: context.run(asyncio.run, coro_factory())
-        )
+    # Preserve request-local privacy/turn ContextVars when a synchronous
+    # caller invokes the bridge from an already-running event loop.  Avoid a
+    # context-manager shutdown: after a timeout, ``__exit__`` would wait for a
+    # Yahoo coroutine that ignored cancellation and defeat this bridge's
+    # fail-fast contract.
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    context = contextvars.copy_context()
+    future = executor.submit(lambda: context.run(asyncio.run, coro_factory()))
+    try:
         return future.result(timeout=timeout)
+    finally:
+        if not future.done():
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 def _value(item: Any, name: str, default: Any = "") -> Any:
@@ -197,11 +203,28 @@ def x_search_impl(
             timeout_seconds=timeout_seconds,
             config=config,
         )
-    except Exception as exc:  # noqa: BLE001 - tool boundary must remain usable
-        return f"X検索（Yahooリアルタイム）に失敗しました: {exc}"
+    except (TimeoutError, asyncio.TimeoutError):
+        return "X検索（Yahooリアルタイム）が制限時間を超えました（engine_timeout）。ネットワーク設定を確認してください。"
+    except Exception:  # noqa: BLE001 - tool boundary must remain usable
+        # Provider exception text may contain query strings, credentials, or
+        # internal endpoints.  Keep this tool boundary secret-free.
+        return "X検索（Yahooリアルタイム）に失敗しました（egress_unreachable）。承認済みネットワーク経路を確認してください。"
     status = str(_value(result, "status", "") or "").strip().lower()
     if status in {"blocked", "privacy_blocked"}:
         return "X検索（Yahooリアルタイム）はプライバシーポリシーにより停止しました。"
+    if status in {
+        "egress_unreachable",
+        "timeout",
+        "network_error",
+        "http_error",
+        "redirect_rejected",
+        "invalid_endpoint",
+        "body_too_large",
+        "parse_error",
+    }:
+        if status == "timeout":
+            return "X検索（Yahooリアルタイム）が制限時間を超えました（engine_timeout）。ネットワーク設定を確認してください。"
+        return "X検索（Yahooリアルタイム）に到達できませんでした（egress_unreachable）。承認済みネットワーク経路を確認してください。"
     return format_yahoo_x_results(query, result, max_results=max_results)
 
 

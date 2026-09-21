@@ -9,14 +9,19 @@ parameters; mode-specific extra_body is applied automatically where needed.
 from __future__ import annotations
 
 import asyncio
+import copy
 import concurrent.futures
+import contextvars
 import dataclasses
+import inspect
 import json
 import logging
 import os
+import threading
 import time
 import urllib.request
 from datetime import datetime
+from collections.abc import Iterator
 from typing import Any, Dict, Generator, List, Optional, Union
 
 from openai import OpenAI
@@ -30,10 +35,19 @@ from ..services.project_context import (
     set_runtime_project_context,
 )
 from ..services.context_builder import ContextBuilder, ContextBundle
-from ..services.turn_context import get_turn_context
+from .manager_parts.context_building import strip_project_context_bundle
+from ..services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    bind_context_to_iterator,
+    get_turn_context,
+)
 from ..services.user_settings_service import get_user_custom_instructions_sync
 from ..services.story_chat_context import run_story_chat_context_sync
-from ..services.outbound_privacy_service import OutboundPrivacyGateway
+from ..services.outbound_privacy_service import (
+    EgressDescriptor,
+    OutboundPrivacyGateway,
+    PrivacyError,
+)
 from ..tools.adapters import OpenAIAPIAdapter
 from ..tools.registry import ToolRegistry
 from .generation_policy import (
@@ -76,6 +90,7 @@ from .openai_compatible_local_profiles import (
     DEFAULT_OPENAI_COMPATIBLE_LOCAL_BASE_URL,
     llama_cpp_model_profile,
     llama_cpp_profile_capabilities,
+    managed_local_runtime_for_model,
     llama_cpp_reasoning_effort_metadata,
     llama_cpp_reasoning_effort_request_extra_body,
     openai_compatible_local_base_url,
@@ -88,7 +103,18 @@ from .conversation_context import (
     persist_usage_sync,
     stable_cache_key,
 )
-from .context_snapshot import component, context_bundle_components, message_components, reconcile_snapshot, snapshot, tool_components, without_text
+from .context_snapshot import (
+    capture_context_manifest_before_context_clear,
+    component,
+    context_bundle_components,
+    context_manifest_metadata,
+    message_components,
+    reconcile_snapshot,
+    context_snapshot_without_manifest_capture,
+    snapshot,
+    tool_components,
+    without_text,
+)
 from .multimodal import openai_content_parts
 from .prompts import build_unified_instructions
 from .provider_capabilities import ProviderCapabilities
@@ -176,6 +202,180 @@ REASONING_OUTPUT_FIELDS = (
     "reasoning",
     "thinking_content",
 )
+
+
+# A direct Help provider call can return a lazy stream whose consumer runs
+# after the request's ContextVar scope has been reset.  Keep the ordinary
+# provider ledgers while the isolated stream is in flight, then restore them
+# when the stream closes.  The fields are intentionally data-only; client,
+# history-manager, and privacy-gateway identity are handled separately.
+_HELP_STREAM_PROVIDER_STATE_FIELDS = (
+    "_last_model_transcript",
+    "_last_usage",
+    "_last_generation_metrics",
+    "_last_context_snapshots",
+    "_last_tool_calls",
+    "_last_agentic_events",
+    "_last_tool_loop_messages",
+    "_last_tool_loop_completion_confirmed",
+    "_last_audit_tool_calls",
+    "_current_turn_system_content",
+    "_current_context_budget",
+    "_current_tool_hint_context",
+    "_current_context_bundle",
+    "_current_dynamic_context",
+    "_current_dynamic_context_metadata",
+    "_last_privacy_payload",
+    "_cache_key",
+    "_privacy_project_metadata",
+)
+_HELP_STREAM_STATE_MISSING = object()
+
+
+def _copy_help_stream_state_value(value: Any) -> Any:
+    """Copy a provider ledger without making isolation depend on deepcopy."""
+
+    if value is _HELP_STREAM_STATE_MISSING:
+        return value
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, dict):
+            return dict(value)
+        return value
+
+
+def _snapshot_help_stream_provider_state(client: Any) -> dict[str, Any]:
+    """Capture ordinary provider fields before an isolated Help stream."""
+
+    snapshot: dict[str, Any] = {}
+    for name in _HELP_STREAM_PROVIDER_STATE_FIELDS:
+        if hasattr(client, name):
+            snapshot[name] = _copy_help_stream_state_value(getattr(client, name))
+        else:
+            snapshot[name] = _HELP_STREAM_STATE_MISSING
+    return snapshot
+
+
+def _restore_help_stream_provider_state(
+    client: Any,
+    snapshot: dict[str, Any],
+) -> None:
+    """Restore ordinary provider fields, including fields absent at setup."""
+
+    for name, value in snapshot.items():
+        try:
+            if value is _HELP_STREAM_STATE_MISSING:
+                if hasattr(client, name):
+                    delattr(client, name)
+            else:
+                setattr(client, name, _copy_help_stream_state_value(value))
+        except Exception:
+            continue
+
+
+class _LifecycleStream(Iterator[str]):
+    """Keep local-provider turn state alive until a returned stream closes.
+
+    ``generate_response`` builds the ContextBundle synchronously, but the
+    returned stream does not execute until its first ``next`` call.  A plain
+    generator ``finally`` in the outer method therefore runs too early.  This
+    small iterator owns the stream's copied Context and invokes the cleanup
+    callback exactly once after normal exhaustion, an exception, or ``close``.
+    """
+
+    def __init__(
+        self,
+        iterator: Iterator[str],
+        *,
+        context: contextvars.Context,
+        on_close: Any,
+    ) -> None:
+        self._iterator = iterator
+        self._context = context
+        self._on_close = on_close
+        self._state_lock = threading.Lock()
+        self._next_active = False
+        self._close_requested = False
+        self._finalizing = False
+        self._closed = False
+
+    def __iter__(self) -> "_LifecycleStream":
+        return self
+
+    def __next__(self) -> str:
+        with self._state_lock:
+            if self._closed or self._close_requested:
+                raise StopIteration
+            if self._next_active:
+                raise RuntimeError("Concurrent _LifecycleStream iteration is rejected")
+            self._next_active = True
+        try:
+            value = self._context.run(next, self._iterator)
+        except BaseException:
+            should_finalize = self._finish_next(close_requested=True)
+            if should_finalize:
+                try:
+                    self._finalize()
+                except BaseException:
+                    # Cleanup must not replace the iterator's original error.
+                    pass
+            raise
+        should_finalize = self._finish_next(close_requested=False)
+        if should_finalize:
+            self._finalize()
+        return value
+
+    def close(self) -> None:
+        should_finalize = False
+        with self._state_lock:
+            if self._closed or self._finalizing:
+                return
+            self._close_requested = True
+            if not self._next_active:
+                self._finalizing = True
+                should_finalize = True
+        if should_finalize:
+            self._finalize()
+
+    def _finish_next(self, *, close_requested: bool) -> bool:
+        with self._state_lock:
+            self._next_active = False
+            if close_requested:
+                self._close_requested = True
+            if self._close_requested and not self._closed and not self._finalizing:
+                self._finalizing = True
+                return True
+            return False
+
+    def _finalize(self) -> None:
+        close_error: BaseException | None = None
+        try:
+            close = getattr(self._iterator, "close", None)
+            if callable(close):
+                self._context.run(close)
+        except BaseException as exc:
+            close_error = exc
+        finally:
+            try:
+                self._context.run(self._on_close)
+            except BaseException as exc:
+                if close_error is None:
+                    close_error = exc
+            finally:
+                with self._state_lock:
+                    self._closed = True
+                    self._finalizing = False
+        if close_error is not None:
+            raise close_error
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 def _current_date_context() -> str:
@@ -385,12 +585,23 @@ class OpenAICompatibleLocalClient:
         extra_body: Optional[Dict[str, Any]] = None,
     ):
         self.config = config
+        self._lightweight_ephemeral_client = bool(
+            _config_get(config, "runtime.lightweight_ephemeral_client", False)
+        )
         self._privacy_gateway = OutboundPrivacyGateway(config)
         self.base_url = _normalize_base_url(base_url)
         self.model_name = model or DEFAULT_LOCAL_MODEL
         self.api_key = api_key or DEFAULT_LOCAL_API_KEY
         self.client = OpenAI(base_url=self.base_url, api_key=self.api_key)
-        self._llama_cpp_profile = llama_cpp_model_profile(self.model_name)
+        self._managed_local_runtime = managed_local_runtime_for_model(
+            config,
+            self.model_name,
+        )
+        self._llama_cpp_profile = (
+            llama_cpp_model_profile(self.model_name)
+            if self._managed_local_runtime != "freetoken"
+            else None
+        )
         profile_tools = _llama_cpp_profile_capability(
             self._llama_cpp_profile,
             "tools",
@@ -402,7 +613,11 @@ class OpenAICompatibleLocalClient:
         # A profile-declared limitation wins over the provider's opt-in
         # setting.  Unknown profiles (including ``local-model``) keep the
         # historical config-controlled behaviour.
-        self.enable_tools = bool(enable_tools) and profile_tools is not False
+        self.enable_tools = (
+            bool(enable_tools)
+            and profile_tools is not False
+            and not self._lightweight_ephemeral_client
+        )
         self.enable_response_format = bool(enable_response_format)
         self.enable_extra_body = bool(enable_extra_body)
         self.extra_body = extra_body if isinstance(extra_body, dict) else {}
@@ -411,14 +626,19 @@ class OpenAICompatibleLocalClient:
         )
         self.capabilities = ProviderCapabilities(
             supports_stream=True,
-            supports_tools=profile_tools is not False,
+            supports_tools=(
+                profile_tools is not False
+                and not self._lightweight_ephemeral_client
+            ),
             supports_response_format=True,
             supports_model_pull=False,
             supports_model_delete=False,
             supports_extra_body=True,
         )
 
-        if hasattr(config, "default_character"):
+        if self._lightweight_ephemeral_client:
+            self.character_name = "Assistant"
+        elif hasattr(config, "default_character"):
             self.character_name = config.default_character
         elif isinstance(config, dict):
             self.character_name = config.get("default_character", "Assistant")
@@ -426,7 +646,11 @@ class OpenAICompatibleLocalClient:
             self.character_name = "Assistant"
 
         self.history_manager = HistoryManager()
-        if config and _config_get(config, "use_tools", True):
+        if (
+            not self._lightweight_ephemeral_client
+            and config
+            and _config_get(config, "use_tools", True)
+        ):
             self._tool_registry = build_runtime_tool_registry_for_client(
                 build_runtime_tool_registry,
                 config,
@@ -471,7 +695,12 @@ class OpenAICompatibleLocalClient:
         self._current_llm_mode = self._effective_reasoning_effort() or (
             "" if profile_reasoning is False else "fast"
         )
-        self.system_prompt = self._build_system_prompt()
+        self.system_prompt = (
+            "You are a concise assistant. Follow the supplied instruction "
+            "exactly and do not use tools."
+            if self._lightweight_ephemeral_client
+            else self._build_system_prompt()
+        )
 
         logger.info("[OpenAICompatibleLocalClient] initialized")
         logger.info("[OpenAICompatibleLocalClient] Base URL: %s", self.base_url)
@@ -489,8 +718,38 @@ class OpenAICompatibleLocalClient:
         return str(metadata_user_id) if metadata_user_id else "default_user"
 
     def _sync_privacy_gateway(self) -> OutboundPrivacyGateway:
+        turn = get_turn_context()
         user_id = str(self._get_session_user_id() or "default_user")
         session_id = str(getattr(self, "current_session_id", None) or "")
+        if bool(getattr(turn, "suppress_automatic_context", False)):
+            # Help is a one-turn controller scope.  Never reuse a normal
+            # request's reversible aliases or policy metadata, including for
+            # direct provider calls that bypass TerminalMode's snapshot.
+            gateway = getattr(self, "_privacy_gateway", None)
+            isolated_user_id = str(getattr(turn, "user_id", None) or user_id)
+            isolated_session_id = str(
+                getattr(turn, "session_id", None) or session_id
+            )
+            if (
+                not bool(getattr(gateway, "_aoitalk_help_isolated", False))
+                or getattr(gateway, "user_id", None) != isolated_user_id
+                or getattr(gateway, "session_id", None) != isolated_session_id
+            ):
+                gateway = OutboundPrivacyGateway(
+                    getattr(self, "config", None),
+                    user_id=isolated_user_id,
+                    session_id=isolated_session_id,
+                    session_context={},
+                    project_metadata={},
+                )
+                setattr(gateway, "_aoitalk_help_isolated", True)
+                self._privacy_gateway = gateway
+            else:
+                gateway.update_policy_context(
+                    session_context={},
+                    project_metadata={},
+                )
+            return gateway
         if (
             self._privacy_gateway.user_id != user_id
             or self._privacy_gateway.session_id != session_id
@@ -513,15 +772,24 @@ class OpenAICompatibleLocalClient:
         return self._privacy_gateway
 
     def _get_memory_metadata(self) -> Dict[str, Any]:
-        return self.session_metadata.copy() if self.session_metadata else {}
+        metadata = self.session_metadata.copy() if self.session_metadata else {}
+        manifest = context_manifest_metadata(self)
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
+        return metadata
 
     def get_generation_metadata(self) -> Dict[str, Any]:
         metadata: Dict[str, Any] = {}
         if self._last_generation_metrics:
             metadata["generation_metrics"] = dict(self._last_generation_metrics)
         if self._last_context_snapshots:
-            latest = dict(self._last_context_snapshots[-1])
-            latest["requests"] = [dict(item) for item in self._last_context_snapshots[-8:]]
+            latest = context_snapshot_without_manifest_capture(
+                self._last_context_snapshots[-1]
+            )
+            latest["requests"] = [
+                context_snapshot_without_manifest_capture(item)
+                for item in self._last_context_snapshots[-8:]
+            ]
             metadata["context_snapshot"] = latest
         if self._last_model_transcript:
             metadata["model_transcript"] = [dict(item) for item in self._last_model_transcript]
@@ -537,11 +805,25 @@ class OpenAICompatibleLocalClient:
             "metrics_source": self.server_profile.get("metrics_source"),
             "cache_key": getattr(self, "_cache_key", None),
         }
+        manifest = context_manifest_metadata(
+            self,
+            allow_snapshot_only=True,
+        )
+        if manifest is not None:
+            metadata["context_manifest"] = manifest
         return metadata
 
     def _capture_context_request(self, api_kwargs: Dict[str, Any], *, reason: str) -> None:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         budget = self._current_context_budget
-        rendered_bundle, bundle_parts = context_bundle_components(self._current_context_bundle)
+        # Use the same Project Context OFF projection as prompt construction;
+        # context snapshots must not retain stale project/task/work layers
+        # merely because a prior turn populated ``_current_context_bundle``.
+        rendered_bundle, bundle_parts = context_bundle_components(
+            self._context_bundle_for_turn()
+        )
         parts = [
             *message_components(without_text(api_kwargs.get("messages", []), rendered_bundle)),
             *bundle_parts,
@@ -551,13 +833,14 @@ class OpenAICompatibleLocalClient:
             str(((item.get("function") or {}).get("name") or ""))
             for item in api_kwargs.get("tools", []) if isinstance(item, dict)
         }
-        for tool_def in self._tool_registry.get_all():
-            name = str(getattr(tool_def, "name", "") or "")
-            if name and name not in active_names:
-                parts.append(component(
-                    "native_tool_schemas", "Native tool schemas", source="runtime tool registry",
-                    status="deferred", tokens=0, preview=f"{name}（未送信）",
-                ))
+        if not suppress_automatic_context:
+            for tool_def in self._tool_registry.get_all():
+                name = str(getattr(tool_def, "name", "") or "")
+                if name and name not in active_names:
+                    parts.append(component(
+                        "native_tool_schemas", "Native tool schemas", source="runtime tool registry",
+                        status="deferred", tokens=0, preview=f"{name}（未送信）",
+                    ))
         item = snapshot(
             provider="openai_compatible_local",
             model=self.model_name,
@@ -572,6 +855,14 @@ class OpenAICompatibleLocalClient:
         self._last_context_snapshots = self._last_context_snapshots[-8:]
 
     def _capture_generation_metrics(self, response: Any) -> Dict[str, Any]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # A direct Help call may reuse a provider instance whose previous
+            # usage is still attached.  Do not replace that ordinary
+            # diagnostic with controller-turn telemetry (the outer terminal
+            # snapshot restores it for normal orchestration).
+            self._last_usage = {}
+            self._last_generation_metrics = None
+            return {}
         payload = _as_plain_dict(response)
         timings = _as_plain_dict(payload.get("timings"))
         usage = _as_plain_dict(payload.get("usage"))
@@ -647,6 +938,10 @@ class OpenAICompatibleLocalClient:
     ) -> Dict[str, Any]:
         """Capture and persist one successful local completion response."""
 
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            self._capture_generation_metrics(response)
+            return {}
+
         usage = self._capture_generation_metrics(response)
         if usage:
             persist_usage_sync(
@@ -661,18 +956,23 @@ class OpenAICompatibleLocalClient:
         return usage
 
     def _build_system_prompt(self) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         if not self.config:
             return "あなたは親切なAIアシスタントです。"
-        try:
-            custom_instructions = get_user_custom_instructions_sync(
-                self._get_session_user_id()
-            )
-        except Exception as exc:
-            logger.debug(
-                "[OpenAICompatibleLocalClient] Failed to load custom instructions: %s",
-                exc,
-            )
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             custom_instructions = ""
+        else:
+            try:
+                custom_instructions = get_user_custom_instructions_sync(
+                    self._get_session_user_id()
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[OpenAICompatibleLocalClient] Failed to load custom instructions: %s",
+                    exc,
+                )
+                custom_instructions = ""
         try:
             return build_unified_instructions(
                 character_name=self.character_name,
@@ -689,8 +989,28 @@ class OpenAICompatibleLocalClient:
             )
             return f"あなたは{self.character_name}です。"
 
+    def _build_effective_system_prompt(self, story_context=None) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # A stale system/isolated override from an ordinary turn is not
+            # permitted to widen the Guide-only Help prompt.
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+        override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if override:
+            return override
+        # Keep compatibility with lightweight clients that still expose the
+        # legacy private override attribute.
+        override = str(getattr(self, "_system_prompt_override", "") or "").strip()
+        if override:
+            return override
+        if story_context:
+            return story_context.prompt
+        return getattr(self, "system_prompt", "")
+
     def set_character(self, character_name: str) -> None:
         self.character_name = character_name
+        self._isolated_system_prompt_override = ""
         self.system_prompt = self._build_system_prompt()
 
     def update_character(self, yaml_filename: str) -> None:
@@ -698,14 +1018,21 @@ class OpenAICompatibleLocalClient:
             return
         character_config = self.config.get_character_config(yaml_filename)
         self.character_name = character_config.get("name", yaml_filename)
+        self._isolated_system_prompt_override = ""
         self.clear_history()
         self.system_prompt = self._build_system_prompt()
 
     def set_system_prompt(self, prompt: str) -> None:
+        self._isolated_system_prompt_override = ""
         if self.config:
             self.system_prompt = self._build_system_prompt()
             return
         self.system_prompt = prompt
+
+    def set_isolated_system_prompt(self, prompt: str) -> None:
+        isolated_prompt = str(prompt or "").strip()
+        self._isolated_system_prompt_override = isolated_prompt
+        self.system_prompt = isolated_prompt
 
     def _reasoning_effort_metadata(self) -> Optional[Dict[str, Any]]:
         if _llama_cpp_profile_capability(
@@ -786,6 +1113,7 @@ class OpenAICompatibleLocalClient:
         user_id: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
+        self._isolated_system_prompt_override = ""
         if user_id:
             self.session_user_id = str(user_id)
         if metadata:
@@ -818,16 +1146,11 @@ class OpenAICompatibleLocalClient:
             if bundle is None
             else bundle
         )
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         if current is None or self._include_project_context_enabled():
             return current
-        return dataclasses.replace(
-            current,
-            project_context_block="",
-            project_information_block="",
-            agent_memory_block="",
-            project_pack_block="",
-            task_context_block="",
-        )
+        return strip_project_context_bundle(current)
 
     def _context_budget(self, max_tokens: Optional[int] = None) -> ContextBudget:
         return resolve_context_budget(
@@ -845,15 +1168,22 @@ class OpenAICompatibleLocalClient:
         user_input: str,
         context_budget: ContextBudget,
     ) -> List[Dict[str, str]]:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         system_prompt = self._system_prompt_for_budget(context_budget)
         context_window = self.history_manager.context_window_size
         history_limit = min(context_window * 2, context_budget.history_messages)
-        history = self.history_manager.get_model_messages()[-history_limit:]
+        history = (
+            []
+            if suppress_automatic_context
+            else self.history_manager.get_model_messages()[-history_limit:]
+        )
         messages = [
             {"role": "system", "content": system_prompt},
             *build_prompt_messages(
                 history,
-                summary=self.history_manager.summary,
+                summary=("" if suppress_automatic_context else self.history_manager.summary),
                 current_user_input=clip_text_preserve_tail(
                     user_input, context_budget.message_budget_chars
                 ),
@@ -905,6 +1235,16 @@ class OpenAICompatibleLocalClient:
         return context_budget.context_window_tokens <= 16384
 
     def _system_prompt_for_budget(self, context_budget: ContextBudget) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+        override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        if override:
+            return override
+        override = str(getattr(self, "_system_prompt_override", "") or "").strip()
+        if override:
+            return override
         if not self._is_constrained_context_budget(context_budget):
             return self.system_prompt
         return "\n".join(
@@ -927,6 +1267,8 @@ class OpenAICompatibleLocalClient:
         *,
         has_tool_hints: bool,
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return ""
         if not context_bundle:
             return ""
         if not self._is_constrained_context_budget(context_budget):
@@ -951,6 +1293,9 @@ class OpenAICompatibleLocalClient:
         project_context: Optional[dict[str, Any]],
         context_budget: ContextBudget,
     ) -> tuple[List[Dict[str, str]], str]:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         self._current_context_bundle = self._build_context_bundle_sync(
             user_input,
             project_context,
@@ -958,10 +1303,13 @@ class OpenAICompatibleLocalClient:
         )
         # Keep direct/fallback ContextBuilder implementations subject to the
         # immutable Project Context OFF boundary as well.
-        context_bundle = self._context_bundle_for_turn()
-        tool_hint_context = self._build_tool_hint_context(
-            user_input,
-            context_budget,
+        context_bundle = (
+            None if suppress_automatic_context else self._context_bundle_for_turn()
+        )
+        tool_hint_context = (
+            ""
+            if suppress_automatic_context
+            else self._build_tool_hint_context(user_input, context_budget)
         )
         self._current_tool_hint_context = tool_hint_context
         model_user_input = compose_tool_hint_user_message(
@@ -979,23 +1327,29 @@ class OpenAICompatibleLocalClient:
         if tool_hint_context:
             dynamic_context.append(("Current tool hints", tool_hint_context))
         model_messages = build_prompt_messages(
-            self.history_manager.get_model_messages()[-context_budget.history_messages :],
-            summary=self.history_manager.summary,
+            (
+                []
+                if suppress_automatic_context
+                else self.history_manager.get_model_messages()[-context_budget.history_messages :]
+            ),
+            summary=("" if suppress_automatic_context else self.history_manager.summary),
             current_user_input=clip_text_preserve_tail(
                 model_user_input, context_budget.message_budget_chars
             ),
-            dynamic_context=dynamic_context,
+            dynamic_context=([] if suppress_automatic_context else dynamic_context),
         )
         # Keep the stable system prefix independent from the current date and
         # current-turn retrieval/tool hints.
+        isolated_override = str(
+            getattr(self, "_isolated_system_prompt_override", "") or ""
+        ).strip()
+        system_content = self._system_prompt_for_budget(context_budget)
+        if not isolated_override:
+            system_content = f"{system_content}\n\n{_current_date_context()}"
         messages = [
             {
                 "role": "system",
-                "content": (
-                    self._system_prompt_for_budget(context_budget)
-                    + "\n\n"
-                    + _current_date_context()
-                ),
+                "content": system_content,
             },
             *model_messages,
         ]
@@ -1069,6 +1423,8 @@ class OpenAICompatibleLocalClient:
 
     def _get_story_chat_context_sync(self):
         """Resolve the trusted StoryWritingSession for this conversation."""
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         # Lightweight provider instances used by review/schema paths may be
         # created with ``__new__`` before the history-session property is
         # initialized.  Read the backing field directly so that an ordinary
@@ -1080,6 +1436,10 @@ class OpenAICompatibleLocalClient:
         return run_story_chat_context_sync(self._run_async_sync, str(session_id))
 
     def _resolve_project_context_sync(self) -> Optional[dict[str, Any]]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # AoiTalk Help is Guide-only; do not perform a selected
+            # session/Project resolver lookup before the stateless generation.
+            return None
         current_project_id = getattr(self, "current_project_id", None)
         current_session_id = getattr(self, "current_session_id", None)
         if not current_project_id and not current_session_id:
@@ -1106,6 +1466,8 @@ class OpenAICompatibleLocalClient:
         user_input: str,
         context_budget: ContextBudget,
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return ""
         return build_tool_hint_context_sync(
             user_input=user_input,
             registry=filtered_registry_for_client(self, self._tool_registry),
@@ -1249,6 +1611,12 @@ class OpenAICompatibleLocalClient:
         return bool(str(self._runtime_unavailable_reason or "").strip())
 
     def _uses_llama_cpp_tool_choice_transport(self) -> bool:
+        if (
+            getattr(self, "_managed_local_runtime", None) == "freetoken"
+            or managed_local_runtime_for_model(self.config, self.model_name)
+            == "freetoken"
+        ):
+            return False
         if self.server_profile.get("name") == "llama.cpp":
             return True
         if llama_cpp_model_profile(self.model_name) is not None:
@@ -1377,6 +1745,8 @@ class OpenAICompatibleLocalClient:
         project_context: Optional[dict[str, Any]],
         context_budget: ContextBudget,
     ) -> Optional[ContextBundle]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return None
         # Project Context is governed by the request-scoped flag (or the
         # provider compatibility flag), never by exact natural-language
         # phrases such as "検索してね".
@@ -1391,8 +1761,14 @@ class OpenAICompatibleLocalClient:
         if not include_project_context and not self.current_session_id:
             return None
         try:
+            try:
+                context_builder = ContextBuilder(manifest_config=self.config)
+            except TypeError:
+                # Keep compatibility with lightweight test/embedding doubles
+                # that still expose the pre-WS1 zero-argument constructor.
+                context_builder = ContextBuilder()
             return self._run_async_sync(
-                ContextBuilder().build_context(
+                context_builder.build_context(
                     user_id=self._get_session_user_id(),
                     message=user_input,
                     project_id=self.current_project_id if include_project_context else None,
@@ -1452,6 +1828,27 @@ class OpenAICompatibleLocalClient:
         well as all unknown/Qwen profiles.
         """
 
+        # Reserved Help is already grounded by the server-owned Guide prompt.
+        # A second continuation/review request would be an unbounded provider
+        # path and could reintroduce ordinary conversation context, so the
+        # isolated turn never enters the generic agentic loop.
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return False
+
+        # A managed profile may explicitly opt out of the verifier for plain
+        # chat without changing the shared GenerationProfile policy or the
+        # behavior of other local profiles.  Keep this metadata separate from
+        # reasoning/tool capability declarations: assisted, autonomous, and
+        # review turns continue through the normal review contract.
+        profile = get_client_generation_policy(self).profile
+        runtime_profile = getattr(self, "_llama_cpp_profile", None)
+        if (
+            profile == GenerationProfile.CHAT
+            and isinstance(runtime_profile, dict)
+            and runtime_profile.get("chat_agentic_completion_review_enabled") is False
+        ):
+            return False
+
         if not (
             self._profile_disables_thinking()
             and _llama_cpp_profile_capability(
@@ -1462,7 +1859,6 @@ class OpenAICompatibleLocalClient:
         ):
             return True
 
-        profile = get_client_generation_policy(self).profile
         if profile == GenerationProfile.CHAT:
             return False
         if profile != GenerationProfile.AUTONOMOUS_WORK:
@@ -1515,13 +1911,16 @@ class OpenAICompatibleLocalClient:
             "temperature": temperature,
             "max_tokens": response_tokens,
         }
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
         tools = (
             self._chat_completion_tools(
                 context_budget=budget,
                 required_tool_name=required_tool_name,
                 user_input=native_tool_user_input,
             )
-            if tools_enabled
+            if tools_enabled and not suppress_automatic_context
             else []
         )
         if required_tool_name and self._is_llama_cpp_server():
@@ -1545,7 +1944,10 @@ class OpenAICompatibleLocalClient:
                     }
             else:
                 api_kwargs["tool_choice"] = "auto"
-        if self.enable_response_format:
+        # Help answers are ordinary Guide-grounded prose.  A persisted JSON
+        # response-format preference is normal-turn state and must not force a
+        # schema-only response on this isolated path.
+        if self.enable_response_format and not suppress_automatic_context:
             api_kwargs["response_format"] = {"type": "json_object"}
         extra_body: Dict[str, Any] = {}
         if self.server_profile.get("name") != "auto":
@@ -1585,19 +1987,22 @@ class OpenAICompatibleLocalClient:
             extra_body.pop("enable_thinking", None)
         if extra_body:
             api_kwargs["extra_body"] = extra_body
-        self._cache_key = stable_cache_key(
-            user_id=self._get_session_user_id(),
-            session_id=getattr(self, "current_session_id", None),
-            project_id=self.current_project_id,
-            character=self.character_name,
-            model=self.model_name,
-            system_prompt=self.system_prompt,
-            tool_schemas=api_kwargs.get("tools", []),
-            provider="openai_compatible_local",
-            branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
-            summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
-            server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
-        )
+        if suppress_automatic_context:
+            self._cache_key = None
+        else:
+            self._cache_key = stable_cache_key(
+                user_id=self._get_session_user_id(),
+                session_id=getattr(self, "current_session_id", None),
+                project_id=self.current_project_id,
+                character=self.character_name,
+                model=self.model_name,
+                system_prompt=self.system_prompt,
+                tool_schemas=api_kwargs.get("tools", []),
+                provider="openai_compatible_local",
+                branch_fingerprint=str(getattr(self, "current_edit_message_id", None) or "default-branch"),
+                summary_version=int(getattr(self.history_manager, "summary_version", 0) or 0),
+                server_instance=str(self.session_metadata.get("server_instance") or "default-instance"),
+            )
         return api_kwargs
 
     def _chat_completion_tools(
@@ -1607,6 +2012,8 @@ class OpenAICompatibleLocalClient:
         required_tool_name: Optional[str] = None,
         user_input: Optional[str] = None,
     ) -> List[Any]:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return []
         if (
             not getattr(self, "enable_tools", False)
             or _llama_cpp_profile_capability(
@@ -1986,6 +2393,54 @@ class OpenAICompatibleLocalClient:
             raise ConnectionError(config_error)
         return None
 
+    def _execute_completion_request(
+        self,
+        payload: Dict[str, Any],
+        *,
+        request_type: str = "chat",
+    ) -> Any:
+        """Run one OpenAI-compatible request through the egress transaction.
+
+        The adapter is usually pointed at a loopback llama.cpp endpoint, but
+        its URL is configurable.  A ``protect_sync`` preflight followed by a
+        direct SDK call would therefore bypass ``review_policy=always`` when
+        an operator configures a remote endpoint.  The sender below is the
+        sole commit point and receives exactly the reviewed final mapping.
+        """
+
+        # Lightweight callers/tests may provide a no-op sync hook while
+        # retaining the initialized gateway.  Keep the canonical execute
+        # boundary in that compatibility shape rather than falling through to
+        # a direct SDK call.
+        gateway = self._sync_privacy_gateway() or getattr(self, "_privacy_gateway", None)
+        if gateway is None:
+            raise PrivacyError("OpenAI-compatible privacy gateway is unavailable")
+        descriptor = EgressDescriptor(
+            action="model.generate",
+            transport="openai-compatible.chat.completions",
+            destination=self.base_url,
+            provider="openai_compatible_local",
+            tool="llm.openai_compatible_local",
+            model=self.model_name,
+        )
+
+        def sender(final_payload: Any) -> Any:
+            if not isinstance(final_payload, dict):
+                raise PrivacyError("OpenAI-compatible outbound payload is malformed")
+            self._last_privacy_payload = dict(final_payload)
+            return self.client.chat.completions.create(**final_payload)
+
+        self._last_privacy_payload = dict(payload)
+        return gateway.execute_sync(
+            payload,
+            provider="openai_compatible_local",
+            descriptor=descriptor,
+            sender=sender,
+            base_url=self.base_url,
+            source_kind=request_type,
+            model=self.model_name,
+        )
+
     def _create_completion_with_fallback(
         self,
         api_kwargs: Dict[str, Any],
@@ -1993,20 +2448,18 @@ class OpenAICompatibleLocalClient:
         request_type: str = "chat",
         allow_connection_retry: bool = True,
     ) -> Any:
-        self._sync_privacy_gateway()
-        protected = self._privacy_gateway.protect_sync(
-            api_kwargs,
-            provider="openai_compatible_local",
-            base_url=self.base_url,
-            source_kind="model_request",
-        )
-        api_kwargs = protected.payload
         lease_ticket = self._prepare_managed_local_server_for_request()
         try:
             started_at = time.monotonic()
             try:
-                self._capture_context_request(api_kwargs, reason="chat.completions")
-                response = self.client.chat.completions.create(**api_kwargs)
+                response = self._execute_completion_request(
+                    api_kwargs,
+                    request_type=request_type,
+                )
+                self._capture_context_request(
+                    getattr(self, "_last_privacy_payload", api_kwargs),
+                    reason="chat.completions",
+                )
                 self._capture_and_persist_usage(
                     response,
                     request_type=request_type,
@@ -2023,9 +2476,15 @@ class OpenAICompatibleLocalClient:
                         "[OpenAICompatibleLocalClient] Context overflow with native tools; retrying without tools: %s",
                         exc,
                     )
-                    self._capture_context_request(retry_kwargs, reason="context_overflow_retry")
                     retry_started_at = time.monotonic()
-                    response = self.client.chat.completions.create(**retry_kwargs)
+                    response = self._execute_completion_request(
+                        retry_kwargs,
+                        request_type="retry",
+                    )
+                    self._capture_context_request(
+                        getattr(self, "_last_privacy_payload", retry_kwargs),
+                        reason="context_overflow_retry",
+                    )
                     self._capture_and_persist_usage(
                         response,
                         request_type="retry",
@@ -2078,9 +2537,15 @@ class OpenAICompatibleLocalClient:
                     ", ".join(removed),
                     exc,
                 )
-                self._capture_context_request(retry_kwargs, reason="compatibility_retry")
                 retry_started_at = time.monotonic()
-                response = self.client.chat.completions.create(**retry_kwargs)
+                response = self._execute_completion_request(
+                    retry_kwargs,
+                    request_type="retry",
+                )
+                self._capture_context_request(
+                    getattr(self, "_last_privacy_payload", retry_kwargs),
+                    reason="compatibility_retry",
+                )
                 self._capture_and_persist_usage(
                     response,
                     request_type="retry",
@@ -2102,6 +2567,12 @@ class OpenAICompatibleLocalClient:
         messages: List[Dict[str, Any]],
         response_text: str,
     ) -> None:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Keep the provider's ordinary transcript untouched.  TerminalMode
+            # snapshots/restores this state around Help; this guard also covers
+            # direct provider callers that bypass that outer lifecycle.
+            self._last_model_transcript = []
+            return
         source_messages = self._last_tool_loop_messages or messages
         self._last_model_transcript = [
             dict(message)
@@ -2152,6 +2623,8 @@ class OpenAICompatibleLocalClient:
         choice = response.choices[0]
         message = choice.message
         if getattr(message, "tool_calls", None) or self._message_content(message):
+            return response
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
             return response
         if not self._should_retry_without_thinking(message, api_kwargs):
             return response
@@ -2223,6 +2696,11 @@ class OpenAICompatibleLocalClient:
         reason: str,
         executed_tool_calls: Optional[list[Any]] = None,
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # A generic minimal retry would no longer be constrained by the
+            # server-grounded Guide prompt.  Let ResponseHandler classify the
+            # empty result and TerminalMode surface its safe Help failure.
+            return ""
         tool_calls = executed_tool_calls or []
         budget = context_budget or self._context_budget(max_tokens)
         retry_input = self._tool_result_retry_input(user_input, tool_calls)
@@ -2307,6 +2785,81 @@ class OpenAICompatibleLocalClient:
         native_tool_user_input: Optional[str] = None,
         event_callback: Optional[SyncStreamEmitter] = None,
     ) -> str:
+        if not bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            return self._chat_impl(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                request_type=request_type,
+                tools_enabled=tools_enabled,
+                context_budget=context_budget,
+                fallback_user_input=fallback_user_input,
+                required_tool_name=required_tool_name,
+                native_tool_user_input=native_tool_user_input,
+                event_callback=event_callback,
+            )
+        previous_gateway = getattr(self, "_privacy_gateway", None)
+        isolated_state = _snapshot_help_stream_provider_state(self)
+        turn = get_turn_context()
+        isolated_gateway = OutboundPrivacyGateway(
+            getattr(self, "config", None),
+            user_id=str(getattr(turn, "user_id", None) or ""),
+            session_id=str(getattr(turn, "session_id", None) or ""),
+            session_context={},
+            project_metadata={},
+        )
+        setattr(isolated_gateway, "_aoitalk_help_isolated", True)
+        self._privacy_gateway = isolated_gateway
+        try:
+            return self._chat_impl(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                request_type=request_type,
+                tools_enabled=tools_enabled,
+                context_budget=context_budget,
+                fallback_user_input=fallback_user_input,
+                required_tool_name=required_tool_name,
+                native_tool_user_input=native_tool_user_input,
+                event_callback=event_callback,
+            )
+        finally:
+            self._privacy_gateway = previous_gateway
+            _restore_help_stream_provider_state(self, isolated_state)
+
+    def _chat_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        request_type: str = "chat",
+        tools_enabled: bool = True,
+        context_budget: Optional[ContextBudget] = None,
+        fallback_user_input: Optional[str] = None,
+        required_tool_name: Optional[str] = None,
+        native_tool_user_input: Optional[str] = None,
+        event_callback: Optional[SyncStreamEmitter] = None,
+    ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            # Public compatibility callers may hand this method a complete
+            # transcript.  Help accepts only the trusted system instruction
+            # and the current user item; prior assistant/tool messages are
+            # never sent to the local provider.
+            system_message = {
+                "role": "system",
+                "content": AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+            }
+            user_message = next(
+                (
+                    dict(message)
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                    and str(message.get("role") or "") == "user"
+                ),
+                {"role": "user", "content": ""},
+            )
+            messages = [system_message, user_message]
         api_kwargs = self._build_api_kwargs(
             messages,
             temperature,
@@ -2338,7 +2891,11 @@ class OpenAICompatibleLocalClient:
             self._record_model_transcript(messages, result)
             return self._privacy_gateway.restore(result)
         content = self._message_content(choice.message)
-        if fallback_user_input and project_progress_review_active(fallback_user_input):
+        if (
+            not bool(getattr(get_turn_context(), "suppress_automatic_context", False))
+            and fallback_user_input
+            and project_progress_review_active(fallback_user_input)
+        ):
             result = self._handle_tool_calls(
                 messages,
                 choice.message,
@@ -2392,29 +2949,97 @@ class OpenAICompatibleLocalClient:
         *,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-    ) -> Generator[str, None, None]:
-        self._sync_privacy_gateway()
-        stream_kwargs = self._build_api_kwargs(
-            messages,
-            temperature,
-            max_tokens,
-            context_budget=self._current_context_budget,
+        suppress_automatic_context: Optional[bool] = None,
+    ) -> Iterator[str]:
+        if suppress_automatic_context is None:
+            suppress_automatic_context = bool(
+                getattr(get_turn_context(), "suppress_automatic_context", False)
+            )
+        else:
+            suppress_automatic_context = bool(suppress_automatic_context)
+        isolated_gateway_previous = (
+            getattr(self, "_privacy_gateway", None)
+            if suppress_automatic_context
+            else None
         )
-        stream_kwargs["stream"] = True
-        stream_kwargs.pop("tools", None)
-        stream_kwargs.pop("tool_choice", None)
-        stream_kwargs.pop("response_format", None)
-        stream_kwargs = self._with_stream_safe_extra_body(stream_kwargs)
-        stream_kwargs = self._privacy_gateway.protect_sync(
-            stream_kwargs,
-            provider="openai_compatible_local",
-            base_url=self.base_url,
-            source_kind="model_request",
-        ).payload
-        lease_ticket = self._prepare_managed_local_server_for_request()
+        isolated_state = (
+            _snapshot_help_stream_provider_state(self)
+            if suppress_automatic_context
+            else {}
+        )
+        return bind_context_to_iterator(
+            self._stream_chat_impl(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                _suppress_automatic_context=suppress_automatic_context,
+                _isolated_gateway_previous=isolated_gateway_previous,
+                _isolated_state=isolated_state,
+            )
+        )
+
+    def _stream_chat_impl(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        _suppress_automatic_context: bool = False,
+        _isolated_gateway_previous: Any = None,
+        _isolated_state: dict[str, Any] | None = None,
+    ) -> Generator[str, None, None]:
+        suppress_automatic_context = bool(_suppress_automatic_context)
+        isolated_gateway_previous = (
+            _isolated_gateway_previous if suppress_automatic_context else None
+        )
+        isolated_state = dict(_isolated_state or {})
+        if suppress_automatic_context:
+            turn = get_turn_context()
+            isolated_gateway = OutboundPrivacyGateway(
+                getattr(self, "config", None),
+                user_id=str(getattr(turn, "user_id", None) or ""),
+                session_id=str(getattr(turn, "session_id", None) or ""),
+                session_context={},
+                project_metadata={},
+            )
+            setattr(isolated_gateway, "_aoitalk_help_isolated", True)
+            self._privacy_gateway = isolated_gateway
+            system_message = {
+                "role": "system",
+                "content": AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+            }
+            user_message = next(
+                (
+                    dict(message)
+                    for message in reversed(messages)
+                    if isinstance(message, dict)
+                    and str(message.get("role") or "") == "user"
+                ),
+                {"role": "user", "content": ""},
+            )
+            messages = [system_message, user_message]
+        lease_ticket = None
         try:
+            stream_kwargs = self._build_api_kwargs(
+                messages,
+                temperature,
+                max_tokens,
+                context_budget=self._current_context_budget,
+            )
+            stream_kwargs["stream"] = True
+            stream_kwargs.pop("tools", None)
+            stream_kwargs.pop("tool_choice", None)
+            stream_kwargs.pop("response_format", None)
+            stream_kwargs = self._with_stream_safe_extra_body(stream_kwargs)
+            lease_ticket = self._prepare_managed_local_server_for_request()
+            stream = self._execute_completion_request(
+                stream_kwargs,
+                request_type="stream",
+            )
+            stream_kwargs = dict(
+                getattr(self, "_last_privacy_payload", stream_kwargs)
+            )
             self._capture_context_request(stream_kwargs, reason="stream")
-            stream = self.client.chat.completions.create(**stream_kwargs)
             for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     yield self._privacy_gateway.restore_aliases(
@@ -2430,6 +3055,9 @@ class OpenAICompatibleLocalClient:
         finally:
             if lease_ticket is not None:
                 lease_ticket.release()
+            if suppress_automatic_context:
+                self._privacy_gateway = isolated_gateway_previous
+                _restore_help_stream_provider_state(self, isolated_state)
 
     def _handle_tool_calls(
         self,
@@ -2445,6 +3073,8 @@ class OpenAICompatibleLocalClient:
         max_rounds: int = 5,
         event_callback: Optional[SyncStreamEmitter] = None,
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            raise RuntimeError("AoiTalk Help turns expose no provider tools")
         effective_max_rounds = max(
             max_rounds,
             agentic_max_rounds(self, fallback_user_input),
@@ -2532,6 +3162,10 @@ class OpenAICompatibleLocalClient:
         context_budget: ContextBudget,
         user_input: str,
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            raise RuntimeError(
+                "OpenAI-compatible review loop is disabled for isolated Help turns"
+            )
         review_messages = [
             {
                 "role": "system",
@@ -2564,6 +3198,10 @@ class OpenAICompatibleLocalClient:
         event_callback: Optional[SyncStreamEmitter] = None,
         system_content: str = "",
     ) -> str:
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            raise RuntimeError(
+                "OpenAI-compatible continuation is disabled for isolated Help turns"
+            )
         continuation_messages = [
             {
                 "role": "system",
@@ -2602,6 +3240,19 @@ class OpenAICompatibleLocalClient:
         image_data: Optional[Dict[str, Any]] = None,
         stream_callback: Any = None,
     ) -> Union[str, Generator[str, None, None]]:
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        isolated_gateway_previous = None
+        isolated_gateway_active = False
+        if suppress_automatic_context:
+            isolated_gateway_previous = getattr(self, "_privacy_gateway", None)
+            isolated_gateway_active = True
+        isolated_provider_state = (
+            _snapshot_help_stream_provider_state(self)
+            if suppress_automatic_context
+            else {}
+        )
         self._last_generation_metrics = None
         self._last_context_snapshots = []
         self._last_tool_calls = []
@@ -2621,6 +3272,7 @@ class OpenAICompatibleLocalClient:
         generation_policy_token = set_current_generation_policy(policy)
         context_budget: Optional[ContextBudget] = None
         project_context: Optional[dict[str, Any]] = None
+        stream_lifecycle_transferred = False
         try:
             context_budget = self._context_budget(max_tokens)
             self._current_context_budget = context_budget
@@ -2648,7 +3300,117 @@ class OpenAICompatibleLocalClient:
             )
             required_tool_name = self._required_tool_name(user_input)
             if stream:
-                return self._stream_response(messages, temperature, max_tokens, user_input)
+                stream_method = self._stream_response
+                # Keep older rolling workers that monkey-patch the private
+                # helper on the four-argument signature, while passing the
+                # authoritative flag to the current implementation.  A
+                # signature check avoids swallowing a real provider TypeError.
+                try:
+                    stream_signature = inspect.signature(stream_method)
+                    stream_parameters = stream_signature.parameters
+                    stream_accepts_kwargs = any(
+                        parameter.kind == inspect.Parameter.VAR_KEYWORD
+                        for parameter in stream_parameters.values()
+                    )
+                except (TypeError, ValueError):
+                    stream_parameters = {}
+                    stream_accepts_kwargs = True
+                suppress_parameter = stream_parameters.get(
+                    "suppress_automatic_context"
+                )
+                stream_accepts_suppress = (
+                    suppress_parameter is not None
+                    and suppress_parameter.kind
+                    in {
+                        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                        inspect.Parameter.KEYWORD_ONLY,
+                    }
+                )
+                if (
+                    stream_accepts_kwargs or stream_accepts_suppress
+                ):
+                    stream_iterator = stream_method(
+                        messages,
+                        temperature,
+                        max_tokens,
+                        user_input,
+                        suppress_automatic_context=suppress_automatic_context,
+                    )
+                else:
+                    stream_iterator = stream_method(
+                        messages,
+                        temperature,
+                        max_tokens,
+                        user_input,
+                    )
+
+                # The stream may be consumed on another thread.  Release the
+                # setup ContextVar tokens in this caller context before
+                # copying it, then bind the same request values in a private
+                # stream context whose tokens can be reset during finalization.
+                if project_token is not None:
+                    reset_runtime_project_context(project_token)
+                    project_token = None
+                reset_runtime_specialist_provider(specialist_provider_token)
+                specialist_provider_token = None
+                reset_current_generation_policy(generation_policy_token)
+                generation_policy_token = None
+                reset_current_user_input(tool_policy_token)
+                tool_policy_token = None
+
+                stream_context = contextvars.copy_context()
+
+                def _bind_stream_context():
+                    return (
+                        set_runtime_project_context(project_context),
+                        set_runtime_specialist_provider(
+                            "openai_compatible_local"
+                        ),
+                        set_current_generation_policy(policy),
+                        set_current_user_input(user_input),
+                    )
+
+                (
+                    stream_project_token,
+                    stream_specialist_provider_token,
+                    stream_generation_policy_token,
+                    stream_tool_policy_token,
+                ) = stream_context.run(_bind_stream_context)
+
+                def _finalize_stream() -> None:
+                    # Preserve the non-stream cleanup order: restore the
+                    # request ContextVars first, capture the completed
+                    # request/bundle observation, then clear turn-local state.
+                    reset_runtime_project_context(stream_project_token)
+                    reset_runtime_specialist_provider(
+                        stream_specialist_provider_token
+                    )
+                    reset_current_generation_policy(
+                        stream_generation_policy_token
+                    )
+                    reset_current_user_input(stream_tool_policy_token)
+                    try:
+                        if not suppress_automatic_context:
+                            capture_context_manifest_before_context_clear(self)
+                    finally:
+                        self._current_context_bundle = None
+                        self._current_context_budget = None
+                        self._current_tool_hint_context = ""
+                        if isolated_gateway_active:
+                            self._privacy_gateway = isolated_gateway_previous
+                        if suppress_automatic_context:
+                            _restore_help_stream_provider_state(
+                                self,
+                                isolated_provider_state,
+                            )
+
+                lifecycle_stream = _LifecycleStream(
+                    stream_iterator,
+                    context=stream_context,
+                    on_close=_finalize_stream,
+                )
+                stream_lifecycle_transferred = True
+                return lifecycle_stream
             turn_event_emitter = make_sync_stream_emitter(stream_callback)
             response_text = self.chat(
                 messages,
@@ -2669,7 +3431,7 @@ class OpenAICompatibleLocalClient:
                 if stream_callback:
                     self._run_async_sync(stream_callback(event_type, data))
 
-            if self._should_run_agentic_completion_review():
+            if not suppress_automatic_context and self._should_run_agentic_completion_review():
                 response_text = run_agentic_completion_loop_sync(
                     client=self,
                     run_once=lambda prompt: self._run_agentic_continuation_once(
@@ -2706,8 +3468,9 @@ class OpenAICompatibleLocalClient:
                     audit_tool_calls_provider=lambda: list(self._last_audit_tool_calls),
                 )
             self._record_model_transcript(messages, response_text)
-            self.history_manager.add_message("user", user_input)
-            self.history_manager.add_message("assistant", response_text)
+            if not suppress_automatic_context:
+                self.history_manager.add_message("user", user_input)
+                self.history_manager.add_message("assistant", response_text)
             return response_text
         except GenerationInterrupted:
             raise
@@ -2724,7 +3487,7 @@ class OpenAICompatibleLocalClient:
                     "[OpenAICompatibleLocalClient] local model context overflow: %s",
                     exc,
                 )
-                if not stream:
+                if not suppress_automatic_context and not stream:
                     try:
                         retry_text = self._retry_after_context_overflow(
                             user_input=user_input,
@@ -2748,20 +3511,37 @@ class OpenAICompatibleLocalClient:
                     exc,
                     exc_info=True,
                 )
+            if suppress_automatic_context:
+                # Do not turn a transport/provider failure into an ordinary
+                # character fallback: it would be ungrounded by the Guide.
+                return ""
             self.history_manager.add_message("user", user_input)
             self.history_manager.add_message("assistant", fallback)
             if stream:
                 return iter([fallback])
             return fallback
         finally:
-            if project_token is not None:
-                reset_runtime_project_context(project_token)
-            reset_runtime_specialist_provider(specialist_provider_token)
-            reset_current_generation_policy(generation_policy_token)
-            reset_current_user_input(tool_policy_token)
-            self._current_context_bundle = None
-            self._current_context_budget = None
-            self._current_tool_hint_context = ""
+            if not stream_lifecycle_transferred:
+                if project_token is not None:
+                    reset_runtime_project_context(project_token)
+                reset_runtime_specialist_provider(specialist_provider_token)
+                reset_current_generation_policy(generation_policy_token)
+                reset_current_user_input(tool_policy_token)
+                if not suppress_automatic_context:
+                    capture_context_manifest_before_context_clear(self)
+                self._current_context_bundle = None
+                self._current_context_budget = None
+                self._current_tool_hint_context = ""
+                if isolated_gateway_active:
+                    self._privacy_gateway = isolated_gateway_previous
+                # A custom/legacy stream helper can fail while being created,
+                # before ownership transfers to ``_LifecycleStream``.  Keep
+                # that setup failure from erasing the prior ordinary ledgers.
+                if suppress_automatic_context:
+                    _restore_help_stream_provider_state(
+                        self,
+                        isolated_provider_state,
+                    )
 
     def generate_title(
         self,
@@ -2833,6 +3613,8 @@ class OpenAICompatibleLocalClient:
         system_prompt: Optional[str] = None,
     ) -> str:
         """Generate text without mutating normal conversation history."""
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            system_prompt = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         return await asyncio.to_thread(
             self._generate_plain_text,
             prompt,
@@ -2848,6 +3630,9 @@ class OpenAICompatibleLocalClient:
     ) -> str:
         """Generate memory extraction text without mutating chat history."""
 
+        if bool(getattr(get_turn_context(), "suppress_automatic_context", False)):
+            system_prompt = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
+
         return await asyncio.to_thread(
             self._generate_plain_text,
             prompt,
@@ -2861,8 +3646,16 @@ class OpenAICompatibleLocalClient:
         temperature: float,
         max_tokens: Optional[int],
         user_input: str,
+        *,
+        suppress_automatic_context: Optional[bool] = None,
     ) -> Generator[str, None, None]:
         full_response = ""
+        if suppress_automatic_context is None:
+            suppress_automatic_context = bool(
+                getattr(get_turn_context(), "suppress_automatic_context", False)
+            )
+        else:
+            suppress_automatic_context = bool(suppress_automatic_context)
         # Keep a request-local ledger.  ``_last_usage`` is also used by
         # non-streaming calls, so reset it before starting and never persist a
         # value left over from an earlier request when stream creation fails
@@ -2874,6 +3667,7 @@ class OpenAICompatibleLocalClient:
                 messages,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                suppress_automatic_context=suppress_automatic_context,
             ):
                 if self._last_usage:
                     stream_usage = dict(self._last_usage)
@@ -2882,6 +3676,11 @@ class OpenAICompatibleLocalClient:
         except GenerationInterrupted:
             raise
         except Exception as exc:
+            if suppress_automatic_context:
+                # Propagate the failure so the outer Help boundary emits its
+                # safe, Guide-unavailable response instead of a generic local
+                # model fallback.
+                raise
             full_response = self._get_error_response(exc)
             if _is_local_model_loading_error(exc):
                 logger.warning(
@@ -2902,14 +3701,15 @@ class OpenAICompatibleLocalClient:
                 )
             yield full_response
         finally:
-            self._record_model_transcript(messages, full_response)
+            if not suppress_automatic_context:
+                self._record_model_transcript(messages, full_response)
             # The final stream chunk can carry usage without content; retain
             # that observation while avoiding stale usage on an empty/failed
             # stream.  Persist exactly once for the whole stream.
             if self._last_usage:
                 stream_usage = dict(self._last_usage)
             self._last_usage = dict(stream_usage)
-            if stream_usage:
+            if stream_usage and not suppress_automatic_context:
                 persist_usage_sync(
                     self,
                     provider="openai_compatible_local",
@@ -2918,8 +3718,9 @@ class OpenAICompatibleLocalClient:
                     request_type="chat",
                     is_streaming=True,
                 )
-            self.history_manager.add_message("user", user_input)
-            self.history_manager.add_message("assistant", full_response)
+            if not suppress_automatic_context:
+                self.history_manager.add_message("user", user_input)
+                self.history_manager.add_message("assistant", full_response)
 
     def _get_error_response(self, exc: Exception) -> str:
         if _is_local_model_loading_error(exc):
@@ -2984,7 +3785,6 @@ class OpenAICompatibleLocalClient:
                 [
                     context_bundle.project_context_block,
                     context_bundle.project_information_block,
-                    context_bundle.project_pack_block,
                 ]
             )
         evidence = "\n\n".join(block.strip() for block in evidence_blocks if block and block.strip())
@@ -3065,11 +3865,11 @@ class OpenAICompatibleLocalClient:
         return await asyncio.to_thread(
             self.generate_response,
             user_input,
-            temperature,
-            max_tokens,
-            False,
-            image_data,
-            bind_stream_callback_loop(stream_callback),
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=False,
+            image_data=image_data,
+            stream_callback=bind_stream_callback_loop(stream_callback),
         )
 
     async def generate_title_async(self, prompt: str) -> str:

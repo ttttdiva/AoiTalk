@@ -227,7 +227,10 @@ export default function CalendarScreen() {
     remoteTasks,
     profiles: remoteProfiles,
     reload: reloadRemote,
-  } = useRemoteTasks(isAuthenticated);
+  } = useRemoteTasks(isAuthenticated, {
+    projectId: selectedProjectId,
+    spaceId: selectedSpaceId,
+  });
   const [remoteDialogTarget, setRemoteDialogTarget] =
     useState<RemoteTaskDialogTarget | null>(null);
 

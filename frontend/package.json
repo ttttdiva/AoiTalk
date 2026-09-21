@@ -19,6 +19,10 @@
     "docs:migrate-supertags": "node scripts/migrate-docs-supertags-out-of-body.mjs",
     "docs:migrate-markdown": "node scripts/migrate-docs-markdown-to-blocks.mjs",
     "docs:verify-markdown-blocks": "node scripts/verify-docs-markdown-blocks.mjs",
+    "docs:backfill-explicit-blanks": "tsx scripts/backfill-docs-explicit-blank.ts --apply",
+    "docs:verify-explicit-blanks": "tsx scripts/backfill-docs-explicit-blank.ts --verify",
+    "docs:backfill-explicit-blank": "tsx scripts/backfill-docs-explicit-blank.ts --apply",
+    "docs:verify-explicit-blank": "tsx scripts/backfill-docs-explicit-blank.ts --verify",
     "docs:configure-table-collections": "tsx scripts/configure-docs-table-collections.ts"
   },
   "dependencies": {
@@ -48,7 +52,6 @@
     "@huggingface/hub": "^2.11.0",
     "@tanstack/react-virtual": "^3.14.6",
     "@xyflow/react": "^12.11.2",
-    "bcryptjs": "^3.0.3",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
@@ -83,7 +86,6 @@
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
     "@testing-library/user-event": "^14.6.1",
-    "@types/bcryptjs": "^2.4.6",
     "@types/node": "^20",
     "@types/pg": "^8.20.0",
     "@types/react": "^19",

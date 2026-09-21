@@ -4,6 +4,7 @@ manager.py から責務分割したもの。メソッド本体のロジックは
 """
 
 import concurrent.futures
+import contextvars
 import json
 import logging
 import re
@@ -13,8 +14,11 @@ from typing import Any, Awaitable, Callable, Dict, Generator, List, Optional, Un
 from ..native_runtime import responses_output_text
 from ..openrouter_provider_routing import merge_provider_options_into_extra_body
 from ..conversation_context import normalize_usage, persist_usage_sync
-from ...services.outbound_privacy_service import OutboundPrivacyGateway
-from ...services.turn_context import get_turn_context
+from ...services.outbound_privacy_service import EgressDescriptor, OutboundPrivacyGateway
+from ...services.turn_context import (
+    AOITALK_HELP_ISOLATED_SYSTEM_PROMPT,
+    get_turn_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +35,9 @@ class GenerationApiMixin:
         """Return a gateway scoped to the active user/session identity."""
 
         turn = get_turn_context()
+        suppress_automatic_context = bool(
+            getattr(turn, "suppress_automatic_context", False)
+        )
         user_id = str(
             getattr(self, "session_user_id", None)
             or getattr(turn, "user_id", None)
@@ -42,6 +49,20 @@ class GenerationApiMixin:
             or ""
         ).strip()
         runner = getattr(self, "_turn_runner", None)
+        if suppress_automatic_context:
+            # Direct plain/title/memory helpers may bypass TerminalMode and
+            # therefore cannot rely on its provider snapshot.  Never reuse or
+            # mutate the ordinary runner gateway for a Help projection;
+            # project/session policy and alias tables are intentionally empty.
+            gateway = OutboundPrivacyGateway(
+                getattr(self, "config", None),
+                user_id=user_id,
+                session_id=session_id,
+                session_context={},
+                project_metadata={},
+            )
+            setattr(gateway, "_aoitalk_help_isolated", True)
+            return gateway
         gateway = getattr(runner, "privacy_gateway", None)
         if not isinstance(gateway, OutboundPrivacyGateway) or (
             gateway.user_id != user_id or gateway.session_id != session_id
@@ -67,6 +88,66 @@ class GenerationApiMixin:
                 gateway.update_policy_context()
         return gateway
 
+    def _model_egress_descriptor(
+        self,
+        *,
+        transport: str,
+        provider: str | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        action: str = "model.generate",
+    ) -> EgressDescriptor:
+        """Build the audit descriptor for a direct provider request."""
+
+        resolved_provider = str(
+            provider or getattr(self, "provider_label", "openai") or "openai"
+        )
+        resolved_model = str(model or getattr(self, "model_name", "") or "")
+        resolved_base_url = str(
+            base_url
+            if base_url is not None
+            else getattr(getattr(self, "_openai_client", None), "base_url", "")
+            or ""
+        )
+        return EgressDescriptor(
+            action=action,
+            transport=transport,
+            destination=resolved_base_url,
+            provider=resolved_provider,
+            model=resolved_model,
+        )
+
+    async def _execute_model_request(
+        self,
+        payload: dict[str, Any],
+        *,
+        transport: str,
+        sender: Callable[[dict[str, Any]], Awaitable[Any]],
+        source_kind: str,
+        gateway: OutboundPrivacyGateway | None = None,
+    ) -> Any:
+        """Run one direct model request inside the privacy transaction."""
+
+        provider = str(getattr(self, "provider_label", "openai") or "openai")
+        base_url = str(
+            getattr(getattr(self, "_openai_client", None), "base_url", "") or ""
+        )
+        active_gateway = gateway or self._privacy_gateway_for_generation()
+        return await active_gateway.execute(
+            payload,
+            provider=provider,
+            descriptor=self._model_egress_descriptor(
+                transport=transport,
+                provider=provider,
+                model=str(getattr(self, "model_name", "") or ""),
+                base_url=base_url,
+            ),
+            sender=sender,
+            base_url=base_url,
+            source_kind=source_kind,
+            model=str(getattr(self, "model_name", "") or ""),
+        )
+
     """chat/generate_* 系の公開エントリポイント、ストリーム抽出、シーン画像生成。"""
 
     def _record_generation_usage(
@@ -86,6 +167,13 @@ class GenerationApiMixin:
         through ``normalize_usage`` so requested and resolved models remain
         distinguishable in ``TokenUsage``.
         """
+
+        if bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        ):
+            # Help is a transient Guide projection.  Even direct ephemeral
+            # provider helpers must not create ordinary TokenUsage rows.
+            return {}
 
         raw_usage = getattr(response, "usage", None)
         resolved_model = getattr(response, "model", None)
@@ -167,8 +255,21 @@ class GenerationApiMixin:
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
     ) -> Generator[str, None, None]:
-        result = self.chat(messages, temperature=temperature, max_tokens=max_tokens)
-        yield result
+        # ``stream_chat`` is a lazy compatibility API.  Capture the request
+        # ContextVar now, not when the consumer eventually calls ``next``;
+        # Help's isolation token is reset as soon as the HTTP turn returns.
+        stream_context = contextvars.copy_context()
+
+        def _deferred() -> Generator[str, None, None]:
+            result = stream_context.run(
+                self.chat,
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            yield result
+
+        return _deferred()
 
     def list_models(self) -> List[Dict[str, Any]]:
         return [{"id": self.model_name}]
@@ -198,9 +299,18 @@ class GenerationApiMixin:
         Returns:
             Generated response
         """
+        # The synchronous compatibility API can still be called directly by
+        # embeddings/tests.  Help is a Guide-only controller turn; preserve
+        # that contract even though the native work is run in a worker thread
+        # and the normal async response handler is not involved.
+        suppress_automatic_context = bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        )
+        worker_context = contextvars.copy_context()
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
                 future = executor.submit(
+                    worker_context.run,
                     self._run_async_safe,
                     user_input,
                     stream_callback,
@@ -221,6 +331,8 @@ class GenerationApiMixin:
 
         except concurrent.futures.TimeoutError:
             print(f"[AgentLLMClient] タイムアウトエラー")
+            if suppress_automatic_context:
+                raise
             personality = (
                 self.config.get_character_config(self.character_name).get(
                     "personality", {}
@@ -235,6 +347,8 @@ class GenerationApiMixin:
             import traceback
 
             traceback.print_exc()
+            if suppress_automatic_context:
+                raise
             personality = (
                 self.config.get_character_config(self.character_name).get(
                     "personality", {}
@@ -447,6 +561,10 @@ class GenerationApiMixin:
         system_prompt: str,
     ) -> str:
         """Generate Dreaming extraction JSON without mutating chat history or using tools."""
+        if bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        ):
+            system_prompt = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         if getattr(self, "provider_label", "openai") == "openai":
             # 公式 OpenAI 経路は Responses API を使う（tools なしの単純呼び出し）。
             try:
@@ -461,14 +579,14 @@ class GenerationApiMixin:
                     "store": False,
                 }
                 gateway = self._privacy_gateway_for_generation()
-                protected = await gateway.protect(
+                response = await self._execute_model_request(
                     request_kwargs,
-                    provider=str(getattr(self, "provider_label", "openai") or "openai"),
-                    base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                    transport="openai.responses",
+                    sender=lambda outbound: self._openai_client.responses.create(
+                        **outbound
+                    ),
                     source_kind="memory_extraction",
-                )
-                response = await self._openai_client.responses.create(
-                    **protected.payload
+                    gateway=gateway,
                 )
             except Exception as first_error:
                 print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
@@ -529,14 +647,14 @@ class GenerationApiMixin:
         try:
             started_at = time.monotonic()
             gateway = self._privacy_gateway_for_generation()
-            protected = await gateway.protect(
+            response = await self._execute_model_request(
                 kwargs,
-                provider=str(getattr(self, "provider_label", "openai") or "openai"),
-                base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                transport="openai.chat.completions",
+                sender=lambda outbound: self._openai_client.chat.completions.create(
+                    **outbound
+                ),
                 source_kind="memory_extraction",
-            )
-            response = await self._openai_client.chat.completions.create(
-                **protected.payload
+                gateway=gateway,
             )
         except Exception as first_error:
             if getattr(self, "provider_label", "") in {"deepseek", "deepinfra", "openrouter"}:
@@ -546,14 +664,14 @@ class GenerationApiMixin:
             try:
                 retry_started_at = time.monotonic()
                 retry_kwargs = {"model": self.model_name, "messages": messages}
-                retry_protected = await gateway.protect(
+                response = await self._execute_model_request(
                     retry_kwargs,
-                    provider=str(getattr(self, "provider_label", "openai") or "openai"),
-                    base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                    transport="openai.chat.completions",
+                    sender=lambda outbound: self._openai_client.chat.completions.create(
+                        **outbound
+                    ),
                     source_kind="memory_extraction",
-                )
-                response = await self._openai_client.chat.completions.create(
-                    **retry_protected.payload
+                    gateway=gateway,
                 )
             except Exception:
                 print(f"[AgentLLMClient] Dreamingメモリ抽出に失敗: {first_error}")
@@ -593,6 +711,10 @@ class GenerationApiMixin:
             "instruction exactly. Do not call tools and output only "
             "the requested format."
         )
+        if bool(
+            getattr(get_turn_context(), "suppress_automatic_context", False)
+        ):
+            system = AOITALK_HELP_ISOLATED_SYSTEM_PROMPT
         if getattr(self, "provider_label", "openai") == "openai":
             started_at = time.monotonic()
             gateway = self._privacy_gateway_for_generation()
@@ -602,14 +724,14 @@ class GenerationApiMixin:
                 "input": prompt or "",
                 "store": False,
             }
-            protected = await gateway.protect(
+            response = await self._execute_model_request(
                 request_kwargs,
-                provider=str(getattr(self, "provider_label", "openai") or "openai"),
-                base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+                transport="openai.responses",
+                sender=lambda outbound: self._openai_client.responses.create(
+                    **outbound
+                ),
                 source_kind=request_type,
-            )
-            response = await self._openai_client.responses.create(
-                **protected.payload
+                gateway=gateway,
             )
             self._record_generation_usage(
                 response,
@@ -659,14 +781,14 @@ class GenerationApiMixin:
                 kwargs["extra_body"] = merged_extra_body
         started_at = time.monotonic()
         gateway = self._privacy_gateway_for_generation()
-        protected = await gateway.protect(
+        response = await self._execute_model_request(
             kwargs,
-            provider=str(getattr(self, "provider_label", "openai") or "openai"),
-            base_url=str(getattr(self._openai_client, "base_url", "") or ""),
+            transport="openai.chat.completions",
+            sender=lambda outbound: self._openai_client.chat.completions.create(
+                **outbound
+            ),
             source_kind=request_type,
-        )
-        response = await self._openai_client.chat.completions.create(
-            **protected.payload
+            gateway=gateway,
         )
         self._record_generation_usage(
             response,
