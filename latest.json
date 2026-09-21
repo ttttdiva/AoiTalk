@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-09-21",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.187/aoitalk-mobile.apk",
-                   "version":  "0.1.187",
-                   "notes":  "リモートPC Bridgeの共有API契約に対応。ブラウザ・Windows操作の操作先PC登録、選択、接続状態の型を同期。既存モバイルChatはサーバーで選択したPCを操作します。"
+                   "date":  "2026-09-22",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.188/aoitalk-mobile.apk",
+                   "version":  "0.1.188",
+                   "notes":  "タスク詳細画面を全面的にコンパクト化。プロジェクト・進捗・担当者・日付・タグを上部に集約し、繰り返しを日付設定へ統合。コメント・添付・関連アプリを必要時だけ展開する構成に変更し、通知・タイマー・AIチャット導線も整理しました。"
                }
 }
