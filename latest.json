@@ -1,8 +1,8 @@
 {
-  "mobile": {
-    "version": "0.1.186",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.186/aoitalk-mobile.apk",
-    "notes": "チャット上部をプロジェクト名・キャラクター名の1段表示に整理。モデル別の推論エフォート、即時送信表示と応答への自動割り込み、SQLite保存競合と送信時のちらつきを修正。",
-    "date": "2026-09-21"
-  }
+    "mobile":  {
+                   "date":  "2026-09-21",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.187/aoitalk-mobile.apk",
+                   "version":  "0.1.187",
+                   "notes":  "リモートPC Bridgeの共有API契約に対応。ブラウザ・Windows操作の操作先PC登録、選択、接続状態の型を同期。既存モバイルChatはサーバーで選択したPCを操作します。"
+               }
 }
