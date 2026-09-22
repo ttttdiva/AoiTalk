@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-09-22",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.189/aoitalk-mobile.apk",
-                   "version":  "0.1.189",
-                   "notes":  "v0.1.189 リリース"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.190/aoitalk-mobile.apk",
+                   "version":  "0.1.190",
+                   "notes":  "Filesで端末ローカルのファイルをコピーし、サーバーのProject/Userフォルダへ貼り付けてアップロードできる機能を復旧しました。複数ファイルの一部で失敗しても残りを処理し、結果を表示します。"
                }
 }
