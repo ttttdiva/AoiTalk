@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-09-22",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.192/aoitalk-mobile.apk",
-                   "version":  "0.1.192",
-                   "notes":  "v0.1.192 リリース"
-               }
+  "mobile": {
+    "version": "0.1.195",
+    "date": "2026-09-23",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.195/aoitalk-mobile.apk",
+    "notes": "モバイルのチャット画面にサーバー接続型の音声会話を追加しました。\r\n\r\n- 端末のマイクで話した内容をサーバー側で認識し、通常の会話へ送信します。\r\n- キャラクター設定に従ったサーバー側の読み上げ音声を端末で再生します。\r\n- マイクと読み上げは独立してミュートでき、音声会話中も文字入力を使えます。\r\n- マイク権限の拒否・再許可、バックグラウンド移行、通信の中止処理を改善しました。\r\n- 読み上げ中は録音を止め、音声の自己入力と重複送信を防ぎます。\r\n\r\n音声機能には、音声認識・読み上げを有効にしたAoiTalkサーバーへの接続が必要です。\r\n\r\nAndroid versionCode: 195\r\nAPK source: 1f009b9017c10a3ec4c17aaa295957ea65d29e9c"
+  }
 }
