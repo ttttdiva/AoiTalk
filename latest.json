@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-09-24",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.199/aoitalk-mobile.apk",
-                   "version":  "0.1.199",
-                   "notes":  "v0.1.199 リリース"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.201/aoitalk-mobile.apk",
+                   "version":  "0.1.201",
+                   "notes":  "モバイルのタスク通知が同じ内容で重複して届く問題を修正しました。"
                }
 }
