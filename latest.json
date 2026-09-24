@@ -1,8 +1,8 @@
 {
     "mobile":  {
                    "date":  "2026-09-24",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.201/aoitalk-mobile.apk",
-                   "version":  "0.1.201",
-                   "notes":  "モバイルのタスク通知が同じ内容で重複して届く問題を修正しました。"
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.202/aoitalk-mobile.apk",
+                   "version":  "0.1.202",
+                   "notes":  "チャット履歴が全体同期を待たずに表示・更新されるよう修正しました。"
                }
 }
