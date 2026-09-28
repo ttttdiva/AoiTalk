@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-09-28",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.207/aoitalk-mobile.apk",
-                   "version":  "0.1.207",
-                   "notes":  "v0.1.207 リリース"
-               }
+  "mobile": {
+    "version": "0.1.208",
+    "date": "2026-09-29",
+    "notes": "AoiRigの共有API定義を更新しました。部品別の変形階層と顔・体の向きのパラメータに対応する生成型を含みます。\n\nAndroid v0.1.208 / versionCode 208。Mobileの既存の静止画表示と同期契約を維持しています。今回、Mobile専用の2D描画エンジンは追加していません。",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.208/aoitalk-mobile.apk"
+  }
 }
