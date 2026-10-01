@@ -1,8 +1,8 @@
 {
   "mobile": {
-    "version": "0.1.208",
-    "date": "2026-09-29",
-    "notes": "AoiRigの共有API定義を更新しました。部品別の変形階層と顔・体の向きのパラメータに対応する生成型を含みます。\n\nAndroid v0.1.208 / versionCode 208。Mobileの既存の静止画表示と同期契約を維持しています。今回、Mobile専用の2D描画エンジンは追加していません。",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.208/aoitalk-mobile.apk"
+    "version": "0.1.209",
+    "notes": "See-through Rigの完成モデル取込とアバター再生を追加しました。\n\nWeb/Nativeは87を正本とする同梱runtimeを使用し、完成モデルはAoiTalk側に保存します。制作連携をOFFにしても取り込み済みモデルを再生できます。候補プレビュー後に使用モデルを切り替えられます。\n\nNativeにモデル取込・使用切替、capabilitiesに応じた表情・表示範囲、実音声プレビュー、会話音声の口パクと返答リアクションを追加しました。型検証・対象30テスト・arm64-v8a/x86_64 APKビルドを確認しています。\n\n検証範囲: Webでは実琴葉葵パッケージの取込・候補・使用切替・旧版復帰・実音声・表情切替を確認済みです。NativeはAndroidエミュレーターへの導入・起動を確認し、ログイン後の実モデル再生と物理実機での検証は未完了です。",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.209/aoitalk-mobile.apk",
+    "date": "2026-10-01"
   }
 }
