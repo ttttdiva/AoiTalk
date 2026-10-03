@@ -1,8 +1,8 @@
 {
-    "mobile":  {
-                   "date":  "2026-10-01",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.210/aoitalk-mobile.apk",
-                   "version":  "0.1.210",
-                   "notes":  "独自AoiRigの再生をやめ、See-through Rigだけを表示します。Expo GLが読めないWebPは、不変パッケージを変えずに端末キャッシュの中だけでPNGへ変換します。"
-               }
+  "mobile": {
+    "notes": "Docsでサーバー取得に成功しているノートが「見つかりません」となる問題を修正しました。\n認証・トークン切替時の表示更新と、読み取り専用状態での遅延書き込みを修正しました。\nDocs対象24スイート・160テスト、型チェック、対象lintを確認済みです。Pixel 10aで213から214へデータを保持した更新と、対象ノートの表示・再表示を確認しました。",
+    "version": "0.1.214",
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.214/aoitalk-mobile.apk",
+    "date": "2026-10-03"
+  }
 }
