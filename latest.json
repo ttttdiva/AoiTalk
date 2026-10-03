@@ -1,8 +1,8 @@
 {
-  "mobile": {
-    "notes": "Docsでサーバー取得に成功しているノートが「見つかりません」となる問題を修正しました。\n認証・トークン切替時の表示更新と、読み取り専用状態での遅延書き込みを修正しました。\nDocs対象24スイート・160テスト、型チェック、対象lintを確認済みです。Pixel 10aで213から214へデータを保持した更新と、対象ノートの表示・再表示を確認しました。",
-    "version": "0.1.214",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.214/aoitalk-mobile.apk",
-    "date": "2026-10-03"
-  }
+    "mobile":  {
+                   "date":  "2026-10-03",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.215/aoitalk-mobile.apk",
+                   "version":  "0.1.215",
+                   "notes":  "葵アバターの白目境界を元絵に合わせて修正しました。Native描画の白い縁と髪・衣服の継ぎ目を修正し、目3状態と5母音をPixel 10aで確認しました。"
+               }
 }
