@@ -1,8 +1,8 @@
 {
   "mobile": {
-    "version": "0.1.216",
+    "version": "0.1.217",
+    "notes": "モバイルDocsのページ表示を改善しました。Pixel 10aの同じ既存データで、Home本文と6子は約26.7秒から1.6秒、FWDの18子は約24.6秒から1.5秒へ短縮。空ページ、戻る、背景復帰と同期完了も確認済みです。216の同期改善と葵アバターの白目境界修正を保持します。",
     "date": "2026-10-03",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.216/aoitalk-mobile.apk",
-    "notes": "Improves repeated mobile sync by skipping unchanged general tables and safely promoting unchanged Docs scopes. Preserves the Aoi avatar sclera boundary fix from 0.1.215. Verified on Pixel 10a: general sync 255.871s to 16.557s after the initial full receipt, with Docs content and navigation retained. Existing page navigation latency remains under investigation."
+    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.217/aoitalk-mobile.apk"
   }
 }
