@@ -1,8 +1,8 @@
 {
-  "mobile": {
-    "version": "0.1.217",
-    "notes": "モバイルDocsのページ表示を改善しました。Pixel 10aの同じ既存データで、Home本文と6子は約26.7秒から1.6秒、FWDの18子は約24.6秒から1.5秒へ短縮。空ページ、戻る、背景復帰と同期完了も確認済みです。216の同期改善と葵アバターの白目境界修正を保持します。",
-    "date": "2026-10-03",
-    "url": "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.217/aoitalk-mobile.apk"
-  }
+    "mobile":  {
+                   "date":  "2026-10-04",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.220/aoitalk-mobile.apk",
+                   "version":  "0.1.220",
+                   "notes":  "モバイル Docs の行間と折返しを調整し、兄弟ノード取得と少数ノード保存時の DB 読取りを対象候補 ID に限定しました。通常の更新で既存データを保持します。\n\nPixel 10a をデータ保持で更新し、既存 QA メモで確定済み ASCII 入力から soft Enter 1回による新規行とフォーカス、同じメモの保存・再読込を確認しました。9件の非空テキストが一致し、起動時の持続する空白画面は今回の1回の起動では再発しませんでした。\n\n新規行とカーソルはツール観測上2.085秒以内に確認しました。画像取得・転送を含む観測上限で、正確な UI 遅延や瞬時応答を示す値ではありません。確認範囲は上記 Docs 操作に限定され、全 Mobile 機能の合格を意味しません。\n\nVersion: 0.1.220 / versionCode: 220\nBuild source: 895352fd4f1168a68400bd058dd10f19e6dae1e3\nAPK bytes: 41633793\nAPK SHA-256: bb3f5f24a139f204f3ae240786f9f07c4432f5f8a2d119efe7645e727cdb1211"
+               }
 }
