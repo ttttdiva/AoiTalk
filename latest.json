@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-10-12",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.256/aoitalk-mobile.apk",
-                   "version":  "0.1.256",
-                   "notes":  "v0.1.256 リリース"
+                   "date":  "2026-10-16",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.266/aoitalk-mobile.apk",
+                   "version":  "0.1.266",
+                   "notes":  "Docsの改行と日本語IMEの入力を改善。連続入力中の保存をまとめ、行位置・再編集タップ・長文カーソルを安定させました。編集ツールバーをアイコンへ整理し、Filesの既存テキスト保存の修正も含みます。"
                }
 }
