@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-10-17",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.273/aoitalk-mobile.apk",
-                   "version":  "0.1.273",
-                   "notes":  "v0.1.273 リリース"
+                   "date":  "2026-10-19",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.278/aoitalk-mobile.apk",
+                   "version":  "0.1.278",
+                   "notes":  "Appsカードで名前・slug・権限・説明が読めるよう表示を修正。Docs同期の既知の取得失敗は継続しています。"
                }
 }
