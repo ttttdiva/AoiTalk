@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-10-19",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.278/aoitalk-mobile.apk",
-                   "version":  "0.1.278",
-                   "notes":  "Appsカードで名前・slug・権限・説明が読めるよう表示を修正。Docs同期の既知の取得失敗は継続しています。"
+                   "date":  "2026-10-20",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.280/aoitalk-mobile.apk",
+                   "version":  "0.1.280",
+                   "notes":  "Tasksコンパクト表示、AoiDotsのBack/×閉じ、Files一括重複処理（skip/overwrite）の受入を反映。※Docs同期と波紋の仕上げは既知の未解決課題として継続対応中であり、全不具合解消ではありません。"
                }
 }
