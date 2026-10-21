@@ -1,8 +1,8 @@
 {
     "mobile":  {
-                   "date":  "2026-10-20",
-                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.280/aoitalk-mobile.apk",
-                   "version":  "0.1.280",
-                   "notes":  "Tasksコンパクト表示、AoiDotsのBack/×閉じ、Files一括重複処理（skip/overwrite）の受入を反映。※Docs同期と波紋の仕上げは既知の未解決課題として継続対応中であり、全不具合解消ではありません。"
+                   "date":  "2026-10-22",
+                   "url":  "https://github.com/ttttdiva/AoiTalk/releases/download/v0.1.288/aoitalk-mobile.apk",
+                   "version":  "0.1.288",
+                   "notes":  "Tasksに日付・期限の条件（期限超過のみ／開始日・期限の以前・以降・より前・より後・当日・設定あり・未設定、今日・昨日・明日・日付指定、すべて満たす／いずれか）を追加し、上部をプロジェクト切替常時表示の1行ツールバーに集約。Filesは場所切替を小型化し、ストレージ選択を歯車の設定内へ移動、表示名を「プロジェクト」に統一。狭い画面での日付指定欄の潰れとFilesのプロジェクト切替の縦折り返しを修正。※同期競合の確認待ち更新など既存の未解決事項は継続対応中であり、全不具合解消ではありません。"
                }
 }
